@@ -2,6 +2,7 @@ package workflow_pbt_test
 
 import "core:bytes"
 import "core:mem/virtual"
+import "core:strings"
 import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
@@ -184,6 +185,181 @@ activity_failures_preserve_generated_retry_contracts :: proc(t: ^testing.T) {
 		"Activity failures preserve generated retry contracts",
 		activity_failure_wire_property,
 		{num_tests = 500, seed = 0x5245_5452_595f_4641},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+Generated_Workflow_Output :: struct {
+	name:    string,
+	count:   int,
+	enabled: bool,
+}
+
+generated_typed_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	input: Generated_Payload_Value,
+) -> Generated_Workflow_Output {
+	return {
+		name = input.name,
+		count = input.count + 1,
+		enabled = !input.enabled,
+	}
+}
+
+clone_pbt_workflow_result :: proc(data: []u8) -> (payload: codec.Payload, found: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+				if variant.value != nil && variant.value.result != nil {
+					clone_error: codec.Error
+					payload, clone_error = proto.clone_payload(variant.value.result)
+					found = clone_error == .None
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
+typed_workflow_payload_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	input_value := Generated_Payload_Value{
+		name = pbt.draw(t, pbt.string_ascii(0, 32)),
+		count = pbt.draw(t, pbt.int_range(-100_000, 100_000)),
+		enabled = pbt.draw(t, pbt.boolean()),
+	}
+	owned_queue, queue_error := strings.clone("pbt-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate generated Workflow queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_typed_workflow",
+		generated_typed_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register generated typed Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Workflow input")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_typed_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.completed {
+		return pbt.fail("generated typed Workflow did not complete")
+	}
+	result_payload, result_found := clone_pbt_workflow_result(initial.completion[:])
+	if !result_found {
+		return pbt.fail("generated typed Workflow completion has no Payload")
+	}
+	defer codec.payload_free(&result_payload)
+	actual: Generated_Workflow_Output
+	if codec.decode_json(codec.payload_view(&result_payload), &actual) != .None {
+		return pbt.fail("generated typed Workflow result did not decode")
+	}
+	defer delete(actual.name)
+	if actual.name != input_value.name || actual.count != input_value.count + 1 || actual.enabled == input_value.enabled {
+		return pbt.fail("generated typed Workflow changed its structured value")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated typed Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated typed Workflow replay changed completion bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+typed_workflow_payloads_replay_for_generated_structs :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"typed Workflow Payloads replay for generated structs",
+		typed_workflow_payload_replay_property,
+		{num_tests = 500, seed = 0x5459_5045_445f_5746},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

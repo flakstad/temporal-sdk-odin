@@ -11,6 +11,17 @@ import workflow "../../temporal/workflow"
 
 TASK_QUEUE :: "odin-hello-workflow"
 WORKFLOW_TYPE :: "odin_hello_workflow"
+TYPED_WORKFLOW_TYPE :: "odin_typed_workflow"
+
+Typed_Greeting_Input :: struct {
+	name:       string,
+	salutation: string,
+}
+
+Typed_Greeting_Output :: struct {
+	message:     string,
+	name_length: int,
+}
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	if name == "cancel-activity" {
@@ -39,6 +50,14 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	return greeting
 }
 
+typed_greeting :: proc(_: ^activity.Context, input: Typed_Greeting_Input) -> Typed_Greeting_Output {
+	message, allocation_error := strings.concatenate({input.salutation, ", ", input.name, "!"})
+	if allocation_error != nil {
+		return {}
+	}
+	return {message = message, name_length = len(input.name)}
+}
+
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if name == "cancel-activity" {
 		return workflow.execute_activity(ctx, "hello", name)
@@ -49,6 +68,18 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		return "Approval timed out"
 	}
 	return workflow.execute_activity(ctx, "hello", approval.value)
+}
+
+typed_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Typed_Greeting_Input,
+) -> Typed_Greeting_Output {
+	return workflow.execute_activity_json(
+		ctx,
+		"typed_greeting",
+		input,
+		Typed_Greeting_Output,
+	)
 }
 
 observe_activation :: proc(processed: ^workflow.Process_Result) {
@@ -117,6 +148,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	register_typed_activity_error := worker.register_json_activity(
+		&activity_worker,
+		"typed_greeting",
+		typed_greeting,
+	)
+	if register_typed_activity_error.message != nil {
+		fmt.eprintf("Typed Activity registration failed: %s\n", string(register_typed_activity_error.message))
+		worker.error_free(&register_typed_activity_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	workflow_register_error := worker.register_workflow(
 		&activity_worker,
@@ -131,12 +175,26 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	typed_workflow_register_error := worker.register_json_workflow(
+		&activity_worker,
+		TYPED_WORKFLOW_TYPE,
+		typed_workflow,
+	)
+	if typed_workflow_register_error.message != nil {
+		fmt.eprintf("Typed Workflow registration failed: %s\n", string(typed_workflow_register_error.message))
+		worker.error_free(&typed_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
 	env_buffer: [64]u8
 	scenario := os.get_env(env_buffer[:], "TEMPORAL_ODIN_SCENARIO")
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
+	expect_typed_payload := scenario == "typed-payload"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity
 	run_stats, run_error := worker.run(
 		&activity_worker,
@@ -172,6 +230,11 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not deliver and acknowledge Activity cancellation")
 				failed = true
 			}
+		} else if expect_typed_payload {
+			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
+				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
+				failed = true
+			}
 		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 {
 			fmt.eprintf(
 				"Workflow spike stats mismatch: activities=%d signals=%d timers_canceled=%d replay_activations=%d\n",
@@ -200,6 +263,8 @@ main :: proc() {
 		fmt.println("Workflow cancellation canceled the pending timer and closed the execution")
 	} else if expect_cancel_activity {
 		fmt.println("Activity heartbeat delivered cancellation and Odin acknowledged it")
+	} else if expect_typed_payload {
+		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

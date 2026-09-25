@@ -191,6 +191,36 @@ present it as containment. Until subprocess-isolated Activity executors or
 language/runtime support is designed, deploy workers under a process supervisor
 and return `activity.Result(T)` for expected failures.
 
+Workflows have the corresponding registration levels:
+
+```odin
+worker.register_workflow(&w, "string_workflow", string_workflow)
+worker.register_json_workflow(&w, "typed_workflow", typed_workflow)
+worker.register_payload_workflow(&w, "payload_workflow", payload_workflow)
+```
+
+The runtime stores Workflow input, scheduled Activity input, resolved Activity
+output, and Workflow completion as allocator-owned `codec.Payload` values in
+the Workflow instance arena. `register_json_workflow` generates a typed adapter
+for `proc(Fiber_Context, Input) -> Output`; `register_workflow` is the existing
+string compatibility adapter. `register_payload_workflow` receives a borrowed
+view and returns an owned `workflow.Payload_Result`. Callback storage belongs to
+the `Fiber_Runtime` and is released by `fiber_runtime_close`.
+
+Workflow code can use `start_activity_payload`/
+`await_activity_payload_result` at the codec boundary, or
+`start_activity_json`, `execute_activity_json_result`, and
+`execute_activity_json` for typed values. The output type is explicit at the
+call site because an Activity name string cannot communicate an Odin return
+type to the compiler. JSON conversion failures become non-retryable
+`OdinWorkflowPayloadConversionError` Workflow failures. Signal payloads remain
+on the string compatibility API for now.
+
+The raw Payload test uses `binary/custom`, an extra `messageType` metadata
+entry, opaque bytes, and external-payload details. It verifies those fields are
+unchanged in both the scheduled Activity argument and final Workflow result;
+the generic runtime does not assume JSON.
+
 `Run_Options.max_activity_tasks` and `max_workflow_executions` are bounded
 test/example controls. Zero means unbounded. Normal workers call `run` without
 bounds and arrange for another thread or process-lifecycle handler to call
@@ -252,6 +282,12 @@ schedule attempt 2; the Odin callback observes `activity.attempt(ctx) == 2`,
 returns success, and the driver receives the typed result. The bounded test
 worker therefore consumes two Activity Tasks before shutdown.
 
+A separate live case starts `odin_typed_workflow` with
+`{name: "Odin", salutation: "Hello"}`. Odin preserves that Payload into a
+typed Activity command, Core evicts the Workflow, fresh-stack replay reproduces
+the same command, and the resolved object becomes the Workflow completion.
+Temporal CLI receives `{message: "Hello, Odin!", name_length: 4}`.
+
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
 if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
@@ -278,6 +314,9 @@ after cancellation becomes visible. A second 500-case property generates
 retryable/non-retryable Application Failures, type strings, JSON details, and
 default/explicit retry delays, then round-trips every field through the Core
 completion protobuf. Both suites pass against the pin and `~/Projects/pbt`.
+The Workflow Payload property adds another 500 generated structs, creates and
+evicts a typed fiber for each, and requires byte-identical completion after
+fresh-stack replay.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
 with `temporal workflow execute` in the background. After the Workflow has

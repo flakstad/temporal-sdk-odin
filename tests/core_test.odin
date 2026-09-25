@@ -102,6 +102,43 @@ typed_activity_result_test :: proc(
 	return activity.result_success(typed_activity_test(nil, input))
 }
 
+Typed_Workflow_Input :: struct {
+	name:       string,
+	salutation: string,
+}
+
+Typed_Workflow_Output :: struct {
+	message:     string,
+	name_length: int,
+}
+
+typed_payload_workflow_test :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Typed_Workflow_Input,
+) -> Typed_Workflow_Output {
+	return workflow.execute_activity_json(
+		ctx,
+		"typed_greeting",
+		input,
+		Typed_Workflow_Output,
+	)
+}
+
+payload_passthrough_workflow_test :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: codec.Payload_View,
+) -> workflow.Payload_Result {
+	result := workflow.execute_activity_payload(ctx, "payload_echo", input)
+	owned, clone_error := codec.payload_clone(result)
+	if clone_error != .None {
+		return workflow.payload_fail(
+			"could not preserve payload echo result",
+			"OdinWorkflowPayloadConversionError",
+		)
+	}
+	return workflow.payload_complete(owned)
+}
+
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	return greeting
@@ -259,6 +296,130 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 				inspection.failure_message = bytes.clone(
 					transmute([]u8)status.value.failure.message,
 				)
+			}
+		}
+	}
+	return
+}
+
+clone_scheduled_activity_payload :: proc(
+	data: []u8,
+) -> (payload: codec.Payload, found: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+				if variant.value != nil && len(variant.value.arguments) == 1 {
+					clone_error: codec.Error
+					payload, clone_error = proto.clone_payload(&variant.value.arguments[0])
+					found = clone_error == .None
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
+clone_workflow_completion_payload :: proc(
+	data: []u8,
+) -> (payload: codec.Payload, found: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+				if variant.value != nil && variant.value.result != nil {
+					clone_error: codec.Error
+					payload, clone_error = proto.clone_payload(variant.value.result)
+					found = clone_error == .None
+					return
+				}
+			}
+		}
+	}
+	return
+}
+
+Workflow_Failure_Inspection :: struct {
+	found:         bool,
+	message:       []u8,
+	failure_type:  []u8,
+	non_retryable: bool,
+}
+
+inspect_workflow_failure_command :: proc(
+	data: []u8,
+) -> (inspection: Workflow_Failure_Inspection) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Fail_Workflow_Execution:
+				if variant.value == nil || variant.value.failure == nil {
+					return
+				}
+				inspection.message = bytes.clone(transmute([]u8)variant.value.failure.message)
+				#partial switch failure_info in variant.value.failure.failure_info {
+				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+					if failure_info.value != nil {
+						inspection.found = true
+						inspection.failure_type = bytes.clone(
+							transmute([]u8)failure_info.value.type,
+						)
+						inspection.non_retryable = failure_info.value.non_retryable
+					}
+				}
+				return
 			}
 		}
 	}
@@ -533,6 +694,368 @@ worker_json_activity_result_preserves_application_failure_fields :: proc(t: ^tes
 	testing.expect_value(t, details.dependency, "test")
 	testing.expect_value(t, details.attempt, u32(1))
 	delete(details.dependency)
+}
+
+@(test)
+typed_workflow_payloads_survive_activity_and_fresh_stack_replay :: proc(t: ^testing.T) {
+	owned_task_queue, task_queue_error := strings.clone("test-queue")
+	testing.expect(t, task_queue_error == nil)
+	if task_queue_error != nil {
+		return
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_task_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"typed_payload_workflow",
+		typed_payload_workflow_test,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	if len(sdk_worker.workflow_registrations) != 1 {
+		return
+	}
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input_value := Typed_Workflow_Input{name = "Odin", salutation = "Hello"}
+	input, input_error := codec.encode_json(input_value)
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "typed_payload_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "typed-payload-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.scheduled_activity)
+	initial_completion := bytes.clone(initial.completion[:])
+	scheduled_input, scheduled_found := clone_scheduled_activity_payload(initial.completion[:])
+	testing.expect(t, scheduled_found)
+	if scheduled_found {
+		decoded_input: Typed_Workflow_Input
+		decode_error := codec.decode_json(codec.payload_view(&scheduled_input), &decoded_input)
+		testing.expect(t, decode_error == .None)
+		testing.expect_value(t, decoded_input.name, "Odin")
+		testing.expect_value(t, decoded_input.salutation, "Hello")
+		delete(decoded_input.name)
+		delete(decoded_input.salutation)
+	}
+	codec.payload_free(&scheduled_input)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	testing.expect(t, evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, replayed.scheduled_activity)
+	testing.expect(t, bytes.equal(initial_completion, replayed.completion[:]))
+	delete(initial_completion)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	activity_output, output_error := codec.encode_json(
+		Typed_Workflow_Output{message = "Hello, Odin!", name_length = 4},
+	)
+	testing.expect(t, output_error == .None)
+	defer codec.payload_free(&activity_output)
+	proto_output := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(proto_output.metadata)
+	defer delete(proto_output.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &proto_output}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(runtime, &activation)
+	testing.expect(t, completed.error.message == nil)
+	testing.expect(t, completed.completed)
+	completion_payload, completion_found := clone_workflow_completion_payload(completed.completion[:])
+	testing.expect(t, completion_found)
+	if completion_found {
+		decoded_output: Typed_Workflow_Output
+		decode_error := codec.decode_json(codec.payload_view(&completion_payload), &decoded_output)
+		testing.expect(t, decode_error == .None)
+		testing.expect_value(t, decoded_output.message, "Hello, Odin!")
+		testing.expect_value(t, decoded_output.name_length, 4)
+		delete(decoded_output.message)
+	}
+	codec.payload_free(&completion_payload)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+typed_workflow_rejects_incompatible_input_as_application_failure :: proc(t: ^testing.T) {
+	owned_task_queue, task_queue_error := strings.clone("test-queue")
+	testing.expect(t, task_queue_error == nil)
+	if task_queue_error != nil {
+		return
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_task_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"typed_payload_workflow",
+		typed_payload_workflow_test,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	if len(sdk_worker.workflow_registrations) != 1 {
+		return
+	}
+
+	input, input_error := codec.encode_json("not a structured input")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "typed_payload_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "typed-invalid-input-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(
+		&sdk_worker.workflow_registrations[0].runtime,
+		&activation,
+	)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.message), "could not decode Workflow input as json/plain")
+	testing.expect_value(t, string(inspection.failure_type), "OdinWorkflowPayloadConversionError")
+	testing.expect(t, inspection.non_retryable)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+payload_workflow_preserves_metadata_and_external_details :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_payload(
+		&runtime,
+		"payload_passthrough",
+		"test-queue",
+		payload_passthrough_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := codec.payload_create(transmute([]u8)string("opaque-input"))
+	defer codec.payload_free(&input)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&input,
+			"encoding",
+			transmute([]u8)string("binary/custom"),
+		) == .None,
+	)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&input,
+			"messageType",
+			transmute([]u8)string("tests.CustomInput"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&input, 2048) == .None)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "payload_passthrough",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "payload-passthrough-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	scheduled, scheduled_found := clone_scheduled_activity_payload(initial.completion[:])
+	testing.expect(t, scheduled_found)
+	if scheduled_found {
+		message_type, found := codec.metadata_get(codec.payload_view(&scheduled), "messageType")
+		testing.expect(t, found)
+		testing.expect_value(t, string(message_type), "tests.CustomInput")
+		testing.expect_value(t, codec.encoding(codec.payload_view(&scheduled)), "binary/custom")
+		testing.expect_value(t, string(scheduled.data), "opaque-input")
+		testing.expect_value(t, len(scheduled.external_payloads), 1)
+		if len(scheduled.external_payloads) == 1 {
+			testing.expect_value(t, scheduled.external_payloads[0].size_bytes, i64(2048))
+		}
+	}
+	codec.payload_free(&scheduled)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	activity_output := codec.payload_create(transmute([]u8)string("opaque-output"))
+	defer codec.payload_free(&activity_output)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&activity_output,
+			"encoding",
+			transmute([]u8)string("binary/custom"),
+		) == .None,
+	)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&activity_output,
+			"messageType",
+			transmute([]u8)string("tests.CustomOutput"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&activity_output, 4096) == .None)
+	proto_output := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(proto_output.metadata)
+	defer delete(proto_output.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &proto_output}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, completed.error.message == nil)
+	completion, completion_found := clone_workflow_completion_payload(completed.completion[:])
+	testing.expect(t, completion_found)
+	if completion_found {
+		message_type, found := codec.metadata_get(codec.payload_view(&completion), "messageType")
+		testing.expect(t, found)
+		testing.expect_value(t, string(message_type), "tests.CustomOutput")
+		testing.expect_value(t, codec.encoding(codec.payload_view(&completion)), "binary/custom")
+		testing.expect_value(t, string(completion.data), "opaque-output")
+		testing.expect_value(t, len(completion.external_payloads), 1)
+		if len(completion.external_payloads) == 1 {
+			testing.expect_value(t, completion.external_payloads[0].size_bytes, i64(4096))
+		}
+	}
+	codec.payload_free(&completion)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
 }
 
 @(test)

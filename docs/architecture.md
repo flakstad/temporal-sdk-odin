@@ -6,9 +6,11 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
-registry and poll loop, 2026-09-25. The Activity slice now also has a generic
-Temporal Payload boundary, typed JSON Activity registration, and structured
-Application Failures proven through a live retry.
+registry and poll loop, updated 2026-09-26. The Activity slice now also has a
+generic Temporal Payload boundary, typed JSON Activity registration, and
+structured Application Failures proven through a live retry. The Workflow fiber now
+preserves generic Payloads across initialization, Activity commands/results,
+completion, eviction, and replay, with typed JSON adapters above that boundary.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -594,6 +596,40 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 }
 ```
 
+The same runtime now has a typed path without changing the C or protobuf
+boundary:
+
+```odin
+typed_workflow :: proc(ctx: ^workflow.Fiber_Context, input: Greeting_Input) -> Greeting_Output {
+    return workflow.execute_activity_json(
+        ctx,
+        "typed_greeting",
+        input,
+        Greeting_Output,
+    )
+}
+```
+
+`Fiber_Instance` owns complete `codec.Payload` values for Workflow input and
+output. Each Activity operation likewise owns its argument and resolved result.
+The raw `register_payload_workflow` boundary receives a borrowed Payload view
+and returns an owned `workflow.Payload_Result`; `register_json_workflow`
+specializes a typed trampoline, while `register_workflow` retains source
+compatibility for string procedures. Metadata and external-payload details are
+copied rather than reconstructed, so custom codecs can use the same runtime.
+
+The offline typed test forces eviction after scheduling the Activity and
+requires the fresh fiber to emit byte-identical command bytes. A live Temporal
+CLI case sends `{name, salutation}`, Core evicts and replays the Workflow, Odin
+runs a typed Activity, and the Service returns `{message, name_length}`. A
+500-case PBT property repeats structured Workflow input/output plus
+eviction/replay with generated values. Incompatible typed input deterministically
+produces a non-retryable `OdinWorkflowPayloadConversionError`, not a worker
+shutdown. A raw Payload test separately carries custom `encoding`,
+`messageType`, opaque bytes, and external-payload size details through Workflow
+input -> Activity command -> Activity resolution -> Workflow completion. Typed
+signal adapters remain future work.
+
 `execute_activity` and `sleep` each record a typed operation and yield from
 inside the nested Odin call. Activity and timer sequence counters are separate;
 the serial test emits `ScheduleActivity(seq=1)`, `StartTimer(seq=1)`, and
@@ -990,10 +1026,10 @@ Workflows are enabled.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
-   a durable timer/signal race, and runtime-owned cancellation across
-   fresh-stack replay. It does not yet prove user cancellation scopes/cleanup,
-   updates, panic containment, nondeterminism diagnostics, bounded stack policy,
-   or a production deterministic scheduler.
+   a durable timer/signal race, generic/typed Payload flow, and runtime-owned
+   cancellation across fresh-stack replay. It does not yet prove user
+   cancellation scopes/cleanup, updates, panic containment, nondeterminism
+   diagnostics, bounded stack policy, or a production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -1027,22 +1063,28 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 Activity concurrency, task-token routing, cooperative cancel delivery,
-heartbeat transport, typed JSON Payloads, and structured user failures with a
-real server-directed retry are now proven live. The PBT suites generate 500
-Payload values and 500 Application Failure contracts against both the pinned
-library and `~/Projects/pbt`.
+heartbeat transport, typed JSON Payloads, structured user failures with a real
+server-directed retry, and generic Workflow Payloads are now proven live. The
+PBT suites generate 500 Payload values, 500 Application Failure contracts, and
+500 typed Workflow replay cases against both the pinned library and
+`~/Projects/pbt`.
 
-The next smallest vertical milestone should carry generic `codec.Payload`
-values through Workflow initialization, Activity scheduling/resolution, and
-Workflow completion, then add typed JSON Workflow registration on top. Today
-that path is string-only even though the underlying generated protobuf graph is
-already generic. This removes a real SDK limitation without prematurely
-freezing the fiber scheduler. Follow it with Activity deadline/execution-info
-fields and pool shutdown/cancel/failure stress. Panic containment should be
-designed as subprocess isolation unless Odin gains supported recovery; it must
-not block ordinary explicit failures. A statechart oracle becomes worthwhile
-when deadlines and retry/cancellation interleavings create additional states.
-User Workflow cancellation scopes remain a separate Workflow-runtime change.
+The next vertical milestone should replace the Workflow runtime's hardcoded
+20-second Activity timeout and single attempt with an Odin `Activity_Options`
+value. Start with activity ID/task queue, Start-to-Close and Schedule-to-Close
+timeouts, heartbeat timeout, cancellation type, and Retry Policy; preserve the
+options in the operation table so replay emits identical commands. In parallel,
+populate Activity context with Core's deadline, retry policy, heartbeat details,
+Workflow identity, and task queue. This turns the current proof into a usable
+Activity scheduling surface without changing the fiber architecture.
+
+After that, extend the same Payload adapter pattern to typed signals and typed
+Activity failure details in Workflow code, then stress pool
+shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
+designed as subprocess isolation unless Odin gains supported recovery. A
+statechart oracle becomes worthwhile when option-driven deadlines and
+retry/cancellation interleavings create additional states. User Workflow
+cancellation scopes remain a separate Workflow-runtime change.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

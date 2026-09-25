@@ -60,6 +60,28 @@ payload_view :: proc(payload: ^Temporal_Api_Common_V1_Payload) -> Payload_View {
 	return result
 }
 
+clone_payload :: proc(
+	payload: ^Temporal_Api_Common_V1_Payload,
+) -> (owned: codec.Payload, error: codec.Error) {
+	if payload == nil {
+		return {}, .Allocation_Failed
+	}
+	owned = codec.payload_create(payload.data)
+	for entry in payload.metadata {
+		if codec.payload_add_metadata(&owned, entry.key, entry.value) != .None {
+			codec.payload_free(&owned)
+			return {}, .Allocation_Failed
+		}
+	}
+	for external in payload.external_payloads {
+		if codec.payload_add_external(&owned, external.size_bytes) != .None {
+			codec.payload_free(&owned)
+			return {}, .Allocation_Failed
+		}
+	}
+	return owned, .None
+}
+
 // Generated decoding allocates nested messages and repeated fields through
 // context.allocator. Callers should use an arena whose lifetime covers all
 // returned views.

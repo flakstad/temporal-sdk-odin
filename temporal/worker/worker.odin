@@ -353,6 +353,119 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 	return {}
 }
 
+register_payload_workflow :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: workflow.Payload_Proc,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("workflows cannot be registered after worker.run starts")
+	}
+	if len(name) == 0 || callback == nil {
+		return error_from_string("workflow name and callback are required")
+	}
+	for registration in worker.workflow_registrations {
+		if registration.name == name {
+			return error_from_string("workflow is already registered")
+		}
+	}
+	owned_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		return error_from_string("could not allocate workflow name")
+	}
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_payload(&runtime, name, worker.task_queue, callback)
+	if init_error.message != nil {
+		delete(owned_name)
+		result := error_from_string(string(init_error.message))
+		workflow.error_free(&init_error)
+		return result
+	}
+	append(
+		&worker.workflow_registrations,
+		Workflow_Registration{name = owned_name, runtime = runtime},
+	)
+	return {}
+}
+
+register_json_workflow :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: proc(ctx: ^workflow.Fiber_Context, input: $Input) -> $Output,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("workflows cannot be registered after worker.run starts")
+	}
+	if len(name) == 0 || callback == nil {
+		return error_from_string("workflow name and callback are required")
+	}
+	for registration in worker.workflow_registrations {
+		if registration.name == name {
+			return error_from_string("workflow is already registered")
+		}
+	}
+	owned_name, name_error := strings.clone(name)
+	if name_error != nil {
+		return error_from_string("could not allocate workflow name")
+	}
+
+	Callback :: #type proc(ctx: ^workflow.Fiber_Context, input: Input) -> Output
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, callback_error := new(Callback, allocator)
+	if callback_error != nil {
+		delete(owned_name)
+		return error_from_string("could not allocate workflow callback")
+	}
+	owned_callback^ = callback
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_invoker(
+		&runtime,
+		name,
+		worker.task_queue,
+		owned_callback,
+		proc(data: rawptr, ctx: ^workflow.Fiber_Context, input: codec.Payload_View) -> workflow.Payload_Result {
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return workflow.payload_fail(
+					"could not decode Workflow input as json/plain",
+					"OdinWorkflowPayloadConversionError",
+				)
+			}
+			callback := cast(^Callback)data
+			output := callback^(ctx, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return workflow.payload_fail(
+					"could not encode Workflow result as json/plain",
+					"OdinWorkflowPayloadConversionError",
+				)
+			}
+			return workflow.payload_complete(payload)
+		},
+		proc(data: rawptr) {
+			free(cast(^Callback)data, allocator_runtime.heap_allocator())
+		},
+	)
+	if init_error.message != nil {
+		delete(owned_name)
+		free(owned_callback, allocator)
+		result := error_from_string(string(init_error.message))
+		workflow.error_free(&init_error)
+		return result
+	}
+	append(
+		&worker.workflow_registrations,
+		Workflow_Registration{name = owned_name, runtime = runtime},
+	)
+	return {}
+}
+
 find_activity :: proc(worker: ^Worker, name: string) -> (^Activity_Registration, bool) {
 	for &registration in worker.activity_registrations {
 		if registration.name == name {

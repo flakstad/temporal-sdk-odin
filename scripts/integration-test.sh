@@ -152,6 +152,40 @@ worker_pid=""
 cat "$worker_log"
 grep -q "two Activity callbacks overlapped and worker shut down cleanly" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=typed-payload \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Typed Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+typed_workflow_id="odin-sdk-typed-workflow-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$typed_workflow_id" \
+  --type odin_typed_workflow \
+  --task-queue odin-hello-workflow \
+  --input '{"name":"Odin","salutation":"Hello"}' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+workflow_output="$(<"$workflow_output_file")"
+echo "$workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$workflow_output"
+grep -q '"message": "Hello, Odin!"' <<<"$workflow_output"
+grep -q '"name_length": 4' <<<"$workflow_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "typed Workflow and Activity Payloads completed end-to-end" "$worker_log"
+
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!

@@ -1,6 +1,6 @@
 package workflow
 
-import "base:runtime"
+import allocator_runtime "base:runtime"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
@@ -16,6 +16,40 @@ Fiber_Context :: struct {
 }
 
 Fiber_Proc :: proc(ctx: ^Fiber_Context, input: string) -> string
+Payload_Proc :: #type proc(ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result
+Workflow_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	input: codec.Payload_View,
+) -> Payload_Result
+Workflow_Callback_Destroy_Proc :: #type proc(callback_data: rawptr)
+
+Payload_Result_Status :: enum {
+	Completed,
+	Failed,
+}
+
+Payload_Result :: struct {
+	status:       Payload_Result_Status,
+	payload:      codec.Payload,
+	failure_message: string,
+	failure_type:    string,
+}
+
+payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
+	return {status = .Completed, payload = payload}
+}
+
+payload_fail :: proc(
+	message: string,
+	failure_type := "OdinWorkflowError",
+) -> Payload_Result {
+	return {
+		status = .Failed,
+		failure_message = message,
+		failure_type = failure_type,
+	}
+}
 
 Fiber_Phase :: enum {
 	Ready,
@@ -52,6 +86,18 @@ Activity_Result :: struct {
 	failure_message: string,
 }
 
+Payload_Activity_Result :: struct {
+	status:          Activity_Result_Status,
+	value:           codec.Payload_View,
+	failure_message: string,
+}
+
+Json_Activity_Result :: struct(T: typeid) {
+	status:          Activity_Result_Status,
+	value:           T,
+	failure_message: string,
+}
+
 Signal_Wait_Status :: enum {
 	Received,
 	Timed_Out,
@@ -66,8 +112,8 @@ Fiber_Activity_Operation :: struct {
 	seq:           u32,
 	activity_id:   string,
 	activity_type: string,
-	input:         []u8,
-	result:        string,
+	input:         codec.Payload,
+	result:        codec.Payload,
 	failure_message: string,
 	failure_proto:   []u8,
 	state:         Fiber_Operation_State,
@@ -87,9 +133,10 @@ Fiber_Signal :: struct {
 
 Fiber_Instance :: struct {
 	run_id:          string,
-	input:           string,
-	output:          string,
-	workflow:        Fiber_Proc,
+	input:           codec.Payload,
+	output:          codec.Payload,
+	callback_data:   rawptr,
+	invoke:          Workflow_Invoke_Proc,
 	workflow_context: Fiber_Context,
 	activities:       [dynamic]Fiber_Activity_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
@@ -100,19 +147,23 @@ Fiber_Instance :: struct {
 	cancellation_reason:  string,
 	terminal_command_sent: bool,
 	unhandled_activity_seq: u32,
+	failure_message:       string,
+	failure_type:          string,
 	next_activity_seq: u32,
 	next_timer_seq:    u32,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
 	arena:           virtual.Arena,
-	odin_context:    runtime.Context,
-	owner_allocator: runtime.Allocator,
+	odin_context:    allocator_runtime.Context,
+	owner_allocator: allocator_runtime.Allocator,
 }
 
 Fiber_Runtime :: struct {
 	workflow_type:          string,
 	task_queue:             string,
-	workflow:               Fiber_Proc,
+	callback_data:          rawptr,
+	invoke:                 Workflow_Invoke_Proc,
+	callback_destroy:       Workflow_Callback_Destroy_Proc,
 	instances:              [dynamic]^Fiber_Instance,
 	activations:            int,
 	replay_activations:     int,
@@ -122,12 +173,14 @@ Fiber_Runtime :: struct {
 
 FIBER_STACK_SIZE :: 128 * 1024
 
-fiber_runtime_init :: proc(
+fiber_runtime_init_invoker :: proc(
 	runtime: ^Fiber_Runtime,
 	workflow_type, task_queue: string,
-	workflow: Fiber_Proc,
+	callback_data: rawptr,
+	invoke: Workflow_Invoke_Proc,
+	callback_destroy: Workflow_Callback_Destroy_Proc,
 ) -> Error {
-	if runtime == nil || len(workflow_type) == 0 || len(task_queue) == 0 || workflow == nil {
+	if runtime == nil || len(workflow_type) == 0 || len(task_queue) == 0 || callback_data == nil || invoke == nil || callback_destroy == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
 	}
 	owned_type, type_error := strings.clone(workflow_type)
@@ -141,9 +194,92 @@ fiber_runtime_init :: proc(
 	}
 	runtime.workflow_type = owned_type
 	runtime.task_queue = owned_queue
-	runtime.workflow = workflow
+	runtime.callback_data = callback_data
+	runtime.invoke = invoke
+	runtime.callback_destroy = callback_destroy
 	runtime.instances = make([dynamic]^Fiber_Instance)
 	return {}
+}
+
+fiber_runtime_init :: proc(
+	runtime: ^Fiber_Runtime,
+	workflow_type, task_queue: string,
+	workflow: Fiber_Proc,
+) -> Error {
+	if workflow == nil {
+		return error_from_string("workflow type, task queue, and workflow procedure are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Fiber_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Workflow callback")
+	}
+	owned_callback^ = workflow
+	init_error := fiber_runtime_init_invoker(
+		runtime,
+		workflow_type,
+		task_queue,
+		owned_callback,
+		proc(data: rawptr, ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result {
+			value: string
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow input as json/plain string",
+					"OdinWorkflowPayloadConversionError",
+				)
+			}
+			callback := cast(^Fiber_Proc)data
+			output := callback^(ctx, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow result as json/plain string",
+					"OdinWorkflowPayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+		proc(data: rawptr) {
+			free(cast(^Fiber_Proc)data, allocator_runtime.heap_allocator())
+		},
+	)
+	if init_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return init_error
+}
+
+fiber_runtime_init_payload :: proc(
+	runtime: ^Fiber_Runtime,
+	workflow_type, task_queue: string,
+	workflow: Payload_Proc,
+) -> Error {
+	if workflow == nil {
+		return error_from_string("workflow type, task queue, and workflow procedure are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Payload_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Workflow callback")
+	}
+	owned_callback^ = workflow
+	init_error := fiber_runtime_init_invoker(
+		runtime,
+		workflow_type,
+		task_queue,
+		owned_callback,
+		proc(data: rawptr, ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result {
+			callback := cast(^Payload_Proc)data
+			return callback^(ctx, input)
+		},
+		proc(data: rawptr) {
+			free(cast(^Payload_Proc)data, allocator_runtime.heap_allocator())
+		},
+	)
+	if init_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return init_error
 }
 
 fiber_result_error :: proc(operation: string, result: fiber_raw.Result) -> Error {
@@ -165,6 +301,12 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		return fiber_result_error("could not destroy Workflow fiber", fiber_result)
 	}
 	instance.fiber = nil
+	codec.payload_free(&instance.input)
+	codec.payload_free(&instance.output)
+	for &operation in instance.activities {
+		codec.payload_free(&operation.input)
+		codec.payload_free(&operation.result)
+	}
 	virtual.arena_destroy(&instance.arena)
 	free(instance, instance.owner_allocator)
 	return {}
@@ -180,6 +322,9 @@ fiber_runtime_close :: proc(runtime: ^Fiber_Runtime) {
 	delete(runtime.instances)
 	delete(runtime.workflow_type)
 	delete(runtime.task_queue)
+	if runtime.callback_data != nil && runtime.callback_destroy != nil {
+		runtime.callback_destroy(runtime.callback_data)
+	}
 	runtime^ = {}
 }
 
@@ -218,10 +363,23 @@ remove_fiber_instance :: proc(runtime: ^Fiber_Runtime, run_id: string) -> Error 
 fiber_entry :: proc "c" (user_data: rawptr) {
 	instance := (^Fiber_Instance)(user_data)
 	context = instance.odin_context
-	instance.output = instance.workflow(&instance.workflow_context, instance.input)
-	if instance.phase != .Failed {
-		instance.phase = .Completed
+	workflow_result := instance.invoke(
+		instance.callback_data,
+		&instance.workflow_context,
+		codec.payload_view(&instance.input),
+	)
+	if instance.phase == .Failed {
+		codec.payload_free(&workflow_result.payload)
+		return
 	}
+	if workflow_result.status == .Failed {
+		instance.failure_message = workflow_result.failure_message
+		instance.failure_type = workflow_result.failure_type
+		instance.phase = .Failed
+		return
+	}
+	instance.output = workflow_result.payload
+	instance.phase = .Completed
 }
 
 add_fiber_instance :: proc(
@@ -247,20 +405,20 @@ add_fiber_instance :: proc(
 	context.allocator = instance.odin_context.allocator
 	owned_run_id, run_id_error := strings.clone(run_id)
 	instance.run_id = owned_run_id
-	payload := proto.payload_view(input_payload)
-	decoded_input, decode_error := codec.decode_string(payload.data, payload.encoding)
-	instance.input = decoded_input
+	owned_input, clone_error := proto.clone_payload(input_payload)
+	instance.input = owned_input
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
 	context.allocator = previous_allocator
-	if run_id_error != nil || decode_error != .None {
+	if run_id_error != nil || clone_error != .None {
 		virtual.arena_destroy(&instance.arena)
 		free(instance, instance.owner_allocator)
-		return nil, error_from_string("could not decode Workflow input as json/plain string")
+		return nil, error_from_string("could not preserve Workflow input Payload")
 	}
 
-	instance.workflow = runtime.workflow
+	instance.callback_data = runtime.callback_data
+	instance.invoke = runtime.invoke
 	instance.workflow_context.instance = instance
 	instance.phase = .Ready
 	fiber_result := fiber_raw.create(
@@ -331,75 +489,177 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	instance.phase = .Canceled
 }
 
-// start_activity records a deterministic Activity command without suspending.
-// The handle contains only a sequence number because the operation table can move.
-start_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Future {
+start_activity_owned :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload,
+) -> Activity_Future {
+	owned_input := input
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		codec.payload_free(&owned_input)
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
 		return {}
 	}
 	instance := ctx.instance
-	encoded, encode_error := codec.encode_string(input)
-	if encode_error != .None {
-		instance.phase = .Failed
-		return {}
-	}
 	instance.next_activity_seq += 1
 	operation := Fiber_Activity_Operation{
 		seq = instance.next_activity_seq,
 		activity_id = fmt.aprintf("activity-%d", instance.next_activity_seq),
 		activity_type = activity_type,
-		input = encoded[:],
+		input = owned_input,
 		state = .Scheduled,
 	}
 	append(&instance.activities, operation)
 	return Activity_Future{seq = operation.seq}
 }
 
-activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Activity_Result {
-	if operation.state == .Resolved {
-		return Activity_Result{status = .Succeeded, value = operation.result}
+// start_activity_payload records a deterministic Activity command without
+// suspending. The handle contains only a sequence number because the operation
+// table can move. The borrowed input is copied into the Workflow instance arena.
+start_activity_payload :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+) -> Activity_Future {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return {}
 	}
-	if operation.state == .Failed {
-		return Activity_Result{status = .Failed, failure_message = operation.failure_message}
+	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		ctx.instance.phase = .Failed
+		ctx.instance.failure_message = "could not preserve Activity input Payload"
+		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		return {}
 	}
-	return Activity_Result{status = .Failed, failure_message = "Activity has not resolved"}
+	return start_activity_owned(ctx, activity_type, owned_input)
 }
 
-// await_activity_result suspends the whole Odin call stack only while the
+start_activity_json :: proc(ctx: ^Fiber_Context, activity_type: string, input: $T) -> Activity_Future {
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	payload, encode_error := codec.encode_json(input, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		ctx.instance.phase = .Failed
+		ctx.instance.failure_message = "could not encode Activity input as json/plain"
+		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		return {}
+	}
+	return start_activity_owned(ctx, activity_type, payload)
+}
+
+start_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Future {
+	return start_activity_json(ctx, activity_type, input)
+}
+
+payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
+	if operation.state == .Resolved {
+		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
+	}
+	if operation.state == .Failed {
+		return {status = .Failed, failure_message = operation.failure_message}
+	}
+	return {status = .Failed, failure_message = "Activity has not resolved"}
+}
+
+// await_activity_payload_result suspends the whole Odin call stack only while the
 // selected operation is unresolved. Success and failure applied earlier in the
 // same activation are consumed synchronously.
-await_activity_result :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> Activity_Result {
+await_activity_payload_result :: proc(
+	ctx: ^Fiber_Context,
+	future: Activity_Future,
+) -> Payload_Activity_Result {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
-		return Activity_Result{status = .Failed, failure_message = "invalid Activity await"}
+		return {status = .Failed, failure_message = "invalid Activity await"}
 	}
 	instance := ctx.instance
 	operation, found := find_activity_operation(instance, future.seq)
 	if !found {
 		instance.phase = .Failed
-		return Activity_Result{status = .Failed, failure_message = "Activity operation was not found"}
+		return {status = .Failed, failure_message = "Activity operation was not found"}
 	}
 	if operation.state == .Resolved || operation.state == .Failed {
-		return activity_result_from_operation(operation)
+		return payload_activity_result_from_operation(operation)
 	}
 	instance.waiting_activity_seq = future.seq
 	instance.phase = .Waiting_Activity
 	yield_result := fiber_raw.yield(instance.fiber)
 	if yield_result != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
-		return Activity_Result{status = .Failed, failure_message = "could not resume Activity await"}
+		return {status = .Failed, failure_message = "could not resume Activity await"}
 	}
 	operation, found = find_activity_operation(instance, future.seq)
 	if !found || (operation.state != .Resolved && operation.state != .Failed) {
 		instance.phase = .Failed
-		return Activity_Result{status = .Failed, failure_message = "Activity resumed without a resolution"}
+		return {status = .Failed, failure_message = "Activity resumed without a resolution"}
 	}
-	return activity_result_from_operation(operation)
+	return payload_activity_result_from_operation(operation)
+}
+
+await_activity_json_result :: proc(
+	ctx: ^Fiber_Context,
+	future: Activity_Future,
+	$T: typeid,
+) -> Json_Activity_Result(T) {
+	payload_result := await_activity_payload_result(ctx, future)
+	if payload_result.status == .Failed {
+		return {
+			status = .Failed,
+			failure_message = payload_result.failure_message,
+		}
+	}
+	value: T
+	if codec.decode_json(payload_result.value, &value) != .None {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+			ctx.instance.failure_message = "could not decode Activity result as json/plain"
+			ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		}
+		return {status = .Failed, failure_message = "could not decode Activity result as json/plain"}
+	}
+	return {status = .Succeeded, value = value}
+}
+
+await_activity_result :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> Activity_Result {
+	result := await_activity_json_result(ctx, future, string)
+	return {
+		status = result.status,
+		value = result.value,
+		failure_message = result.failure_message,
+	}
+}
+
+await_activity_payload :: proc(
+	ctx: ^Fiber_Context,
+	future: Activity_Future,
+) -> codec.Payload_View {
+	result := await_activity_payload_result(ctx, future)
+	if result.status == .Failed {
+		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	return result.value
+}
+
+mark_activity_failure_unhandled :: proc(ctx: ^Fiber_Context, future: Activity_Future) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	if future.seq != 0 {
+		operation, found := find_activity_operation(ctx.instance, future.seq)
+		if found && operation.state == .Failed {
+			ctx.instance.unhandled_activity_seq = future.seq
+		}
+	}
+	ctx.instance.phase = .Failed
 }
 
 // await_activity is the convenience form for Workflows that want an unhandled
@@ -407,12 +667,7 @@ await_activity_result :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> A
 await_activity :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> string {
 	result := await_activity_result(ctx, future)
 	if result.status == .Failed {
-		if ctx != nil && ctx.instance != nil {
-			if future.seq != 0 {
-				ctx.instance.unhandled_activity_seq = future.seq
-			}
-			ctx.instance.phase = .Failed
-		}
+		mark_activity_failure_unhandled(ctx, future)
 		return ""
 	}
 	return result.value
@@ -425,6 +680,45 @@ execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> s
 
 execute_activity_result :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Result {
 	return await_activity_result(ctx, start_activity(ctx, activity_type, input))
+}
+
+execute_activity_payload :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_activity_payload(ctx, activity_type, input),
+	)
+}
+
+execute_activity_json_result :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+) -> Json_Activity_Result(Output) {
+	return await_activity_json_result(
+		ctx,
+		start_activity_json(ctx, activity_type, input),
+		Output,
+	)
+}
+
+execute_activity_json :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+) -> Output {
+	future := start_activity_json(ctx, activity_type, input)
+	result := await_activity_json_result(ctx, future, Output)
+	if result.status == .Failed {
+		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	return result.value
 }
 
 // await_signal consumes the oldest buffered signal with the requested name, or
@@ -550,14 +844,7 @@ append_fiber_schedule_command :: proc(
 	task_queue: string,
 ) {
 	payload := new(proto.Temporal_Api_Common_V1_Payload)
-	payload.data = operation.input
-	append(
-		&payload.metadata,
-		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
-			key = "encoding",
-			value = transmute([]u8)string("json/plain"),
-		},
-	)
+	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 	timeout := new(proto.Google_Protobuf_Duration)
 	timeout.seconds = 20
 	// The bounded spike has no Activity options yet. One attempt makes failure
@@ -727,19 +1014,8 @@ append_fiber_completion_command :: proc(
 		return error_from_string("fiber spike emitted completion after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
-	completion_output, encode_error := codec.encode_string(instance.output)
-	if encode_error != .None {
-		return error_from_string("could not encode Workflow result")
-	}
 	completion_payload := new(proto.Temporal_Api_Common_V1_Payload)
-	completion_payload.data = completion_output[:]
-	append(
-		&completion_payload.metadata,
-		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
-			key = "encoding",
-			value = transmute([]u8)string("json/plain"),
-		},
-	)
+	completion_payload^ = proto.encode_payload(codec.payload_view(&instance.output))
 	complete := new(proto.Coresdk_Workflow_Commands_CompleteWorkflowExecution)
 	complete.result = completion_payload
 	append(
@@ -764,13 +1040,33 @@ append_fiber_failure_command :: proc(
 	if len(commands^) != 0 {
 		return error_from_string("fiber spike emitted failure after another command")
 	}
-	operation, found := find_activity_operation(instance, instance.unhandled_activity_seq)
-	if !found || operation.state != .Failed || len(operation.failure_proto) == 0 {
-		return error_from_string("Workflow fiber failed without a preserved Activity failure")
-	}
 	failure := new(proto.Temporal_Api_Failure_V1_Failure)
-	if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
-		return error_from_string("could not restore unhandled Activity failure")
+	if instance.unhandled_activity_seq != 0 {
+		operation, found := find_activity_operation(instance, instance.unhandled_activity_seq)
+		if !found || operation.state != .Failed || len(operation.failure_proto) == 0 {
+			return error_from_string("Workflow fiber failed without a preserved Activity failure")
+		}
+		if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
+			return error_from_string("could not restore unhandled Activity failure")
+		}
+	} else {
+		if len(instance.failure_message) == 0 {
+			return error_from_string("Workflow fiber failed without failure details")
+		}
+		failure_type := instance.failure_type
+		if len(failure_type) == 0 {
+			failure_type = "OdinWorkflowError"
+		}
+		application_info := new(proto.Temporal_Api_Failure_V1_ApplicationFailureInfo)
+		application_info.type = failure_type
+		application_info.non_retryable = true
+		failure^ = proto.Temporal_Api_Failure_V1_Failure{
+			message = instance.failure_message,
+			source = "OdinSDK",
+			failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+				value = application_info,
+			},
+		}
 	}
 	fail := new(proto.Coresdk_Workflow_Commands_FailWorkflowExecution)
 	fail.failure = failure
@@ -844,7 +1140,7 @@ append_fiber_progress_command :: proc(
 }
 
 process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result: Process_Result) {
-	if runtime == nil || runtime.workflow == nil {
+	if runtime == nil || runtime.invoke == nil || runtime.callback_data == nil {
 		result.error = error_from_string("Workflow fiber runtime is not initialized")
 		return
 	}
@@ -930,15 +1226,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					process_error(&result, activation.run_id, "completed Activity has no result")
 					return
 				}
-				payload := proto.payload_view(status.value.result)
 				context.allocator = instance.odin_context.allocator
-				decoded_result, decode_error := codec.decode_string(payload.data, payload.encoding)
+				owned_result, clone_error := proto.clone_payload(status.value.result)
 				context.allocator = previous_allocator
-				if decode_error != .None {
-					process_error(&result, activation.run_id, "could not decode Activity result as json/plain string")
+				if clone_error != .None {
+					process_error(&result, activation.run_id, "could not preserve Activity result Payload")
 					return
 				}
-				operation.result = decoded_result
+				operation.result = owned_result
 				operation.state = .Resolved
 				result.resolved_activity_seq = operation.seq
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed:

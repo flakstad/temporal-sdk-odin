@@ -21,9 +21,12 @@ cancellation. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
-attempt 1 to attempt 2. It does **not** provide user Workflow cancellation
-scopes/cleanup, signal handlers, queries/updates, multiple Activity arguments,
-in-process panic containment, or a stable public API.
+attempt 1 to attempt 2. Workflow initialization, Activity arguments/results,
+and Workflow completion now preserve generic Payloads; typed JSON Workflows run
+end-to-end across eviction and fresh-stack replay. It does **not** provide user
+Workflow cancellation scopes/cleanup, signal handlers, queries/updates,
+multiple Activity arguments, in-process panic containment, or a stable public
+API.
 Do not use it in production.
 
 ```text
@@ -52,7 +55,8 @@ The fiber experiment also builds pinned
 [minicoro](https://github.com/edubart/minicoro) through a six-symbol local C
 shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
-activation races and verifies byte-identical replay completions.
+payload/failure contracts and activation races, and verifies byte-identical
+replay completions.
 
 Clone submodules and build the pinned Core bridge:
 
@@ -104,6 +108,7 @@ temporal_worker, _ := worker.create(
 _ = worker.register_activity(&temporal_worker, "hello", hello)
 _ = worker.register_json_activity(&temporal_worker, "typed_greeting", typed_greeting)
 _ = worker.register_workflow(&temporal_worker, "odin_hello_workflow", hello_workflow)
+_ = worker.register_json_workflow(&temporal_worker, "odin_typed_workflow", typed_workflow)
 _, _ = worker.run(&temporal_worker)
 ```
 
@@ -136,6 +141,28 @@ _ = worker.register_json_activity_result(&temporal_worker, "charge", charge)
 override the next retry delay. Retryable is the default for this explicit
 result API. Payload-conversion failures are non-retryable SDK failures.
 
+Typed Workflows use the same codec boundary:
+
+```odin
+greeting_workflow :: proc(
+    ctx: ^workflow.Fiber_Context,
+    input: Greeting_Input,
+) -> Greeting_Output {
+    return workflow.execute_activity_json(
+        ctx,
+        "typed_greeting",
+        input,
+        Greeting_Output,
+    )
+}
+
+_ = worker.register_json_workflow(&temporal_worker, "greeting", greeting_workflow)
+```
+
+`register_payload_workflow` is the lower-level form. String Workflows remain a
+compatibility adapter over `json/plain`. Signals are still string-only in the
+experimental public API.
+
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
 registered Activities and Workflows. A worker is intentionally single-run;
@@ -159,6 +186,9 @@ worker can complete a registered Workflow afterward. Its Activity cases include
 a structured JSON object round trip between a Rust Workflow and a typed Odin
 Activity, plus a retryable typed failure whose 10 ms `next_retry_delay` is
 honored before the same Activity succeeds with `activity.attempt(ctx) == 2`.
+It also starts a typed Odin Workflow with a structured object, schedules a typed
+Odin Activity, observes Core eviction and replay, and receives the structured
+Workflow result through Temporal CLI.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
