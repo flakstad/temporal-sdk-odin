@@ -1,8 +1,10 @@
 package workflow
 
 import "base:runtime"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+import "core:time"
 import codec "../codec"
 import proto "../core/proto"
 import fiber_raw "fiber/raw"
@@ -18,14 +20,21 @@ Fiber_Proc :: proc(ctx: ^Fiber_Context, input: string) -> string
 Fiber_Phase :: enum {
 	Ready,
 	Waiting_Activity,
+	Waiting_Timer,
 	Completed,
 	Failed,
 }
 
 Fiber_Activity_Request :: struct {
 	seq:           u32,
+	activity_id:   string,
 	activity_type: string,
 	input:         []u8,
+}
+
+Fiber_Timer_Request :: struct {
+	seq:      u32,
+	duration: time.Duration,
 }
 
 Fiber_Instance :: struct {
@@ -35,7 +44,10 @@ Fiber_Instance :: struct {
 	activity_result: string,
 	workflow:        Fiber_Proc,
 	workflow_context: Fiber_Context,
-	request:         Fiber_Activity_Request,
+	activity_request: Fiber_Activity_Request,
+	timer_request:    Fiber_Timer_Request,
+	next_activity_seq: u32,
+	next_timer_seq:    u32,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
 	arena:           virtual.Arena,
@@ -202,9 +214,12 @@ add_fiber_instance :: proc(
 }
 
 // execute_activity looks sequential to Workflow authors. Internally it records
-// one deterministic request and suspends the entire Odin call stack.
+// a deterministic request and suspends the entire Odin call stack.
 execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> string {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
 		return ""
 	}
 	instance := ctx.instance
@@ -213,18 +228,41 @@ execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> s
 		instance.phase = .Failed
 		return ""
 	}
-	instance.request = Fiber_Activity_Request{
-		seq = 1,
+	instance.next_activity_seq += 1
+	instance.activity_request = Fiber_Activity_Request{
+		seq = instance.next_activity_seq,
+		activity_id = fmt.aprintf("activity-%d", instance.next_activity_seq),
 		activity_type = activity_type,
 		input = encoded[:],
 	}
 	instance.phase = .Waiting_Activity
 	yield_result := fiber_raw.yield(instance.fiber)
-	if yield_result != .Success {
+	if yield_result != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
 		return ""
 	}
 	return instance.activity_result
+}
+
+// sleep schedules a durable Temporal timer and suspends the Workflow fiber.
+// It never reads wall-clock time in the language runtime.
+sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return
+	}
+	instance := ctx.instance
+	instance.next_timer_seq += 1
+	instance.timer_request = Fiber_Timer_Request{
+		seq = instance.next_timer_seq,
+		duration = duration,
+	}
+	instance.phase = .Waiting_Timer
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		instance.phase = .Failed
+	}
 }
 
 append_fiber_schedule_command :: proc(
@@ -235,7 +273,7 @@ append_fiber_schedule_command :: proc(
 	timeout: ^proto.Google_Protobuf_Duration,
 	schedule: ^proto.Coresdk_Workflow_Commands_ScheduleActivity,
 ) {
-	payload.data = instance.request.input
+	payload.data = instance.activity_request.input
 	append(
 		&payload.metadata,
 		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
@@ -245,9 +283,9 @@ append_fiber_schedule_command :: proc(
 	)
 	timeout.seconds = 20
 	schedule^ = proto.Coresdk_Workflow_Commands_ScheduleActivity{
-		seq = instance.request.seq,
-		activity_id = "activity-1",
-		activity_type = instance.request.activity_type,
+		seq = instance.activity_request.seq,
+		activity_id = instance.activity_request.activity_id,
+		activity_type = instance.activity_request.activity_type,
 		task_queue = task_queue,
 		start_to_close_timeout = timeout,
 		do_not_eagerly_execute = true,
@@ -261,6 +299,147 @@ append_fiber_schedule_command :: proc(
 			},
 		},
 	)
+}
+
+append_fiber_timer_command :: proc(
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+	timeout: ^proto.Google_Protobuf_Duration,
+	start_timer: ^proto.Coresdk_Workflow_Commands_StartTimer,
+) {
+	nanoseconds := i64(instance.timer_request.duration)
+	timeout.seconds = nanoseconds / i64(time.Second)
+	timeout.nanos = i32(nanoseconds % i64(time.Second))
+	start_timer^ = proto.Coresdk_Workflow_Commands_StartTimer{
+		seq = instance.timer_request.seq,
+		start_to_fire_timeout = timeout,
+	}
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer{
+				value = start_timer,
+			},
+		},
+	)
+}
+
+append_fiber_suspension_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+	task_queue: string,
+	schedule_payload: ^proto.Temporal_Api_Common_V1_Payload,
+	schedule_timeout: ^proto.Google_Protobuf_Duration,
+	schedule: ^proto.Coresdk_Workflow_Commands_ScheduleActivity,
+	timer_timeout: ^proto.Google_Protobuf_Duration,
+	start_timer: ^proto.Coresdk_Workflow_Commands_StartTimer,
+) -> Error {
+	if len(commands^) != 0 {
+		return error_from_string("fiber spike emitted more than one command in an activation")
+	}
+	switch instance.phase {
+	case .Waiting_Activity:
+		append_fiber_schedule_command(
+			commands,
+			instance,
+			task_queue,
+			schedule_payload,
+			schedule_timeout,
+			schedule,
+		)
+		result.scheduled_activity = true
+		result.activity_seq = instance.activity_request.seq
+	case .Waiting_Timer:
+		append_fiber_timer_command(commands, instance, timer_timeout, start_timer)
+		result.started_timer = true
+		result.timer_seq = instance.timer_request.seq
+	case .Ready, .Completed, .Failed:
+		return error_from_string("Workflow fiber suspended without a supported pending operation")
+	}
+	result.run_id = instance.run_id
+	return {}
+}
+
+append_fiber_completion_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+	completion_output: ^[]u8,
+	completion_payload: ^proto.Temporal_Api_Common_V1_Payload,
+	complete: ^proto.Coresdk_Workflow_Commands_CompleteWorkflowExecution,
+) -> Error {
+	if len(commands^) != 0 {
+		return error_from_string("fiber spike emitted completion after another command")
+	}
+	encode_error: codec.Error
+	completion_output^, encode_error = codec.encode_string(instance.output)
+	if encode_error != .None {
+		return error_from_string("could not encode Workflow result")
+	}
+	completion_payload.data = completion_output^
+	append(
+		&completion_payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	complete.result = completion_payload
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution{
+				value = complete,
+			},
+		},
+	)
+	result.completed = true
+	result.run_id = instance.run_id
+	return {}
+}
+
+append_fiber_progress_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+	task_queue: string,
+	schedule_payload: ^proto.Temporal_Api_Common_V1_Payload,
+	schedule_timeout: ^proto.Google_Protobuf_Duration,
+	schedule: ^proto.Coresdk_Workflow_Commands_ScheduleActivity,
+	timer_timeout: ^proto.Google_Protobuf_Duration,
+	start_timer: ^proto.Coresdk_Workflow_Commands_StartTimer,
+	completion_output: ^[]u8,
+	completion_payload: ^proto.Temporal_Api_Common_V1_Payload,
+	complete: ^proto.Coresdk_Workflow_Commands_CompleteWorkflowExecution,
+) -> Error {
+	switch fiber_raw.status(instance.fiber) {
+	case .Suspended:
+		return append_fiber_suspension_command(
+			result,
+			commands,
+			instance,
+			task_queue,
+			schedule_payload,
+			schedule_timeout,
+			schedule,
+			timer_timeout,
+			start_timer,
+		)
+	case .Dead:
+		if instance.phase == .Completed {
+			return append_fiber_completion_command(
+				result,
+				commands,
+				instance,
+				completion_output,
+				completion_payload,
+				complete,
+			)
+		}
+	case .Normal, .Running:
+	}
+	return error_from_string("Workflow fiber reached an invalid state after resolution")
 }
 
 process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result: Process_Result) {
@@ -300,6 +479,8 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	schedule_timeout := proto.Google_Protobuf_Duration{}
 	schedule := proto.Coresdk_Workflow_Commands_ScheduleActivity{}
 	defer delete(schedule.arguments)
+	timer_timeout := proto.Google_Protobuf_Duration{}
+	start_timer := proto.Coresdk_Workflow_Commands_StartTimer{}
 	completion_payload := proto.Temporal_Api_Common_V1_Payload{}
 	defer delete(completion_payload.metadata)
 	completion_output: []u8
@@ -328,30 +509,37 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				runtime.replay_initializations += 1
 			}
 			resume_result := fiber_raw.resume(instance.fiber)
-			if resume_result != .Success || fiber_raw.status(instance.fiber) != .Suspended || instance.phase != .Waiting_Activity {
-				process_error(&result, activation.run_id, "Workflow did not suspend on its first Activity")
+			if resume_result != .Success || fiber_raw.status(instance.fiber) != .Suspended {
+				process_error(&result, activation.run_id, "Workflow did not suspend during initialization")
 				return
 			}
-			append_fiber_schedule_command(
+			suspension_error := append_fiber_suspension_command(
+				&result,
 				&commands,
 				instance,
 				runtime.task_queue,
 				&schedule_payload,
 				&schedule_timeout,
 				&schedule,
+				&timer_timeout,
+				&start_timer,
 			)
-			result.scheduled_activity = true
-			result.run_id = instance.run_id
+			if suspension_error.message != nil {
+				result.error = suspension_error
+				result.completion = encode_activation_failure(activation.run_id, string(suspension_error.message))
+				return
+			}
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity:
 			handled = true
-			if variant.value == nil || variant.value.result == nil || !instance_found || instance.phase != .Waiting_Activity || variant.value.seq != instance.request.seq {
+			if variant.value == nil || variant.value.result == nil || !instance_found || instance.phase != .Waiting_Activity || variant.value.seq != instance.activity_request.seq {
 				process_error(&result, activation.run_id, "Activity resolution does not match suspended Workflow fiber")
 				return
 			}
-			completed := false
+			resolution_handled := false
 			#partial switch status in variant.value.result.status {
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed:
+				resolution_handled = true
 				if status.value == nil || status.value.result == nil {
 					process_error(&result, activation.run_id, "completed Activity has no result")
 					return
@@ -367,35 +555,31 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 				instance.phase = .Ready
 				resume_result := fiber_raw.resume(instance.fiber)
-				if resume_result != .Success || fiber_raw.status(instance.fiber) != .Dead || instance.phase != .Completed {
-					process_error(&result, activation.run_id, "Workflow fiber did not complete after Activity resolution")
+				if resume_result != .Success {
+					process_error(&result, activation.run_id, "could not resume Workflow fiber after Activity resolution")
 					return
 				}
-				encode_error: codec.Error
-				completion_output, encode_error = codec.encode_string(instance.output)
-				if encode_error != .None {
-					process_error(&result, activation.run_id, "could not encode Workflow result")
-					return
-				}
-				completion_payload.data = completion_output
-				append(
-					&completion_payload.metadata,
-					proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
-						key = "encoding",
-						value = transmute([]u8)string("json/plain"),
-					},
-				)
-				complete.result = &completion_payload
-				append(
+				progress_error := append_fiber_progress_command(
+					&result,
 					&commands,
-					proto.Coresdk_Workflow_Commands_WorkflowCommand{
-						variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution{
-							value = &complete,
-						},
-					},
+					instance,
+					runtime.task_queue,
+					&schedule_payload,
+					&schedule_timeout,
+					&schedule,
+					&timer_timeout,
+					&start_timer,
+					&completion_output,
+					&completion_payload,
+					&complete,
 				)
-				completed = true
+				if progress_error.message != nil {
+					result.error = progress_error
+					result.completion = encode_activation_failure(activation.run_id, string(progress_error.message))
+					return
+				}
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed:
+				resolution_handled = true
 				if status.value == nil || status.value.failure == nil {
 					process_error(&result, activation.run_id, "failed Activity has no failure")
 					return
@@ -408,14 +592,45 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					},
 				)
 				instance.phase = .Failed
-				completed = true
+				result.completed = true
+				result.run_id = instance.run_id
 			}
-			if !completed {
+			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
 				return
 			}
-			result.completed = true
-			result.run_id = instance.run_id
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer:
+			handled = true
+			if variant.value == nil || !instance_found || instance.phase != .Waiting_Timer || variant.value.seq != instance.timer_request.seq {
+				process_error(&result, activation.run_id, "timer firing does not match suspended Workflow fiber")
+				return
+			}
+			instance.phase = .Ready
+			resume_result := fiber_raw.resume(instance.fiber)
+			if resume_result != .Success {
+				process_error(&result, activation.run_id, "could not resume Workflow fiber after timer firing")
+				return
+			}
+			progress_error := append_fiber_progress_command(
+				&result,
+				&commands,
+				instance,
+				runtime.task_queue,
+				&schedule_payload,
+				&schedule_timeout,
+				&schedule,
+				&timer_timeout,
+				&start_timer,
+				&completion_output,
+				&completion_payload,
+				&complete,
+			)
+			if progress_error.message != nil {
+				result.error = progress_error
+				result.completion = encode_activation_failure(activation.run_id, string(progress_error.message))
+				return
+			}
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
 			handled = true

@@ -6,9 +6,10 @@ not a reimplementation of Temporal Server or its gRPC protocol.
 Current status: Milestones 0–2 plus bounded explicit-state-machine and stackful
 fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
-Odin, and runs one sequential-looking Workflow through suspension, forced
-eviction, fresh-stack replay, Activity resolution, and completion. It does
-**not** provide general Workflow registration, timers/signals/updates, Activity
+Odin, and runs one sequential-looking `Activity -> timer -> Activity` Workflow
+through three forced evictions, increasingly deep fresh-stack replay, and
+completion. It does **not** provide general Workflow registration,
+signals/updates, Activity
 concurrency/cancellation/heartbeats, or a stable public API. Do not use it in
 production.
 
@@ -74,8 +75,8 @@ Run it with:
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
 also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
-Workflow result after destroying a suspended fiber, recreating it during
-replay, and resuming it with an Activity result.
+Workflow result after destroying the suspended fiber at every await boundary,
+recreating it during replay, and resuming it with Activity and timer events.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 

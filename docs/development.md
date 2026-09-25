@@ -122,12 +122,12 @@ also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
-with `temporal workflow execute`. The Odin worker's sequential Workflow
-suspends inside `workflow.execute_activity`, while the example forces a Core
-eviction between scheduling and resolution. The suspended fiber is destroyed,
-recreated from the beginning during replay, and resumed with the Activity
-result. The test requires a replay initialization and a final eviction before
-it succeeds.
+with `temporal workflow execute`. The Odin worker runs a sequential
+`Activity -> timer -> Activity` Workflow and forces Core eviction at all three
+await boundaries. Each suspended fiber is destroyed; subsequent history drives
+a new fiber through the already-recorded commands and results until it reaches
+the current frontier. The test requires three replay initializations and the
+final completion eviction before it succeeds.
 
 ## Manual run
 
@@ -157,8 +157,8 @@ temporal workflow execute \
   --input '"Odin"'
 ```
 
-This example is intentionally a one-Activity fiber experiment, not a stable or
-general sequential Workflow API.
+This example is intentionally a serial Activity/timer fiber experiment, not a
+stable or general Workflow API.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and

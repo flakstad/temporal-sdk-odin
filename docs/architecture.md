@@ -2,8 +2,8 @@
 
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
 Activity Worker slice, schema-derived Core protobuf bindings, a bounded
-Milestone 3 explicit-state-machine Workflow spike, and a stackful-fiber
-feasibility spike, 2026-09-25.
+Milestone 3 explicit-state-machine Workflow spike, and a serial multi-operation
+stackful-fiber replay spike, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -545,24 +545,44 @@ The author-facing proof is genuinely sequential:
 
 ```odin
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-    greeting := workflow.execute_activity(ctx, "hello", name)
-    return greeting
+    first := workflow.execute_activity(ctx, "hello", name)
+    workflow.sleep(ctx, 250 * time.Millisecond)
+    return workflow.execute_activity(ctx, "hello", first)
 }
 ```
 
-`execute_activity` encodes the request, records deterministic sequence 1, and
-yields from inside the nested Odin call. The activation driver emits the Core
-command. On resolution it decodes into the instance arena and resumes the same
-stack, so the call returns normally to user code.
+`execute_activity` and `sleep` each record a typed pending operation and yield
+from inside the nested Odin call. Activity and timer sequence counters are
+separate; the example emits `ScheduleActivity(seq=1)`, `StartTimer(seq=1)`, and
+`ScheduleActivity(seq=2)`. Resolutions are matched against both operation type
+and sequence before the fiber resumes.
 
-The forced-eviction acceptance test now runs this fiber implementation. On the
-first initialization it creates fiber A and suspends at `execute_activity`.
-Eviction destroys fiber A and its arena. Replay creates a fresh fiber B from
-the original input, runs from the top, and produces a byte-for-byte identical
-`ScheduleActivity(seq=1)` completion. The Activity result then resumes fiber B,
-the Workflow returns `"Hello Odin"`, and the final eviction destroys the dead
-fiber. Both the offline test under Odin's memory tracker and the live Temporal
-CLI dev-server path pass on macOS arm64.
+The live acceptance test requests eviction at all three suspension points. The
+observed Core boundary was:
+
+| History | Replay | Odin command/job |
+| ---: | :---: | --- |
+| 3 | no | initialize -> Activity 1 |
+| 3 | no | forced eviction |
+| 3 | yes | initialize -> Activity 1 |
+| 9 | no | resolve Activity 1 -> Timer 1 |
+| 9 | no | forced eviction |
+| 3 | yes | initialize -> Activity 1 |
+| 9 | yes | resolve Activity 1 -> Timer 1 |
+| 14 | no | fire Timer 1 -> Activity 2 |
+| 14 | no | forced eviction |
+| 3 | yes | initialize -> Activity 1 |
+| 9 | yes | resolve Activity 1 -> Timer 1 |
+| 14 | yes | fire Timer 1 -> Activity 2 |
+| 20 | no | resolve Activity 2 -> complete Workflow |
+| 20 | no | completion eviction |
+
+Thus the third fresh fiber re-executed the Workflow from its original input,
+consumed two prior resolutions, reproduced all three commands, and only then
+continued at the live Activity 2 frontier. Temporal CLI returned
+`"Hello Hello Odin"`; neither Activity was re-executed during replay. Offline
+tests cover the individual eviction/recreation path and the complete serial
+Activity/timer/Activity transition sequence under Odin's memory tracker.
 
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
@@ -594,11 +614,12 @@ Workflows are enabled.
    but not scalable. A real worker needs a callback-to-channel/event loop with
    heap-stable state, concurrent Activity execution, cancellation, and
    heartbeats.
-4. **Workflow runtime.** The fiber proves nested Odin suspension, resumption,
-   fresh-stack replay, and a first sequential author API. It does not yet prove
-   multiple outstanding operations, timers, signal/update ordering, panic
-   containment, nondeterminism diagnostics, bounded stack policy, or a
-   production deterministic scheduler.
+4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
+   timers, separate operation sequence spaces, resumption, and increasingly
+   deep fresh-stack replay for serial code. It does not yet prove multiple
+   outstanding operations, signal/update ordering, panic containment,
+   nondeterminism diagnostics, bounded stack policy, or a production
+   deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -617,7 +638,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for one sequential Activity await, eviction, fresh-stack replay, resumption, and completion on macOS arm64 | Add a timer between two Activity awaits and compare all replayed commands |
+| Stackful coroutine/fiber | Proven for serial Activity/timer/Activity execution with eviction at every await and three-level fresh-stack replay on macOS arm64 | Schedule two Activities before awaiting either, then replay batched commands/resolutions |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -627,19 +648,20 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The fiber Activity await works. The next bounded vertical milestone should be
-one Workflow with **Activity -> timer -> Activity**, with forced eviction at
-each suspension boundary. That requires only the `FireTimer` activation and
-`StartTimer` command already present in the generated graph, but it tests the
-important generalization from one hard-coded await to multiple operation kinds
-and sequence counters. The replay assertion should compare every completion
-byte-for-byte and prove that a new fiber walks through prior resolutions before
-suspending at the current frontier.
+The serial multi-operation fiber works. The next bounded runtime milestone
+should test **two outstanding Activities**: schedule both before awaiting
+either, return their combined results, and force eviction before and between
+resolutions. This directly tests the current architectural limit—the spike has
+one pending-operation slot and intentionally rejects more than one command per
+activation. The experiment needs a small operation table keyed by type and
+sequence plus a deterministic ready queue. It should not yet grow into a
+general futures framework; the acceptance criterion is that batched commands
+and possibly batched resolution jobs replay in the same order.
 
 In parallel with that small language-runtime slice, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Do not add a scheduler, general futures framework, signals,
-queries, or updates until the two-operation replay model is sound. Activity
+dependency. Do not add signals, queries, or updates until the multi-outstanding
+operation model is sound. Activity
 concurrency, heartbeats, and cancellation remain the next worker-side
 production work, but the Activity Worker vertical milestone itself is already
 complete.

@@ -3,6 +3,7 @@ package tests
 import "core:testing"
 import "core:bytes"
 import "core:mem/virtual"
+import "core:time"
 import temporal_core "../temporal/core"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
@@ -12,6 +13,21 @@ import workflow "../temporal/workflow"
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	return greeting
+}
+
+fiber_chain_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	first := workflow.execute_activity(ctx, "hello", name)
+	workflow.sleep(ctx, time.Millisecond)
+	return workflow.execute_activity(ctx, "hello", first)
+}
+
+process_fiber_test_activation :: proc(
+	runtime: ^workflow.Fiber_Runtime,
+	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
+) -> workflow.Process_Result {
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(activation)
+	defer delete(encoded)
+	return workflow.process_fiber_activation(runtime, encoded[:])
 }
 
 @(test)
@@ -381,6 +397,148 @@ workflow_fiber_recreates_stack_after_eviction :: proc(t: ^testing.T) {
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.completed)
 	testing.expect_value(t, processed.history_length, u32(9))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_chain_workflow",
+		"test-queue",
+		fiber_chain_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_chain_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-chain-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	first_output := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Hello Odin"`)}
+	defer delete(first_output.metadata)
+	append(
+		&first_output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	first_success := proto.Coresdk_Activity_Result_Success{result = &first_output}
+	first_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &first_success,
+		},
+	}
+	resolve_first := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &first_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_first,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.started_timer)
+	testing.expect_value(t, processed.timer_seq, u32(1))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(2))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	second_output := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Hello Hello Odin"`)}
+	defer delete(second_output.metadata)
+	append(
+		&second_output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	second_success := proto.Coresdk_Activity_Result_Success{result = &second_output}
+	second_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &second_success,
+		},
+	}
+	resolve_second := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 2,
+		result = &second_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 20
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_second,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.scheduled_activity)
+	testing.expect(t, !processed.started_timer)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
