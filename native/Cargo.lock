@@ -2148,6 +2148,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "odin-proto-gen"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "prost",
+ "prost-types",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

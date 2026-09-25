@@ -41,9 +41,37 @@ not an upstream-supported output of this bridge.
 The first native build is substantial because it compiles Core and its Rust
 dependency graph. Incremental builds are fast.
 
+## Protobuf generation
+
+The C bridge exchanges Core messages as protobuf bytes. The repository-owned
+generator reads a descriptor set produced from the exact schemas in the pinned
+`native/sdk-core` submodule:
+
+```bash
+./scripts/generate-protos.sh
+```
+
+This currently generates the transitive type graph rooted at
+`coresdk.activity_task.ActivityTask` and `coresdk.ActivityTaskCompletion` into
+`temporal/core/proto/generated.odin`. The generated file is committed. After a
+Core pin or root-list change, regenerate it and review the diff; do not edit it
+by hand. CI/local tests use:
+
+```bash
+./scripts/generate-protos.sh --check
+```
+
+The command needs `protoc` and Cargo, uses the pinned schemas plus the local
+`protoc` well-known-type include directory, and has no separate runtime
+dependency. Schema-independent wire operations live in `temporal/protobuf`.
+Decoded nested objects and repeated fields use `context.allocator`; callers
+must supply an arena or another allocator with a lifetime at least as long as
+all decoded views. String and byte values borrow the input buffer.
+
 ## Tests
 
-Fast tests initialize and close a real Core runtime but do not require a server:
+Fast tests check generated-code freshness, initialize and close a real Core
+runtime, and do not require a server:
 
 ```bash
 ./scripts/test.sh
@@ -81,7 +109,9 @@ schedule a real Activity because Temporal CLI Server 1.29.1 does not implement
 the newer standalone-Activity start RPC. The first run verifies `"Odin"` ->
 `"Hello Odin"`; the second schedules an unknown type and verifies that Odin's
 application failure reaches the Workflow. The driver is test infrastructure,
-not part of the distributed Odin SDK and not an Odin workflow runtime.
+not part of the distributed Odin SDK and not an Odin workflow runtime. This is
+also the protobuf interoperability test: the Rust/Core side uses `prost` to
+encode Activity Tasks and decode Odin's success/failure completions.
 
 ## Manual run
 

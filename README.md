@@ -3,13 +3,14 @@
 An experimental Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
 not a reimplementation of Temporal Server or its gRPC protocol.
 
-Current status: Milestones 0–1 plus a narrow Milestone 2 Activity Worker. The
-repository builds the official Rust Core C bridge, connects to a Temporal CLI
-dev server, polls and completes remote Activity Tasks in Odin, and shuts down
-cleanly. The worker currently supports one synchronous `json/plain` string
-argument and one string result. It does **not** provide an Odin workflow
-runtime, Activity concurrency/cancellation/heartbeats, a complete protobuf
-binding, or a stable public API. Do not use it in production.
+Current status: Milestones 0–1, a narrow Milestone 2 Activity Worker, and
+schema-derived protobuf bindings for that Activity slice. The repository builds
+the official Rust Core C bridge, connects to a Temporal CLI dev server, polls
+and completes remote Activity Tasks in Odin, and shuts down cleanly. The worker
+currently supports one synchronous `json/plain` string argument and one string
+result. It does **not** provide an Odin workflow runtime, Activity
+concurrency/cancellation/heartbeats, bindings for the Workflow schemas, or a
+stable public API. Do not use it in production.
 
 ```text
 Temporal CLI dev server
@@ -18,7 +19,7 @@ Temporal CLI dev server
 Temporal SDK Core
           ^ C ABI
           |
-Odin raw bindings -> lifecycle wrapper -> Activity dispatch + JSON codec
+Odin raw bindings -> generated Core protobuf types -> Activity dispatch + JSON codec
 ```
 
 ## Quick start
@@ -68,7 +69,7 @@ Run it with:
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved.
 
-Unit, codec, protobuf-envelope, and lifecycle tests:
+Unit, codec, generated-protobuf, and lifecycle tests:
 
 ```bash
 ./scripts/test.sh
@@ -84,14 +85,15 @@ docs/                     architecture and development notes
 native/                   pinned sdk-core submodule and Cargo lockfile
 temporal/core/raw/        near-1:1 subset of the C ABI
 temporal/core/            blocking ownership/lifecycle wrapper
-temporal/core/proto/      narrow Activity envelope wire codec
+temporal/core/proto/      generated Activity schema types plus small adapters
+temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/worker/          synchronous Activity registry and run loop
 temporal/codec/           isolated json/plain user payload codec
 temporal/{client,...}/    planned public packages
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/hello_activity/  Odin hello Activity Worker
-tests/                    lifecycle, codec, and envelope tests
+tests/                    lifecycle, codec, and protobuf tests
 ```
 
 ## License

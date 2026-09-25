@@ -1,7 +1,11 @@
 # This wrapper workspace gives the unpublished Core C bridge a repository-owned
 # Cargo.lock. The inherited tables must be kept in sync with sdk-core/Cargo.toml.
 [workspace]
-members = ["sdk-core/crates/sdk-core-c-bridge", "activity-test-driver"]
+members = [
+    "sdk-core/crates/sdk-core-c-bridge",
+    "activity-test-driver",
+    "odin-proto-gen",
+]
 default-members = ["sdk-core/crates/sdk-core-c-bridge"]
 resolver = "2"
 

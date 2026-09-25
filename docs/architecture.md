@@ -1,7 +1,8 @@
 # Architecture: Temporal SDK for Odin
 
-Status: Milestone 0 research, Milestone 1 bridge spike, and a narrow Milestone
-2 Activity Worker slice, 2026-09-25.
+Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
+Activity Worker slice, and schema-derived Activity protobuf bindings,
+2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -198,8 +199,8 @@ types.
 
 Odin therefore needs protobuf capability for complete workers. Milestone 1
 avoids pretending otherwise: `GetSystemInfoRequest` is an empty message, and
-the spike treats its response as opaque bytes. A complete Activity binding
-would need generated representations for:
+the spike treats its response as opaque bytes. The generated Activity slice
+now includes representations for:
 
 - Core `ActivityTask`, `ActivityTaskCompletion`, and `ActivityExecutionResult`;
 - Temporal `Payload`, `Failure`, `WorkflowExecution`, `RetryPolicy`, and
@@ -212,34 +213,52 @@ JSON is acceptable as the first user codec, expressed through payload metadata
 and data, but it does not replace the protobuf envelope. The codec belongs in
 `temporal/codec`, not the Core binding.
 
-### Odin protobuf survey
+### Odin protobuf survey and decision
 
-Two current projects were examined:
+Three projects were examined at their current revisions on 2026-09-25:
 
 - [`lordhippo/odin-protobuf`](https://github.com/lordhippo/odin-protobuf) and
   its [`odin-protoc-plugin`](https://github.com/lordhippo/odin-protoc-plugin)
-  are active and allocator-aware, but currently document missing native
-  `oneof` support, deterministic map serialization, field presence, and unknown
-  field retention. The generator also lists dependency handling as incomplete.
-  Core's task schemas depend heavily on imports and `oneof`, so it is not usable
-  unchanged for this SDK today.
+  (`ae5b9b5` and `cf37925`) are active and allocator-aware, but currently
+  document missing `oneof` support, deterministic map serialization, field
+  presence, and unknown-field retention. The plugin also lists dependency
+  handling as incomplete. We built the plugin and ran it against the pinned
+  Core descriptors rather than relying only on that documentation. Imported
+  message names were emitted as invalid identifiers such as
+  `_WorkflowExecution`; imported Google types were truncated to `amp` and `on`;
+  and protobuf `oneof`s became raw Odin unions without a discriminator. It is
+  therefore not usable unchanged for these schemas.
 - [`lukasjarosch/protoc-gen-godin`](https://github.com/lukasjarosch/protoc-gen-godin)
-  is explicitly work in progress, has very little activity, and is not a
+  (`cec442a`, last changed in 2019) is explicitly work in progress and is not a
   sufficient runtime/codegen foundation.
 
-Do not hand-write a general protobuf implementation. For Milestone 2 we did
-write a deliberately narrow wire codec for the two Activity envelopes. It
-decodes only task token, start/cancel variant, activity ID/type, attempt, the
-first input `Payload`, and its `encoding` metadata/data; it skips valid unknown
-fields. It encodes success and non-retryable application failure completions.
-This proved the boundary without adopting an unsuitable generator, but it is
-not a scalable answer for Workflow schemas. The next protobuf step should
-either contribute the required import/`oneof` support to the more active Odin
-project or build a small schema-driven Odin generator/runtime with explicit
-scope.
-A custom Rust shim that decodes every message would reduce Odin protobuf work
-but create a second, project-owned ABI and duplicate language-layer semantics;
-keep it as a fallback, not the starting point.
+The project now owns a small descriptor-driven generator in
+`native/odin-proto-gen`. `protoc` resolves the pinned Core, Temporal API, and
+Google imports into a `FileDescriptorSet`; the generator walks the transitive
+graph from an explicit root-message list and emits one Odin package. Fully
+qualified names are flattened predictably, protobuf `oneof`s become tagged Odin
+unions, message presence remains explicit through pointers, and map entries are
+represented as their generated repeated entry messages. Generated decoders use
+`context.allocator`, borrow strings/bytes from the input buffer, skip valid
+unknown fields, and reject malformed wire data. Encoders produce standard
+protobuf wire data and omit default-valued singular fields.
+
+The first roots are `coresdk.activity_task.ActivityTask` and
+`coresdk.ActivityTaskCompletion`. Their reachable type graph replaces the
+hand-written Activity envelope codec. The generated file is committed and
+`./scripts/generate-protos.sh --check` makes schema drift visible in normal
+tests. The live integration test is the interoperability oracle: Core encodes
+the polled task with Rust `prost`, Odin decodes it, Odin encodes success or
+failure, and Core decodes the completion with `prost` before talking to the
+server. Both paths pass against the CLI dev server.
+
+This is intentionally a Core-schema tool, not a claimed general-purpose Odin
+protobuf library. It does not retain unknown fields, emit a native Odin map, or
+promise support for schema features not reachable from the selected roots.
+Those limitations are acceptable at this boundary because Odin does not
+decode-and-reencode the polled task, but they must be revisited when adding new
+root messages. A custom Rust message shim remains a fallback; it would add a
+second project-owned ABI and was not needed.
 
 ## How .NET binds Core
 
@@ -303,10 +322,13 @@ as ABI requirements:
 The current wrapper blocks the caller on an Odin one-shot event. This keeps
 stack-backed options and callback state alive, copies all returned bytes, and
 frees them before returning. It deliberately exposes no general asynchronous
-API yet. Activity inputs are views into the copied poll buffer and stay valid
-only until that buffer is deleted after completion. Each Activity invocation
-uses a temporary Odin virtual-memory arena; allocations made by the Activity,
-including its returned string, are released together after result encoding.
+API yet. Generated protobuf decoding allocates nested messages and repeated
+fields in a per-task virtual-memory arena while string and byte fields remain
+views into the copied poll buffer. Both therefore stay alive through Activity
+dispatch and completion encoding, then the arena and poll buffer are released.
+Each Activity invocation has a separate temporary arena; allocations made by
+the Activity, including its returned string, are released after result
+encoding.
 
 Shutdown exposed an important lifecycle detail in practice: after
 `temporal_core_worker_initiate_shutdown`, an active poll must observe the
@@ -395,15 +417,16 @@ Verified environment:
 - end-to-end `GetSystemInfo` green through a directly started
   `temporal server start-dev --headless` process.
 
-The Milestone 2 path also executed end-to-end on the same environment:
+The Milestone 2 path, now using schema-generated bindings, also executed
+end-to-end on the same environment:
 
 ```text
 Rust workflow-only test driver -> Temporal CLI dev server
   -> Core Activity poll callback -> Odin worker
-  -> decode ActivityTask protobuf
+  -> decode prost ActivityTask with generated Odin types
   -> dispatch hello(ctx, "Odin")
   -> JSON Payload "Hello Odin"
-  -> encode ActivityTaskCompletion protobuf -> Core -> server
+  -> encode ActivityTaskCompletion -> Core prost decode -> server
   -> workflow observes "Hello Odin"
 ```
 
@@ -426,9 +449,11 @@ for the requested CLI development loop today.
    and evolves with Core. Pinning plus ABI assertions is mandatory. We should
    ask upstream whether third-party language SDK consumption has compatibility
    guarantees or a preferred release channel.
-2. **Protobuf maturity in Odin.** The narrow Activity codec proves wire
-   compatibility, but Core uses `oneof`, imported types, maps, unknown fields,
-   and schema evolution. Hand-maintaining Workflow messages is not viable.
+2. **Protobuf generator scope.** The exact Activity graph and its imports,
+   maps, presence, and `oneof`s are generated and wire-compatible with `prost`.
+   Unknown fields are skipped rather than retained, and Workflow roots are not
+   generated yet. Every new root graph needs generation, compile, unit, and
+   live `prost` interoperability checks.
 3. **Async callback integration.** The synchronous single-task worker is safe
    but not scalable. A real worker needs a callback-to-channel/event loop with
    heap-stable state, concurrent Activity execution, cancellation, and
@@ -465,21 +490,19 @@ incorrect understanding of Core.
 
 ## Recommended next vertical milestone
 
-The Activity Worker is now proven, so it is no longer the next unknown. Before
-attempting rich Workflow activations, make one bounded **schema/tooling
-milestone**: generate or otherwise maintain schema-derived Odin types for the
-exact Core Activity messages, replace the hand-maintained Activity codec, and
-cross-check golden bytes with `prost`. This directly retires the largest risk
-that would otherwise explode during Workflow work.
-
-After that, start Milestone 3 with an explicit-state-machine workflow that
+The bounded schema/tooling milestone is complete: Activity messages are
+schema-derived and cross-checked with `prost` through the live Core boundary.
+Next, start Milestone 3 with an explicit-state-machine workflow that
 schedules this already-working `hello` Activity and completes after its
 resolution. That should prove activation ordering, command encoding, replay,
-and eviction before selecting fibers or code generation. Activity concurrency,
-heartbeats, and cancellation remain important follow-up slices, but they need
-not block the first bounded Workflow activation experiment.
+and eviction before selecting fibers or code generation. Generate only the
+Workflow activation/completion graph required by that experiment. Activity
+concurrency, heartbeats, and cancellation remain important follow-up slices,
+but they need not block the bounded Workflow activation experiment.
 
-The C bridge remains the recommended foundation. Milestone 2 strengthened that
-decision: Core handled polling, tokens, transport, retries, server completion,
-and shutdown as expected. The findings add protobuf/tooling and version-skew
-obligations but give no reason to bypass Core or implement direct server gRPC.
+The C bridge remains the recommended foundation. Milestone 2 and the subsequent
+schema milestone strengthened that decision: Core handled polling, tokens,
+transport, retries, server completion, and shutdown as expected, while its
+protobuf boundary proved practical to generate directly for Odin. The findings
+add protobuf/tooling and version-skew obligations but give no reason to bypass
+Core or implement direct server gRPC.

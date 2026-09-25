@@ -1,0 +1,13 @@
+[package]
+name = "odin-proto-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+prost = { workspace = true }
+prost-descriptor-types = { package = "prost-types", version = "0.14" }
+
+[lints]
+workspace = true

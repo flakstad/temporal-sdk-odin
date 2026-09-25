@@ -162,8 +162,18 @@ run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
 			break
 		}
 
+		decode_arena: virtual.Arena
+		arena_error := virtual.arena_init_growing(&decode_arena)
+		if arena_error != nil {
+			delete(poll.protobuf)
+			return error_from_string("could not initialize protobuf decode arena")
+		}
+		previous_allocator := context.allocator
+		context.allocator = virtual.arena_allocator(&decode_arena)
 		task, decode_error := proto.decode_activity_task(poll.protobuf)
+		context.allocator = previous_allocator
 		if decode_error != .None {
+			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
 			return error_from_string("Core returned a malformed ActivityTask protobuf")
 		}
@@ -171,11 +181,13 @@ run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
 			// Concurrent cancellation is intentionally deferred. The current worker
 			// executes one synchronous task at a time and cannot have an in-flight
 			// task to cancel while it is polling.
+			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
 			continue
 		}
 
 		completion, execute_error := execute_start(worker, &task)
+		virtual.arena_destroy(&decode_arena)
 		if execute_error.message != nil {
 			delete(poll.protobuf)
 			return execute_error

@@ -2,9 +2,11 @@ package tests
 
 import "core:testing"
 import "core:bytes"
+import "core:mem/virtual"
 import temporal_core "../temporal/core"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
+import protobuf "../temporal/protobuf"
 
 @(test)
 runtime_init_and_shutdown :: proc(t: ^testing.T) {
@@ -47,21 +49,45 @@ json_string_codec_round_trip :: proc(t: ^testing.T) {
 
 @(test)
 activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
-	payload := proto.encode_payload(transmute([]u8)string(`"Odin"`))
-	defer delete(payload)
-	start := make([dynamic]u8)
-	defer delete(start)
-	proto.append_string_field(&start, 4, "activity-id")
-	proto.append_string_field(&start, 5, "hello")
-	proto.append_bytes_field(&start, 7, payload[:])
-	proto.append_key(&start, 12, 0)
-	proto.append_varint(&start, 2)
-	task_bytes := make([dynamic]u8)
+	payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Odin"`),
+	}
+	defer delete(payload.metadata)
+	append(
+		&payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	start := proto.Coresdk_Activity_Task_Start{
+		activity_id = "activity-id",
+		activity_type = "hello",
+		attempt = 2,
+	}
+	defer delete(start.input)
+	append(&start.input, payload)
+	raw_task := proto.Coresdk_Activity_Task_ActivityTask{
+		task_token = transmute([]u8)string("token"),
+		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Start{value = &start},
+	}
+	task_bytes := proto.encode_Coresdk_Activity_Task_ActivityTask(&raw_task)
 	defer delete(task_bytes)
-	proto.append_string_field(&task_bytes, 1, "token")
-	proto.append_bytes_field(&task_bytes, 3, start[:])
+	// Schema evolution must not make older bindings reject valid unknown fields.
+	protobuf.append_varint_field(&task_bytes, 100, 7)
+
+	decode_arena: virtual.Arena
+	arena_error := virtual.arena_init_growing(&decode_arena)
+	testing.expect(t, arena_error == nil)
+	if arena_error != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
 
 	task, decode_error := proto.decode_activity_task(task_bytes[:])
+	context.allocator = previous_allocator
 	testing.expect(t, decode_error == .None)
 	testing.expect(t, task.kind == .Start)
 	testing.expect_value(t, string(task.task_token), "token")
@@ -73,5 +99,34 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 
 	completion := proto.encode_activity_success(task.task_token, transmute([]u8)string(`"Hello Odin"`))
 	defer delete(completion)
-	testing.expect(t, len(completion) > len(task.task_token))
+	decoded_completion := proto.Coresdk_ActivityTaskCompletion{}
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion_ok := proto.decode_Coresdk_ActivityTaskCompletion(completion[:], &decoded_completion)
+	context.allocator = previous_allocator
+	testing.expect(t, completion_ok)
+	testing.expect_value(t, string(decoded_completion.task_token), "token")
+	testing.expect(t, decoded_completion.result != nil)
+	if decoded_completion.result == nil {
+		return
+	}
+	found_success := false
+	#partial switch status in decoded_completion.result.status {
+	case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Completed:
+		found_success = true
+		testing.expect(t, status.value != nil)
+		if status.value != nil {
+			testing.expect(t, status.value.result != nil)
+			if status.value.result != nil {
+				testing.expect_value(t, string(status.value.result.data), `"Hello Odin"`)
+			}
+		}
+	}
+	testing.expect(t, found_success)
+}
+
+@(test)
+generated_protobuf_rejects_truncated_bytes :: proc(t: ^testing.T) {
+	malformed := [3]u8{0x0a, 0x05, 0x01}
+	decoded := proto.Coresdk_ActivityTaskCompletion{}
+	testing.expect(t, !proto.decode_Coresdk_ActivityTaskCompletion(malformed[:], &decoded))
 }
