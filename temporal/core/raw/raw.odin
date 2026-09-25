@@ -12,6 +12,7 @@ when ODIN_OS == .Darwin || ODIN_OS == .Linux {
 
 Runtime    :: struct { _opaque: u8 }
 Connection :: struct { _opaque: u8 }
+Worker     :: struct { _opaque: u8 }
 
 Byte_Array_Ref :: struct {
 	data: ^u8,
@@ -133,9 +134,148 @@ Client_Rpc_Call_Callback :: #type proc "c" (
 	failure_details: ^Byte_Array,
 )
 
+Worker_Or_Fail :: struct {
+	worker: ^Worker,
+	fail:   ^Byte_Array,
+}
+
+Worker_Versioning_Strategy_Tag :: enum c.int {
+	None = 0,
+	Deployment_Based,
+	Legacy_Build_Id_Based,
+}
+
+Worker_Versioning_None :: struct {
+	build_id: Byte_Array_Ref,
+}
+
+Worker_Deployment_Version :: struct {
+	deployment_name: Byte_Array_Ref,
+	build_id:        Byte_Array_Ref,
+}
+
+Worker_Deployment_Options :: struct {
+	version:                     Worker_Deployment_Version,
+	use_worker_versioning:       bool,
+	default_versioning_behavior: i32,
+}
+
+Legacy_Build_Id_Based_Strategy :: struct {
+	build_id: Byte_Array_Ref,
+}
+
+Worker_Versioning_Strategy :: struct {
+	tag: Worker_Versioning_Strategy_Tag,
+	using value: struct #raw_union {
+		none:                  Worker_Versioning_None,
+		deployment_based:      Worker_Deployment_Options,
+		legacy_build_id_based: Legacy_Build_Id_Based_Strategy,
+	},
+}
+
+Fixed_Size_Slot_Supplier :: struct {
+	num_slots: uintptr,
+}
+
+Resource_Based_Tuner_Options :: struct {
+	target_memory_usage: f64,
+	target_cpu_usage:    f64,
+}
+
+Resource_Based_Slot_Supplier :: struct {
+	minimum_slots:    uintptr,
+	maximum_slots:    uintptr,
+	ramp_throttle_ms: u64,
+	tuner_options:    Resource_Based_Tuner_Options,
+}
+
+Custom_Slot_Supplier_Callbacks_Impl :: struct {
+	callbacks: rawptr,
+}
+
+Slot_Supplier_Tag :: enum c.int {
+	Fixed_Size = 0,
+	Resource_Based,
+	Custom,
+}
+
+Slot_Supplier :: struct {
+	tag: Slot_Supplier_Tag,
+	using value: struct #raw_union {
+		fixed_size:     Fixed_Size_Slot_Supplier,
+		resource_based: Resource_Based_Slot_Supplier,
+		custom:         Custom_Slot_Supplier_Callbacks_Impl,
+	},
+}
+
+Tuner_Holder :: struct {
+	workflow_slot_supplier:       Slot_Supplier,
+	activity_slot_supplier:       Slot_Supplier,
+	local_activity_slot_supplier: Slot_Supplier,
+	nexus_task_slot_supplier:     Slot_Supplier,
+}
+
+Worker_Task_Types :: struct {
+	enable_workflows:         bool,
+	enable_local_activities:  bool,
+	enable_remote_activities: bool,
+	enable_nexus:             bool,
+}
+
+Poller_Behavior_Simple_Maximum :: struct {
+	simple_maximum: uintptr,
+}
+
+Poller_Behavior_Autoscaling :: struct {
+	minimum: uintptr,
+	maximum: uintptr,
+	initial: uintptr,
+}
+
+Poller_Behavior :: struct {
+	simple_maximum: ^Poller_Behavior_Simple_Maximum,
+	autoscaling:    ^Poller_Behavior_Autoscaling,
+}
+
+Worker_Options :: struct {
+	namespace:                                  Byte_Array_Ref,
+	task_queue:                                 Byte_Array_Ref,
+	versioning_strategy:                        Worker_Versioning_Strategy,
+	identity_override:                          Byte_Array_Ref,
+	max_cached_workflows:                       u32,
+	tuner:                                      Tuner_Holder,
+	task_types:                                 Worker_Task_Types,
+	sticky_queue_schedule_to_start_timeout_ms:  u64,
+	max_heartbeat_throttle_interval_ms:         u64,
+	default_heartbeat_throttle_interval_ms:     u64,
+	max_activities_per_second:                  f64,
+	max_task_queue_activities_per_second:       f64,
+	graceful_shutdown_period_ms:                u64,
+	workflow_task_poller_behavior:              Poller_Behavior,
+	nonsticky_to_sticky_poll_ratio:             f32,
+	activity_task_poller_behavior:              Poller_Behavior,
+	nexus_task_poller_behavior:                 Poller_Behavior,
+	nondeterminism_as_workflow_fail:             bool,
+	nondeterminism_as_workflow_fail_for_types:   Byte_Array_Ref_Array,
+	plugins:                                    Byte_Array_Ref_Array,
+	storage_drivers:                            Byte_Array_Ref_Array,
+	disable_payload_error_limit:                 bool,
+	max_eager_activity_reservations_per_wf_task: u32,
+}
+
+Worker_Callback :: #type proc "c" (user_data: rawptr, fail: ^Byte_Array)
+
+Worker_Poll_Callback :: #type proc "c" (
+	user_data: rawptr,
+	success:   ^Byte_Array,
+	fail:      ^Byte_Array,
+)
+
 #assert(size_of(bool) == 1)
 #assert(size_of(Runtime_Type) == size_of(c.int))
 #assert(size_of(Rpc_Service) == size_of(c.int))
+#assert(size_of(Worker_Versioning_Strategy_Tag) == size_of(c.int))
+#assert(size_of(Slot_Supplier_Tag) == size_of(c.int))
 when size_of(uintptr) == 8 {
 	// Values verified against Clang's layout of the pinned generated C header.
 	#assert(size_of(Byte_Array_Ref) == 16)
@@ -149,6 +289,25 @@ when size_of(uintptr) == 8 {
 	#assert(size_of(Rpc_Call_Options) == 96)
 	#assert(offset_of(Rpc_Call_Options, retry) == 40)
 	#assert(offset_of(Rpc_Call_Options, cancellation_token) == 88)
+	#assert(size_of(Worker_Versioning_Strategy) == 48)
+	#assert(size_of(Slot_Supplier) == 48)
+	#assert(size_of(Tuner_Holder) == 192)
+	#assert(size_of(Worker_Task_Types) == 4)
+	#assert(size_of(Poller_Behavior) == 16)
+	#assert(size_of(Worker_Options) == 472)
+	#assert(offset_of(Worker_Options, versioning_strategy) == 32)
+	#assert(offset_of(Worker_Options, identity_override) == 80)
+	#assert(offset_of(Worker_Options, max_cached_workflows) == 96)
+	#assert(offset_of(Worker_Options, tuner) == 104)
+	#assert(offset_of(Worker_Options, task_types) == 296)
+	#assert(offset_of(Worker_Options, sticky_queue_schedule_to_start_timeout_ms) == 304)
+	#assert(offset_of(Worker_Options, workflow_task_poller_behavior) == 352)
+	#assert(offset_of(Worker_Options, nonsticky_to_sticky_poll_ratio) == 368)
+	#assert(offset_of(Worker_Options, activity_task_poller_behavior) == 376)
+	#assert(offset_of(Worker_Options, nondeterminism_as_workflow_fail) == 408)
+	#assert(offset_of(Worker_Options, nondeterminism_as_workflow_fail_for_types) == 416)
+	#assert(offset_of(Worker_Options, disable_payload_error_limit) == 464)
+	#assert(offset_of(Worker_Options, max_eager_activity_reservations_per_wf_task) == 468)
 }
 
 @(default_calling_convention = "c", link_prefix = "temporal_core_")
@@ -169,4 +328,20 @@ foreign temporal_core {
 		user_data: rawptr,
 		callback: Client_Rpc_Call_Callback,
 	) ---
+	worker_new :: proc(connection: ^Connection, options: ^Worker_Options) -> Worker_Or_Fail ---
+	worker_free :: proc(worker: ^Worker) ---
+	worker_validate :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
+	worker_poll_activity_task :: proc(
+		worker: ^Worker,
+		user_data: rawptr,
+		callback: Worker_Poll_Callback,
+	) ---
+	worker_complete_activity_task :: proc(
+		worker: ^Worker,
+		completion: Byte_Array_Ref,
+		user_data: rawptr,
+		callback: Worker_Callback,
+	) ---
+	worker_initiate_shutdown :: proc(worker: ^Worker) ---
+	worker_finalize_shutdown :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
 }

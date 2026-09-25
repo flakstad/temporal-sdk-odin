@@ -66,22 +66,34 @@ It checks for a healthy service on `localhost:7233`. If none exists, it starts:
 temporal server start-dev --headless --log-level error
 ```
 
-It then builds and runs `examples/core_connect`, which performs:
+It first builds and runs `examples/core_connect`, which performs:
 
 ```text
 runtime_new -> client_connect -> GetSystemInfo RPC -> client_free -> runtime_free
 ```
 
 The request protobuf is empty by definition. The response is intentionally kept
-opaque in this milestone; receiving and freeing it proves the network and ABI
-path without prematurely selecting an Odin protobuf implementation.
+opaque; receiving and freeing it proves the network and ABI path.
+
+The same script then runs `examples/hello_activity` twice. A small workflow-only
+driver under `native/activity-test-driver` uses the pinned upstream Rust SDK to
+schedule a real Activity because Temporal CLI Server 1.29.1 does not implement
+the newer standalone-Activity start RPC. The first run verifies `"Odin"` ->
+`"Hello Odin"`; the second schedules an unknown type and verifies that Odin's
+application failure reaches the Workflow. The driver is test infrastructure,
+not part of the distributed Odin SDK and not an Odin workflow runtime.
 
 ## Manual run
 
 ```bash
 temporal server start-dev
 ./scripts/run-core-connect.sh
+./scripts/run-hello-activity.sh
 ```
+
+`run-hello-activity.sh` polls task queue `odin-hello-activity` and completes one
+task before shutting down. Run `./scripts/integration-test.sh` instead when you
+want the repository to schedule that task automatically.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
@@ -93,6 +105,11 @@ configuration profiles are not exposed yet.
   `./scripts/build-core.sh` and use the provided run/test scripts.
 - `Temporal connection failed`: confirm `temporal operator cluster health`
   succeeds and port 7233 is not occupied by another service.
+- A worker hangs in shutdown: Core shutdown requires a final poll to observe
+  its shutdown result before `finalize_shutdown`; preserve that lifecycle order.
+- `StartActivityExecution` is unimplemented: this is expected from CLI Server
+  1.29.1 even though the pinned client contains the newer API. Use the included
+  workflow-only integration driver.
 - Rust manifest inheritance errors after a Core bump: synchronize the workspace
   tables in `native/Cargo.toml` before regenerating the lockfile.
 - An ABI assertion fails: do not weaken it. Compare the upstream generated C
@@ -100,6 +117,6 @@ configuration profiles are not exposed yet.
 
 ## Current platform evidence
 
-Milestone 1 was built and run end-to-end on macOS arm64. Linux source/build
-paths are present but were not executed in this environment. Cross-platform
-release packaging is intentionally deferred.
+Milestones 1 and 2 were built and run end-to-end on macOS arm64. Linux
+source/build paths are present but were not executed in this environment.
+Cross-platform release packaging is intentionally deferred.

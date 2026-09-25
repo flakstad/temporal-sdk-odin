@@ -1,6 +1,7 @@
 # Architecture: Temporal SDK for Odin
 
-Status: Milestone 0 research plus Milestone 1 bridge spike, 2026-09-25.
+Status: Milestone 0 research, Milestone 1 bridge spike, and a narrow Milestone
+2 Activity Worker slice, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -195,10 +196,10 @@ messages. Core uses Rust `prost` to encode poll results and decode completions.
 The relevant Core-local schemas import Temporal API schemas and Google well-known
 types.
 
-Odin therefore needs protobuf capability for real workers. Milestone 1 avoids
-pretending otherwise: `GetSystemInfoRequest` is an empty message, and the spike
-treats its response as opaque bytes. Milestone 2 cannot avoid decoding and
-encoding at least:
+Odin therefore needs protobuf capability for complete workers. Milestone 1
+avoids pretending otherwise: `GetSystemInfoRequest` is an empty message, and
+the spike treats its response as opaque bytes. A complete Activity binding
+would need generated representations for:
 
 - Core `ActivityTask`, `ActivityTaskCompletion`, and `ActivityExecutionResult`;
 - Temporal `Payload`, `Failure`, `WorkflowExecution`, `RetryPolicy`, and
@@ -226,10 +227,16 @@ Two current projects were examined:
   is explicitly work in progress, has very little activity, and is not a
   sufficient runtime/codegen foundation.
 
-Do not hand-write a general protobuf implementation. The next milestone should
-first make a narrow compatibility spike against the activity schema: either
-contribute the required import/`oneof` support to the more active Odin project,
-or build a small schema-driven Odin generator/runtime whose scope is explicit.
+Do not hand-write a general protobuf implementation. For Milestone 2 we did
+write a deliberately narrow wire codec for the two Activity envelopes. It
+decodes only task token, start/cancel variant, activity ID/type, attempt, the
+first input `Payload`, and its `encoding` metadata/data; it skips valid unknown
+fields. It encodes success and non-retryable application failure completions.
+This proved the boundary without adopting an unsuitable generator, but it is
+not a scalable answer for Workflow schemas. The next protobuf step should
+either contribute the required import/`oneof` support to the more active Odin
+project or build a small schema-driven Odin generator/runtime with explicit
+scope.
 A custom Rust shim that decodes every message would reduce Odin protobuf work
 but create a second, project-owned ABI and duplicate language-layer semantics;
 keep it as a fallback, not the starting point.
@@ -293,10 +300,19 @@ as ABI requirements:
 - Callback thread identity is unspecified. Odin callbacks must not assume they
   run on the main thread or use an uninitialized thread-local context.
 
-Milestone 1's wrapper blocks the caller on an Odin one-shot event. This keeps
+The current wrapper blocks the caller on an Odin one-shot event. This keeps
 stack-backed options and callback state alive, copies all returned bytes, and
 frees them before returning. It deliberately exposes no general asynchronous
-API yet.
+API yet. Activity inputs are views into the copied poll buffer and stay valid
+only until that buffer is deleted after completion. Each Activity invocation
+uses a temporary Odin virtual-memory arena; allocations made by the Activity,
+including its returned string, are released together after result encoding.
+
+Shutdown exposed an important lifecycle detail in practice: after
+`temporal_core_worker_initiate_shutdown`, an active poll must observe the
+both-null shutdown callback before `temporal_core_worker_finalize_shutdown`.
+The synchronous wrapper therefore performs one final Activity poll before
+finalization.
 
 ## Native build and distribution
 
@@ -328,7 +344,7 @@ libSystem). Linux still needs target-specific validation, including glibc vs
 musl policy and certificate-store behavior. Static linking would require an
 upstream/project modification and is not part of this spike.
 
-## Milestone 1 implementation and evidence
+## Milestone 1 and 2 implementation and evidence
 
 Raw Odin declarations live in `temporal/core/raw` and mirror only the structs,
 enums, callbacks, and symbols required for the spike. `temporal/core` adds a
@@ -344,6 +360,13 @@ temporal_core_byte_array_free
 temporal_core_client_connect
 temporal_core_client_free
 temporal_core_client_rpc_call
+temporal_core_worker_new
+temporal_core_worker_validate
+temporal_core_worker_poll_activity_task
+temporal_core_worker_complete_activity_task
+temporal_core_worker_initiate_shutdown
+temporal_core_worker_finalize_shutdown
+temporal_core_worker_free
 ```
 
 The integration path actually executed on macOS arm64:
@@ -372,17 +395,44 @@ Verified environment:
 - end-to-end `GetSystemInfo` green through a directly started
   `temporal server start-dev --headless` process.
 
+The Milestone 2 path also executed end-to-end on the same environment:
+
+```text
+Rust workflow-only test driver -> Temporal CLI dev server
+  -> Core Activity poll callback -> Odin worker
+  -> decode ActivityTask protobuf
+  -> dispatch hello(ctx, "Odin")
+  -> JSON Payload "Hello Odin"
+  -> encode ActivityTaskCompletion protobuf -> Core -> server
+  -> workflow observes "Hello Odin"
+```
+
+The integration suite repeats the path with an unregistered Activity type and
+observes a workflow failure produced from Odin's non-retryable
+`ApplicationFailure`. It also verifies validate, initiate-shutdown, shutdown
+poll, finalize, and handle-free order. The driver uses the pinned upstream Rust
+SDK only to create a Workflow that schedules the Activity; it is test
+infrastructure and no Odin workflow runtime is implied.
+
+An attempted smaller test using the pinned client's standalone-Activity API
+failed because the CLI-bundled Temporal Server 1.29.1 returned `Unimplemented`
+for `StartActivityExecution`. The API exists in the pinned client/protos but is
+not available in this server version, so the workflow-only driver is required
+for the requested CLI development loop today.
+
 ## Risks and unresolved questions
 
 1. **ABI stability.** The C bridge is generated from Rust structs, unpublished,
    and evolves with Core. Pinning plus ABI assertions is mandatory. We should
    ask upstream whether third-party language SDK consumption has compatibility
    guarantees or a preferred release channel.
-2. **Protobuf maturity in Odin.** This is the immediate Milestone 2 risk. Core
-   uses `oneof`, imported types, maps, unknown fields, and schema evolution.
-3. **Async callback integration.** The sync spike is safe but not a scalable
-   worker design. A worker needs a callback-to-channel/event loop design with
-   heap-stable state and explicit shutdown.
+2. **Protobuf maturity in Odin.** The narrow Activity codec proves wire
+   compatibility, but Core uses `oneof`, imported types, maps, unknown fields,
+   and schema evolution. Hand-maintaining Workflow messages is not viable.
+3. **Async callback integration.** The synchronous single-task worker is safe
+   but not scalable. A real worker needs a callback-to-channel/event loop with
+   heap-stable state, concurrent Activity execution, cancellation, and
+   heartbeats.
 4. **Workflow runtime.** Core does not solve Odin suspension, deterministic
    scheduling, or cached coroutine lifecycle. Fibers remain promising but must
    replay from a fresh stack after eviction.
@@ -392,8 +442,12 @@ Verified environment:
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.
 7. **Error/cancellation completeness.** The spike copies messages and frees all
-   buffers, but a public API must preserve gRPC status/details, cancellation,
-   deadlines, and richer Temporal failures.
+   buffers and emits an application failure for dispatch/codec errors, but a
+   public API must preserve gRPC status/details, Activity cancellation,
+   heartbeats, deadlines, panics, and richer Temporal failures.
+8. **Client/server feature skew.** The pinned standalone-Activity client API is
+   newer than CLI Server 1.29.1. Feature availability must be tested against
+   the supported server matrix rather than inferred from generated APIs.
 
 ## Workflow runtime alternatives: decision deliberately deferred
 
@@ -411,30 +465,21 @@ incorrect understanding of Core.
 
 ## Recommended next vertical milestone
 
-Activity Worker should still be next, but split into two tight proofs:
+The Activity Worker is now proven, so it is no longer the next unknown. Before
+attempting rich Workflow activations, make one bounded **schema/tooling
+milestone**: generate or otherwise maintain schema-derived Odin types for the
+exact Core Activity messages, replace the hand-maintained Activity codec, and
+cross-check golden bytes with `prost`. This directly retires the largest risk
+that would otherwise explode during Workflow work.
 
-1. **Milestone 2a — protobuf/activity transport:** decode a real
-   `ActivityTask`, encode its completion, and round-trip golden messages from
-   Core. Make the protobuf dependency decision here.
-2. **Milestone 2b — hello activity end-to-end:** construct a Core worker with
-   workflows/local activities/Nexus disabled, poll remote activity tasks,
-   dispatch a registered Odin procedure, encode a JSON payload through an
-   isolated codec, complete the task, and implement graceful shutdown.
+After that, start Milestone 3 with an explicit-state-machine workflow that
+schedules this already-working `hello` Activity and completes after its
+resolution. That should prove activation ordering, command encoding, replay,
+and eviction before selecting fibers or code generation. Activity concurrency,
+heartbeats, and cancellation remain important follow-up slices, but they need
+not block the first bounded Workflow activation experiment.
 
-Expected new C symbols are:
-
-```text
-temporal_core_worker_new
-temporal_core_worker_validate
-temporal_core_worker_poll_activity_task
-temporal_core_worker_complete_activity_task
-temporal_core_worker_record_activity_heartbeat
-temporal_core_worker_initiate_shutdown
-temporal_core_worker_finalize_shutdown
-temporal_core_worker_free
-```
-
-This remains the smallest slice that tests the worker boundary without taking
-on deterministic workflow execution. The C bridge remains the recommended
-foundation; the findings add packaging and protobuf obligations but do not
-justify bypassing Core or implementing direct server gRPC.
+The C bridge remains the recommended foundation. Milestone 2 strengthened that
+decision: Core handled polling, tokens, transport, retries, server completion,
+and shutdown as expected. The findings add protobuf/tooling and version-skew
+obligations but give no reason to bypass Core or implement direct server gRPC.

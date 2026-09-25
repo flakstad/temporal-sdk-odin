@@ -1,0 +1,16 @@
+[package]
+name = "activity-test-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+temporalio-client = { path = "../sdk-core/crates/client", default-features = false }
+temporalio-common = { path = "../sdk-core/crates/common", default-features = false }
+temporalio-macros = { path = "../sdk-core/crates/macros" }
+temporalio-sdk = { path = "../sdk-core/crates/sdk", default-features = false }
+temporalio-workflow = { path = "../sdk-core/crates/workflow" }
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

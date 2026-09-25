@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "activity-test-driver"
+version = "0.0.0"
+dependencies = [
+ "temporalio-client",
+ "temporalio-common",
+ "temporalio-macros",
+ "temporalio-sdk",
+ "temporalio-workflow",
+ "tokio",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

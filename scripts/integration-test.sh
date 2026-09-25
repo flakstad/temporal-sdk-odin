@@ -3,9 +3,15 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 server_pid=""
+worker_pid=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
+worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 
 cleanup() {
+  if [[ -n "$worker_pid" ]]; then
+    kill "$worker_pid" 2>/dev/null || true
+    wait "$worker_pid" 2>/dev/null || true
+  fi
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -43,3 +49,43 @@ if ! temporal operator cluster health \
 fi
 
 "$repo_root/scripts/run-core-connect.sh"
+
+run_activity_case() {
+  local expect_failure="$1"
+  "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  worker_pid=$!
+  for _ in {1..30}; do
+    if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
+      break
+    fi
+    if ! kill -0 "$worker_pid" 2>/dev/null; then
+      echo "Odin Activity Worker exited before polling; see $worker_log" >&2
+      cat "$worker_log" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+
+  if ! grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
+    echo "Odin Activity Worker did not become ready; see $worker_log" >&2
+    exit 1
+  fi
+
+  if [[ "$expect_failure" == "yes" ]]; then
+    ACTIVITY_EXPECT_FAILURE=1 cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
+  else
+    cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
+  fi
+
+  wait "$worker_pid"
+  worker_pid=""
+  cat "$worker_log"
+  grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
+}
+
+run_activity_case no
+run_activity_case yes

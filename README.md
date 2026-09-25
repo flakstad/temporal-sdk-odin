@@ -3,11 +3,13 @@
 An experimental Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
 not a reimplementation of Temporal Server or its gRPC protocol.
 
-Current status: Milestone 0 research and a Milestone 1 Core bridge spike. The
-repository can build the official Rust Core C bridge, initialize it from Odin,
-connect to a local Temporal CLI dev server, call `GetSystemInfo`, and shut down
-cleanly. It does **not** yet provide workers, activities, workflows, payload
-codecs, or a stable public API. Do not use it in production.
+Current status: Milestones 0–1 plus a narrow Milestone 2 Activity Worker. The
+repository builds the official Rust Core C bridge, connects to a Temporal CLI
+dev server, polls and completes remote Activity Tasks in Odin, and shuts down
+cleanly. The worker currently supports one synchronous `json/plain` string
+argument and one string result. It does **not** provide an Odin workflow
+runtime, Activity concurrency/cancellation/heartbeats, a complete protobuf
+binding, or a stable public API. Do not use it in production.
 
 ```text
 Temporal CLI dev server
@@ -16,7 +18,7 @@ Temporal CLI dev server
 Temporal SDK Core
           ^ C ABI
           |
-Odin raw bindings -> minimal lifecycle wrapper -> core_connect example
+Odin raw bindings -> lifecycle wrapper -> Activity dispatch + JSON codec
 ```
 
 ## Quick start
@@ -42,26 +44,31 @@ In one terminal, start the recommended local development server:
 temporal server start-dev
 ```
 
-In another terminal, run the Odin spike:
+In another terminal, run the Activity Worker:
 
 ```bash
-./scripts/run-core-connect.sh
+./scripts/run-hello-activity.sh
 ```
 
-Expected output resembles:
+The worker waits for an Activity on task queue `odin-hello-activity`. The full
+integration test starts a small workflow-only driver from the pinned upstream
+Rust SDK, verifies both success and failure through the server, and exits:
 
 ```text
-Connected through Temporal SDK Core; GetSystemInfo returned 32 protobuf bytes.
+Workflow observed Odin Activity result: Hello Odin
+one Activity Task completed and worker shut down cleanly
 ```
 
-The self-contained integration test starts a headless CLI dev server only when
-one is not already healthy on `localhost:7233`:
+Run it with:
 
 ```bash
 ./scripts/integration-test.sh
 ```
 
-Unit/lifecycle tests:
+The script starts `temporal server start-dev --headless` only when a healthy
+service is not already running on `localhost:7233`; Docker is not involved.
+
+Unit, codec, protobuf-envelope, and lifecycle tests:
 
 ```bash
 ./scripts/test.sh
@@ -76,10 +83,15 @@ See [architecture](docs/architecture.md) for the researched boundary and
 docs/                     architecture and development notes
 native/                   pinned sdk-core submodule and Cargo lockfile
 temporal/core/raw/        near-1:1 subset of the C ABI
-temporal/core/            minimal Odin ownership/lifecycle wrapper
+temporal/core/            blocking ownership/lifecycle wrapper
+temporal/core/proto/      narrow Activity envelope wire codec
+temporal/activity/        Activity context
+temporal/worker/          synchronous Activity registry and run loop
+temporal/codec/           isolated json/plain user payload codec
 temporal/{client,...}/    planned public packages
 examples/core_connect/    Odin -> Core -> Temporal proof
-tests/                    lifecycle and ownership tests
+examples/hello_activity/  Odin hello Activity Worker
+tests/                    lifecycle, codec, and envelope tests
 ```
 
 ## License

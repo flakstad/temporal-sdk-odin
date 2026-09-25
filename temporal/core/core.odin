@@ -1,4 +1,4 @@
-// Package core owns the minimal safe-ish lifecycle wrapper used by Milestone 1.
+// Package core owns the blocking lifecycle wrapper around the raw C ABI.
 package core
 
 import "core:c"
@@ -19,12 +19,27 @@ Client :: struct {
 	runtime: ^Runtime,
 }
 
+Worker :: struct {
+	handle:  ^raw.Worker,
+	runtime: ^Runtime,
+}
+
 Get_System_Info_Result :: struct {
 	protobuf: []u8,
 	error:    Error,
 }
 
 byte_ref :: proc(value: string) -> raw.Byte_Array_Ref {
+	return raw.Byte_Array_Ref{
+		data = raw_data(value),
+		size = c.size_t(len(value)),
+	}
+}
+
+bytes_ref :: proc(value: []u8) -> raw.Byte_Array_Ref {
+	if len(value) == 0 {
+		return {}
+	}
 	return raw.Byte_Array_Ref{
 		data = raw_data(value),
 		size = c.size_t(len(value)),
@@ -96,6 +111,7 @@ client_connect :: proc(runtime: ^Runtime, target_url := "http://localhost:7233")
 		target_url     = byte_ref(target_url),
 		client_name    = byte_ref("temporal-sdk-odin"),
 		client_version = byte_ref("0.0.1-experimental"),
+		identity       = byte_ref("temporal-sdk-odin@local"),
 		grpc_compression = .Gzip,
 	}
 	state := Connect_State{}
@@ -119,6 +135,187 @@ client_close :: proc(client: ^Client) {
 	raw.client_free(client.handle)
 	client.handle = nil
 	client.runtime = nil
+}
+
+fixed_slot_supplier :: proc(count: uintptr) -> raw.Slot_Supplier {
+	return raw.Slot_Supplier{
+		tag = .Fixed_Size,
+		fixed_size = raw.Fixed_Size_Slot_Supplier{num_slots = count},
+	}
+}
+
+worker_create :: proc(client: ^Client, task_queue: string, namespace := "default") -> (worker: Worker, error: Error) {
+	if client == nil || client.handle == nil || client.runtime == nil {
+		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
+		return
+	}
+	if len(task_queue) == 0 {
+		error.message = bytes.clone(transmute([]u8)string("task queue must not be empty"))
+		return
+	}
+
+	options := raw.Worker_Options{
+		namespace = byte_ref(namespace),
+		task_queue = byte_ref(task_queue),
+		versioning_strategy = raw.Worker_Versioning_Strategy{
+			tag = .None,
+			none = raw.Worker_Versioning_None{build_id = byte_ref("temporal-sdk-odin-experimental")},
+		},
+		tuner = raw.Tuner_Holder{
+			workflow_slot_supplier       = fixed_slot_supplier(1),
+			activity_slot_supplier       = fixed_slot_supplier(10),
+			local_activity_slot_supplier = fixed_slot_supplier(1),
+			nexus_task_slot_supplier     = fixed_slot_supplier(1),
+		},
+		task_types = raw.Worker_Task_Types{enable_remote_activities = true},
+		max_heartbeat_throttle_interval_ms     = 60_000,
+		default_heartbeat_throttle_interval_ms = 1_000,
+		graceful_shutdown_period_ms            = 5_000,
+		nonsticky_to_sticky_poll_ratio         = 0.2,
+	}
+	result := raw.worker_new(client.handle, &options)
+	if result.fail != nil {
+		error.message = copy_core_bytes(result.fail)
+		raw.byte_array_free(client.runtime.handle, result.fail)
+		return
+	}
+	worker.handle = result.worker
+	worker.runtime = client.runtime
+	return
+}
+
+Worker_Callback_State :: struct {
+	done: sync.One_Shot_Event,
+	fail: ^raw.Byte_Array,
+}
+
+worker_callback :: proc "c" (user_data: rawptr, fail: ^raw.Byte_Array) {
+	state := cast(^Worker_Callback_State)user_data
+	state.fail = fail
+	sync.one_shot_event_signal(&state.done)
+}
+
+worker_wait_call :: proc(worker: ^Worker, invoke: proc(^raw.Worker, rawptr, raw.Worker_Callback)) -> Error {
+	state := Worker_Callback_State{}
+	invoke(worker.handle, &state, worker_callback)
+	wait_until(&state.done)
+	if state.fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(state.fail)}
+	raw.byte_array_free(worker.runtime.handle, state.fail)
+	return error
+}
+
+worker_validate_invoke :: proc(handle: ^raw.Worker, user_data: rawptr, callback: raw.Worker_Callback) {
+	raw.worker_validate(handle, user_data, callback)
+}
+
+worker_validate :: proc(worker: ^Worker) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("worker is not initialized"))}
+	}
+	return worker_wait_call(worker, worker_validate_invoke)
+}
+
+Activity_Poll_Result :: struct {
+	protobuf: []u8,
+	error:    Error,
+	shutdown: bool,
+}
+
+Worker_Poll_State :: struct {
+	done:    sync.One_Shot_Event,
+	success: ^raw.Byte_Array,
+	fail:    ^raw.Byte_Array,
+}
+
+worker_poll_callback :: proc "c" (user_data: rawptr, success, fail: ^raw.Byte_Array) {
+	state := cast(^Worker_Poll_State)user_data
+	state.success = success
+	state.fail = fail
+	sync.one_shot_event_signal(&state.done)
+}
+
+worker_poll_activity :: proc(worker: ^Worker) -> Activity_Poll_Result {
+	result := Activity_Poll_Result{}
+	if worker == nil || worker.handle == nil || worker.runtime == nil {
+		result.error.message = bytes.clone(transmute([]u8)string("worker is not initialized"))
+		return result
+	}
+	state := Worker_Poll_State{}
+	raw.worker_poll_activity_task(worker.handle, &state, worker_poll_callback)
+	wait_until(&state.done)
+	if state.fail != nil {
+		result.error.message = copy_core_bytes(state.fail)
+		raw.byte_array_free(worker.runtime.handle, state.fail)
+		return result
+	}
+	if state.success == nil {
+		result.shutdown = true
+		return result
+	}
+	result.protobuf = copy_core_bytes(state.success)
+	raw.byte_array_free(worker.runtime.handle, state.success)
+	return result
+}
+
+Complete_State :: struct {
+	done: sync.One_Shot_Event,
+	fail: ^raw.Byte_Array,
+}
+
+complete_callback :: proc "c" (user_data: rawptr, fail: ^raw.Byte_Array) {
+	state := cast(^Complete_State)user_data
+	state.fail = fail
+	sync.one_shot_event_signal(&state.done)
+}
+
+worker_complete_activity :: proc(worker: ^Worker, completion: []u8) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("worker is not initialized"))}
+	}
+	state := Complete_State{}
+	raw.worker_complete_activity_task(worker.handle, bytes_ref(completion), &state, complete_callback)
+	wait_until(&state.done)
+	if state.fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(state.fail)}
+	raw.byte_array_free(worker.runtime.handle, state.fail)
+	return error
+}
+
+finalize_shutdown_invoke :: proc(handle: ^raw.Worker, user_data: rawptr, callback: raw.Worker_Callback) {
+	raw.worker_finalize_shutdown(handle, user_data, callback)
+}
+
+worker_close :: proc(worker: ^Worker) -> Error {
+	if worker == nil || worker.handle == nil {
+		return {}
+	}
+	raw.worker_initiate_shutdown(worker.handle)
+	// Core shutdown is driven by active pollers observing PollError::ShutDown.
+	// This synchronous spike has no outstanding poll at this point, so issue one
+	// final poll before finalize_shutdown.
+	poll := worker_poll_activity(worker)
+	if poll.protobuf != nil {
+		delete(poll.protobuf)
+	}
+	error := poll.error
+	if error.message == nil && !poll.shutdown {
+		error.message = bytes.clone(transmute([]u8)string("worker shutdown poll returned an unexpected task"))
+	}
+	finalize_error := worker_wait_call(worker, finalize_shutdown_invoke)
+	if error.message == nil {
+		error = finalize_error
+	} else {
+		error_free(&finalize_error)
+	}
+	raw.worker_free(worker.handle)
+	worker.handle = nil
+	worker.runtime = nil
+	return error
 }
 
 Rpc_State :: struct {

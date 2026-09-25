@@ -1,4 +1,5 @@
 # Workflow package (research only)
 
-No workflow runtime is implemented. Runtime alternatives must be tested after
-the Activity Worker slice.
+No Odin workflow runtime is implemented. The Activity Worker boundary is now
+proven; schema tooling and a bounded explicit-state-machine activation spike
+come before any fiber/runtime choice.
