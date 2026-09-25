@@ -34,6 +34,17 @@ impl ActivityDefinition for MissingActivity {
     }
 }
 
+struct TypedGreetingActivity;
+
+impl ActivityDefinition for TypedGreetingActivity {
+    type Input = serde_json::Value;
+    type Output = serde_json::Value;
+
+    fn name(&self) -> &str {
+        "typed_greeting"
+    }
+}
+
 #[workflow]
 #[derive(Default)]
 struct ActivityDriverWorkflow;
@@ -96,6 +107,28 @@ impl ConcurrentActivityDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct TypedActivityDriverWorkflow;
+
+#[workflow_methods]
+impl TypedActivityDriverWorkflow {
+    #[run(name = "odin_typed_activity_driver")]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        input: serde_json::Value,
+    ) -> WorkflowResult<serde_json::Value> {
+        let result = ctx
+            .execute_activity(
+                TypedGreetingActivity,
+                input,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+            .await?;
+        Ok(result)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -105,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::env::var("ACTIVITY_INPUT").unwrap_or_else(|_| "Odin".to_string());
     let expect_failure = std::env::var_os("ACTIVITY_EXPECT_FAILURE").is_some();
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
+    let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let expected = if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
     } else {
@@ -119,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<ActivityDriverWorkflow>()?
         .register_workflow::<FailureDriverWorkflow>()?
         .register_workflow::<ConcurrentActivityDriverWorkflow>()?
+        .register_workflow::<TypedActivityDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -126,6 +161,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let workflow_id = format!("odin-sdk-activity-spike-{}-{unique}", std::process::id());
     let driver = async move {
+        if typed {
+            let typed_input = serde_json::json!({
+                "name": "Odin",
+                "salutation": "Hello",
+            });
+            let expected = serde_json::json!({
+                "message": "Hello, Odin!",
+                "name_length": 4,
+            });
+            let handle = client
+                .start_workflow(
+                    TypedActivityDriverWorkflow::run,
+                    typed_input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != expected {
+                return Err(format!(
+                    "unexpected typed Activity result: {result}; expected {expected}"
+                )
+                .into());
+            }
+            println!("Workflow observed typed Odin Activity result: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
         let result = if expect_failure {
             let handle = client
                 .start_workflow(

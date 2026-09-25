@@ -12,6 +12,16 @@ import worker "../../temporal/worker"
 concurrent_activities: int
 concurrent_overlap_observed: bool
 
+Greeting_Input :: struct {
+	name:       string,
+	salutation: string,
+}
+
+Greeting_Output :: struct {
+	message:     string,
+	name_length: int,
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	_ = ctx
 	if strings.has_prefix(name, "concurrent-") {
@@ -42,6 +52,14 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	return greeting
 }
 
+typed_greeting :: proc(_: ^activity.Context, input: Greeting_Input) -> Greeting_Output {
+	message, allocation_error := strings.concatenate({input.salutation, ", ", input.name, "!"})
+	if allocation_error != nil {
+		return {}
+	}
+	return {message = message, name_length = len(input.name)}
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -70,6 +88,17 @@ main :: proc() {
 	if register_error.message != nil {
 		fmt.eprintf("Activity registration failed: %s\n", string(register_error.message))
 		worker.error_free(&register_error)
+		_ = worker.close(&activity_worker)
+		os.exit(1)
+	}
+	register_typed_error := worker.register_json_activity(
+		&activity_worker,
+		"typed_greeting",
+		typed_greeting,
+	)
+	if register_typed_error.message != nil {
+		fmt.eprintf("Typed Activity registration failed: %s\n", string(register_typed_error.message))
+		worker.error_free(&register_typed_error)
 		_ = worker.close(&activity_worker)
 		os.exit(1)
 	}

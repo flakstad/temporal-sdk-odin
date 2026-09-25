@@ -19,11 +19,58 @@ Heartbeat_Capture :: struct {
 	details: string,
 }
 
-capture_heartbeat :: proc(user_data: rawptr, details: string) -> activity.Heartbeat_Status {
+Heartbeat_Progress :: struct {
+	completed: int,
+}
+
+Heartbeat_Progress_Capture :: struct {
+	calls:     int,
+	completed: int,
+}
+
+capture_heartbeat :: proc(
+	user_data: rawptr,
+	details: codec.Payload_View,
+) -> activity.Heartbeat_Status {
 	capture := cast(^Heartbeat_Capture)user_data
 	capture.calls += 1
-	capture.details = details
+	decoded, decode_error := codec.decode_string(details.data, codec.encoding(details))
+	if decode_error != .None {
+		return .Encoding_Failed
+	}
+	capture.details = decoded
 	return .Recorded
+}
+
+capture_progress_heartbeat :: proc(
+	user_data: rawptr,
+	details: codec.Payload_View,
+) -> activity.Heartbeat_Status {
+	capture := cast(^Heartbeat_Progress_Capture)user_data
+	progress: Heartbeat_Progress
+	if codec.decode_json(details, &progress) != .None {
+		return .Encoding_Failed
+	}
+	capture.calls += 1
+	capture.completed = progress.completed
+	return .Recorded
+}
+
+Codec_Test_Value :: struct {
+	name:    string,
+	count:   int,
+	enabled: bool,
+}
+
+typed_activity_test :: proc(
+	_: ^activity.Context,
+	input: Codec_Test_Value,
+) -> Codec_Test_Value {
+	return {
+		name = input.name,
+		count = input.count + 1,
+		enabled = !input.enabled,
+	}
 }
 
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -293,6 +340,112 @@ json_string_codec_round_trip :: proc(t: ^testing.T) {
 }
 
 @(test)
+json_payload_codec_round_trips_structs_and_owns_metadata :: proc(t: ^testing.T) {
+	expected := Codec_Test_Value{name = "Odin", count = 7, enabled = true}
+	payload, encode_error := codec.encode_json(expected)
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&payload)
+	testing.expect_value(t, codec.encoding(codec.payload_view(&payload)), "json/plain")
+	testing.expect(
+		t,
+		codec.payload_add_metadata(&payload, "test-key", transmute([]u8)string("first")) == .None,
+	)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(&payload, "test-key", transmute([]u8)string("second")) == .None,
+	)
+	metadata_value, metadata_found := codec.metadata_get(codec.payload_view(&payload), "test-key")
+	testing.expect(t, metadata_found)
+	testing.expect_value(t, string(metadata_value), "second")
+	testing.expect_value(t, len(payload.metadata), 2)
+
+	decoded: Codec_Test_Value
+	decode_error := codec.decode_json(codec.payload_view(&payload), &decoded)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, decoded.name, expected.name)
+	testing.expect_value(t, decoded.count, expected.count)
+	testing.expect_value(t, decoded.enabled, expected.enabled)
+	delete(decoded.name)
+
+	cloned, clone_error := codec.payload_clone(codec.payload_view(&payload))
+	testing.expect(t, clone_error == .None)
+	codec.payload_free(&payload)
+	testing.expect_value(t, codec.encoding(codec.payload_view(&cloned)), "json/plain")
+	testing.expect(t, len(cloned.data) > 0)
+	codec.payload_free(&cloned)
+}
+
+@(test)
+worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+
+	register_error := worker.register_json_activity(
+		&sdk_worker,
+		"typed_activity",
+		typed_activity_test,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	testing.expect_value(t, len(sdk_worker.activity_registrations), 1)
+	if len(sdk_worker.activity_registrations) != 1 {
+		return
+	}
+
+	input := Codec_Test_Value{name = "Temporal", count = 2, enabled = false}
+	input_payload, encode_error := codec.encode_json(input)
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&input_payload)
+	ctx := activity.Context{}
+	registration := &sdk_worker.activity_registrations[0]
+	callback_arena: virtual.Arena
+	callback_arena_error := virtual.arena_init_growing(&callback_arena)
+	testing.expect(t, callback_arena_error == nil)
+	if callback_arena_error != nil {
+		return
+	}
+	defer virtual.arena_destroy(&callback_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&callback_arena)
+	result := registration.invoke(
+		registration.callback_data,
+		&ctx,
+		codec.payload_view(&input_payload),
+	)
+	context.allocator = previous_allocator
+	defer codec.payload_free(&result.payload)
+	testing.expect_value(t, result.failure_message, "")
+
+	output: Codec_Test_Value
+	decode_error := codec.decode_json(codec.payload_view(&result.payload), &output)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, output.name, "Temporal")
+	testing.expect_value(t, output.count, 3)
+	testing.expect(t, output.enabled)
+	delete(output.name)
+
+	unsupported_metadata := [1]codec.Metadata_Entry{{
+		key = "encoding",
+		value = transmute([]u8)string("binary/plain"),
+	}}
+	failed := registration.invoke(
+		registration.callback_data,
+		&ctx,
+		codec.Payload_View{metadata = unsupported_metadata[:], data = transmute([]u8)string("raw")},
+	)
+	defer codec.payload_free(&failed.payload)
+	testing.expect(t, len(failed.failure_message) > 0)
+	testing.expect(t, failed.non_retryable)
+}
+
+@(test)
 worker_routes_registered_workflow_types_and_evictions :: proc(t: ^testing.T) {
 	sdk_worker := worker.Worker{
 		task_queue = "test-queue",
@@ -540,6 +693,18 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 			value = transmute([]u8)string("json/plain"),
 		},
 	)
+	append(
+		&payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "messageType",
+			value = transmute([]u8)string("tests.Greeting"),
+		},
+	)
+	defer delete(payload.external_payloads)
+	append(
+		&payload.external_payloads,
+		proto.Temporal_Api_Common_V1_Payload_ExternalPayloadDetails{size_bytes = 2048},
+	)
 	start := proto.Coresdk_Activity_Task_Start{
 		activity_id = "activity-id",
 		activity_type = "hello",
@@ -576,8 +741,35 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, task.attempt, u32(2))
 	testing.expect_value(t, task.input.encoding, "json/plain")
 	testing.expect_value(t, string(task.input.data), `"Odin"`)
+	testing.expect_value(t, len(task.input.metadata), 2)
+	testing.expect_value(t, len(task.input.external_payloads), 1)
+	if len(task.input.external_payloads) == 1 {
+		testing.expect_value(t, task.input.external_payloads[0].size_bytes, i64(2048))
+	}
 
-	completion := proto.encode_activity_success(task.task_token, transmute([]u8)string(`"Hello Odin"`))
+	result_payload := codec.payload_create(transmute([]u8)string(`{"message":"Hello Odin"}`))
+	defer codec.payload_free(&result_payload)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&result_payload,
+			"encoding",
+			transmute([]u8)string("json/plain"),
+		) == .None,
+	)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&result_payload,
+			"messageType",
+			transmute([]u8)string("tests.GreetingResult"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&result_payload, 4096) == .None)
+	completion := proto.encode_activity_success_payload(
+		task.task_token,
+		codec.payload_view(&result_payload),
+	)
 	defer delete(completion)
 	decoded_completion := proto.Coresdk_ActivityTaskCompletion{}
 	context.allocator = virtual.arena_allocator(&decode_arena)
@@ -597,7 +789,16 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 		if status.value != nil {
 			testing.expect(t, status.value.result != nil)
 			if status.value.result != nil {
-				testing.expect_value(t, string(status.value.result.data), `"Hello Odin"`)
+				testing.expect_value(t, string(status.value.result.data), `{"message":"Hello Odin"}`)
+				testing.expect_value(t, len(status.value.result.metadata), 2)
+				testing.expect_value(t, len(status.value.result.external_payloads), 1)
+				if len(status.value.result.external_payloads) == 1 {
+					testing.expect_value(
+						t,
+						status.value.result.external_payloads[0].size_bytes,
+						i64(4096),
+					)
+				}
 			}
 		}
 	}
@@ -676,6 +877,7 @@ activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 @(test)
 activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^testing.T) {
 	capture := Heartbeat_Capture{}
+	defer delete(capture.details)
 	ctx := activity.Context{}
 	activity.context_init(&ctx, "activity-id", 3, &capture, capture_heartbeat)
 
@@ -691,6 +893,22 @@ activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^test
 	testing.expect(t, activity.cancellation_reason(&ctx) == .Worker_Shutdown)
 	testing.expect(t, activity.heartbeat(&ctx, "too late") == .Cancellation_Requested)
 	testing.expect_value(t, capture.calls, 1)
+
+	progress_capture := Heartbeat_Progress_Capture{}
+	progress_ctx := activity.Context{}
+	activity.context_init(
+		&progress_ctx,
+		"typed-heartbeat-activity",
+		1,
+		&progress_capture,
+		capture_progress_heartbeat,
+	)
+	testing.expect(
+		t,
+		activity.heartbeat_json(&progress_ctx, Heartbeat_Progress{completed = 42}) == .Recorded,
+	)
+	testing.expect_value(t, progress_capture.calls, 1)
+	testing.expect_value(t, progress_capture.completed, 42)
 }
 
 @(test)

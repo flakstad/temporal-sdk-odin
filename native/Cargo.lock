@@ -6,6 +6,7 @@ version = 4
 name = "activity-test-driver"
 version = "0.0.0"
 dependencies = [
+ "serde_json",
  "temporalio-client",
  "temporalio-common",
  "temporalio-macros",

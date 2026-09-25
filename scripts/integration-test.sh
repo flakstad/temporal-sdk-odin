@@ -69,7 +69,7 @@ fi
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
 run_activity_case() {
-  local expect_failure="$1"
+  local mode="$1"
   TEMPORAL_ODIN_SKIP_BUILD=1 \
     "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   worker_pid=$!
@@ -90,8 +90,12 @@ run_activity_case() {
     exit 1
   fi
 
-  if [[ "$expect_failure" == "yes" ]]; then
+  if [[ "$mode" == "failure" ]]; then
     ACTIVITY_EXPECT_FAILURE=1 cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
+  elif [[ "$mode" == "typed" ]]; then
+    ACTIVITY_TYPED=1 cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   else
@@ -106,8 +110,9 @@ run_activity_case() {
   grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
 }
 
-run_activity_case no
-run_activity_case yes
+run_activity_case string
+run_activity_case failure
+run_activity_case typed
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

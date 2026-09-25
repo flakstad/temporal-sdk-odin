@@ -1,5 +1,5 @@
 // Package worker owns registration, Core polling, dispatch, and lifecycle.
-// The one-string codec and Workflow fiber runtime remain experimental.
+// The payload codecs and Workflow fiber runtime remain experimental.
 package worker
 
 import allocator_runtime "base:runtime"
@@ -15,10 +15,20 @@ import proto "../core/proto"
 import workflow "../workflow"
 
 String_Activity_Proc :: #type proc(ctx: ^activity.Context, input: string) -> string
+Payload_Activity_Proc :: #type proc(
+	ctx: ^activity.Context,
+	input: codec.Payload_View,
+) -> activity.Payload_Result
+Activity_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^activity.Context,
+	input: codec.Payload_View,
+) -> activity.Payload_Result
 
 Activity_Registration :: struct {
-	name:     string,
-	callback: String_Activity_Proc,
+	name:          string,
+	callback_data: rawptr,
+	invoke:        Activity_Invoke_Proc,
 }
 
 Workflow_Registration :: struct {
@@ -145,14 +155,19 @@ create :: proc(
 	return
 }
 
-register_activity :: proc(worker: ^Worker, name: string, callback: String_Activity_Proc) -> Error {
+register_activity_invoker :: proc(
+	worker: ^Worker,
+	name: string,
+	callback_data: rawptr,
+	invoke: Activity_Invoke_Proc,
+) -> Error {
 	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return error_from_string("worker is not initialized")
 	}
 	if worker.lifecycle != .Configuring {
 		return error_from_string("activities cannot be registered after worker.run starts")
 	}
-	if len(name) == 0 || callback == nil {
+	if len(name) == 0 || callback_data == nil || invoke == nil {
 		return error_from_string("activity name and callback are required")
 	}
 	for registration in worker.activity_registrations {
@@ -164,8 +179,89 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 	if allocation_error != nil {
 		return error_from_string("could not allocate activity name")
 	}
-	append(&worker.activity_registrations, Activity_Registration{name = owned_name, callback = callback})
+	append(
+		&worker.activity_registrations,
+		Activity_Registration{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke = invoke,
+		},
+	)
 	return {}
+}
+
+register_payload_activity :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: Payload_Activity_Proc,
+) -> Error {
+	if callback == nil {
+		return error_from_string("activity name and callback are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Payload_Activity_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate activity callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_activity_invoker(
+		worker,
+		name,
+		owned_callback,
+		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+			callback := cast(^Payload_Activity_Proc)data
+			return callback^(ctx, input)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_json_activity :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: proc(ctx: ^activity.Context, input: $Input) -> $Output,
+) -> Error {
+	Callback :: #type proc(ctx: ^activity.Context, input: Input) -> Output
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Callback, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate activity callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_activity_invoker(
+		worker,
+		name,
+		owned_callback,
+		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+			value: Input
+			decode_error := codec.decode_json(input, &value)
+			if decode_error != .None {
+				return activity.payload_fail("activity input is not valid json/plain for its Odin type")
+			}
+			callback := cast(^Callback)data
+			output := callback^(ctx, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return activity.payload_fail("could not encode Activity result as json/plain")
+			}
+			return activity.payload_complete(payload)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_activity :: proc(worker: ^Worker, name: string, callback: String_Activity_Proc) -> Error {
+	return register_json_activity(
+		worker,
+		name,
+		cast(proc(ctx: ^activity.Context, input: string) -> string)callback,
+	)
 }
 
 register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
@@ -202,10 +298,10 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 	return {}
 }
 
-find_activity :: proc(worker: ^Worker, name: string) -> (String_Activity_Proc, bool) {
-	for registration in worker.activity_registrations {
+find_activity :: proc(worker: ^Worker, name: string) -> (^Activity_Registration, bool) {
+	for &registration in worker.activity_registrations {
 		if registration.name == name {
-			return registration.callback, true
+			return &registration, true
 		}
 	}
 	return nil, false
@@ -215,50 +311,13 @@ completion_failure :: proc(task_token: []u8, message: string) -> [dynamic]u8 {
 	return proto.encode_activity_failure(task_token, message)
 }
 
-execute_start :: proc(worker: ^Worker, task: ^proto.Activity_Task) -> (completion: [dynamic]u8, error: Error) {
-	callback, found := find_activity(worker, task.activity_type)
-	if !found {
-		message := fmt.aprintf("activity %q is not registered", task.activity_type)
-		defer delete(message)
-		return completion_failure(task.task_token, message), {}
-	}
-
-	input, decode_error := codec.decode_string(task.input.data, task.input.encoding)
-	if decode_error != .None {
-		return completion_failure(task.task_token, "activity input must be one json/plain string"), {}
-	}
-	defer delete(input)
-
-	activity_context := activity.Context{
-	}
-	activity.context_init(&activity_context, task.activity_id, task.attempt, nil, nil)
-	// Activity-local allocations, including the returned string, live only until
-	// its payload has been copied into the completion.
-	arena: virtual.Arena
-	arena_error := virtual.arena_init_growing(&arena)
-	if arena_error != nil {
-		return nil, error_from_string("could not initialize activity allocation arena")
-	}
-	defer virtual.arena_destroy(&arena)
-	previous_allocator := context.allocator
-	context.allocator = virtual.arena_allocator(&arena)
-	output := callback(&activity_context, input)
-	context.allocator = previous_allocator
-
-	result_data, encode_error := codec.encode_string(output)
-	if encode_error != .None {
-		return nil, error_from_string("could not encode activity result")
-	}
-	defer delete(result_data)
-	return proto.encode_activity_success(task.task_token, result_data), {}
-}
-
 Activity_Execution :: struct {
-	worker:     ^Worker,
-	callback:   String_Activity_Proc,
-	task_token: []u8,
+	worker:        ^Worker,
+	callback_data: rawptr,
+	invoke:        Activity_Invoke_Proc,
+	task_token:    []u8,
 	activity_id: string,
-	input:       string,
+	input:       codec.Payload,
 	ctx:         activity.Context,
 	error:       Error,
 }
@@ -281,17 +340,15 @@ activity_cancel_reason :: proc(reason: proto.Coresdk_Activity_Task_ActivityCance
 	return .Cancelled
 }
 
-activity_heartbeat_recorder :: proc(user_data: rawptr, details: string) -> activity.Heartbeat_Status {
+activity_heartbeat_recorder :: proc(
+	user_data: rawptr,
+	details: codec.Payload_View,
+) -> activity.Heartbeat_Status {
 	execution := cast(^Activity_Execution)user_data
 	if execution == nil || execution.worker == nil {
 		return .Invalid_Context
 	}
-	details_data, encode_error := codec.encode_string(details)
-	if encode_error != .None {
-		return .Encoding_Failed
-	}
-	defer delete(details_data)
-	heartbeat := proto.encode_activity_heartbeat(execution.task_token, details_data)
+	heartbeat := proto.encode_activity_heartbeat_payload(execution.task_token, details)
 	defer delete(heartbeat)
 	core_error := temporal_core.worker_record_activity_heartbeat(&execution.worker.core, heartbeat[:])
 	if core_error.message != nil {
@@ -302,7 +359,7 @@ activity_heartbeat_recorder :: proc(user_data: rawptr, details: string) -> activ
 }
 
 activity_execution_main :: proc(execution: ^Activity_Execution) {
-	// Activity-local allocations, including the returned string, live only until
+	// Activity-local allocations, including the returned payload, live only until
 	// its payload has been copied into the completion.
 	arena: virtual.Arena
 	arena_error := virtual.arena_init_growing(&arena)
@@ -314,21 +371,28 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	defer virtual.arena_destroy(&arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&arena)
-	output := execution.callback(&execution.ctx, execution.input)
+	result := execution.invoke(
+		execution.callback_data,
+		&execution.ctx,
+		codec.payload_view(&execution.input),
+	)
 	context.allocator = previous_allocator
+	defer codec.payload_free(&result.payload)
 
 	completion: [dynamic]u8
 	if activity.is_cancellation_requested(&execution.ctx) {
 		completion = proto.encode_activity_cancellation(execution.task_token)
+	} else if len(result.failure_message) > 0 {
+		completion = proto.encode_activity_failure(
+			execution.task_token,
+			result.failure_message,
+			result.non_retryable,
+		)
 	} else {
-		result_data, encode_error := codec.encode_string(output)
-		if encode_error != .None {
-			execution.error = error_from_string("could not encode activity result")
-			temporal_core.worker_initiate_shutdown(&execution.worker.core)
-			return
-		}
-		defer delete(result_data)
-		completion = proto.encode_activity_success(execution.task_token, result_data)
+		completion = proto.encode_activity_success_payload(
+			execution.task_token,
+			codec.payload_view(&result.payload),
+		)
 	}
 	defer delete(completion)
 	core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
@@ -348,7 +412,7 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 	}
 	delete(execution.task_token)
 	delete(execution.activity_id)
-	delete(execution.input)
+	codec.payload_free(&execution.input)
 	error_free(&execution.error)
 	free(execution)
 }
@@ -358,7 +422,7 @@ activity_execution_start :: proc(
 	pool: ^thread.Pool,
 	task: ^proto.Activity_Task,
 ) -> (execution: ^Activity_Execution, error: Error) {
-	callback, found := find_activity(worker, task.activity_type)
+	registration, found := find_activity(worker, task.activity_type)
 	if !found {
 		message := fmt.aprintf("activity %q is not registered", task.activity_type)
 		defer delete(message)
@@ -368,16 +432,24 @@ activity_execution_start :: proc(
 		return nil, error_from_core(&core_error)
 	}
 
-	input, decode_error := codec.decode_string(task.input.data, task.input.encoding)
-	if decode_error != .None {
-		completion := completion_failure(task.task_token, "activity input must be one json/plain string")
-		defer delete(completion)
-		core_error := temporal_core.worker_complete_activity(&worker.core, completion[:])
-		return nil, error_from_core(&core_error)
+	input := codec.payload_create(task.input.data, allocator_runtime.heap_allocator())
+	for metadata in task.input.metadata {
+		metadata_error := codec.payload_add_metadata(&input, metadata.key, metadata.value)
+		if metadata_error != .None {
+			codec.payload_free(&input)
+			return nil, error_from_string("could not allocate Activity input payload")
+		}
+	}
+	for external in task.input.external_payloads {
+		if codec.payload_add_external(&input, external.size_bytes) != .None {
+			codec.payload_free(&input)
+			return nil, error_from_string("could not allocate Activity external payload details")
+		}
 	}
 	execution = new(Activity_Execution)
 	execution.worker = worker
-	execution.callback = callback
+	execution.callback_data = registration.callback_data
+	execution.invoke = registration.invoke
 	execution.task_token = bytes.clone(task.task_token)
 	execution.input = input
 	owned_activity_id, allocation_error := strings.clone(task.activity_id)
@@ -931,6 +1003,7 @@ close :: proc(worker: ^Worker) -> Error {
 	}
 	core_error := temporal_core.worker_close(&worker.core)
 	for registration in worker.activity_registrations {
+		free(registration.callback_data, allocator_runtime.heap_allocator())
 		delete(registration.name)
 	}
 	for &registration in worker.workflow_registrations {

@@ -6,7 +6,8 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
-registry and poll loop, 2026-09-25.
+registry and poll loop, 2026-09-25. The Activity slice now also has a generic
+Temporal Payload boundary and typed JSON Activity registration.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -217,6 +218,26 @@ User data is a separate codec layer inside `temporal.api.common.v1.Payload`.
 JSON is acceptable as the first user codec, expressed through payload metadata
 and data, but it does not replace the protobuf envelope. The codec belongs in
 `temporal/codec`, not the Core binding.
+
+The implemented language boundary distinguishes borrowed and owned values:
+
+- `codec.Payload_View` borrows metadata, data, and external-payload details for
+  the duration of a callback;
+- `codec.Payload` owns cloned fields through a recorded Odin allocator and must
+  be released with `codec.payload_free`;
+- `codec.encode_json` and `decode_json` operate on arbitrary Odin values while
+  requiring the Temporal `encoding=json/plain` metadata contract;
+- `worker.register_json_activity` specializes a compile-time trampoline from
+  `proc(Context, Input) -> Output` to the worker's uniform payload callback;
+- `worker.register_payload_activity` exposes the lower-level payload boundary
+  without coupling custom codecs to Core protobuf types.
+
+Metadata is represented as owned entries rather than only an `encoding` string;
+lookup follows protobuf map last-value-wins semantics and SDK construction
+replaces duplicate keys. This preserves codec-specific keys such as
+`messageType`, and the bridge also copies the schema's external-payload size
+details. The current Activity API still accepts exactly one argument Payload;
+repeated arguments remain future work.
 
 ### Odin protobuf survey and decision
 
@@ -465,6 +486,13 @@ observes a workflow failure produced from Odin's non-retryable
 poll, finalize, and handle-free order. The driver uses the pinned upstream Rust
 SDK only to create a Workflow that schedules the Activity; it is test
 infrastructure and no Odin workflow runtime is implied.
+
+A second live path sends `{name, salutation}` from the Rust Workflow as
+`json/plain`, invokes an Odin
+`proc(^activity.Context, Greeting_Input) -> Greeting_Output`, and observes the
+structured `{message, name_length}` result after it crosses Odin -> Core ->
+Server -> Rust. This proves that typed Activity values are an Odin-side adapter
+over Temporal Payloads rather than a change to the C bridge.
 
 An attempted smaller test using the pinned client's standalone-Activity API
 failed because the CLI-bundled Temporal Server 1.29.1 returned `Unimplemented`
@@ -945,8 +973,9 @@ Workflows are enabled.
    Temporal failure protobuf for propagation, but the catchable experimental API
    exposes only status and message. Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
-   A public API must model typed causes/details, deadlines, panics, and codec
-   failures.
+   A public API must model typed causes/details, deadlines, panics, and richer
+   codec failures. Typed JSON Activities now turn decode/encode errors into
+   non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -966,15 +995,15 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-Activity concurrency, task-token routing, cooperative cancel delivery, and
-heartbeat transport are now proven live, and delayed Core construction now
-makes the registered task types the single source of worker capabilities. The
-Activity executor now uses a small reusable pool; the next vertical milestone
-should stress pool shutdown/cancel/heartbeat interleavings and callback failure
-using `pbt`. A statechart oracle becomes worthwhile once retries and deadlines
-join that model. Unknown Workflow types now produce a failed activation without
-terminating the worker. Generic payload APIs, Workflow panic containment, and
-user Workflow cancellation scopes should follow as separate changes.
+Activity concurrency, task-token routing, cooperative cancel delivery,
+heartbeat transport, and typed JSON Payloads are now proven live. The PBT suite
+also generates 500 struct values, clones their arbitrary metadata, releases the
+source, and requires an identical decode from the clone. The next vertical
+milestone should add Activity callback panic containment and retryable user
+failures, then stress pool shutdown/cancel/heartbeat/failure interleavings. A
+statechart oracle becomes worthwhile once retry policy and deadlines join that
+model. User Workflow cancellation scopes remain a separate Workflow-runtime
+change.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

@@ -2,6 +2,7 @@
 package activity
 
 import "core:sync"
+import codec "../codec"
 
 Cancel_Reason :: enum u32 {
 	None,
@@ -21,7 +22,21 @@ Heartbeat_Status :: enum {
 	Core_Error,
 }
 
-Heartbeat_Recorder :: #type proc(user_data: rawptr, details: string) -> Heartbeat_Status
+Heartbeat_Recorder :: #type proc(user_data: rawptr, details: codec.Payload_View) -> Heartbeat_Status
+
+Payload_Result :: struct {
+	payload:       codec.Payload,
+	failure_message: string,
+	non_retryable: bool,
+}
+
+payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
+	return {payload = payload}
+}
+
+payload_fail :: proc(message: string, non_retryable := true) -> Payload_Result {
+	return {failure_message = message, non_retryable = non_retryable}
+}
 
 Context :: struct {
 	activity_id: string,
@@ -80,7 +95,7 @@ attempt :: proc(ctx: ^Context) -> u32 {
 	return ctx.attempt
 }
 
-heartbeat :: proc(ctx: ^Context, details: string) -> Heartbeat_Status {
+heartbeat_payload :: proc(ctx: ^Context, details: codec.Payload_View) -> Heartbeat_Status {
 	if ctx == nil || ctx.heartbeat_recorder == nil {
 		return .Invalid_Context
 	}
@@ -92,4 +107,17 @@ heartbeat :: proc(ctx: ^Context, details: string) -> Heartbeat_Status {
 		return .Cancellation_Requested
 	}
 	return status
+}
+
+heartbeat_json :: proc(ctx: ^Context, details: $T) -> Heartbeat_Status {
+	payload, encode_error := codec.encode_json(details)
+	if encode_error != .None {
+		return .Encoding_Failed
+	}
+	defer codec.payload_free(&payload)
+	return heartbeat_payload(ctx, codec.payload_view(&payload))
+}
+
+heartbeat :: proc(ctx: ^Context, details: string) -> Heartbeat_Status {
+	return heartbeat_json(ctx, details)
 }

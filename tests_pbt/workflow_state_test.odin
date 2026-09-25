@@ -5,6 +5,7 @@ import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
 import activity "../temporal/activity"
+import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
@@ -15,12 +16,83 @@ Activity_Heartbeat_Capture :: struct {
 
 capture_activity_heartbeat :: proc(
 	user_data: rawptr,
-	details: string,
+	details: codec.Payload_View,
 ) -> activity.Heartbeat_Status {
 	_ = details
 	capture := cast(^Activity_Heartbeat_Capture)user_data
 	capture.calls += 1
 	return .Recorded
+}
+
+Generated_Payload_Value :: struct {
+	name:    string,
+	count:   int,
+	enabled: bool,
+}
+
+json_payload_round_trip_property :: proc(t: ^pbt.T) -> pbt.Result {
+	expected := Generated_Payload_Value{
+		name = pbt.draw(t, pbt.string_ascii(0, 32)),
+		count = pbt.draw(t, pbt.int_range(-100000, 100000)),
+		enabled = pbt.draw(t, pbt.boolean()),
+	}
+	external_size := i64(pbt.draw(t, pbt.int_range(0, 1000000)))
+	pbt.cover(t, len(expected.name) == 0, 2.0, "empty string")
+	pbt.cover(t, len(expected.name) >= 24, 10.0, "long string")
+	pbt.cover(t, expected.count < 0, 30.0, "negative integer")
+
+	payload, encode_error := codec.encode_json(expected)
+	if encode_error != .None {
+		return pbt.fail("generated Odin value could not be encoded")
+	}
+	defer codec.payload_free(&payload)
+	metadata_error := codec.payload_add_metadata(
+		&payload,
+		"odin-sdk-pbt",
+		transmute([]u8)expected.name,
+	)
+	if metadata_error != .None {
+		return pbt.error("could not add generated payload metadata")
+	}
+	if codec.payload_add_external(&payload, external_size) != .None {
+		return pbt.error("could not add generated external payload details")
+	}
+
+	cloned, clone_error := codec.payload_clone(codec.payload_view(&payload))
+	if clone_error != .None {
+		return pbt.error("could not clone generated payload")
+	}
+	defer codec.payload_free(&cloned)
+	codec.payload_free(&payload)
+
+	metadata, found := codec.metadata_get(codec.payload_view(&cloned), "odin-sdk-pbt")
+	if !found || string(metadata) != expected.name {
+		return pbt.fail("payload clone did not preserve generated metadata")
+	}
+	if len(cloned.external_payloads) != 1 || cloned.external_payloads[0].size_bytes != external_size {
+		return pbt.fail("payload clone did not preserve external payload details")
+	}
+	actual: Generated_Payload_Value
+	decode_error := codec.decode_json(codec.payload_view(&cloned), &actual)
+	if decode_error != .None {
+		return pbt.fail("cloned generated payload could not be decoded")
+	}
+	defer delete(actual.name)
+	if actual.name != expected.name || actual.count != expected.count || actual.enabled != expected.enabled {
+		return pbt.fail("generated payload changed during JSON round trip")
+	}
+	return pbt.pass()
+}
+
+@(test)
+json_payloads_preserve_generated_values_and_metadata :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"JSON payloads preserve generated Odin values and metadata",
+		json_payload_round_trip_property,
+		{num_tests = 500, seed = 0x5041_594c_4f41_4453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
 }
 
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {

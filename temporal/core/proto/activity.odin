@@ -1,6 +1,8 @@
 // Activity-facing adapters over the schema-generated protobuf types.
 package proto
 
+import codec "../../codec"
+
 Task_Kind :: enum {
 	Invalid,
 	Start,
@@ -8,8 +10,10 @@ Task_Kind :: enum {
 }
 
 Payload_View :: struct {
-	encoding: string,
-	data:     []u8,
+	encoding:         string,
+	metadata:         []Temporal_Api_Common_V1_Payload_MetadataEntry,
+	data:             []u8,
+	external_payloads: []Temporal_Api_Common_V1_Payload_ExternalPayloadDetails,
 }
 
 Activity_Task :: struct {
@@ -45,6 +49,8 @@ payload_view :: proc(payload: ^Temporal_Api_Common_V1_Payload) -> Payload_View {
 		return result
 	}
 	result.data = payload.data
+	result.metadata = payload.metadata[:]
+	result.external_payloads = payload.external_payloads[:]
 	for entry in payload.metadata {
 		if entry.key == "encoding" {
 			result.encoding = string(entry.value)
@@ -101,32 +107,53 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 	return task, .None
 }
 
-encode_activity_heartbeat :: proc(task_token, details_data: []u8) -> [dynamic]u8 {
-	payload := Temporal_Api_Common_V1_Payload{data = details_data}
+encode_payload :: proc(view: codec.Payload_View) -> Temporal_Api_Common_V1_Payload {
+	payload := Temporal_Api_Common_V1_Payload{data = view.data}
+	for entry in view.metadata {
+		append(
+			&payload.metadata,
+			Temporal_Api_Common_V1_Payload_MetadataEntry{
+				key = entry.key,
+				value = entry.value,
+			},
+		)
+	}
+	for external in view.external_payloads {
+		append(
+			&payload.external_payloads,
+			Temporal_Api_Common_V1_Payload_ExternalPayloadDetails{
+				size_bytes = external.size_bytes,
+			},
+		)
+	}
+	return payload
+}
+
+encode_activity_heartbeat_payload :: proc(task_token: []u8, details: codec.Payload_View) -> [dynamic]u8 {
+	payload := encode_payload(details)
 	defer delete(payload.metadata)
-	append(
-		&payload.metadata,
-		Temporal_Api_Common_V1_Payload_MetadataEntry{
-			key = "encoding",
-			value = transmute([]u8)string("json/plain"),
-		},
-	)
+	defer delete(payload.external_payloads)
 	heartbeat := Coresdk_ActivityHeartbeat{task_token = task_token}
 	defer delete(heartbeat.details)
 	append(&heartbeat.details, payload)
 	return encode_Coresdk_ActivityHeartbeat(&heartbeat)
 }
 
-encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
-	payload := Temporal_Api_Common_V1_Payload{data = result_data}
-	defer delete(payload.metadata)
-	append(
-		&payload.metadata,
-		Temporal_Api_Common_V1_Payload_MetadataEntry{
-			key = "encoding",
-			value = transmute([]u8)string("json/plain"),
-		},
+encode_activity_heartbeat :: proc(task_token, details_data: []u8) -> [dynamic]u8 {
+	metadata := [1]codec.Metadata_Entry{{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	}}
+	return encode_activity_heartbeat_payload(
+		task_token,
+		codec.Payload_View{metadata = metadata[:], data = details_data},
 	)
+}
+
+encode_activity_success_payload :: proc(task_token: []u8, result: codec.Payload_View) -> [dynamic]u8 {
+	payload := encode_payload(result)
+	defer delete(payload.metadata)
+	defer delete(payload.external_payloads)
 	success := Coresdk_Activity_Result_Success{result = &payload}
 	execution_result := Coresdk_Activity_Result_ActivityExecutionResult{
 		status = Coresdk_Activity_Result_ActivityExecutionResult_Status_Completed{value = &success},
@@ -136,6 +163,17 @@ encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
 		result = &execution_result,
 	}
 	return encode_Coresdk_ActivityTaskCompletion(&completion)
+}
+
+encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
+	metadata := [1]codec.Metadata_Entry{{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	}}
+	return encode_activity_success_payload(
+		task_token,
+		codec.Payload_View{metadata = metadata[:], data = result_data},
+	)
 }
 
 encode_activity_failure :: proc(task_token: []u8, message: string, non_retryable := true) -> [dynamic]u8 {

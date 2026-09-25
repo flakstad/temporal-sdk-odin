@@ -149,11 +149,27 @@ pool finishes queued/running callbacks before its execution records are freed.
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the state Core delivered; returning
 from the callback after a request makes the worker send a cancellation result
-with `CanceledFailureInfo`. `activity.heartbeat(ctx, details)` sends one
-`json/plain` string payload through
+with `CanceledFailureInfo`. `activity.heartbeat(ctx, details)` remains the
+string convenience API; `activity.heartbeat_json` accepts any JSON-compatible
+Odin value and `activity.heartbeat_payload` accepts a borrowed payload. All
+three send one Temporal Payload through
 `temporal_core_worker_record_activity_heartbeat`. Core owns heartbeat
 throttling, and any server cancellation response returns later through the
 normal Activity poll stream.
+
+Activities can be registered at three levels:
+
+```odin
+worker.register_activity(&w, "hello", hello_string)
+worker.register_json_activity(&w, "typed_greeting", typed_greeting)
+worker.register_payload_activity(&w, "custom", custom_payload_activity)
+```
+
+The string form is a compatibility wrapper over the typed JSON adapter. JSON
+callbacks receive one decoded Odin value and return one encoded value. Payload
+callbacks borrow their input only for the callback and return an owned
+`codec.Payload`; the executor frees that result with its recorded allocator
+after Core completion bytes have been constructed.
 
 `Run_Options.max_activity_tasks` and `max_workflow_executions` are bounded
 test/example controls. Zero means unbounded. Normal workers call `run` without

@@ -15,12 +15,12 @@ of a pending timer or Activity and `CancelWorkflowExecution`. A reusable worker
 now registers both Activity and Workflow procedures, routes run IDs to the
 correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
-cooperative cancellation and string heartbeat details through
+cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
 cancellation. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. It does **not** provide user Workflow cancellation
-scopes/cleanup, signal handlers,
-queries/updates, generic payloads, panic containment, or a stable public API.
+scopes/cleanup, signal handlers, queries/updates, multiple Activity arguments,
+panic containment, or a stable public API.
 Do not use it in production.
 
 ```text
@@ -99,9 +99,17 @@ temporal_worker, _ := worker.create(
     "odin-hello-workflow",
 )
 _ = worker.register_activity(&temporal_worker, "hello", hello)
+_ = worker.register_json_activity(&temporal_worker, "typed_greeting", typed_greeting)
 _ = worker.register_workflow(&temporal_worker, "odin_hello_workflow", hello_workflow)
 _, _ = worker.run(&temporal_worker)
 ```
+
+`register_json_activity` accepts ordinary typed Odin procedures such as
+`proc(^activity.Context, Greeting_Input) -> Greeting_Output`. The generic
+adapter encodes one `json/plain` Temporal Payload; the lower-level
+`register_payload_activity` callback receives a borrowed `codec.Payload_View`
+and can return any allocator-owned `codec.Payload`. Existing string Activities
+remain source-compatible through `register_activity`.
 
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
@@ -122,7 +130,9 @@ with a cancellation completion. A separate fan-out case proves two Odin
 Activity callbacks overlap rather than merely being queued concurrently. The
 suite also starts an unregistered Workflow type, verifies a retryable
 `WorkflowTaskFailed` event and Core eviction, then proves that the same Odin
-worker can complete a registered Workflow afterward.
+worker can complete a registered Workflow afterward. Its Activity cases include
+a structured JSON object round trip between a Rust Workflow and a typed Odin
+Activity.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
@@ -144,7 +154,7 @@ temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/worker/          Activity/Workflow registry and concurrent Core polling
-temporal/codec/           isolated json/plain user payload codec
+temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/client/          planned public client package
 examples/core_connect/    Odin -> Core -> Temporal proof
