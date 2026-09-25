@@ -6,14 +6,17 @@
 initialize -> schedule hello Activity -> resolve Activity -> complete
 ```
 
-`fiber_spike.odin` now drives a longer serial shape through a stackful
-coroutine:
+`fiber_spike.odin` drives both serial commands and two outstanding Activities
+through a stackful coroutine. The current live example is:
 
 ```odin
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-    first := workflow.execute_activity(ctx, "hello", name)
-    workflow.sleep(ctx, 250 * time.Millisecond)
-    return workflow.execute_activity(ctx, "hello", first)
+    first := workflow.start_activity(ctx, "hello", name)
+    second := workflow.start_activity(ctx, "hello", "Temporal")
+    a := workflow.await_activity(ctx, first)
+    b := workflow.await_activity(ctx, second)
+    result, _ := strings.concatenate({a, " & ", b})
+    return result
 }
 ```
 
@@ -22,7 +25,8 @@ again on a new stack and must reproduce the same commands from history. A
 per-instance Odin arena owns values that cross activation boundaries.
 
 Both implementations exist to test Core activations, commands, ownership,
-forced eviction, and replay. The fiber version currently supports serial
-string Activities and durable timers, with one outstanding operation at a
-time. Neither is a stable registration API or a complete Workflow runtime. Do
+forced eviction, and replay. The fiber version has seq-keyed Activity/timer
+operation tables, emits multiple commands in one completion, and applies every
+resolution job before resuming the single Workflow fiber. Neither
+implementation is a stable registration API or a complete Workflow runtime. Do
 not build application Workflows against them.

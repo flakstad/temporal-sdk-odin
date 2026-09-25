@@ -3,7 +3,6 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import "core:time"
 import activity "../../temporal/activity"
 import temporal_core "../../temporal/core"
 import worker "../../temporal/worker"
@@ -22,10 +21,15 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	first_greeting := workflow.execute_activity(ctx, "hello", name)
-	workflow.sleep(ctx, 250 * time.Millisecond)
-	second_greeting := workflow.execute_activity(ctx, "hello", first_greeting)
-	return second_greeting
+	first := workflow.start_activity(ctx, "hello", name)
+	second := workflow.start_activity(ctx, "hello", "Temporal")
+	first_greeting := workflow.await_activity(ctx, first)
+	second_greeting := workflow.await_activity(ctx, second)
+	result, allocation_error := strings.concatenate({first_greeting, " & ", second_greeting})
+	if allocation_error != nil {
+		return ""
+	}
+	return result
 }
 
 main :: proc() {
@@ -98,7 +102,7 @@ main :: proc() {
 	evictions_requested := 0
 	evictions_observed := 0
 	activities_completed := 0
-	timer_started := false
+	live_resolutions := 0
 	workflow_completed := false
 	final_eviction := false
 	failed := false
@@ -135,11 +139,13 @@ main :: proc() {
 		}
 
 		fmt.printf(
-			"activation history=%d replay=%v activity=%d timer=%d completed=%v evicted=%v\n",
+			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d waiting=%d completed=%v evicted=%v\n",
 			processed.history_length,
 			processed.is_replaying,
+			processed.scheduled_activity_count,
 			processed.activity_seq,
-			processed.timer_seq,
+			processed.resolved_activity_seq,
+			processed.waiting_activity_seq,
 			processed.completed,
 			processed.evicted,
 		)
@@ -150,10 +156,12 @@ main :: proc() {
 			break
 		}
 
+		if processed.resolved_activity_seq != 0 && !processed.is_replaying {
+			live_resolutions += 1
+		}
 		request_eviction :=
-			(evictions_requested == 0 && processed.scheduled_activity && processed.activity_seq == 1) ||
-			(evictions_requested == 1 && processed.started_timer && processed.timer_seq == 1) ||
-			(evictions_requested == 2 && processed.scheduled_activity && processed.activity_seq == 2)
+			(evictions_requested == 0 && processed.scheduled_activity_count == 2) ||
+			(evictions_requested == 1 && processed.resolved_activity_seq != 0 && !processed.is_replaying && !processed.completed)
 		if request_eviction {
 			eviction_error := temporal_core.worker_request_workflow_eviction(
 				&activity_worker.core,
@@ -166,14 +174,11 @@ main :: proc() {
 				break
 			}
 			evictions_requested += 1
-			if processed.started_timer {
-				timer_started = true
-			}
 		}
 
 		if processed.evicted {
 			evictions_observed += 1
-			if evictions_observed == 1 || evictions_observed == 3 {
+			if evictions_observed == 1 || evictions_observed == 2 {
 				activity_error := worker.run(&activity_worker, max_tasks = 1)
 				if activity_error.message != nil {
 					fmt.eprintf("Activity execution failed: %s\n", string(activity_error.message))
@@ -193,13 +198,13 @@ main :: proc() {
 		}
 	}
 
-	if !failed && (evictions_requested != 3 || activities_completed != 2 || !timer_started || !workflow_completed || !final_eviction) {
-		fmt.eprintln("Workflow spike did not observe Activity -> timer -> Activity with eviction at every suspension")
+	if !failed && (evictions_requested != 2 || activities_completed != 2 || live_resolutions != 2 || !workflow_completed || !final_eviction) {
+		fmt.eprintln("Workflow spike did not observe two outstanding Activities with eviction before and between resolutions")
 		failed = true
 	}
-	if !failed && (workflow_runtime.replay_initializations < 3 || workflow_runtime.evictions < 4) {
+	if !failed && (workflow_runtime.replay_initializations < 2 || workflow_runtime.evictions < 3) {
 		fmt.eprintf(
-			"Workflow spike expected three replays and four evictions; replay_initializations=%d evictions=%d\n",
+			"Workflow spike expected two replays and three evictions; replay_initializations=%d evictions=%d\n",
 			workflow_runtime.replay_initializations,
 			workflow_runtime.evictions,
 		)
@@ -219,5 +224,5 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("sequential Activity -> timer -> Activity Workflow completed across three forced evictions")
+	fmt.println("two outstanding Activities completed across evictions before and between resolutions")
 }

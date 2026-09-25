@@ -3,6 +3,7 @@ package tests
 import "core:testing"
 import "core:bytes"
 import "core:mem/virtual"
+import "core:strings"
 import "core:time"
 import temporal_core "../temporal/core"
 import codec "../temporal/codec"
@@ -19,6 +20,18 @@ fiber_chain_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 	first := workflow.execute_activity(ctx, "hello", name)
 	workflow.sleep(ctx, time.Millisecond)
 	return workflow.execute_activity(ctx, "hello", first)
+}
+
+fiber_parallel_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	first := workflow.start_activity(ctx, "hello", name)
+	second := workflow.start_activity(ctx, "hello", "Temporal")
+	first_result := workflow.await_activity(ctx, first)
+	second_result := workflow.await_activity(ctx, second)
+	result, allocation_error := strings.concatenate({first_result, " & ", second_result})
+	if allocation_error != nil {
+		return ""
+	}
+	return result
 }
 
 process_fiber_test_activation :: proc(
@@ -539,6 +552,148 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, processed.completed)
 	testing.expect(t, !processed.scheduled_activity)
 	testing.expect(t, !processed.started_timer)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_applies_all_activity_resolutions_before_resume :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_parallel_workflow",
+		"test-queue",
+		fiber_parallel_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_parallel_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-parallel-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.scheduled_activity_count, 2)
+	testing.expect_value(t, processed.activity_seq, u32(2))
+	testing.expect_value(t, processed.waiting_activity_seq, u32(1))
+
+	decode_arena: virtual.Arena
+	arena_error := virtual.arena_init_growing(&decode_arena)
+	testing.expect(t, arena_error == nil)
+	if arena_error != nil {
+		delete(processed.completion)
+		workflow.error_free(&processed.error)
+		return
+	}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	initial_completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	completion_ok := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		processed.completion[:],
+		&initial_completion,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, completion_ok)
+	command_count := 0
+	#partial switch status in initial_completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value != nil {
+			command_count = len(status.value.commands)
+			if command_count == 2 {
+				first_seq: u32
+				second_seq: u32
+				#partial switch command in status.value.commands[0].variant {
+				case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+					if command.value != nil {
+						first_seq = command.value.seq
+					}
+				}
+				#partial switch command in status.value.commands[1].variant {
+				case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+					if command.value != nil {
+						second_seq = command.value.seq
+					}
+				}
+				testing.expect_value(t, first_seq, u32(1))
+				testing.expect_value(t, second_seq, u32(2))
+			}
+		}
+	}
+	testing.expect_value(t, command_count, 2)
+	virtual.arena_destroy(&decode_arena)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	first_output := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Hello Odin"`)}
+	second_output := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Hello Temporal"`)}
+	defer delete(first_output.metadata)
+	defer delete(second_output.metadata)
+	encoding := proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	}
+	append(&first_output.metadata, encoding)
+	append(&second_output.metadata, encoding)
+	first_success := proto.Coresdk_Activity_Result_Success{result = &first_output}
+	second_success := proto.Coresdk_Activity_Result_Success{result = &second_output}
+	first_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &first_success},
+	}
+	second_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &second_success},
+	}
+	resolve_first := proto.Coresdk_Workflow_Activation_ResolveActivity{seq = 1, result = &first_resolution}
+	resolve_second := proto.Coresdk_Workflow_Activation_ResolveActivity{seq = 2, result = &second_resolution}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	// Reverse order is deliberate: both results must be stored before the fiber
+	// resumes and awaits them in source order.
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_second,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_first,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "parallel resolution failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.scheduled_activity)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(1))
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

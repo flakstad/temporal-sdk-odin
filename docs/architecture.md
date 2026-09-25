@@ -2,8 +2,8 @@
 
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
 Activity Worker slice, schema-derived Core protobuf bindings, a bounded
-Milestone 3 explicit-state-machine Workflow spike, and a serial multi-operation
-stackful-fiber replay spike, 2026-09-25.
+Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
+spikes covering serial operations plus two outstanding Activities, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -551,9 +551,9 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 }
 ```
 
-`execute_activity` and `sleep` each record a typed pending operation and yield
-from inside the nested Odin call. Activity and timer sequence counters are
-separate; the example emits `ScheduleActivity(seq=1)`, `StartTimer(seq=1)`, and
+`execute_activity` and `sleep` each record a typed operation and yield from
+inside the nested Odin call. Activity and timer sequence counters are separate;
+the serial test emits `ScheduleActivity(seq=1)`, `StartTimer(seq=1)`, and
 `ScheduleActivity(seq=2)`. Resolutions are matched against both operation type
 and sequence before the fiber resumes.
 
@@ -583,6 +583,41 @@ continued at the live Activity 2 frontier. Temporal CLI returned
 `"Hello Hello Odin"`; neither Activity was re-executed during replay. Offline
 tests cover the individual eviction/recreation path and the complete serial
 Activity/timer/Activity transition sequence under Odin's memory tracker.
+
+The next bounded experiment replaced the single pending slot with per-instance,
+seq-keyed Activity and timer operation tables. `start_activity` records without
+yielding and returns a seq-only handle; `await_activity` yields only when that
+operation is unresolved. Handles deliberately do not retain pointers into the
+growable table. Command protobuf objects are activation-arena-owned until the
+completion is encoded, allowing one completion to contain multiple commands.
+This shape follows two current upstream boundaries: the pinned Rust Workflow
+runtime [applies every activation job and returns their results before routines
+are polled](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/instance.rs),
+while the TypeScript runtime keeps
+[seq-keyed completion maps and an activation command buffer](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
+
+The live example schedules `Activity(seq=1)` and `Activity(seq=2)` in the
+initial activation, then awaits them in source order. The observed boundary was:
+
+| History | Replay | Odin command/job |
+| ---: | :---: | --- |
+| 3 | no | initialize -> schedule Activities 1 and 2 |
+| 3 | no | forced eviction |
+| 3 | yes | initialize -> reproduce both schedule commands |
+| 10 | no | resolve Activity 2 -> remain waiting for Activity 1 |
+| 10 | no | forced eviction |
+| 3 | yes | initialize -> reproduce both schedule commands |
+| 10 | yes | resolve Activity 2 -> remain waiting for Activity 1 |
+| 15 | no | resolve Activity 1 -> consume both results and complete |
+| 15 | no | completion eviction |
+
+Activity 2 happened to finish first, which is useful evidence: completion order
+need not equal await order. Temporal CLI returned
+`"Hello Odin & Hello Temporal"`. An offline test also delivers both resolution
+jobs in reverse order in one activation and asserts that the runtime stores all
+jobs before resuming the fiber. This is the narrow `apply-all-before-resume`
+rule required at the language/runtime boundary; it is not yet a general ready
+queue or multi-fiber scheduler.
 
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
@@ -615,11 +650,11 @@ Workflows are enabled.
    heap-stable state, concurrent Activity execution, cancellation, and
    heartbeats.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
-   timers, separate operation sequence spaces, resumption, and increasingly
-   deep fresh-stack replay for serial code. It does not yet prove multiple
-   outstanding operations, signal/update ordering, panic containment,
-   nondeterminism diagnostics, bounded stack policy, or a production
-   deterministic scheduler.
+   timers, multiple outstanding Activities, multi-command completions,
+   apply-all-before-resume, and fresh-stack replay. It does not yet prove
+   signal/update ordering, catchable Activity failures, cancellation, panic
+   containment, nondeterminism diagnostics, bounded stack policy, or a
+   production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -638,7 +673,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial Activity/timer/Activity execution with eviction at every await and three-level fresh-stack replay on macOS arm64 | Schedule two Activities before awaiting either, then replay batched commands/resolutions |
+| Stackful coroutine/fiber | Proven for serial Activity/timer/Activity plus two outstanding Activities, multi-command completion, out-of-order resolution, eviction, and replay on macOS arm64 | Make Activity failure a resumable result and replay it across eviction |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -648,23 +683,20 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The serial multi-operation fiber works. The next bounded runtime milestone
-should test **two outstanding Activities**: schedule both before awaiting
-either, return their combined results, and force eviction before and between
-resolutions. This directly tests the current architectural limit—the spike has
-one pending-operation slot and intentionally rejects more than one command per
-activation. The experiment needs a small operation table keyed by type and
-sequence plus a deterministic ready queue. It should not yet grow into a
-general futures framework; the acceptance criterion is that batched commands
-and possibly batched resolution jobs replay in the same order.
+The multi-outstanding operation table works. The next bounded runtime milestone
+should make **Activity failure a resumable Workflow result** instead of
+immediately failing the whole Workflow. The acceptance test should schedule a
+failing Activity, evict before its resolution, replay the failure, let Workflow
+code branch on the result, and then complete normally. This tests failure
+ownership and replay semantics without introducing signals, cancellation, or a
+general futures framework.
 
 In parallel with that small language-runtime slice, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Do not add signals, queries, or updates until the multi-outstanding
-operation model is sound. Activity
-concurrency, heartbeats, and cancellation remain the next worker-side
-production work, but the Activity Worker vertical milestone itself is already
-complete.
+dependency. Do not add signals, queries, or updates until the Activity result
+and failure model is sound. Activity concurrency, heartbeats, and cancellation
+remain the next worker-side production work, but the Activity Worker vertical
+milestone itself is already complete.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and
