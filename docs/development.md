@@ -130,11 +130,13 @@ The C wrapper currently presents blocking poll calls. When both task types are
 registered, `worker.run` creates one Workflow poll thread and one Activity poll
 thread. Only the Workflow thread reads or mutates Workflow runtimes, so a fiber
 never migrates between threads. The Activity poll thread instead creates one
-heap-stable execution record and Odin thread per start task. Core's fixed-size
-Activity slot supplier bounds these at `max_concurrent_activities` (10 by
-default), while the poll thread remains free to deliver task-token-matched
-cancel tasks. `worker.request_shutdown` is safe to call from a coordinating
-thread; `worker.close` must only be called after `run` returns.
+heap-stable execution record per start task and submits it to a reusable Odin
+standard-library thread pool. The pool and Core's fixed-size Activity slot
+supplier both use `max_concurrent_activities` (10 by default), while the poll
+thread remains free to deliver task-token-matched cancel tasks. On exit, the
+pool finishes queued/running callbacks before its execution records are freed.
+`worker.request_shutdown` is safe to call from a coordinating thread;
+`worker.close` must only be called after `run` returns.
 
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the state Core delivered; returning
@@ -191,9 +193,10 @@ encode Activity Tasks and decode Odin's success/failure completions.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
-if both Odin callbacks overlap. The run scripts build and `exec` their binaries
-rather than using `odin run`; this keeps the process PID identical to the
-worker PID so integration cleanup cannot orphan a task-queue poller.
+if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
+then the run scripts `exec` those binaries without rebuilding. Standalone use
+still builds by default. Keeping the process PID identical to the worker PID
+lets integration cleanup avoid orphaning a task-queue poller.
 
 `./scripts/test.sh` uses the pinned `test-deps/pbt` submodule by default. During
 local PBT library development, run `PBT_ROOT=~/Projects/pbt ./scripts/test.sh`

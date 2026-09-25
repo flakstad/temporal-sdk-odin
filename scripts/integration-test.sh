@@ -55,11 +55,14 @@ if ! temporal operator cluster health \
   exit 1
 fi
 
-"$repo_root/scripts/run-core-connect.sh"
+"$repo_root/scripts/build-examples.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
 run_activity_case() {
   local expect_failure="$1"
-  "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+    "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   worker_pid=$!
   for _ in {1..30}; do
     if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
@@ -98,6 +101,7 @@ run_activity_case no
 run_activity_case yes
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
 for _ in {1..30}; do
@@ -119,7 +123,8 @@ worker_pid=""
 cat "$worker_log"
 grep -q "two Activity callbacks overlapped and worker shut down cleanly" "$worker_log"
 
-"$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
 for _ in {1..30}; do
   if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
@@ -194,6 +199,7 @@ run_workflow_cancellation_case() {
   local completion_message="$5"
 
   TEMPORAL_ODIN_SCENARIO="$scenario" \
+    TEMPORAL_ODIN_SKIP_BUILD=1 \
     "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
   worker_pid=$!
   for _ in {1..30}; do

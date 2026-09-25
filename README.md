@@ -14,9 +14,10 @@ eviction. It also translates Workflow cancellation into deterministic cleanup
 of a pending timer or Activity and `CancelWorkflowExecution`. A reusable worker
 now registers both Activity and Workflow procedures, routes run IDs to the
 correct fiber runtime, and polls both Core task streams concurrently. Its
-bounded Activity executor runs callbacks concurrently, exposes cooperative
-cancellation and string heartbeat details through `activity.Context`, and has
-live tests for overlap and heartbeat-driven cancellation. It does **not**
+bounded reusable Activity thread pool runs callbacks concurrently, exposes
+cooperative cancellation and string heartbeat details through
+`activity.Context`, and has live tests for overlap and heartbeat-driven
+cancellation. It does **not**
 provide user Workflow cancellation scopes/cleanup, signal handlers,
 queries/updates, generic payloads, panic containment, or a stable public API.
 Do not use it in production.
@@ -54,6 +55,12 @@ Clone submodules and build the pinned Core bridge:
 ```bash
 git submodule update --init --recursive
 ./scripts/build-core.sh
+```
+
+Build all three Odin examples in one pass with:
+
+```bash
+./scripts/build-examples.sh
 ```
 
 In one terminal, start the recommended local development server:

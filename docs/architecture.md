@@ -906,9 +906,10 @@ Workflows are enabled.
    live `prost` interoperability checks.
 3. **Worker concurrency.** The fixed-slot Activity executor, heap-stable
    task-token routes, cooperative cancellation, and heartbeat transport pass
-   live tests. It currently creates one OS thread per Core slot rather than a
-   reusable pool, uses a linear in-flight lookup, and lacks load/backpressure,
-   panic-containment, deadline, and shutdown-timeout stress tests.
+   live tests. It now reuses a standard-library thread pool sized to the same
+   limit as Core's Activity slot supplier. It still uses a linear in-flight
+   lookup and lacks load/backpressure, panic-containment, deadline, and
+   shutdown-timeout stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -949,10 +950,10 @@ a comparison point; it is not yet enough to freeze the public API.
 Activity concurrency, task-token routing, cooperative cancel delivery, and
 heartbeat transport are now proven live, and delayed Core construction now
 makes the registered task types the single source of worker capabilities. The
-next vertical milestone should replace the one-thread-per-slot executor with a
-small reusable pool and stress shutdown/cancel/heartbeat interleavings using
-`pbt`; a statechart oracle becomes worthwhile once retries and deadlines join
-that model. Unknown Workflow types must produce a language-facing failed
+Activity executor now uses a small reusable pool; the next vertical milestone
+should stress pool shutdown/cancel/heartbeat interleavings and callback failure
+using `pbt`. A statechart oracle becomes worthwhile once retries and deadlines
+join that model. Unknown Workflow types must produce a language-facing failed
 activation without terminating the worker. Generic payload APIs and user
 Workflow cancellation scopes should follow as separate changes.
 

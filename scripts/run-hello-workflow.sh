@@ -2,11 +2,15 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-"$repo_root/scripts/build-core.sh"
-
 lib_dir="$repo_root/native/target/release"
 binary="$lib_dir/temporal-odin-hello-workflow"
-odin build "$repo_root/examples/hello_workflow" \
-  -out:"$binary" \
-  -extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
+if [[ "${TEMPORAL_ODIN_SKIP_BUILD:-}" != "1" ]]; then
+  "$repo_root/scripts/build-core.sh"
+  odin build "$repo_root/examples/hello_workflow" \
+    -out:"$binary" \
+    -extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
+elif [[ ! -x "$binary" ]]; then
+  echo "Example binary is missing; run ./scripts/build-examples.sh first" >&2
+  exit 1
+fi
 exec "$binary"

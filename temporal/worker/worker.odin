@@ -2,6 +2,7 @@
 // The one-string codec and Workflow fiber runtime remain experimental.
 package worker
 
+import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:fmt"
 import "core:mem/virtual"
@@ -252,7 +253,6 @@ Activity_Execution :: struct {
 	activity_id: string,
 	input:       string,
 	ctx:         activity.Context,
-	thread:      ^thread.Thread,
 	error:       Error,
 }
 
@@ -331,6 +331,10 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	}
 }
 
+activity_execution_task :: proc(task: thread.Task) {
+	activity_execution_main(cast(^Activity_Execution)task.data)
+}
+
 activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 	if execution == nil {
 		return
@@ -344,6 +348,7 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 
 activity_execution_start :: proc(
 	worker: ^Worker,
+	pool: ^thread.Pool,
 	task: ^proto.Activity_Task,
 ) -> (execution: ^Activity_Execution, error: Error) {
 	callback, found := find_activity(worker, task.activity_type)
@@ -381,11 +386,7 @@ activity_execution_start :: proc(
 		cast(rawptr)execution,
 		activity_heartbeat_recorder,
 	)
-	execution.thread = thread.create_and_start_with_poly_data(execution, activity_execution_main)
-	if execution.thread == nil {
-		activity_execution_destroy(execution)
-		return nil, error_from_string("could not start Activity execution thread")
-	}
+	thread.pool_add_task(pool, context.allocator, activity_execution_task, execution)
 	return execution, {}
 }
 
@@ -521,16 +522,28 @@ find_activity_execution :: proc(
 
 reap_activity_executions :: proc(
 	executions: ^[dynamic]^Activity_Execution,
-	wait_for_all: bool,
+	pool: ^thread.Pool,
 ) -> (completed: int, error: Error) {
-	for index := len(executions^) - 1; index >= 0; index -= 1 {
-		execution := executions^[index]
-		if !wait_for_all && !thread.is_done(execution.thread) {
+	for {
+		task, done := thread.pool_pop_done(pool)
+		if !done {
+			break
+		}
+		execution := cast(^Activity_Execution)task.data
+		index := -1
+		for candidate, candidate_index in executions^ {
+			if candidate == execution {
+				index = candidate_index
+				break
+			}
+		}
+		if index < 0 {
+			activity_execution_destroy(execution)
+			if error.message == nil {
+				error = error_from_string("Activity executor returned an unknown task")
+			}
 			continue
 		}
-		thread.join(execution.thread)
-		thread.destroy(execution.thread)
-		execution.thread = nil
 		if execution.error.message != nil {
 			if error.message == nil {
 				error = execution.error
@@ -551,18 +564,25 @@ run_activity_loop :: proc(
 ) -> (completed: int, cancellations: int, error: Error) {
 	executions := make([dynamic]^Activity_Execution)
 	defer delete(executions)
+	pool := thread.Pool{}
+	thread.pool_init(
+		&pool,
+		allocator_runtime.heap_allocator(),
+		worker.max_concurrent_activities,
+	)
+	thread.pool_start(&pool)
+	pool_finished := false
 	defer {
-		reaped, cleanup_error := reap_activity_executions(&executions, true)
-		completed += reaped
-		if error.message == nil {
-			error = cleanup_error
-		} else {
+		if !pool_finished {
+			thread.pool_finish(&pool)
+			_, cleanup_error := reap_activity_executions(&executions, &pool)
 			error_free(&cleanup_error)
 		}
+		thread.pool_destroy(&pool)
 	}
 	started := 0
 	for max_tasks <= 0 || started < max_tasks {
-		reaped, reap_error := reap_activity_executions(&executions, false)
+		reaped, reap_error := reap_activity_executions(&executions, &pool)
 		completed += reaped
 		if reap_error.message != nil {
 			return completed, cancellations, reap_error
@@ -604,7 +624,7 @@ run_activity_loop :: proc(
 			continue
 		}
 
-		execution, execute_error := activity_execution_start(worker, &task)
+		execution, execute_error := activity_execution_start(worker, &pool, &task)
 		virtual.arena_destroy(&decode_arena)
 		delete(poll.protobuf)
 		if execute_error.message != nil {
@@ -617,7 +637,9 @@ run_activity_loop :: proc(
 			append(&executions, execution)
 		}
 	}
-	reaped, reap_error := reap_activity_executions(&executions, true)
+	thread.pool_finish(&pool)
+	pool_finished = true
+	reaped, reap_error := reap_activity_executions(&executions, &pool)
 	completed += reaped
 	return completed, cancellations, reap_error
 }
