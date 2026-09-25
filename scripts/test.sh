@@ -10,4 +10,20 @@ cargo test --quiet \
 
 lib_dir="$repo_root/native/target/release"
 odin test "$repo_root/tests" \
-  -extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
+	-vet \
+	-strict-style \
+	-warnings-as-errors \
+	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
+
+pbt_root="$repo_root/test-deps/pbt"
+if [[ ! -f "$pbt_root/pbt/check.odin" ]]; then
+	echo "PBT test dependency is missing; run: git submodule update --init --recursive" >&2
+	exit 1
+fi
+
+# The pinned PBT repository includes its own tests in the imported collection.
+# Keep SDK tests warning-clean above, but do not promote dependency warnings to
+# errors in this separately compiled property suite.
+odin test "$repo_root/tests_pbt" \
+	-collection:pbt="$pbt_root" \
+	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"

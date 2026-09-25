@@ -4,7 +4,8 @@ Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
 Activity Worker slice, schema-derived Core protobuf bindings, a bounded
 Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
-failure, buffered Workflow signals, and a durable signal/timer race, 2026-09-25.
+failure, buffered Workflow signals, a durable signal/timer race, and
+runtime-owned Workflow cancellation, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -728,6 +729,73 @@ byte-identical before and after eviction. Separate tests prove the timeout
 branch emits no cancellation and the same-activation signal/timer tie selects
 the signal without attempting to cancel the fired timer.
 
+### Workflow cancellation while suspended
+
+Temporal cancellation is a cooperative Workflow event, not server-side
+termination. The Service records a cancellation request and Core presents it as
+`CancelWorkflow`; the language runtime decides how user execution and pending
+operations react. This matches the [.NET cancellation contract](https://github.com/temporalio/documentation/blob/main/docs/develop/dotnet/workflows/cancellation.mdx)
+and the TypeScript runtime's
+[root cancellation-scope handling](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
+
+The current Odin policy is deliberately smaller than either public SDK:
+
+1. Preserve the cancellation reason in the Workflow-owned arena.
+2. Do not resume a suspended user fiber and do not run user cleanup.
+3. Drop operations that were only locally scheduled.
+4. Emit `RequestCancelActivity(seq)` and/or `CancelTimer(seq)` for commands
+   already sent to Core.
+5. Emit `CancelWorkflowExecution` in the same completion and mark the terminal
+   command as sent.
+
+This policy keeps the external semantics correct while postponing user-visible
+cancellation tokens/scopes and cleanup syntax. It is not the intended final
+API. In particular, Activity cancellation remains cooperative at the Activity
+implementation boundary; the Workflow request does not forcibly stop arbitrary
+Odin code.
+
+The live timer path was:
+
+| History | Odin command/job |
+| ---: | --- |
+| 3 | initialize -> `StartTimer(seq=1)` |
+| 8 | `CancelWorkflow` -> `CancelTimer(seq=1)` + `CancelWorkflowExecution` |
+| 8 | final cache eviction |
+
+The live Activity path exposed an additional lifecycle rule:
+
+| History | Odin command/job |
+| ---: | --- |
+| 3 | initialize -> `ScheduleActivity(seq=1)` |
+| 8 | `CancelWorkflow` -> `RequestCancelActivity(seq=1)` + `CancelWorkflowExecution` |
+| 8 | late terminal `ResolveActivity(seq=1)` -> empty successful completion |
+| 8 | final cache eviction |
+
+The late resolution is a Core-language-runtime handshake, not a second user
+event. The Workflow instance must remain alive until eviction, accept the
+terminal resolution idempotently, and never repeat `CancelWorkflowExecution`.
+Offline tests cover both pending-operation kinds, cancellation before an
+initial command is emitted, same-activation races, the late Activity
+resolution, and byte-identical replay of both timer and Activity cancellation
+sequences.
+
+### Generated lifecycle testing
+
+`tests_pbt` uses the pinned, test-only
+[flakstad/pbt](https://github.com/flakstad/pbt) library to generate 500 batches
+from nine signal/timer/cancellation presence and ordering classes. Each case is
+checked against a small event-outcome model, then evicted and replayed from a
+fresh fiber; the decisive completion must be byte-identical. Coverage
+constraints ensure every class appears in a successful run.
+
+The sibling `statecharts` library was evaluated as a possible independent
+model oracle. We are not adding it yet: the present model has one wait state and
+three event kinds, so a direct transition table is smaller and easier to audit.
+Revisit a statechart model when cancellation scopes, multiple simultaneous
+waits, or a real Workflow scheduler introduce orthogonal regions or nested
+states. At that point it can be valuable precisely because the model should be
+independent of the runtime implementation.
+
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
@@ -761,9 +829,10 @@ Workflows are enabled.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
-   a durable timer/signal race across fresh-stack replay. It does not yet prove
-   Workflow cancellation, updates, panic containment, nondeterminism
-   diagnostics, bounded stack policy, or a production deterministic scheduler.
+   a durable timer/signal race, and runtime-owned cancellation across
+   fresh-stack replay. It does not yet prove user cancellation scopes/cleanup,
+   updates, panic containment, nondeterminism diagnostics, bounded stack policy,
+   or a production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -772,7 +841,8 @@ Workflows are enabled.
 7. **Error/cancellation completeness.** The Workflow runtime preserves the raw
    Temporal failure protobuf for propagation, but the catchable experimental API
    exposes only status and message. A public API must model typed causes/details,
-   Activity cancellation, heartbeats, deadlines, panics, and codec failures.
+   Activity-side cancellation delivery, heartbeats, deadlines, panics, and
+   codec failures.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -782,7 +852,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, eviction, and replay on macOS arm64 | Deliver Workflow cancellation while suspended and clean up the pending operation deterministically |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, runtime-owned cancellation, eviction, and replay on macOS arm64 | Move orchestration behind a reusable Workflow registry/worker loop, then design user cancellation scopes |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -792,21 +862,22 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The signal/timer race works. The next bounded runtime milestone should handle a
-**Workflow cancellation request while suspended**. Start with one deliberately
-narrow policy: deliver `CancelWorkflow`, terminate a fiber waiting on the
-signal/timer primitive without running user cleanup, cancel its still-pending
-timer, and emit `CancelWorkflowExecution`. Force eviction and require replay to
-reproduce the same cleanup commands. This would test external cancellation and
-runtime-owned pending-operation cleanup before designing user-visible
-cancellation scopes or exception syntax.
+Workflow cancellation now works for pending timers and Activities, including
+Core's late Activity-cancellation resolution. The next vertical milestone
+should move the orchestration currently embedded in `examples/hello_workflow`
+into `temporal/worker`: a typed Workflow registry plus one worker run loop that
+owns both Core poll streams, dispatches Workflow types to their runtimes,
+completes activations, and shuts down deterministically. Keep the current
+single-string codec boundary while proving registration and lifecycle; generic
+payload APIs and user cancellation scopes should follow rather than being mixed
+into that refactor.
 
-In parallel with that small language-runtime slice, add CI compile/smoke jobs
+In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
 dependency. Keep queries and updates deferred until cancellation semantics are
-grounded. Activity concurrency, heartbeats, and cancellation remain the next
-worker-side production work, but the Activity Worker vertical milestone itself
-is already complete.
+grounded at the user-code boundary. Activity concurrency, heartbeats, and
+Activity-side cancellation delivery remain the next worker-side production
+work, but the Activity Worker vertical milestone itself is already complete.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

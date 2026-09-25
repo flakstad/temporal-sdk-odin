@@ -23,6 +23,7 @@ Fiber_Phase :: enum {
 	Waiting_Timer,
 	Waiting_Signal,
 	Waiting_Signal_Or_Timer,
+	Canceled,
 	Completed,
 	Failed,
 }
@@ -96,6 +97,8 @@ Fiber_Instance :: struct {
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
+	cancellation_reason:  string,
+	terminal_command_sent: bool,
 	unhandled_activity_seq: u32,
 	next_activity_seq: u32,
 	next_timer_seq:    u32,
@@ -293,6 +296,31 @@ find_buffered_signal :: proc(instance: ^Fiber_Instance, name: string) -> (^Fiber
 		}
 	}
 	return nil, false
+}
+
+apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
+	instance.cancellation_reason = reason
+	for index in 0..<len(instance.activities) {
+		operation := &instance.activities[index]
+		switch operation.state {
+		case .Scheduled:
+			operation.state = .Canceled
+		case .Commanded:
+			operation.state = .Cancel_Requested
+		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
+		}
+	}
+	for index in 0..<len(instance.timers) {
+		operation := &instance.timers[index]
+		switch operation.state {
+		case .Scheduled:
+			operation.state = .Canceled
+		case .Commanded:
+			operation.state = .Cancel_Requested
+		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
+		}
+	}
+	instance.phase = .Canceled
 }
 
 // start_activity records a deterministic Activity command without suspending.
@@ -613,6 +641,40 @@ append_fiber_timer_cancellations :: proc(
 	}
 }
 
+append_fiber_cancel_activity_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	operation: ^Fiber_Activity_Operation,
+) {
+	request := new(proto.Coresdk_Workflow_Commands_RequestCancelActivity)
+	request.seq = operation.seq
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_Activity{
+				value = request,
+			},
+		},
+	)
+	operation.state = .Canceled
+	result.requested_activity_cancellation = true
+	result.requested_activity_cancellation_count += 1
+	result.canceled_activity_seq = operation.seq
+}
+
+append_fiber_activity_cancellations :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) {
+	for index in 0..<len(instance.activities) {
+		operation := &instance.activities[index]
+		if operation.state == .Cancel_Requested {
+			append_fiber_cancel_activity_command(result, commands, operation)
+		}
+	}
+}
+
 append_fiber_pending_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -641,7 +703,7 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Signal_Or_Timer:
 		result.waiting_signal = true
 		result.waiting_timer_seq = instance.waiting_timer_seq
-	case .Ready, .Completed, .Failed:
+	case .Ready, .Canceled, .Completed, .Failed:
 		return error_from_string("Workflow fiber suspended without a supported pending operation")
 	}
 	result.run_id = instance.run_id
@@ -682,6 +744,7 @@ append_fiber_completion_command :: proc(
 	)
 	result.completed = true
 	result.run_id = instance.run_id
+	instance.terminal_command_sent = true
 	return {}
 }
 
@@ -713,6 +776,34 @@ append_fiber_failure_command :: proc(
 	)
 	result.completed = true
 	result.run_id = instance.run_id
+	instance.terminal_command_sent = true
+	return {}
+}
+
+append_fiber_cancellation_commands :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) -> Error {
+	if len(commands^) != 0 {
+		return error_from_string("fiber spike emitted cancellation after another command")
+	}
+	append_fiber_activity_cancellations(result, commands, instance)
+	append_fiber_timer_cancellations(result, commands, instance)
+	cancel := new(proto.Coresdk_Workflow_Commands_CancelWorkflowExecution)
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Workflow_Execution{
+				value = cancel,
+			},
+		},
+	)
+	result.canceled_workflow = true
+	result.completed = true
+	result.cancellation_reason = instance.cancellation_reason
+	result.run_id = instance.run_id
+	instance.terminal_command_sent = true
 	return {}
 }
 
@@ -722,6 +813,13 @@ append_fiber_progress_command :: proc(
 	instance: ^Fiber_Instance,
 	task_queue: string,
 ) -> Error {
+	if instance.terminal_command_sent {
+		result.run_id = instance.run_id
+		return {}
+	}
+	if instance.phase == .Canceled {
+		return append_fiber_cancellation_commands(result, commands, instance)
+	}
 	switch fiber_raw.status(instance.fiber) {
 	case .Suspended:
 		return append_fiber_pending_commands(result, commands, instance, task_queue)
@@ -801,7 +899,17 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			operation, operation_found := find_activity_operation(instance, variant.value.seq)
-			if !operation_found || operation.state != .Commanded {
+			if !operation_found {
+				process_error(&result, activation.run_id, "Activity resolution does not match a pending Workflow operation")
+				return
+			}
+			if operation.state == .Canceled && instance.terminal_command_sent {
+				// Core may report the terminal cancellation of a requested Activity
+				// after accepting CancelWorkflowExecution but before cache eviction.
+				result.resolved_activity_seq = operation.seq
+				continue
+			}
+			if operation.state != .Commanded && operation.state != .Cancel_Requested {
 				process_error(&result, activation.run_id, "Activity resolution does not match a pending Workflow operation")
 				return
 			}
@@ -871,6 +979,23 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			result.received_signal = true
 			result.received_signal_count += 1
 
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow:
+			handled = true
+			if variant.value == nil || !instance_found || instance.phase == .Canceled || instance.phase == .Completed || instance.phase == .Failed {
+				process_error(&result, activation.run_id, "Workflow cancellation has no active Workflow fiber")
+				return
+			}
+			context.allocator = instance.odin_context.allocator
+			cancellation_reason, allocation_error := strings.clone(variant.value.reason)
+			context.allocator = previous_allocator
+			if allocation_error != nil {
+				process_error(&result, activation.run_id, "could not preserve Workflow cancellation reason")
+				return
+			}
+			apply_fiber_cancellation(instance, cancellation_reason)
+			result.received_cancellation = true
+			result.cancellation_reason = cancellation_reason
+
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer:
 			handled = true
 			if variant.value == nil || !instance_found {
@@ -878,7 +1003,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			timer_operation, timer_found := find_timer_operation(instance, variant.value.seq)
-			if !timer_found || timer_operation.state != .Commanded {
+			if !timer_found {
+				process_error(&result, activation.run_id, "timer firing does not match a pending Workflow operation")
+				return
+			}
+			if timer_operation.state == .Canceled && instance.terminal_command_sent {
+				continue
+			}
+			if timer_operation.state != .Commanded && timer_operation.state != .Cancel_Requested {
 				process_error(&result, activation.run_id, "timer firing does not match a pending Workflow operation")
 				return
 			}
@@ -923,7 +1055,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
 			timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
 			should_resume = signal_found || (timer_found && timer.state == .Resolved)
-		case .Ready, .Completed, .Failed:
+		case .Ready, .Canceled, .Completed, .Failed:
 		}
 		if should_resume {
 			instance.phase = .Ready

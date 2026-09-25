@@ -22,7 +22,10 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	_ = name
+	if name == "cancel-activity" {
+		return workflow.execute_activity(ctx, "hello", name)
+	}
+
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
@@ -97,13 +100,21 @@ main :: proc() {
 	}
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
+	env_buffer: [64]u8
+	scenario := os.get_env(env_buffer[:], "TEMPORAL_ODIN_SCENARIO")
+	expect_cancel_timer := scenario == "cancel-timer"
+	expect_cancel_activity := scenario == "cancel-activity"
+	expect_cancel := expect_cancel_timer || expect_cancel_activity
 	evictions_requested := 0
 	activities_completed := 0
 	live_resolutions := 0
 	live_signals := 0
 	replayed_signal := false
 	live_timer_cancellations := 0
+	live_activity_cancellations := 0
 	replayed_timer_cancellation := false
+	live_cancellations := 0
+	live_workflow_cancellations := 0
 	workflow_completed := false
 	final_eviction := false
 	failed := false
@@ -140,7 +151,7 @@ main :: proc() {
 		}
 
 		fmt.printf(
-			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v started_timer=%v canceled_timer=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
 			processed.history_length,
 			processed.is_replaying,
 			processed.scheduled_activity_count,
@@ -148,8 +159,11 @@ main :: proc() {
 			processed.resolved_activity_seq,
 			processed.resolved_activity_failed,
 			processed.received_signal,
+			processed.received_cancellation,
+			processed.canceled_workflow,
 			processed.started_timer,
 			processed.canceled_timer,
+			processed.requested_activity_cancellation,
 			processed.waiting_activity_seq,
 			processed.waiting_timer_seq,
 			processed.waiting_signal,
@@ -175,10 +189,19 @@ main :: proc() {
 		if processed.canceled_timer && !processed.is_replaying {
 			live_timer_cancellations += 1
 		}
+		if processed.requested_activity_cancellation && !processed.is_replaying {
+			live_activity_cancellations += processed.requested_activity_cancellation_count
+		}
 		if processed.canceled_timer && processed.is_replaying {
 			replayed_timer_cancellation = true
 		}
-		request_eviction := evictions_requested == 0 && processed.received_signal && !processed.is_replaying
+		if processed.received_cancellation && !processed.is_replaying {
+			live_cancellations += 1
+		}
+		if processed.canceled_workflow && !processed.is_replaying {
+			live_workflow_cancellations += 1
+		}
+		request_eviction := !expect_cancel && evictions_requested == 0 && processed.received_signal && !processed.is_replaying
 		if request_eviction {
 			eviction_error := temporal_core.worker_request_workflow_eviction(
 				&activity_worker.core,
@@ -214,17 +237,31 @@ main :: proc() {
 		}
 	}
 
-	if !failed && (evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || live_timer_cancellations != 1 || !replayed_signal || !replayed_timer_cancellation || !workflow_completed || !final_eviction) {
-		fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
-		failed = true
-	}
-	if !failed && (workflow_runtime.replay_initializations < 1 || workflow_runtime.evictions < 2) {
-		fmt.eprintf(
-			"Workflow spike expected one replay and two evictions; replay_initializations=%d evictions=%d\n",
-			workflow_runtime.replay_initializations,
-			workflow_runtime.evictions,
-		)
-		failed = true
+	if !failed {
+		if expect_cancel_timer {
+			if evictions_requested != 0 || activities_completed != 0 || live_signals != 0 || live_cancellations != 1 || live_workflow_cancellations != 1 || live_timer_cancellations != 1 || live_activity_cancellations != 0 || !workflow_completed || !final_eviction {
+				fmt.eprintln("Workflow spike did not cancel its pending timer and Workflow Execution")
+				failed = true
+			}
+		} else if expect_cancel_activity {
+			if evictions_requested != 0 || activities_completed != 0 || live_signals != 0 || live_cancellations != 1 || live_workflow_cancellations != 1 || live_timer_cancellations != 0 || live_activity_cancellations != 1 || !workflow_completed || !final_eviction {
+				fmt.eprintln("Workflow spike did not cancel its pending Activity and Workflow Execution")
+				failed = true
+			}
+		} else {
+			if evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || live_timer_cancellations != 1 || !replayed_signal || !replayed_timer_cancellation || !workflow_completed || !final_eviction {
+				fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
+				failed = true
+			}
+			if workflow_runtime.replay_initializations < 1 || workflow_runtime.evictions < 2 {
+				fmt.eprintf(
+					"Workflow spike expected one replay and two evictions; replay_initializations=%d evictions=%d\n",
+					workflow_runtime.replay_initializations,
+					workflow_runtime.evictions,
+				)
+				failed = true
+			}
+		}
 	}
 
 	workflow.fiber_runtime_close(&workflow_runtime)
@@ -240,5 +277,11 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
+	if expect_cancel_timer {
+		fmt.println("Workflow cancellation canceled the pending timer and closed the execution")
+	} else if expect_cancel_activity {
+		fmt.println("Workflow cancellation requested pending Activity cancellation and closed the execution")
+	} else {
+		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
+	}
 }

@@ -10,10 +10,11 @@ Odin, and proves multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 `CancelTimer` alongside an Activity command, and reproduces both commands after
-eviction. It does **not** provide general Workflow registration, signal
-handlers, queries/updates, Workflow cancellation, Activity
-concurrency/cancellation/heartbeats, or a stable public API. Do not use it in
-production.
+eviction. It also translates Workflow cancellation into deterministic cleanup
+of a pending timer or Activity and `CancelWorkflowExecution`. It does **not**
+provide general Workflow registration, user cancellation scopes/cleanup,
+signal handlers, queries/updates, Activity execution cancellation/heartbeats,
+or a stable public API. Do not use it in production.
 
 ```text
 Temporal CLI dev server
@@ -39,6 +40,8 @@ Prerequisites:
 The fiber experiment also builds pinned
 [minicoro](https://github.com/edubart/minicoro) through a six-symbol local C
 shim. It is a research dependency, not yet a frozen SDK choice.
+The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
+activation races and verifies byte-identical replay completions.
 
 Clone submodules and build the pinned Core bridge:
 
@@ -80,6 +83,9 @@ also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
 Workflow result after delivering an `approval` signal while the fiber is blocked
 on a durable timer, cancelling that timer, evicting the fiber, and requiring
 replay to reproduce the timer cancellation and following Activity command.
+Two more executions use `temporal workflow cancel` to verify pending-timer and
+pending-Activity cleanup through Core. The latter also verifies the late
+terminal `ResolveActivity` activation that Core sends before cache eviction.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
@@ -108,6 +114,8 @@ examples/core_connect/    Odin -> Core -> Temporal proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests
+tests_pbt/                generated activation-order and replay properties
+test-deps/pbt/            pinned, test-only property-testing submodule
 ```
 
 ## License

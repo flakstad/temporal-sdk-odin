@@ -4,3 +4,6 @@
 [submodule "native/minicoro"]
 	path = native/minicoro
 	url = https://github.com/edubart/minicoro.git
+[submodule "test-deps/pbt"]
+	path = test-deps/pbt
+	url = https://github.com/flakstad/pbt.git

@@ -7,6 +7,10 @@ commit `399cb7adb40f45eefbef90149e212743e474142c`. That upstream release commit
 contains `sdk-core` crate 0.9.0 and client/common crates 1.0.0, and is pinned by
 `sdk-dotnet` main as inspected on 2026-09-25.
 
+Property tests pin `flakstad/pbt` at
+`3b465330bd3a11c45990ef2d7f44f1cf25a18145` as the `test-deps/pbt`
+submodule. It is not linked into SDK or application artifacts.
+
 `native/Cargo.toml` is a wrapper workspace. SDK Core deliberately does not
 commit a workspace lockfile, while a language SDK needs reproducible native
 artifacts. The wrapper therefore owns `native/Cargo.lock`, following the same
@@ -85,6 +89,22 @@ resumption without requiring a server:
 ./scripts/test.sh
 ```
 
+The script runs the repository tests with Odin vetting, strict style, and
+warnings promoted to errors. It then runs a separate property suite from
+`tests_pbt` against the pinned `test-deps/pbt` submodule. That suite generates
+500 signal/timer/cancellation activation batches across nine ordering classes,
+forces eviction, reconstructs a fresh fiber, and requires the decisive
+`WorkflowActivationCompletion` bytes to match replay exactly. PBT is a
+test-only dependency. Its own package tests currently contain an upstream
+unused-variable warning, so dependency warnings are not promoted to errors in
+that second compilation; SDK-owned tests remain strict.
+
+If the property dependency is absent, initialize it with:
+
+```bash
+git submodule update --init --recursive
+```
+
 The raw package also contains compile-time ABI assertions for the structs used
 by the spike. They are checked against the pinned generated header's 64-bit C
 layout.
@@ -128,7 +148,13 @@ started a durable timer and is visibly waiting for either that timer or an
 wins, so the Odin runtime emits `CancelTimer` and schedules an Activity in the
 same completion. It then requests eviction and runs the Activity only after
 replay has reproduced both commands. The final completion eviction is required
-before the test succeeds.
+before the test succeeds. It then runs two cancellation cases through
+`temporal workflow cancel`: a Workflow blocked on a timer must emit
+`CancelTimer` plus `CancelWorkflowExecution`, and a Workflow blocked on an
+Activity must emit `RequestCancelActivity` plus `CancelWorkflowExecution`.
+Core delivers the Activity's terminal cancellation resolution in one final
+activation before eviction; Odin acknowledges it with an empty successful
+completion and does not repeat the terminal command.
 
 ## Manual run
 
@@ -160,6 +186,18 @@ temporal workflow execute \
 
 This example is intentionally a signal/timer-race replay experiment, not a
 stable or general Workflow API.
+
+To manually exercise the runtime-owned cancellation policy, start the example
+with `TEMPORAL_ODIN_SCENARIO=cancel-timer` or
+`TEMPORAL_ODIN_SCENARIO=cancel-activity`, execute it as above (use input
+`"cancel-activity"` for the latter), and then run:
+
+```bash
+temporal workflow cancel --workflow-id odin-workflow-manual
+```
+
+This narrow policy cancels pending Core operations and closes the Workflow. It
+does not yet resume the user fiber to run cleanup code.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
