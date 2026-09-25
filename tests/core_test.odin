@@ -9,6 +9,7 @@ import temporal_core "../temporal/core"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import protobuf "../temporal/protobuf"
+import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -77,6 +78,18 @@ fiber_signal_timeout_activity_test_workflow :: proc(ctx: ^workflow.Fiber_Context
 		return "Timed out"
 	}
 	return workflow.execute_activity(ctx, "hello", result.value)
+}
+
+registry_first_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	_ = ctx
+	_ = input
+	return "first"
+}
+
+registry_second_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	_ = ctx
+	_ = input
+	return "second"
 }
 
 process_fiber_test_activation :: proc(
@@ -186,6 +199,152 @@ json_string_codec_round_trip :: proc(t: ^testing.T) {
 
 	_, unsupported := codec.decode_string(encoded, "binary/plain")
 	testing.expect(t, unsupported == .Unsupported_Encoding)
+}
+
+@(test)
+worker_routes_registered_workflow_types_and_evictions :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		task_queue = "test-queue",
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		workflow_runs = make([dynamic]worker.Workflow_Run),
+	}
+	defer {
+		for &registration in sdk_worker.workflow_registrations {
+			workflow.fiber_runtime_close(&registration.runtime)
+		}
+		for workflow_run in sdk_worker.workflow_runs {
+			delete(workflow_run.run_id)
+		}
+		delete(sdk_worker.workflow_registrations)
+		delete(sdk_worker.workflow_runs)
+	}
+
+	first_runtime := workflow.Fiber_Runtime{}
+	first_init_error := workflow.fiber_runtime_init(
+		&first_runtime,
+		"first_workflow",
+		"test-queue",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, first_init_error.message == nil)
+	workflow.error_free(&first_init_error)
+	second_runtime := workflow.Fiber_Runtime{}
+	second_init_error := workflow.fiber_runtime_init(
+		&second_runtime,
+		"second_workflow",
+		"test-queue",
+		registry_second_test_workflow,
+	)
+	testing.expect(t, second_init_error.message == nil)
+	workflow.error_free(&second_init_error)
+	append(
+		&sdk_worker.workflow_registrations,
+		worker.Workflow_Registration{name = "first_workflow", runtime = first_runtime},
+		worker.Workflow_Registration{name = "second_workflow", runtime = second_runtime},
+	)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"input"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	first_initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "first_workflow",
+	}
+	defer delete(first_initialize.arguments)
+	append(&first_initialize.arguments, input)
+	second_initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "second_workflow",
+	}
+	defer delete(second_initialize.arguments)
+	append(&second_initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "registry-run-first",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &first_initialize,
+			},
+		},
+	)
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error := worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expectf(t, dispatch_error.message == nil, "first Workflow dispatch failed: %s", string(dispatch_error.message))
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil)
+	first_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, first_inspection.decoded)
+	testing.expect_value(t, string(first_inspection.completion_result), `"first"`)
+	delete(first_inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.run_id = "registry-run-second"
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &second_initialize,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expectf(t, dispatch_error.message == nil, "second Workflow dispatch failed: %s", string(dispatch_error.message))
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil)
+	second_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, second_inspection.decoded)
+	testing.expect_value(t, string(second_inspection.completion_result), `"second"`)
+	delete(second_inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 2)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.run_id = "registry-run-first"
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
+	testing.expect_value(t, sdk_worker.workflow_runs[0].run_id, "registry-run-second")
+
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message != nil)
+	worker.error_free(&dispatch_error)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
 }
 
 @(test)

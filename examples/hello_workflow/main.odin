@@ -33,6 +33,29 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	return workflow.execute_activity(ctx, "hello", approval.value)
 }
 
+observe_activation :: proc(processed: ^workflow.Process_Result) {
+	fmt.printf(
+		"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+		processed.history_length,
+		processed.is_replaying,
+		processed.scheduled_activity_count,
+		processed.activity_seq,
+		processed.resolved_activity_seq,
+		processed.resolved_activity_failed,
+		processed.received_signal,
+		processed.received_cancellation,
+		processed.canceled_workflow,
+		processed.started_timer,
+		processed.canceled_timer,
+		processed.requested_activity_cancellation,
+		processed.waiting_activity_seq,
+		processed.waiting_timer_seq,
+		processed.waiting_signal,
+		processed.completed,
+		processed.evicted,
+	)
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -72,27 +95,14 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	workflow_runtime := workflow.Fiber_Runtime{}
-	workflow_init_error := workflow.fiber_runtime_init(
-		&workflow_runtime,
+	workflow_register_error := worker.register_workflow(
+		&activity_worker,
 		WORKFLOW_TYPE,
-		TASK_QUEUE,
 		hello_workflow,
 	)
-	if workflow_init_error.message != nil {
-		fmt.eprintf("Workflow runtime initialization failed: %s\n", string(workflow_init_error.message))
-		workflow.error_free(&workflow_init_error)
-		_ = worker.close(&activity_worker)
-		temporal_core.client_close(&client)
-		temporal_core.runtime_close(&runtime)
-		os.exit(1)
-	}
-
-	validate_error := temporal_core.worker_validate(&activity_worker.core)
-	if validate_error.message != nil {
-		fmt.eprintf("Worker validation failed: %s\n", string(validate_error.message))
-		temporal_core.error_free(&validate_error)
-		workflow.fiber_runtime_close(&workflow_runtime)
+	if workflow_register_error.message != nil {
+		fmt.eprintf("Workflow registration failed: %s\n", string(workflow_register_error.message))
+		worker.error_free(&workflow_register_error)
 		_ = worker.close(&activity_worker)
 		temporal_core.client_close(&client)
 		temporal_core.runtime_close(&runtime)
@@ -105,166 +115,46 @@ main :: proc() {
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity
-	evictions_requested := 0
-	activities_completed := 0
-	live_resolutions := 0
-	live_signals := 0
-	replayed_signal := false
-	live_timer_cancellations := 0
-	live_activity_cancellations := 0
-	replayed_timer_cancellation := false
-	live_cancellations := 0
-	live_workflow_cancellations := 0
-	workflow_completed := false
-	final_eviction := false
+	run_stats, run_error := worker.run(
+		&activity_worker,
+		{
+			max_activity_tasks = expect_cancel ? 0 : 1,
+			max_workflow_executions = 1,
+			disable_activity_polling = expect_cancel,
+			on_workflow_activation = observe_activation,
+		},
+	)
 	failed := false
-
-	for poll_count := 0; poll_count < 32 && !(workflow_completed && final_eviction); poll_count += 1 {
-		poll := temporal_core.worker_poll_workflow(&activity_worker.core)
-		if poll.error.message != nil {
-			fmt.eprintf("Workflow poll failed: %s\n", string(poll.error.message))
-			temporal_core.error_free(&poll.error)
-			failed = true
-			break
-		}
-		if poll.shutdown {
-			fmt.eprintln("Workflow poll shut down before the Workflow completed")
-			failed = true
-			break
-		}
-
-		processed := workflow.process_fiber_activation(&workflow_runtime, poll.protobuf)
-		delete(poll.protobuf)
-		if processed.completion != nil {
-			completion_error := temporal_core.worker_complete_workflow(
-				&activity_worker.core,
-				processed.completion[:],
-			)
-			delete(processed.completion)
-			if completion_error.message != nil {
-				fmt.eprintf("Workflow completion failed: %s\n", string(completion_error.message))
-				temporal_core.error_free(&completion_error)
-				workflow.error_free(&processed.error)
-				failed = true
-				break
-			}
-		}
-
-		fmt.printf(
-			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
-			processed.history_length,
-			processed.is_replaying,
-			processed.scheduled_activity_count,
-			processed.activity_seq,
-			processed.resolved_activity_seq,
-			processed.resolved_activity_failed,
-			processed.received_signal,
-			processed.received_cancellation,
-			processed.canceled_workflow,
-			processed.started_timer,
-			processed.canceled_timer,
-			processed.requested_activity_cancellation,
-			processed.waiting_activity_seq,
-			processed.waiting_timer_seq,
-			processed.waiting_signal,
-			processed.completed,
-			processed.evicted,
-		)
-		if processed.error.message != nil {
-			fmt.eprintf("Workflow state machine failed: %s\n", string(processed.error.message))
-			workflow.error_free(&processed.error)
-			failed = true
-			break
-		}
-
-		if processed.resolved_activity_seq != 0 && !processed.is_replaying {
-			live_resolutions += 1
-		}
-		if processed.received_signal && !processed.is_replaying {
-			live_signals += processed.received_signal_count
-		}
-		if processed.received_signal && processed.is_replaying {
-			replayed_signal = true
-		}
-		if processed.canceled_timer && !processed.is_replaying {
-			live_timer_cancellations += 1
-		}
-		if processed.requested_activity_cancellation && !processed.is_replaying {
-			live_activity_cancellations += processed.requested_activity_cancellation_count
-		}
-		if processed.canceled_timer && processed.is_replaying {
-			replayed_timer_cancellation = true
-		}
-		if processed.received_cancellation && !processed.is_replaying {
-			live_cancellations += 1
-		}
-		if processed.canceled_workflow && !processed.is_replaying {
-			live_workflow_cancellations += 1
-		}
-		request_eviction := !expect_cancel && evictions_requested == 0 && processed.received_signal && !processed.is_replaying
-		if request_eviction {
-			eviction_error := temporal_core.worker_request_workflow_eviction(
-				&activity_worker.core,
-				processed.run_id,
-			)
-			if eviction_error.message != nil {
-				fmt.eprintf("Workflow eviction request failed: %s\n", string(eviction_error.message))
-				temporal_core.error_free(&eviction_error)
-				failed = true
-				break
-			}
-			evictions_requested += 1
-		}
-
-		if processed.evicted {
-			if activities_completed < evictions_requested {
-				activity_error := worker.run(&activity_worker, max_tasks = 1)
-				if activity_error.message != nil {
-					fmt.eprintf("Activity execution failed: %s\n", string(activity_error.message))
-					worker.error_free(&activity_error)
-					failed = true
-					break
-				}
-				activities_completed += 1
-			}
-		}
-
-		if processed.completed {
-			workflow_completed = true
-		}
-		if processed.evicted && workflow_completed {
-			final_eviction = true
-		}
+	if run_error.message != nil {
+		fmt.eprintf("Worker run failed: %s\n", string(run_error.message))
+		worker.error_free(&run_error)
+		failed = true
 	}
-
+	if !failed && run_stats.workflow_executions_completed != 1 {
+		fmt.eprintln("Workflow worker did not complete exactly one Workflow Execution")
+		failed = true
+	}
+	if !failed && run_stats.workflow_evictions < 1 {
+		fmt.eprintln("Workflow worker did not observe final cache eviction")
+		failed = true
+	}
 	if !failed {
 		if expect_cancel_timer {
-			if evictions_requested != 0 || activities_completed != 0 || live_signals != 0 || live_cancellations != 1 || live_workflow_cancellations != 1 || live_timer_cancellations != 1 || live_activity_cancellations != 0 || !workflow_completed || !final_eviction {
+			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 || run_stats.activity_cancellations_requested != 0 {
 				fmt.eprintln("Workflow spike did not cancel its pending timer and Workflow Execution")
 				failed = true
 			}
 		} else if expect_cancel_activity {
-			if evictions_requested != 0 || activities_completed != 0 || live_signals != 0 || live_cancellations != 1 || live_workflow_cancellations != 1 || live_timer_cancellations != 0 || live_activity_cancellations != 1 || !workflow_completed || !final_eviction {
+			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
 				fmt.eprintln("Workflow spike did not cancel its pending Activity and Workflow Execution")
 				failed = true
 			}
-		} else {
-			if evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || live_timer_cancellations != 1 || !replayed_signal || !replayed_timer_cancellation || !workflow_completed || !final_eviction {
-				fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
-				failed = true
-			}
-			if workflow_runtime.replay_initializations < 1 || workflow_runtime.evictions < 2 {
-				fmt.eprintf(
-					"Workflow spike expected one replay and two evictions; replay_initializations=%d evictions=%d\n",
-					workflow_runtime.replay_initializations,
-					workflow_runtime.evictions,
-				)
-				failed = true
-			}
+		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 {
+			fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
+			failed = true
 		}
 	}
 
-	workflow.fiber_runtime_close(&workflow_runtime)
 	close_error := worker.close(&activity_worker)
 	if close_error.message != nil {
 		fmt.eprintf("Worker shutdown failed: %s\n", string(close_error.message))

@@ -5,7 +5,8 @@ Activity Worker slice, schema-derived Core protobuf bindings, a bounded
 Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
-runtime-owned Workflow cancellation, 2026-09-25.
+runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
+registry and poll loop, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -796,6 +797,52 @@ waits, or a real Workflow scheduler introduce orthogonal regions or nested
 states. At that point it can be valuable precisely because the model should be
 independent of the runtime implementation.
 
+### Reusable worker registry and poll boundary
+
+Core's architecture assigns task dispatch and concurrency to the language SDK:
+the language layer continuously polls each enabled task kind, invokes user
+code, and returns completions, using language-appropriate threads or
+coroutines. The pinned
+[Core architecture document](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/ARCHITECTURE.md)
+is explicit that this concurrency is not supplied by Core.
+
+The first reusable Odin worker implements this boundary:
+
+```text
+worker.run
+    |-- Workflow poll thread
+    |      decode route
+    |      Workflow type --initialization--> registered Fiber_Runtime
+    |      run ID --------subsequent-------> same Fiber_Runtime
+    |      process activation -> complete activation
+    |      RemoveFromCache -> destroy fiber and route
+    |
+    `-- Activity poll thread
+           decode task -> registered Activity -> complete task
+```
+
+The blocking C calls can run concurrently against the same Core worker. The
+Workflow registry itself is frozen while `run` is active, and only the Workflow
+poll thread accesses its fiber runtimes and run-ID table. This preserves
+single-threaded fiber affinity while allowing a Workflow-produced Activity to
+execute without stopping Workflow polling. The Activity side is still one
+poller executing one procedure synchronously; this is orchestration
+concurrency, not yet concurrent Activity execution.
+
+`register_workflow(name, proc)` owns one `Fiber_Runtime` per Workflow type. A
+unit test initializes two types under different run IDs, verifies dispatch to
+the correct procedure, evicts one, and proves that the other route remains.
+The live signal/timer test now uses only this worker boundary: Workflow and
+Activity streams run together, Core eviction causes fresh-stack replay, and
+the Activity result resumes the correct Workflow.
+
+Normal `worker.run` is unbounded. `request_shutdown` forwards Core's shutdown
+request so outstanding poll calls can return; `close` is rejected while `run`
+is active and finalizes only afterward. Bounded task/execution counts exist for
+examples and tests. The current construction API still requires
+`enable_workflows = true` before registration because the Core worker is
+created too early; delayed construction is the clean fix.
+
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
@@ -822,10 +869,11 @@ Workflows are enabled.
    wire-compatible with `prost`. Unknown fields are skipped rather than
    retained. Every new root graph still needs generation, compile, unit, and
    live `prost` interoperability checks.
-3. **Async callback integration.** The synchronous single-task worker is safe
-   but not scalable. A real worker needs a callback-to-channel/event loop with
-   heap-stable state, concurrent Activity execution, cancellation, and
-   heartbeats.
+3. **Worker concurrency.** Dedicated Workflow and Activity poll threads now
+   integrate the blocking callbacks and preserve Workflow fiber affinity, but
+   the Activity side remains synchronous. A production worker needs a bounded
+   Activity executor, heap-stable in-flight state, cancellation delivery,
+   heartbeats, and backpressure tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -852,7 +900,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, runtime-owned cancellation, eviction, and replay on macOS arm64 | Move orchestration behind a reusable Workflow registry/worker loop, then design user cancellation scopes |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, runtime-owned cancellation, registered dispatch, eviction, and replay on macOS arm64 | Add user cancellation scopes and test multiple live Workflow runs without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -862,15 +910,20 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-Workflow cancellation now works for pending timers and Activities, including
-Core's late Activity-cancellation resolution. The next vertical milestone
-should move the orchestration currently embedded in `examples/hello_workflow`
-into `temporal/worker`: a typed Workflow registry plus one worker run loop that
-owns both Core poll streams, dispatches Workflow types to their runtimes,
-completes activations, and shuts down deterministically. Keep the current
-single-string codec boundary while proving registration and lifecycle; generic
-payload APIs and user cancellation scopes should follow rather than being mixed
-into that refactor.
+Workflow and Activity orchestration now lives in `temporal/worker`, and the live
+example no longer polls Core or dispatches activations itself. The next vertical
+milestone should make Activity execution genuinely asynchronous: one poll loop,
+a small bounded executor, task-token keyed in-flight state, `ActivityTask`
+cancellation delivery, and heartbeat support through `Activity_Context`. This
+tests the next unproven Core/language lifecycle boundary and removes the largest
+gap in the Activity worker without coupling it to Workflow cancellation-scope
+syntax.
+
+Alongside that slice, delay Core worker construction until `run` so registered
+task types determine Core options and the public API no longer exposes
+`enable_workflows`. Unknown Workflow types must also produce a language-facing
+failed activation without terminating the worker. Generic payload APIs and
+user Workflow cancellation scopes should follow as separate changes.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

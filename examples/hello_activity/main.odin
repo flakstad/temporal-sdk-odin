@@ -49,7 +49,10 @@ main :: proc() {
 	}
 
 	fmt.println("Odin Activity Worker is polling task queue odin-hello-activity")
-	run_error := worker.run(&activity_worker, max_tasks = 1)
+	_, run_error := worker.run(
+		&activity_worker,
+		{max_activity_tasks = 1},
+	)
 	close_error := worker.close(&activity_worker)
 	if run_error.message != nil {
 		fmt.eprintf("Worker failed: %s\n", string(run_error.message))

@@ -192,6 +192,14 @@ find_fiber_instance :: proc(runtime: ^Fiber_Runtime, run_id: string) -> (^Fiber_
 	return nil, false
 }
 
+fiber_runtime_has_run :: proc(runtime: ^Fiber_Runtime, run_id: string) -> bool {
+	if runtime == nil {
+		return false
+	}
+	_, found := find_fiber_instance(runtime, run_id)
+	return found
+}
+
 remove_fiber_instance :: proc(runtime: ^Fiber_Runtime, run_id: string) -> Error {
 	for index in 0..<len(runtime.instances) {
 		if runtime.instances[index].run_id == run_id {

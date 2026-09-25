@@ -347,6 +347,13 @@ worker_request_workflow_eviction :: proc(worker: ^Worker, run_id: string) -> Err
 	return {}
 }
 
+worker_initiate_shutdown :: proc(worker: ^Worker) {
+	if worker == nil || worker.handle == nil {
+		return
+	}
+	raw.worker_initiate_shutdown(worker.handle)
+}
+
 finalize_shutdown_invoke :: proc(handle: ^raw.Worker, user_data: rawptr, callback: raw.Worker_Callback) {
 	raw.worker_finalize_shutdown(handle, user_data, callback)
 }
@@ -355,7 +362,7 @@ worker_close :: proc(worker: ^Worker) -> Error {
 	if worker == nil || worker.handle == nil {
 		return {}
 	}
-	raw.worker_initiate_shutdown(worker.handle)
+	worker_initiate_shutdown(worker)
 	// Core shutdown completes only after every enabled poll stream observes
 	// PollError::ShutDown. The synchronous wrapper has no outstanding polls, so
 	// drain each enabled stream here before finalize_shutdown.

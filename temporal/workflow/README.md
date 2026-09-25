@@ -33,5 +33,6 @@ the simpler `execute_activity` propagates an unhandled failure to Temporal.
 Named string signals are queued in arrival order and do not resume a fiber that
 is waiting on another operation. `await_signal_or_timeout` schedules a durable
 timer and emits `CancelTimer` only when a signal wins before the timer fires.
-Neither implementation is a stable registration API or a complete Workflow
-runtime. Do not build application Workflows against them.
+`temporal/worker` now provides experimental name-based Workflow registration
+and dispatch, but neither the fiber API nor its one-string codec is stable or a
+complete Workflow runtime. Do not build production Workflows against them.

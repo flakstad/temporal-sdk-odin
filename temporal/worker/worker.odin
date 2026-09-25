@@ -1,27 +1,65 @@
-// Package worker is the first public vertical slice. It supports synchronous
-// one-string/one-string Activities while the API shape is still experimental.
+// Package worker owns registration, Core polling, dispatch, and lifecycle.
+// The one-string codec and Workflow fiber runtime remain experimental.
 package worker
 
 import "core:bytes"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+import "core:thread"
 import activity "../activity"
 import codec "../codec"
 import temporal_core "../core"
 import proto "../core/proto"
+import workflow "../workflow"
 
 String_Activity_Proc :: #type proc(ctx: ^activity.Context, input: string) -> string
 
-Registration :: struct {
+Activity_Registration :: struct {
 	name:     string,
 	callback: String_Activity_Proc,
 }
 
+Workflow_Registration :: struct {
+	name:    string,
+	runtime: workflow.Fiber_Runtime,
+}
+
+Workflow_Run :: struct {
+	run_id:             string,
+	registration_index: int,
+}
+
+Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
+
+Run_Options :: struct {
+	// Zero means no bound. These limits exist for tests and examples; production
+	// workers normally run until request_shutdown is called.
+	max_activity_tasks:       int,
+	max_workflow_executions: int,
+	disable_activity_polling: bool,
+	on_workflow_activation:  Workflow_Activation_Observer,
+}
+
+Run_Stats :: struct {
+	activity_tasks_completed:             int,
+	workflow_activations_completed:       int,
+	workflow_executions_completed:        int,
+	workflow_replay_activations:          int,
+	workflow_evictions:                   int,
+	workflow_signals_received:            int,
+	workflow_cancellations_received:      int,
+	timers_canceled:                      int,
+	activity_cancellations_requested:     int,
+}
+
 Worker :: struct {
-	core:          temporal_core.Worker,
-	registrations: [dynamic]Registration,
-	running:       bool,
+	core:                   temporal_core.Worker,
+	task_queue:             string,
+	activity_registrations: [dynamic]Activity_Registration,
+	workflow_registrations: [dynamic]Workflow_Registration,
+	workflow_runs:          [dynamic]Workflow_Run,
+	running:                bool,
 }
 
 Error :: struct {
@@ -59,8 +97,17 @@ create :: proc(
 	if core_error.message != nil {
 		return {}, error_from_core(&core_error)
 	}
+	owned_task_queue, allocation_error := strings.clone(task_queue)
+	if allocation_error != nil {
+		close_error := temporal_core.worker_close(&core_worker)
+		temporal_core.error_free(&close_error)
+		return {}, error_from_string("could not allocate worker task queue")
+	}
 	worker.core = core_worker
-	worker.registrations = make([dynamic]Registration)
+	worker.task_queue = owned_task_queue
+	worker.activity_registrations = make([dynamic]Activity_Registration)
+	worker.workflow_registrations = make([dynamic]Workflow_Registration)
+	worker.workflow_runs = make([dynamic]Workflow_Run)
 	return
 }
 
@@ -74,7 +121,7 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 	if len(name) == 0 || callback == nil {
 		return error_from_string("activity name and callback are required")
 	}
-	for registration in worker.registrations {
+	for registration in worker.activity_registrations {
 		if registration.name == name {
 			return error_from_string("activity is already registered")
 		}
@@ -83,12 +130,49 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 	if allocation_error != nil {
 		return error_from_string("could not allocate activity name")
 	}
-	append(&worker.registrations, Registration{name = owned_name, callback = callback})
+	append(&worker.activity_registrations, Activity_Registration{name = owned_name, callback = callback})
+	return {}
+}
+
+register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
+	if worker == nil || worker.core.handle == nil {
+		return error_from_string("worker is not initialized")
+	}
+	if !worker.core.workflows_enabled {
+		return error_from_string("worker was created without Workflow polling enabled")
+	}
+	if worker.running {
+		return error_from_string("workflows cannot be registered after worker.run starts")
+	}
+	if len(name) == 0 || callback == nil {
+		return error_from_string("workflow name and callback are required")
+	}
+	for registration in worker.workflow_registrations {
+		if registration.name == name {
+			return error_from_string("workflow is already registered")
+		}
+	}
+	owned_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		return error_from_string("could not allocate workflow name")
+	}
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(&runtime, name, worker.task_queue, callback)
+	if init_error.message != nil {
+		delete(owned_name)
+		result := error_from_string(string(init_error.message))
+		workflow.error_free(&init_error)
+		return result
+	}
+	append(
+		&worker.workflow_registrations,
+		Workflow_Registration{name = owned_name, runtime = runtime},
+	)
 	return {}
 }
 
 find_activity :: proc(worker: ^Worker, name: string) -> (String_Activity_Proc, bool) {
-	for registration in worker.registrations {
+	for registration in worker.activity_registrations {
 		if registration.name == name {
 			return registration.callback, true
 		}
@@ -139,29 +223,129 @@ execute_start :: proc(worker: ^Worker, task: ^proto.Activity_Task) -> (completio
 	return proto.encode_activity_success(task.task_token, result_data), {}
 }
 
-run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
-	if worker == nil || worker.core.handle == nil {
-		return error_from_string("worker is not initialized")
-	}
-	if worker.running {
-		return error_from_string("worker is already running")
-	}
-	if len(worker.registrations) == 0 {
-		return error_from_string("worker has no registered activities")
-	}
-	worker.running = true
-	defer { worker.running = false }
+Workflow_Activation_Route :: struct {
+	run_id:        string,
+	workflow_type: string,
+	initializes:   bool,
+}
 
-	validate_error := temporal_core.worker_validate(&worker.core)
-	if validate_error.message != nil {
-		return error_from_core(&validate_error)
+decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activation_Route, ok: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{}
+	ok = proto.decode_Coresdk_Workflow_Activation_WorkflowActivation(data, &activation)
+	context.allocator = previous_allocator
+	if !ok || len(activation.run_id) == 0 {
+		ok = false
+		return
+	}
+	route.run_id = activation.run_id
+	for job in activation.jobs {
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow:
+			if variant.value == nil || route.initializes {
+				ok = false
+				return
+			}
+			route.initializes = true
+			route.workflow_type = variant.value.workflow_type
+		}
+	}
+	return
+}
+
+find_workflow_registration :: proc(worker: ^Worker, name: string) -> (int, bool) {
+	for registration, index in worker.workflow_registrations {
+		if registration.name == name {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+find_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, bool) {
+	for workflow_run, index in worker.workflow_runs {
+		if workflow_run.run_id == run_id {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+remove_workflow_run :: proc(worker: ^Worker, index: int) {
+	delete(worker.workflow_runs[index].run_id)
+	ordered_remove(&worker.workflow_runs, index)
+}
+
+process_workflow_activation :: proc(
+	worker: ^Worker,
+	data: []u8,
+) -> (processed: workflow.Process_Result, error: Error) {
+	route, route_ok := decode_workflow_activation_route(data)
+	if !route_ok {
+		return {}, error_from_string("Core returned a malformed WorkflowActivation protobuf")
 	}
 
-	completed := 0
+	registration_index := 0
+	run_index, run_found := find_workflow_run(worker, route.run_id)
+	owned_run_id := ""
+	if route.initializes {
+		if run_found {
+			return {}, error_from_string("Workflow run was initialized more than once without eviction")
+		}
+		registration_found: bool
+		registration_index, registration_found = find_workflow_registration(worker, route.workflow_type)
+		if !registration_found {
+			message := fmt.aprintf("workflow %q is not registered", route.workflow_type)
+			defer delete(message)
+			return {}, error_from_string(message)
+		}
+		cloned_run_id, allocation_error := strings.clone(route.run_id)
+		if allocation_error != nil {
+			return {}, error_from_string("could not allocate Workflow run route")
+		}
+		owned_run_id = cloned_run_id
+	} else {
+		if !run_found {
+			return {}, error_from_string("Workflow activation does not match a registered run")
+		}
+		registration_index = worker.workflow_runs[run_index].registration_index
+	}
+
+	registration := &worker.workflow_registrations[registration_index]
+	processed = workflow.process_fiber_activation(&registration.runtime, data)
+	if route.initializes {
+		if workflow.fiber_runtime_has_run(&registration.runtime, route.run_id) {
+			append(
+				&worker.workflow_runs,
+				Workflow_Run{
+					run_id = owned_run_id,
+					registration_index = registration_index,
+				},
+			)
+			owned_run_id = ""
+		}
+		delete(owned_run_id)
+	}
+	if processed.evicted {
+		run_index, run_found = find_workflow_run(worker, route.run_id)
+		if run_found {
+			remove_workflow_run(worker, run_index)
+		}
+	}
+	return
+}
+
+run_activity_loop :: proc(worker: ^Worker, max_tasks: int) -> (completed: int, error: Error) {
 	for max_tasks <= 0 || completed < max_tasks {
 		poll := temporal_core.worker_poll_activity(&worker.core)
 		if poll.error.message != nil {
-			return error_from_core(&poll.error)
+			return completed, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
 			break
@@ -171,7 +355,7 @@ run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
 		arena_error := virtual.arena_init_growing(&decode_arena)
 		if arena_error != nil {
 			delete(poll.protobuf)
-			return error_from_string("could not initialize protobuf decode arena")
+			return completed, error_from_string("could not initialize protobuf decode arena")
 		}
 		previous_allocator := context.allocator
 		context.allocator = virtual.arena_allocator(&decode_arena)
@@ -180,12 +364,10 @@ run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
 		if decode_error != .None {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return error_from_string("Core returned a malformed ActivityTask protobuf")
+			return completed, error_from_string("Core returned a malformed ActivityTask protobuf")
 		}
 		if task.kind == .Cancel {
-			// Concurrent cancellation is intentionally deferred. The current worker
-			// executes one synchronous task at a time and cannot have an in-flight
-			// task to cancel while it is polling.
+			// Concurrent Activity execution and cancellation delivery are deferred.
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
 			continue
@@ -195,29 +377,228 @@ run :: proc(worker: ^Worker, max_tasks := 0) -> Error {
 		virtual.arena_destroy(&decode_arena)
 		if execute_error.message != nil {
 			delete(poll.protobuf)
-			return execute_error
+			return completed, execute_error
 		}
 		complete_error := temporal_core.worker_complete_activity(&worker.core, completion[:])
 		delete(completion)
 		delete(poll.protobuf)
 		if complete_error.message != nil {
-			return error_from_core(&complete_error)
+			return completed, error_from_core(&complete_error)
 		}
 		completed += 1
 	}
-	return {}
+	return
+}
+
+record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
+	stats.workflow_activations_completed += 1
+	if processed.completed {
+		stats.workflow_executions_completed += 1
+	}
+	if processed.is_replaying {
+		stats.workflow_replay_activations += 1
+	}
+	if processed.evicted {
+		stats.workflow_evictions += 1
+	}
+	if !processed.is_replaying {
+		stats.workflow_signals_received += processed.received_signal_count
+		if processed.received_cancellation {
+			stats.workflow_cancellations_received += 1
+		}
+		if processed.canceled_timer {
+			stats.timers_canceled += 1
+		}
+		stats.activity_cancellations_requested += processed.requested_activity_cancellation_count
+	}
+}
+
+run_workflow_loop :: proc(
+	worker: ^Worker,
+	options: Run_Options,
+) -> (stats: Run_Stats, error: Error) {
+	target_reached := false
+	for {
+		poll := temporal_core.worker_poll_workflow(&worker.core)
+		if poll.error.message != nil {
+			return stats, error_from_core(&poll.error)
+		}
+		if poll.shutdown {
+			break
+		}
+
+		processed, dispatch_error := process_workflow_activation(worker, poll.protobuf)
+		delete(poll.protobuf)
+		if dispatch_error.message != nil {
+			return stats, dispatch_error
+		}
+		if processed.completion == nil {
+			workflow.error_free(&processed.error)
+			return stats, error_from_string("Workflow activation produced no completion")
+		}
+		complete_error := temporal_core.worker_complete_workflow(
+			&worker.core,
+			processed.completion[:],
+		)
+		if options.on_workflow_activation != nil {
+			options.on_workflow_activation(&processed)
+		}
+		delete(processed.completion)
+		processed.completion = nil
+		if complete_error.message != nil {
+			workflow.error_free(&processed.error)
+			return stats, error_from_core(&complete_error)
+		}
+		record_workflow_result(&stats, &processed)
+		if processed.error.message != nil {
+			message := string(processed.error.message)
+			result := error_from_string(message)
+			workflow.error_free(&processed.error)
+			return stats, result
+		}
+		workflow.error_free(&processed.error)
+
+		if options.max_workflow_executions > 0 &&
+		   stats.workflow_executions_completed >= options.max_workflow_executions {
+			target_reached = true
+		}
+		// Core owns cache eviction. A bounded run waits for the first eviction
+		// after its terminal command so the language-owned fiber is destroyed.
+		if target_reached && processed.evicted {
+			break
+		}
+	}
+	return
+}
+
+Activity_Thread_State :: struct {
+	worker:    ^Worker,
+	max_tasks: int,
+	completed: int,
+	error:     Error,
+}
+
+Workflow_Thread_State :: struct {
+	worker:  ^Worker,
+	options: Run_Options,
+	stats:   Run_Stats,
+	error:   Error,
+}
+
+activity_thread_main :: proc(state: ^Activity_Thread_State) {
+	state.completed, state.error = run_activity_loop(state.worker, state.max_tasks)
+	if state.error.message != nil {
+		temporal_core.worker_initiate_shutdown(&state.worker.core)
+	}
+}
+
+workflow_thread_main :: proc(state: ^Workflow_Thread_State) {
+	state.stats, state.error = run_workflow_loop(state.worker, state.options)
+	if state.error.message != nil {
+		temporal_core.worker_initiate_shutdown(&state.worker.core)
+	}
+}
+
+run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, error: Error) {
+	if worker == nil || worker.core.handle == nil {
+		return {}, error_from_string("worker is not initialized")
+	}
+	if worker.running {
+		return {}, error_from_string("worker is already running")
+	}
+	if options.max_activity_tasks < 0 || options.max_workflow_executions < 0 {
+		return {}, error_from_string("worker run limits must not be negative")
+	}
+	poll_activities := len(worker.activity_registrations) > 0 && !options.disable_activity_polling
+	poll_workflows := len(worker.workflow_registrations) > 0
+	if !poll_activities && !poll_workflows {
+		return {}, error_from_string("worker has no enabled registered task types")
+	}
+	worker.running = true
+	defer { worker.running = false }
+
+	validate_error := temporal_core.worker_validate(&worker.core)
+	if validate_error.message != nil {
+		return {}, error_from_core(&validate_error)
+	}
+
+	if poll_activities && !poll_workflows {
+		stats.activity_tasks_completed, error = run_activity_loop(worker, options.max_activity_tasks)
+		return
+	}
+	if poll_workflows && !poll_activities {
+		return run_workflow_loop(worker, options)
+	}
+
+	activity_state := Activity_Thread_State{
+		worker = worker,
+		max_tasks = options.max_activity_tasks,
+	}
+	workflow_state := Workflow_Thread_State{worker = worker, options = options}
+	workflow_thread := thread.create_and_start_with_poly_data(&workflow_state, workflow_thread_main)
+	if workflow_thread == nil {
+		return {}, error_from_string("could not start Workflow poll thread")
+	}
+	activity_thread := thread.create_and_start_with_poly_data(&activity_state, activity_thread_main)
+	if activity_thread == nil {
+		temporal_core.worker_initiate_shutdown(&worker.core)
+		thread.join(workflow_thread)
+		thread.destroy(workflow_thread)
+		error_free(&workflow_state.error)
+		return {}, error_from_string("could not start Activity poll thread")
+	}
+	thread.join(workflow_thread)
+	thread.join(activity_thread)
+	thread.destroy(workflow_thread)
+	thread.destroy(activity_thread)
+
+	stats = workflow_state.stats
+	stats.activity_tasks_completed = activity_state.completed
+	if workflow_state.error.message != nil {
+		error = workflow_state.error
+		error_free(&activity_state.error)
+		return
+	}
+	if activity_state.error.message != nil {
+		error = activity_state.error
+		return
+	}
+	return
+}
+
+request_shutdown :: proc(worker: ^Worker) {
+	if worker == nil {
+		return
+	}
+	temporal_core.worker_initiate_shutdown(&worker.core)
 }
 
 close :: proc(worker: ^Worker) -> Error {
 	if worker == nil {
 		return {}
 	}
+	if worker.running {
+		return error_from_string("worker cannot be closed while worker.run is active")
+	}
 	core_error := temporal_core.worker_close(&worker.core)
-	for registration in worker.registrations {
+	for registration in worker.activity_registrations {
 		delete(registration.name)
 	}
-	delete(worker.registrations)
-	worker.registrations = nil
+	for &registration in worker.workflow_registrations {
+		workflow.fiber_runtime_close(&registration.runtime)
+		delete(registration.name)
+	}
+	for workflow_run in worker.workflow_runs {
+		delete(workflow_run.run_id)
+	}
+	delete(worker.activity_registrations)
+	delete(worker.workflow_registrations)
+	delete(worker.workflow_runs)
+	delete(worker.task_queue)
+	worker.activity_registrations = nil
+	worker.workflow_registrations = nil
+	worker.workflow_runs = nil
+	worker.task_queue = ""
 	worker.running = false
 	return error_from_core(&core_error)
 }

@@ -109,6 +109,31 @@ The raw package also contains compile-time ABI assertions for the structs used
 by the spike. They are checked against the pinned generated header's 64-bit C
 layout.
 
+## Worker registration and polling
+
+`temporal/worker` owns the reusable language-side worker boundary. Activities
+and Workflows must be registered before `worker.run` starts. Initialization
+activations are routed by Workflow type; subsequent activations are routed by
+run ID until Core sends `RemoveFromCache`. Eviction destroys the corresponding
+fiber and removes that route.
+
+The C wrapper currently presents blocking poll calls. When both task types are
+registered, `worker.run` creates one Workflow poll thread and one Activity poll
+thread. Only the Workflow thread reads or mutates Workflow runtimes, so a fiber
+never migrates between threads. The Activity thread still invokes one Activity
+synchronously at a time. `worker.request_shutdown` is safe to call from a
+coordinating thread; `worker.close` must only be called after `run` returns.
+
+`Run_Options.max_activity_tasks` and `max_workflow_executions` are bounded
+test/example controls. Zero means unbounded. Normal workers call `run` without
+bounds and arrange for another thread or process-lifecycle handler to call
+`request_shutdown`.
+
+Core is still constructed by `worker.create`, before registrations are known.
+Consequently, callers registering Workflows must temporarily pass
+`enable_workflows = true`. Delaying Core worker construction until `run` would
+remove this leaky option and let registrations select the enabled task streams.
+
 The integration test uses Temporal CLI directly—no Docker, PostgreSQL, or
 Elasticsearch:
 
@@ -146,9 +171,10 @@ with `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
 `approval` signal, the script sends the signal through Temporal CLI. The signal
 wins, so the Odin runtime emits `CancelTimer` and schedules an Activity in the
-same completion. It then requests eviction and runs the Activity only after
-replay has reproduced both commands. The final completion eviction is required
-before the test succeeds. It then runs two cancellation cases through
+same completion. The reusable worker's Activity poll thread completes that
+Activity while its Workflow poll thread handles Core-directed eviction and
+fresh-stack replay. The final completion eviction is required before the test
+succeeds. It then runs two cancellation cases through
 `temporal workflow cancel`: a Workflow blocked on a timer must emit
 `CancelTimer` plus `CancelWorkflowExecution`, and a Workflow blocked on an
 Activity must emit `RequestCancelActivity` plus `CancelWorkflowExecution`.

@@ -11,10 +11,12 @@ buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 `CancelTimer` alongside an Activity command, and reproduces both commands after
 eviction. It also translates Workflow cancellation into deterministic cleanup
-of a pending timer or Activity and `CancelWorkflowExecution`. It does **not**
-provide general Workflow registration, user cancellation scopes/cleanup,
-signal handlers, queries/updates, Activity execution cancellation/heartbeats,
-or a stable public API. Do not use it in production.
+of a pending timer or Activity and `CancelWorkflowExecution`. A reusable worker
+now registers both Activity and Workflow procedures, routes run IDs to the
+correct fiber runtime, and polls both Core task streams concurrently. It does
+**not** provide user cancellation scopes/cleanup, signal handlers,
+queries/updates, concurrent Activity execution/cancellation/heartbeats, or a
+stable public API. Do not use it in production.
 
 ```text
 Temporal CLI dev server
@@ -23,8 +25,9 @@ Temporal CLI dev server
 Temporal SDK Core
           ^ C ABI
           |
-Odin raw bindings -> generated Core protobuf types -> Activity dispatch
-                                            `-----> experimental Workflow fiber
+Odin raw bindings -> generated Core protobuf types -> worker registry/run loop
+                                                   |-> Activity dispatch
+                                                   `-> Workflow fibers
 ```
 
 ## Quick start
@@ -77,6 +80,22 @@ Run it with:
 ./scripts/integration-test.sh
 ```
 
+The combined example now uses the reusable registration boundary:
+
+```odin
+temporal_worker, _ := worker.create(
+    &client,
+    "odin-hello-workflow",
+    enable_workflows = true,
+)
+_ = worker.register_activity(&temporal_worker, "hello", hello)
+_ = worker.register_workflow(&temporal_worker, "odin_hello_workflow", hello_workflow)
+_, _ = worker.run(&temporal_worker)
+```
+
+The explicit `enable_workflows` construction flag is temporary; Core currently
+gets constructed before registrations are known.
+
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
 also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
@@ -106,7 +125,7 @@ temporal/core/            blocking ownership/lifecycle wrapper
 temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
-temporal/worker/          synchronous Activity registry and run loop
+temporal/worker/          Activity/Workflow registry and concurrent Core polling
 temporal/codec/           isolated json/plain user payload codec
 temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/client/          planned public client package
