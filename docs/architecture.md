@@ -1,8 +1,8 @@
 # Architecture: Temporal SDK for Odin
 
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
-Activity Worker slice, and schema-derived Activity protobuf bindings,
-2026-09-25.
+Activity Worker slice, schema-derived Core protobuf bindings, and a bounded
+Milestone 3 explicit-state-machine Workflow spike, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -243,14 +243,18 @@ represented as their generated repeated entry messages. Generated decoders use
 unknown fields, and reject malformed wire data. Encoders produce standard
 protobuf wire data and omit default-valued singular fields.
 
-The first roots are `coresdk.activity_task.ActivityTask` and
-`coresdk.ActivityTaskCompletion`. Their reachable type graph replaces the
-hand-written Activity envelope codec. The generated file is committed and
+The current roots are `coresdk.activity_task.ActivityTask`,
+`coresdk.ActivityTaskCompletion`,
+`coresdk.workflow_activation.WorkflowActivation`, and
+`coresdk.workflow_completion.WorkflowActivationCompletion`. Their reachable
+type graph covers the Activity slice and the complete Core-facing Workflow
+activation/command boundary. The generated file is committed and
 `./scripts/generate-protos.sh --check` makes schema drift visible in normal
 tests. The live integration test is the interoperability oracle: Core encodes
-the polled task with Rust `prost`, Odin decodes it, Odin encodes success or
-failure, and Core decodes the completion with `prost` before talking to the
-server. Both paths pass against the CLI dev server.
+poll results with Rust `prost`, Odin decodes them, Odin encodes completions,
+and Core decodes those completions with `prost` before talking to the server.
+Activity success/failure and Workflow schedule/complete paths all pass against
+the CLI dev server.
 
 This is intentionally a Core-schema tool, not a claimed general-purpose Odin
 protobuf library. It does not retain unknown fields, emit a native Odin map, or
@@ -366,7 +370,7 @@ libSystem). Linux still needs target-specific validation, including glibc vs
 musl policy and certificate-store behavior. Static linking would require an
 upstream/project modification and is not part of this spike.
 
-## Milestone 1 and 2 implementation and evidence
+## Milestones 1–3 implementation and evidence
 
 Raw Odin declarations live in `temporal/core/raw` and mirror only the structs,
 enums, callbacks, and symbols required for the spike. `temporal/core` adds a
@@ -386,6 +390,9 @@ temporal_core_worker_new
 temporal_core_worker_validate
 temporal_core_worker_poll_activity_task
 temporal_core_worker_complete_activity_task
+temporal_core_worker_poll_workflow_activation
+temporal_core_worker_complete_workflow_activation
+temporal_core_worker_request_workflow_eviction
 temporal_core_worker_initiate_shutdown
 temporal_core_worker_finalize_shutdown
 temporal_core_worker_free
@@ -443,24 +450,63 @@ for `StartActivityExecution`. The API exists in the pinned client/protos but is
 not available in this server version, so the workflow-only driver is required
 for the requested CLI development loop today.
 
+### Explicit Workflow state-machine experiment
+
+The Milestone 3 experiment implements exactly one Workflow shape and does not
+claim to be a user-facing Workflow runtime. Its explicit phases are:
+
+```text
+InitializeWorkflow
+  -> ScheduleActivity(seq=1, type="hello")
+  -> Waiting_Activity
+ResolveActivity(seq=1)
+  -> CompleteWorkflowExecution(result)
+  -> Completed
+```
+
+The live test deliberately evicts the language state after the schedule
+command and before executing the Activity. The observed activation sequence was:
+
+| History | Replay | Job/result | Odin action |
+| ---: | :---: | --- | --- |
+| 3 | no | initialize | emit `ScheduleActivity(seq=1)` |
+| 3 | no | requested eviction | delete the Odin instance |
+| 3 | yes | initialize from history | recreate instance and emit the same command |
+| 9 | no | activity resolved | emit `CompleteWorkflowExecution` |
+| 9 | no | completion eviction | delete the completed instance |
+
+Temporal CLI observed the final `"Hello Odin"` result. This demonstrates that
+Core matches deterministic replay commands against history and that Odin state
+can be discarded and reconstructed. The offline state-machine test additionally
+asserts that the initial and replayed schedule completions are byte-for-byte
+identical. This does not demonstrate sequential-looking Workflow code, timers,
+multiple outstanding operations, signals, queries, updates, concurrency, or
+nondeterminism detection in the language layer.
+
+The blocking wrapper now drains both enabled poll streams during shutdown.
+Core requires every enabled workflow/activity poll stream to observe shutdown
+before finalization; draining only the Activity stream is insufficient once
+Workflows are enabled.
+
 ## Risks and unresolved questions
 
 1. **ABI stability.** The C bridge is generated from Rust structs, unpublished,
    and evolves with Core. Pinning plus ABI assertions is mandatory. We should
    ask upstream whether third-party language SDK consumption has compatibility
    guarantees or a preferred release channel.
-2. **Protobuf generator scope.** The exact Activity graph and its imports,
-   maps, presence, and `oneof`s are generated and wire-compatible with `prost`.
-   Unknown fields are skipped rather than retained, and Workflow roots are not
-   generated yet. Every new root graph needs generation, compile, unit, and
+2. **Protobuf generator scope.** The Activity and Workflow boundary graphs,
+   including imports, maps, presence, and `oneof`s, are generated and
+   wire-compatible with `prost`. Unknown fields are skipped rather than
+   retained. Every new root graph still needs generation, compile, unit, and
    live `prost` interoperability checks.
 3. **Async callback integration.** The synchronous single-task worker is safe
    but not scalable. A real worker needs a callback-to-channel/event loop with
    heap-stable state, concurrent Activity execution, cancellation, and
    heartbeats.
-4. **Workflow runtime.** Core does not solve Odin suspension, deterministic
-   scheduling, or cached coroutine lifecycle. Fibers remain promising but must
-   replay from a fresh stack after eviction.
+4. **Workflow runtime.** The explicit state machine proves activation replay,
+   not Odin suspension, deterministic coroutine scheduling, or a usable author
+   API. Fibers remain promising but must restart from a fresh stack after
+   eviction and reproduce the same commands.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -474,35 +520,36 @@ for the requested CLI development loop today.
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
 
-## Workflow runtime alternatives: decision deliberately deferred
-
-No workflow runtime was implemented.
+## Workflow runtime alternatives: final decision still deferred
 
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
-| Explicit state machine | Easiest replay model, worst desired authoring API | Complete one activation/timer cycle with hand-written states |
-| Stackful coroutine/fiber | Best match for sequential Odin syntax; stack is cache-only, never durable | Start, suspend, evict, recreate, and replay a tiny workflow deterministically |
+| Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Add a timer only if another transport/state-machine uncertainty appears |
+| Stackful coroutine/fiber | Best match for sequential Odin syntax; stack is cache-only, never durable | Reproduce this same forced-eviction test from a fresh fiber stack |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
-Revisit only after activity transport, protobuf, worker lifecycle, and error
-handling are proven. That order prevents choosing a workflow runtime around an
-incorrect understanding of Core.
+Activity transport, protobuf, worker lifecycle, command matching, and a first
+replay path are now proven. That is enough evidence to investigate the authoring
+runtime without pretending that the explicit state machine is the final API.
 
 ## Recommended next vertical milestone
 
-The bounded schema/tooling milestone is complete: Activity messages are
-schema-derived and cross-checked with `prost` through the live Core boundary.
-Next, start Milestone 3 with an explicit-state-machine workflow that
-schedules this already-working `hello` Activity and completes after its
-resolution. That should prove activation ordering, command encoding, replay,
-and eviction before selecting fibers or code generation. Generate only the
-Workflow activation/completion graph required by that experiment. Activity
-concurrency, heartbeats, and cancellation remain important follow-up slices,
-but they need not block the bounded Workflow activation experiment.
+The explicit-state-machine milestone is complete. The next bounded milestone
+should investigate a **stackful coroutine/fiber** implementation of this same
+Workflow shape. The acceptance test should remain unchanged: schedule the
+Activity, force eviction, destroy the cached execution, restart the Workflow on
+a fresh stack during replay, reproduce `ScheduleActivity(seq=1)`, then resume
+with the result. Add one timer suspension only after the Activity await works.
 
-The C bridge remains the recommended foundation. Milestone 2 and the subsequent
-schema milestone strengthened that decision: Core handled polling, tokens,
-transport, retries, server completion, and shutdown as expected, while its
-protobuf boundary proved practical to generate directly for Odin. The findings
-add protobuf/tooling and version-skew obligations but give no reason to bypass
-Core or implement direct server gRPC.
+Before adopting a dependency, inspect Odin's current runtime and maintained
+fiber libraries for stack ownership, allocator behavior, sanitizer/platform
+support, and whether execution can be driven deterministically on one worker
+thread. If the smallest portable fiber experiment cannot recreate cleanly on
+replay, use that result to compare CPS/code generation rather than expanding a
+fragile runtime. Activity concurrency, heartbeats, and cancellation remain
+important follow-up slices but do not block this experiment.
+
+The C bridge remains the recommended foundation. It now handles both Activity
+Tasks and multi-activation Workflow execution end-to-end, including replay and
+eviction. The findings add protobuf/tooling, language-runtime, and version-skew
+obligations but give no reason to bypass Core or implement direct server gRPC.

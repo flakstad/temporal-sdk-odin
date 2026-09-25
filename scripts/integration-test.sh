@@ -89,3 +89,40 @@ run_activity_case() {
 
 run_activity_case no
 run_activity_case yes
+
+"$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+  echo "Odin Workflow Worker did not become ready; see $worker_log" >&2
+  exit 1
+fi
+
+workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
+workflow_output="$(temporal workflow execute \
+  --workflow-id "$workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Odin"' \
+  --command-timeout 30s \
+  --output json)"
+echo "$workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$workflow_output"
+grep -q '"result": "Hello Odin"' <<<"$workflow_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "replay=true scheduled=true" "$worker_log"
+grep -q "explicit Workflow state machine completed after eviction and replay" "$worker_log"

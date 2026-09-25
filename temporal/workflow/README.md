@@ -1,5 +1,11 @@
 # Workflow package (research only)
 
-No Odin workflow runtime is implemented. The Activity Worker boundary is now
-proven; schema tooling and a bounded explicit-state-machine activation spike
-come before any fiber/runtime choice.
+`spike.odin` is a bounded explicit state machine for one Workflow shape:
+
+```text
+initialize -> schedule hello Activity -> resolve Activity -> complete
+```
+
+It exists to test Core activations, commands, forced eviction, and replay. It is
+not a registration API or the intended sequential Odin Workflow runtime. Do not
+build application Workflows against it.

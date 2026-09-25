@@ -336,12 +336,24 @@ foreign temporal_core {
 		user_data: rawptr,
 		callback: Worker_Poll_Callback,
 	) ---
+	worker_poll_workflow_activation :: proc(
+		worker: ^Worker,
+		user_data: rawptr,
+		callback: Worker_Poll_Callback,
+	) ---
 	worker_complete_activity_task :: proc(
 		worker: ^Worker,
 		completion: Byte_Array_Ref,
 		user_data: rawptr,
 		callback: Worker_Callback,
 	) ---
+	worker_complete_workflow_activation :: proc(
+		worker: ^Worker,
+		completion: Byte_Array_Ref,
+		user_data: rawptr,
+		callback: Worker_Callback,
+	) ---
+	worker_request_workflow_eviction :: proc(worker: ^Worker, run_id: Byte_Array_Ref) ---
 	worker_initiate_shutdown :: proc(worker: ^Worker) ---
 	worker_finalize_shutdown :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
 }

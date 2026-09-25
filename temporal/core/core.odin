@@ -20,8 +20,10 @@ Client :: struct {
 }
 
 Worker :: struct {
-	handle:  ^raw.Worker,
-	runtime: ^Runtime,
+	handle:                    ^raw.Worker,
+	runtime:                   ^Runtime,
+	workflows_enabled:         bool,
+	remote_activities_enabled: bool,
 }
 
 Get_System_Info_Result :: struct {
@@ -144,7 +146,12 @@ fixed_slot_supplier :: proc(count: uintptr) -> raw.Slot_Supplier {
 	}
 }
 
-worker_create :: proc(client: ^Client, task_queue: string, namespace := "default") -> (worker: Worker, error: Error) {
+worker_create :: proc(
+	client: ^Client,
+	task_queue: string,
+	namespace := "default",
+	enable_workflows := false,
+) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
 		return
@@ -167,7 +174,10 @@ worker_create :: proc(client: ^Client, task_queue: string, namespace := "default
 			local_activity_slot_supplier = fixed_slot_supplier(1),
 			nexus_task_slot_supplier     = fixed_slot_supplier(1),
 		},
-		task_types = raw.Worker_Task_Types{enable_remote_activities = true},
+		task_types = raw.Worker_Task_Types{
+			enable_workflows = enable_workflows,
+			enable_remote_activities = true,
+		},
 		max_heartbeat_throttle_interval_ms     = 60_000,
 		default_heartbeat_throttle_interval_ms = 1_000,
 		graceful_shutdown_period_ms            = 5_000,
@@ -181,6 +191,8 @@ worker_create :: proc(client: ^Client, task_queue: string, namespace := "default
 	}
 	worker.handle = result.worker
 	worker.runtime = client.runtime
+	worker.workflows_enabled = enable_workflows
+	worker.remote_activities_enabled = true
 	return
 }
 
@@ -218,7 +230,7 @@ worker_validate :: proc(worker: ^Worker) -> Error {
 	return worker_wait_call(worker, worker_validate_invoke)
 }
 
-Activity_Poll_Result :: struct {
+Poll_Result :: struct {
 	protobuf: []u8,
 	error:    Error,
 	shutdown: bool,
@@ -237,14 +249,37 @@ worker_poll_callback :: proc "c" (user_data: rawptr, success, fail: ^raw.Byte_Ar
 	sync.one_shot_event_signal(&state.done)
 }
 
-worker_poll_activity :: proc(worker: ^Worker) -> Activity_Poll_Result {
-	result := Activity_Poll_Result{}
+worker_poll_activity :: proc(worker: ^Worker) -> Poll_Result {
+	result := Poll_Result{}
 	if worker == nil || worker.handle == nil || worker.runtime == nil {
 		result.error.message = bytes.clone(transmute([]u8)string("worker is not initialized"))
 		return result
 	}
 	state := Worker_Poll_State{}
 	raw.worker_poll_activity_task(worker.handle, &state, worker_poll_callback)
+	wait_until(&state.done)
+	if state.fail != nil {
+		result.error.message = copy_core_bytes(state.fail)
+		raw.byte_array_free(worker.runtime.handle, state.fail)
+		return result
+	}
+	if state.success == nil {
+		result.shutdown = true
+		return result
+	}
+	result.protobuf = copy_core_bytes(state.success)
+	raw.byte_array_free(worker.runtime.handle, state.success)
+	return result
+}
+
+worker_poll_workflow :: proc(worker: ^Worker) -> Poll_Result {
+	result := Poll_Result{}
+	if worker == nil || worker.handle == nil || worker.runtime == nil || !worker.workflows_enabled {
+		result.error.message = bytes.clone(transmute([]u8)string("workflow polling is not enabled"))
+		return result
+	}
+	state := Worker_Poll_State{}
+	raw.worker_poll_workflow_activation(worker.handle, &state, worker_poll_callback)
 	wait_until(&state.done)
 	if state.fail != nil {
 		result.error.message = copy_core_bytes(state.fail)
@@ -286,6 +321,32 @@ worker_complete_activity :: proc(worker: ^Worker, completion: []u8) -> Error {
 	return error
 }
 
+worker_complete_workflow :: proc(worker: ^Worker, completion: []u8) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil || !worker.workflows_enabled {
+		return Error{message = bytes.clone(transmute([]u8)string("workflow completion is not enabled"))}
+	}
+	state := Complete_State{}
+	raw.worker_complete_workflow_activation(worker.handle, bytes_ref(completion), &state, complete_callback)
+	wait_until(&state.done)
+	if state.fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(state.fail)}
+	raw.byte_array_free(worker.runtime.handle, state.fail)
+	return error
+}
+
+worker_request_workflow_eviction :: proc(worker: ^Worker, run_id: string) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil || !worker.workflows_enabled {
+		return Error{message = bytes.clone(transmute([]u8)string("workflow eviction is not enabled"))}
+	}
+	if len(run_id) == 0 {
+		return Error{message = bytes.clone(transmute([]u8)string("workflow run id must not be empty"))}
+	}
+	raw.worker_request_workflow_eviction(worker.handle, byte_ref(run_id))
+	return {}
+}
+
 finalize_shutdown_invoke :: proc(handle: ^raw.Worker, user_data: rawptr, callback: raw.Worker_Callback) {
 	raw.worker_finalize_shutdown(handle, user_data, callback)
 }
@@ -295,16 +356,33 @@ worker_close :: proc(worker: ^Worker) -> Error {
 		return {}
 	}
 	raw.worker_initiate_shutdown(worker.handle)
-	// Core shutdown is driven by active pollers observing PollError::ShutDown.
-	// This synchronous spike has no outstanding poll at this point, so issue one
-	// final poll before finalize_shutdown.
-	poll := worker_poll_activity(worker)
-	if poll.protobuf != nil {
-		delete(poll.protobuf)
+	// Core shutdown completes only after every enabled poll stream observes
+	// PollError::ShutDown. The synchronous wrapper has no outstanding polls, so
+	// drain each enabled stream here before finalize_shutdown.
+	error := Error{}
+	if worker.workflows_enabled {
+		poll := worker_poll_workflow(worker)
+		if poll.protobuf != nil {
+			delete(poll.protobuf)
+		}
+		error = poll.error
+		if error.message == nil && !poll.shutdown {
+			error.message = bytes.clone(transmute([]u8)string("workflow shutdown poll returned an unexpected activation"))
+		}
 	}
-	error := poll.error
-	if error.message == nil && !poll.shutdown {
-		error.message = bytes.clone(transmute([]u8)string("worker shutdown poll returned an unexpected task"))
+	if worker.remote_activities_enabled {
+		poll := worker_poll_activity(worker)
+		if poll.protobuf != nil {
+			delete(poll.protobuf)
+		}
+		if error.message == nil {
+			error = poll.error
+		} else {
+			error_free(&poll.error)
+		}
+		if error.message == nil && !poll.shutdown {
+			error.message = bytes.clone(transmute([]u8)string("activity shutdown poll returned an unexpected task"))
+		}
 	}
 	finalize_error := worker_wait_call(worker, finalize_shutdown_invoke)
 	if error.message == nil {
@@ -315,6 +393,8 @@ worker_close :: proc(worker: ^Worker) -> Error {
 	raw.worker_free(worker.handle)
 	worker.handle = nil
 	worker.runtime = nil
+	worker.workflows_enabled = false
+	worker.remote_activities_enabled = false
 	return error
 }
 

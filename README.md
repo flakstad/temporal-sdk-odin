@@ -3,14 +3,14 @@
 An experimental Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
 not a reimplementation of Temporal Server or its gRPC protocol.
 
-Current status: Milestones 0–1, a narrow Milestone 2 Activity Worker, and
-schema-derived protobuf bindings for that Activity slice. The repository builds
-the official Rust Core C bridge, connects to a Temporal CLI dev server, polls
-and completes remote Activity Tasks in Odin, and shuts down cleanly. The worker
-currently supports one synchronous `json/plain` string argument and one string
-result. It does **not** provide an Odin workflow runtime, Activity
-concurrency/cancellation/heartbeats, bindings for the Workflow schemas, or a
-stable public API. Do not use it in production.
+Current status: Milestones 0–2 plus a bounded Milestone 3 explicit-state-machine
+Workflow spike. The repository builds the official Rust Core C bridge, connects
+to a Temporal CLI dev server, executes a remote Activity in Odin, and can run
+one experimental Workflow through activation, forced eviction, replay,
+Activity resolution, and completion. It does **not** provide the intended
+sequential Odin Workflow API, general Workflow registration, Activity
+concurrency/cancellation/heartbeats, or a stable public API. Do not use it in
+production.
 
 ```text
 Temporal CLI dev server
@@ -19,7 +19,8 @@ Temporal CLI dev server
 Temporal SDK Core
           ^ C ABI
           |
-Odin raw bindings -> generated Core protobuf types -> Activity dispatch + JSON codec
+Odin raw bindings -> generated Core protobuf types -> Activity dispatch
+                                            `-----> explicit Workflow state machine
 ```
 
 ## Quick start
@@ -67,7 +68,9 @@ Run it with:
 ```
 
 The script starts `temporal server start-dev --headless` only when a healthy
-service is not already running on `localhost:7233`; Docker is not involved.
+service is not already running on `localhost:7233`; Docker is not involved. It
+also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
+Workflow result after a forced eviction and replay.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
@@ -85,15 +88,17 @@ docs/                     architecture and development notes
 native/                   pinned sdk-core submodule and Cargo lockfile
 temporal/core/raw/        near-1:1 subset of the C ABI
 temporal/core/            blocking ownership/lifecycle wrapper
-temporal/core/proto/      generated Activity schema types plus small adapters
+temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/worker/          synchronous Activity registry and run loop
 temporal/codec/           isolated json/plain user payload codec
-temporal/{client,...}/    planned public packages
+temporal/workflow/        explicit state-machine experiment, not public API
+temporal/client/          planned public client package
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/hello_activity/  Odin hello Activity Worker
-tests/                    lifecycle, codec, and protobuf tests
+examples/hello_workflow/  activation/replay/eviction Workflow proof
+tests/                    lifecycle, codec, protobuf, and state-machine tests
 ```
 
 ## License

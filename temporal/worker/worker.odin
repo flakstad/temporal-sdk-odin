@@ -49,8 +49,13 @@ error_from_core :: proc(core_error: ^temporal_core.Error) -> Error {
 	return result
 }
 
-create :: proc(client: ^temporal_core.Client, task_queue: string, namespace := "default") -> (worker: Worker, error: Error) {
-	core_worker, core_error := temporal_core.worker_create(client, task_queue, namespace)
+create :: proc(
+	client: ^temporal_core.Client,
+	task_queue: string,
+	namespace := "default",
+	enable_workflows := false,
+) -> (worker: Worker, error: Error) {
+	core_worker, core_error := temporal_core.worker_create(client, task_queue, namespace, enable_workflows)
 	if core_error.message != nil {
 		return {}, error_from_core(&core_error)
 	}

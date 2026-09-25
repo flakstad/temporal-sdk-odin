@@ -51,8 +51,8 @@ generator reads a descriptor set produced from the exact schemas in the pinned
 ./scripts/generate-protos.sh
 ```
 
-This currently generates the transitive type graph rooted at
-`coresdk.activity_task.ActivityTask` and `coresdk.ActivityTaskCompletion` into
+This currently generates the transitive type graph rooted at the Core Activity
+task/completion and Workflow activation/completion messages into
 `temporal/core/proto/generated.odin`. The generated file is committed. After a
 Core pin or root-list change, regenerate it and review the diff; do not edit it
 by hand. CI/local tests use:
@@ -113,6 +113,12 @@ not part of the distributed Odin SDK and not an Odin workflow runtime. This is
 also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
 
+Finally, the script starts `examples/hello_workflow` and invokes it directly
+with `temporal workflow execute`. The Odin worker schedules and executes its own
+`hello` Activity, while the example forces a Core eviction between scheduling
+and resolution. The test requires a replay initialization and a final eviction
+before it succeeds.
+
 ## Manual run
 
 ```bash
@@ -124,6 +130,25 @@ temporal server start-dev
 `run-hello-activity.sh` polls task queue `odin-hello-activity` and completes one
 task before shutting down. Run `./scripts/integration-test.sh` instead when you
 want the repository to schedule that task automatically.
+
+For the explicit Workflow experiment, run the worker in one terminal:
+
+```bash
+./scripts/run-hello-workflow.sh
+```
+
+Then execute the Workflow from another:
+
+```bash
+temporal workflow execute \
+  --workflow-id odin-workflow-manual \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Odin"'
+```
+
+This example is intentionally a hard-coded state machine, not the proposed
+sequential Workflow API.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
@@ -147,6 +172,6 @@ configuration profiles are not exposed yet.
 
 ## Current platform evidence
 
-Milestones 1 and 2 were built and run end-to-end on macOS arm64. Linux
+Milestones 1–3 were built and run end-to-end on macOS arm64. Linux
 source/build paths are present but were not executed in this environment.
 Cross-platform release packaging is intentionally deferred.

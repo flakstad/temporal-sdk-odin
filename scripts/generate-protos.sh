@@ -41,7 +41,9 @@ cargo run --quiet \
   "$descriptor_set" \
   "$generated" \
   coresdk.activity_task.ActivityTask \
-  coresdk.ActivityTaskCompletion
+  coresdk.ActivityTaskCompletion \
+  coresdk.workflow_activation.WorkflowActivation \
+  coresdk.workflow_completion.WorkflowActivationCompletion
 
 if [[ "$mode" == "--check" ]]; then
   if ! cmp -s "$generated" "$destination"; then
