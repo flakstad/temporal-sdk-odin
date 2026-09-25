@@ -89,15 +89,17 @@ The combined example now uses the reusable registration boundary:
 temporal_worker, _ := worker.create(
     &client,
     "odin-hello-workflow",
-    enable_workflows = true,
 )
 _ = worker.register_activity(&temporal_worker, "hello", hello)
 _ = worker.register_workflow(&temporal_worker, "odin_hello_workflow", hello_workflow)
 _, _ = worker.run(&temporal_worker)
 ```
 
-The explicit `enable_workflows` construction flag is temporary; Core currently
-gets constructed before registrations are known.
+`worker.create` owns only language-side configuration and registries. The first
+`worker.run` constructs one Core worker whose enabled task streams match the
+registered Activities and Workflows. A worker is intentionally single-run;
+call `worker.close` after `run` returns and keep its borrowed client open until
+that close completes.
 
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It

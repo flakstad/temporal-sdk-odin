@@ -54,13 +54,23 @@ Run_Stats :: struct {
 	activity_cancellations_requested:     int,
 }
 
+Lifecycle :: enum {
+	Uninitialized,
+	Configuring,
+	Running,
+	Stopped,
+	Closed,
+}
+
 Worker :: struct {
 	core:                   temporal_core.Worker,
+	client:                 ^temporal_core.Client,
+	namespace:              string,
 	task_queue:             string,
 	activity_registrations: [dynamic]Activity_Registration,
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
-	running:                bool,
+	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
 }
 
@@ -93,27 +103,33 @@ create :: proc(
 	client: ^temporal_core.Client,
 	task_queue: string,
 	namespace := "default",
-	enable_workflows := false,
 	max_concurrent_activities := 10,
 ) -> (worker: Worker, error: Error) {
-	core_worker, core_error := temporal_core.worker_create(
-		client,
-		task_queue,
-		namespace,
-		enable_workflows,
-		max_concurrent_activities,
-	)
-	if core_error.message != nil {
-		return {}, error_from_core(&core_error)
+	if client == nil || client.handle == nil || client.runtime == nil {
+		return {}, error_from_string("client is not initialized")
+	}
+	if len(task_queue) == 0 {
+		return {}, error_from_string("task queue must not be empty")
+	}
+	if len(namespace) == 0 {
+		return {}, error_from_string("namespace must not be empty")
+	}
+	if max_concurrent_activities <= 0 {
+		return {}, error_from_string("max concurrent activities must be positive")
 	}
 	owned_task_queue, allocation_error := strings.clone(task_queue)
 	if allocation_error != nil {
-		close_error := temporal_core.worker_close(&core_worker)
-		temporal_core.error_free(&close_error)
 		return {}, error_from_string("could not allocate worker task queue")
 	}
-	worker.core = core_worker
+	owned_namespace, namespace_allocation_error := strings.clone(namespace)
+	if namespace_allocation_error != nil {
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate worker namespace")
+	}
+	worker.client = client
+	worker.namespace = owned_namespace
 	worker.task_queue = owned_task_queue
+	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = max_concurrent_activities
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.workflow_registrations = make([dynamic]Workflow_Registration)
@@ -122,10 +138,10 @@ create :: proc(
 }
 
 register_activity :: proc(worker: ^Worker, name: string, callback: String_Activity_Proc) -> Error {
-	if worker == nil || worker.core.handle == nil {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return error_from_string("worker is not initialized")
 	}
-	if worker.running {
+	if worker.lifecycle != .Configuring {
 		return error_from_string("activities cannot be registered after worker.run starts")
 	}
 	if len(name) == 0 || callback == nil {
@@ -145,13 +161,10 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 }
 
 register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
-	if worker == nil || worker.core.handle == nil {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return error_from_string("worker is not initialized")
 	}
-	if !worker.core.workflows_enabled {
-		return error_from_string("worker was created without Workflow polling enabled")
-	}
-	if worker.running {
+	if worker.lifecycle != .Configuring {
 		return error_from_string("workflows cannot be registered after worker.run starts")
 	}
 	if len(name) == 0 || callback == nil {
@@ -720,11 +733,14 @@ workflow_thread_main :: proc(state: ^Workflow_Thread_State) {
 }
 
 run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, error: Error) {
-	if worker == nil || worker.core.handle == nil {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return {}, error_from_string("worker is not initialized")
 	}
-	if worker.running {
+	if worker.lifecycle == .Running {
 		return {}, error_from_string("worker is already running")
+	}
+	if worker.lifecycle == .Stopped {
+		return {}, error_from_string("worker cannot be run more than once")
 	}
 	if options.max_activity_tasks < 0 || options.max_workflow_executions < 0 {
 		return {}, error_from_string("worker run limits must not be negative")
@@ -734,13 +750,32 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if !poll_activities && !poll_workflows {
 		return {}, error_from_string("worker has no enabled registered task types")
 	}
-	worker.running = true
-	defer { worker.running = false }
+	if worker.client == nil || worker.client.handle == nil || worker.client.runtime == nil {
+		return {}, error_from_string("client must remain open until worker.close returns")
+	}
+
+	core_worker, create_error := temporal_core.worker_create(
+		worker.client,
+		worker.task_queue,
+		worker.namespace,
+		enable_workflows = poll_workflows,
+		enable_remote_activities = poll_activities,
+		max_activity_slots = worker.max_concurrent_activities,
+	)
+	if create_error.message != nil {
+		return {}, error_from_core(&create_error)
+	}
+	worker.core = core_worker
 
 	validate_error := temporal_core.worker_validate(&worker.core)
 	if validate_error.message != nil {
-		return {}, error_from_core(&validate_error)
+		result := error_from_core(&validate_error)
+		close_error := temporal_core.worker_close(&worker.core)
+		temporal_core.error_free(&close_error)
+		return {}, result
 	}
+	worker.lifecycle = .Running
+	defer { worker.lifecycle = .Stopped }
 
 	if poll_activities && !poll_workflows {
 		stats.activity_tasks_completed,
@@ -795,7 +830,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 }
 
 request_shutdown :: proc(worker: ^Worker) {
-	if worker == nil {
+	if worker == nil || worker.lifecycle != .Running {
 		return
 	}
 	temporal_core.worker_initiate_shutdown(&worker.core)
@@ -805,7 +840,10 @@ close :: proc(worker: ^Worker) -> Error {
 	if worker == nil {
 		return {}
 	}
-	if worker.running {
+	if worker.lifecycle == .Closed {
+		return {}
+	}
+	if worker.lifecycle == .Running {
 		return error_from_string("worker cannot be closed while worker.run is active")
 	}
 	core_error := temporal_core.worker_close(&worker.core)
@@ -822,12 +860,15 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.activity_registrations)
 	delete(worker.workflow_registrations)
 	delete(worker.workflow_runs)
+	delete(worker.namespace)
 	delete(worker.task_queue)
 	worker.activity_registrations = nil
 	worker.workflow_registrations = nil
 	worker.workflow_runs = nil
+	worker.client = nil
+	worker.namespace = ""
 	worker.task_queue = ""
-	worker.running = false
+	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
 	return error_from_core(&core_error)
 }

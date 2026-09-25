@@ -7,6 +7,7 @@ import "core:strings"
 import "core:time"
 import activity "../temporal/activity"
 import temporal_core "../temporal/core"
+import raw "../temporal/core/raw"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import protobuf "../temporal/protobuf"
@@ -188,6 +189,70 @@ runtime_init_and_shutdown :: proc(t: ^testing.T) {
 	testing.expect(t, runtime.handle == nil)
 	// Closing twice is intentionally safe in the Odin lifecycle wrapper.
 	temporal_core.runtime_close(&runtime)
+}
+
+@(test)
+language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+
+	sdk_worker, create_error := worker.create(&client, "delayed-core", "test-namespace")
+	testing.expectf(t, create_error.message == nil, "worker.create failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	testing.expect(t, sdk_worker.core.handle == nil)
+	testing.expect(t, sdk_worker.client == &client)
+	testing.expect_value(t, sdk_worker.namespace, "test-namespace")
+	testing.expect_value(t, sdk_worker.task_queue, "delayed-core")
+	testing.expect(t, sdk_worker.lifecycle == .Configuring)
+
+	register_error := worker.register_workflow(&sdk_worker, "first_workflow", registry_first_test_workflow)
+	testing.expectf(t, register_error.message == nil, "workflow registration failed: %s", string(register_error.message))
+	worker.error_free(&register_error)
+	testing.expect(t, sdk_worker.core.handle == nil)
+
+	client.handle = nil
+	_, run_error := worker.run(&sdk_worker)
+	testing.expect(t, run_error.message != nil)
+	worker.error_free(&run_error)
+	testing.expect(t, sdk_worker.core.handle == nil)
+	testing.expect(t, sdk_worker.lifecycle == .Configuring)
+	client.handle = &raw_connection
+
+	close_error := worker.close(&sdk_worker)
+	testing.expectf(t, close_error.message == nil, "worker.close before run failed: %s", string(close_error.message))
+	worker.error_free(&close_error)
+	testing.expect(t, sdk_worker.lifecycle == .Closed)
+	testing.expect(t, sdk_worker.client == nil)
+	testing.expect(t, sdk_worker.namespace == "")
+	testing.expect(t, sdk_worker.task_queue == "")
+
+	// The language lifecycle wrapper intentionally makes close idempotent.
+	close_error = worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+}
+
+@(test)
+language_worker_rejects_run_without_materializing_empty_core_worker :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+
+	sdk_worker, create_error := worker.create(&client, "empty-worker")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	_, run_error := worker.run(&sdk_worker)
+	testing.expect(t, run_error.message != nil)
+	worker.error_free(&run_error)
+	testing.expect(t, sdk_worker.core.handle == nil)
+	testing.expect(t, sdk_worker.lifecycle == .Configuring)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
 }
 
 @(test)

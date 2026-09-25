@@ -117,6 +117,15 @@ activations are routed by Workflow type; subsequent activations are routed by
 run ID until Core sends `RemoveFromCache`. Eviction destroys the corresponding
 fiber and removes that route.
 
+`worker.create` clones the namespace and task-queue strings and initializes the
+language registries, but deliberately does not create a Core worker. On the
+first `run`, the registration set selects Core's `enable_workflows` and
+`enable_remote_activities` task types; `disable_activity_polling` can suppress
+the Activity type for that bounded run. This avoids polling unused streams and
+removes task-type switches from the public construction API. The worker borrows
+the client passed to `create`, so the stable client value, its connection, and
+the Core runtime must outlive `worker.close`.
+
 The C wrapper currently presents blocking poll calls. When both task types are
 registered, `worker.run` creates one Workflow poll thread and one Activity poll
 thread. Only the Workflow thread reads or mutates Workflow runtimes, so a fiber
@@ -141,10 +150,12 @@ test/example controls. Zero means unbounded. Normal workers call `run` without
 bounds and arrange for another thread or process-lifecycle handler to call
 `request_shutdown`.
 
-Core is still constructed by `worker.create`, before registrations are known.
-Consequently, callers registering Workflows must temporarily pass
-`enable_workflows = true`. Delaying Core worker construction until `run` would
-remove this leaky option and let registrations select the enabled task streams.
+The lifecycle is `Configuring -> Running -> Stopped -> Closed`. Registration is
+accepted only while configuring, and a worker cannot be run twice. `close` is
+also valid before `run`, in which case it only releases language-owned state;
+it is idempotent after closing. If Core validation fails, `run` closes the
+newly-created Core worker and leaves the language worker configurable so the
+failure does not leak a native handle.
 
 The integration test uses Temporal CLI directly—no Docker, PostgreSQL, or
 Elasticsearch:

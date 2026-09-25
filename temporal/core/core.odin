@@ -151,6 +151,7 @@ worker_create :: proc(
 	task_queue: string,
 	namespace := "default",
 	enable_workflows := false,
+	enable_remote_activities := true,
 	max_activity_slots := 10,
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
@@ -181,7 +182,7 @@ worker_create :: proc(
 		},
 		task_types = raw.Worker_Task_Types{
 			enable_workflows = enable_workflows,
-			enable_remote_activities = true,
+			enable_remote_activities = enable_remote_activities,
 		},
 		max_heartbeat_throttle_interval_ms     = 60_000,
 		default_heartbeat_throttle_interval_ms = 1_000,
@@ -197,7 +198,7 @@ worker_create :: proc(
 	worker.handle = result.worker
 	worker.runtime = client.runtime
 	worker.workflows_enabled = enable_workflows
-	worker.remote_activities_enabled = true
+	worker.remote_activities_enabled = enable_remote_activities
 	return
 }
 

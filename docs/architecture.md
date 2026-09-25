@@ -817,7 +817,9 @@ is explicit that this concurrency is not supplied by Core.
 The first reusable Odin worker implements this boundary:
 
 ```text
-worker.run
+worker.create -> language configuration + registries only
+
+worker.run -> derive Core task types -> worker_new + worker_validate
     |-- Workflow poll thread
     |      decode route
     |      Workflow type --initialization--> registered Fiber_Runtime
@@ -860,9 +862,21 @@ the Activity result resumes the correct Workflow.
 Normal `worker.run` is unbounded. `request_shutdown` forwards Core's shutdown
 request so outstanding poll calls can return; `close` is rejected while `run`
 is active and finalizes only afterward. Bounded task/execution counts exist for
-examples and tests. The current construction API still requires
-`enable_workflows = true` before registration because the Core worker is
-created too early; delayed construction is the clean fix.
+examples and tests. Core worker construction is delayed until `run`, so
+registered task types select `WorkerTaskTypes.enable_workflows` and
+`enable_remote_activities` exactly. The public API no longer exposes either
+Core capability flag.
+
+This creates an explicit ownership boundary. The Odin worker owns cloned
+namespace/task-queue strings, registrations, Workflow runtimes, and eventually
+the Core worker handle. It only borrows the client pointer; the client and Core
+runtime must remain open until `worker.close` has finalized and freed the Core
+worker. The C bridge converts all string refs into owned Rust configuration
+during synchronous `temporal_core_worker_new`, so no Odin string pointer is
+retained across that call. Registration is limited to `Configuring`; a
+successful run is one-shot (`Running -> Stopped`) because Core shutdown and
+poll-stream state are not reusable. Closing before `run` releases only the
+language-owned configuration and is safe.
 
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
@@ -933,11 +947,10 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 Activity concurrency, task-token routing, cooperative cancel delivery, and
-heartbeat transport are now proven live. The next vertical milestone should
-delay Core worker construction until `run` so registered
-task types determine Core options and the public API no longer exposes
-`enable_workflows`. It should also replace the one-thread-per-slot executor with
-a small reusable pool and stress shutdown/cancel/heartbeat interleavings using
+heartbeat transport are now proven live, and delayed Core construction now
+makes the registered task types the single source of worker capabilities. The
+next vertical milestone should replace the one-thread-per-slot executor with a
+small reusable pool and stress shutdown/cancel/heartbeat interleavings using
 `pbt`; a statechart oracle becomes worthwhile once retries and deadlines join
 that model. Unknown Workflow types must produce a language-facing failed
 activation without terminating the worker. Generic payload APIs and user

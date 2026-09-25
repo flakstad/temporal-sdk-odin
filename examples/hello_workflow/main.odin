@@ -93,7 +93,6 @@ main :: proc() {
 	activity_worker, create_error := worker.create(
 		&client,
 		TASK_QUEUE,
-		enable_workflows = true,
 	)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
