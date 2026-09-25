@@ -19,6 +19,17 @@ Activity_Task :: struct {
 	activity_type: string,
 	attempt:       u32,
 	input:         Payload_View,
+	cancel_reason: Coresdk_Activity_Task_ActivityCancelReason,
+	cancel_details: Activity_Cancel_Details,
+}
+
+Activity_Cancel_Details :: struct {
+	is_not_found:       bool,
+	is_cancelled:       bool,
+	is_paused:          bool,
+	is_timed_out:       bool,
+	is_worker_shutdown: bool,
+	is_reset:           bool,
 }
 
 Decode_Error :: enum {
@@ -69,11 +80,41 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 		}
 	case Coresdk_Activity_Task_ActivityTask_Variant_Cancel:
 		task.kind = .Cancel
+		if variant.value == nil {
+			return {}, .Malformed
+		}
+		task.cancel_reason = variant.value.reason
+		if variant.value.details != nil {
+			task.cancel_details = Activity_Cancel_Details{
+				is_not_found = variant.value.details.is_not_found,
+				is_cancelled = variant.value.details.is_cancelled,
+				is_paused = variant.value.details.is_paused,
+				is_timed_out = variant.value.details.is_timed_out,
+				is_worker_shutdown = variant.value.details.is_worker_shutdown,
+				is_reset = variant.value.details.is_reset,
+			}
+		}
 	}
 	if task.kind == .Invalid {
 		return {}, .Missing_Variant
 	}
 	return task, .None
+}
+
+encode_activity_heartbeat :: proc(task_token, details_data: []u8) -> [dynamic]u8 {
+	payload := Temporal_Api_Common_V1_Payload{data = details_data}
+	defer delete(payload.metadata)
+	append(
+		&payload.metadata,
+		Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	heartbeat := Coresdk_ActivityHeartbeat{task_token = task_token}
+	defer delete(heartbeat.details)
+	append(&heartbeat.details, payload)
+	return encode_Coresdk_ActivityHeartbeat(&heartbeat)
 }
 
 encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
@@ -116,6 +157,28 @@ encode_activity_failure :: proc(task_token: []u8, message: string, non_retryable
 	execution_result := Coresdk_Activity_Result_ActivityExecutionResult{
 		status = Coresdk_Activity_Result_ActivityExecutionResult_Status_Failed{
 			value = &activity_failure,
+		},
+	}
+	completion := Coresdk_ActivityTaskCompletion{
+		task_token = task_token,
+		result = &execution_result,
+	}
+	return encode_Coresdk_ActivityTaskCompletion(&completion)
+}
+
+encode_activity_cancellation :: proc(task_token: []u8, message := "Activity canceled") -> [dynamic]u8 {
+	canceled_info := Temporal_Api_Failure_V1_CanceledFailureInfo{}
+	failure := Temporal_Api_Failure_V1_Failure{
+		message = message,
+		source = "OdinSDK",
+		failure_info = Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{
+			value = &canceled_info,
+		},
+	}
+	cancellation := Coresdk_Activity_Result_Cancellation{failure = &failure}
+	execution_result := Coresdk_Activity_Result_ActivityExecutionResult{
+		status = Coresdk_Activity_Result_ActivityExecutionResult_Status_Cancelled{
+			value = &cancellation,
 		},
 	}
 	completion := Coresdk_ActivityTaskCompletion{

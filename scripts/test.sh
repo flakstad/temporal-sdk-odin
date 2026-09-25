@@ -15,7 +15,7 @@ odin test "$repo_root/tests" \
 	-warnings-as-errors \
 	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
 
-pbt_root="$repo_root/test-deps/pbt"
+pbt_root="${PBT_ROOT:-$repo_root/test-deps/pbt}"
 if [[ ! -f "$pbt_root/pbt/check.odin" ]]; then
 	echo "PBT test dependency is missing; run: git submodule update --init --recursive" >&2
 	exit 1

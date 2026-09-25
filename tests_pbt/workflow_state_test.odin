@@ -4,8 +4,24 @@ import "core:bytes"
 import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
+import activity "../temporal/activity"
 import proto "../temporal/core/proto"
+import worker "../temporal/worker"
 import workflow "../temporal/workflow"
+
+Activity_Heartbeat_Capture :: struct {
+	calls: int,
+}
+
+capture_activity_heartbeat :: proc(
+	user_data: rawptr,
+	details: string,
+) -> activity.Heartbeat_Status {
+	_ = details
+	capture := cast(^Activity_Heartbeat_Capture)user_data
+	capture.calls += 1
+	return .Recorded
+}
 
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
@@ -247,6 +263,74 @@ workflow_event_races_are_deterministic :: proc(t: ^testing.T) {
 		"Workflow event races replay deterministically",
 		workflow_race_replays_deterministically,
 		{num_tests = 500, seed = 0x5445_4d50_4f52_414c},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
+	count := pbt.draw(t, pbt.int_range(1, 10))
+	target := pbt.draw(t, pbt.int_range(0, count - 1))
+	reason_value := pbt.draw(t, pbt.int_range(1, 6))
+	heartbeats_before := pbt.draw(t, pbt.int_range(0, 8))
+	pbt.cover(t, target == 0, 10.0, "first task token")
+	pbt.cover(t, target == count - 1, 10.0, "last task token")
+	pbt.cover(t, count >= 8, 15.0, "large in-flight set")
+
+	tokens: [10][2]u8
+	executions: [10]worker.Activity_Execution
+	routes: [10]^worker.Activity_Execution
+	captures: [10]Activity_Heartbeat_Capture
+	for index in 0 ..< count {
+		tokens[index] = {u8(index), u8(index + 0xa5)}
+		executions[index].task_token = tokens[index][:]
+		activity.context_init(
+			&executions[index].ctx,
+			"generated-activity",
+			u32(index + 1),
+			&captures[index],
+			capture_activity_heartbeat,
+		)
+		routes[index] = &executions[index]
+	}
+
+	for _ in 0 ..< heartbeats_before {
+		if activity.heartbeat(&executions[target].ctx, "progress") != .Recorded {
+			return pbt.fail("heartbeat failed before generated cancellation")
+		}
+	}
+	found, ok := worker.find_activity_execution(routes[:count], tokens[target][:])
+	if !ok || found != &executions[target] {
+		return pbt.fail("task token routed to the wrong Activity execution")
+	}
+	reason := activity.Cancel_Reason(reason_value)
+	activity.context_request_cancellation(&found.ctx, reason)
+
+	for &execution, index in executions[:count] {
+		if index == target {
+			if !activity.is_cancellation_requested(&execution.ctx) ||
+			   activity.cancellation_reason(&execution.ctx) != reason {
+				return pbt.fail("target Activity lost its cancellation state")
+			}
+		} else if activity.is_cancellation_requested(&execution.ctx) {
+			return pbt.fail("cancellation leaked to another task token")
+		}
+	}
+	if activity.heartbeat(&found.ctx, "after cancellation") != .Cancellation_Requested {
+		return pbt.fail("heartbeat did not expose generated cancellation")
+	}
+	if captures[target].calls != heartbeats_before {
+		return pbt.fail("heartbeat transport ran after cancellation was visible")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_cancel_routing_is_token_local :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity cancellation remains local to its task token",
+		activity_token_routing_preserves_cancellation,
+		{num_tests = 500, seed = 0x4143_5449_5649_5459},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

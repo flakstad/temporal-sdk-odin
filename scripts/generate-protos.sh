@@ -40,6 +40,7 @@ cargo run --quiet \
   --package odin-proto-gen -- \
   "$descriptor_set" \
   "$generated" \
+  coresdk.ActivityHeartbeat \
   coresdk.activity_task.ActivityTask \
   coresdk.ActivityTaskCompletion \
   coresdk.workflow_activation.WorkflowActivation \

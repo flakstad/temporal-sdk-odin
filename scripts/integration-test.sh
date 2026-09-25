@@ -97,6 +97,28 @@ run_activity_case() {
 run_activity_case no
 run_activity_case yes
 
+ACTIVITY_EXPECT_CONCURRENT=1 \
+  "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Concurrent Odin Activity Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+ACTIVITY_CONCURRENT=1 cargo run --quiet \
+  --manifest-path "$repo_root/native/Cargo.toml" \
+  --package activity-test-driver
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "two Activity callbacks overlapped and worker shut down cleanly" "$worker_log"
+
 "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
 for _ in {1..30}; do
@@ -251,6 +273,6 @@ run_workflow_cancellation_case \
 run_workflow_cancellation_case \
   cancel-activity \
   '"cancel-activity"' \
-  'scheduled=1 last_activity=1 .*waiting_activity=1' \
+  'cancel-activity heartbeat recorded' \
   'replay=false .*cancel=true canceled_workflow=true .*canceled_timer=false canceled_activity=true' \
-  'Workflow cancellation requested pending Activity cancellation and closed the execution'
+  'Activity heartbeat delivered cancellation and Odin acknowledged it'

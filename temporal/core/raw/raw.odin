@@ -347,6 +347,10 @@ foreign temporal_core {
 		user_data: rawptr,
 		callback: Worker_Callback,
 	) ---
+	worker_record_activity_heartbeat :: proc(
+		worker: ^Worker,
+		heartbeat: Byte_Array_Ref,
+	) -> ^Byte_Array ---
 	worker_complete_workflow_activation :: proc(
 		worker: ^Worker,
 		completion: Byte_Array_Ref,

@@ -5,12 +5,25 @@ import "core:bytes"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
+import activity "../temporal/activity"
 import temporal_core "../temporal/core"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import protobuf "../temporal/protobuf"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
+
+Heartbeat_Capture :: struct {
+	calls:   int,
+	details: string,
+}
+
+capture_heartbeat :: proc(user_data: rawptr, details: string) -> activity.Heartbeat_Status {
+	capture := cast(^Heartbeat_Capture)user_data
+	capture.calls += 1
+	capture.details = details
+	return .Recorded
+}
 
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
@@ -422,6 +435,95 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, found_success)
+}
+
+@(test)
+activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
+	cancel_details := proto.Coresdk_Activity_Task_ActivityCancellationDetails{
+		is_cancelled = true,
+	}
+	cancel := proto.Coresdk_Activity_Task_Cancel{
+		reason = .CANCELLED,
+		details = &cancel_details,
+	}
+	raw_task := proto.Coresdk_Activity_Task_ActivityTask{
+		task_token = transmute([]u8)string("cancel-token"),
+		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Cancel{value = &cancel},
+	}
+	encoded_task := proto.encode_Coresdk_Activity_Task_ActivityTask(&raw_task)
+	defer delete(encoded_task)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	task, decode_error := proto.decode_activity_task(encoded_task[:])
+	context.allocator = previous_allocator
+	testing.expect(t, decode_error == .None)
+	testing.expect(t, task.kind == .Cancel)
+	testing.expect(t, task.cancel_reason == .CANCELLED)
+	testing.expect(t, task.cancel_details.is_cancelled)
+
+	heartbeat := proto.encode_activity_heartbeat(
+		transmute([]u8)string("heartbeat-token"),
+		transmute([]u8)string(`"halfway"`),
+	)
+	defer delete(heartbeat)
+	decoded_heartbeat := proto.Coresdk_ActivityHeartbeat{}
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	heartbeat_ok := proto.decode_Coresdk_ActivityHeartbeat(heartbeat[:], &decoded_heartbeat)
+	context.allocator = previous_allocator
+	testing.expect(t, heartbeat_ok)
+	testing.expect_value(t, string(decoded_heartbeat.task_token), "heartbeat-token")
+	testing.expect_value(t, len(decoded_heartbeat.details), 1)
+	if len(decoded_heartbeat.details) == 1 {
+		testing.expect_value(t, string(decoded_heartbeat.details[0].data), `"halfway"`)
+	}
+
+	completion := proto.encode_activity_cancellation(transmute([]u8)string("cancel-token"))
+	defer delete(completion)
+	decoded_completion := proto.Coresdk_ActivityTaskCompletion{}
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion_ok := proto.decode_Coresdk_ActivityTaskCompletion(completion[:], &decoded_completion)
+	context.allocator = previous_allocator
+	testing.expect(t, completion_ok)
+	cancelled := false
+	if decoded_completion.result != nil {
+		#partial switch status in decoded_completion.result.status {
+		case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Cancelled:
+			cancelled = status.value != nil && status.value.failure != nil
+			if cancelled {
+				#partial switch failure_info in status.value.failure.failure_info {
+				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
+					cancelled = failure_info.value != nil
+				case:
+					cancelled = false
+				}
+			}
+		}
+	}
+	testing.expect(t, cancelled)
+}
+
+@(test)
+activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^testing.T) {
+	capture := Heartbeat_Capture{}
+	ctx := activity.Context{}
+	activity.context_init(&ctx, "activity-id", 3, &capture, capture_heartbeat)
+
+	testing.expect_value(t, activity.activity_id(&ctx), "activity-id")
+	testing.expect_value(t, activity.attempt(&ctx), u32(3))
+	testing.expect(t, !activity.is_cancellation_requested(&ctx))
+	testing.expect(t, activity.heartbeat(&ctx, "halfway") == .Recorded)
+	testing.expect_value(t, capture.calls, 1)
+	testing.expect_value(t, capture.details, "halfway")
+
+	activity.context_request_cancellation(&ctx, .Worker_Shutdown)
+	testing.expect(t, activity.is_cancellation_requested(&ctx))
+	testing.expect(t, activity.cancellation_reason(&ctx) == .Worker_Shutdown)
+	testing.expect(t, activity.heartbeat(&ctx, "too late") == .Cancellation_Requested)
+	testing.expect_value(t, capture.calls, 1)
 }
 
 @(test)

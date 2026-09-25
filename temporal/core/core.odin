@@ -151,6 +151,7 @@ worker_create :: proc(
 	task_queue: string,
 	namespace := "default",
 	enable_workflows := false,
+	max_activity_slots := 10,
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
@@ -158,6 +159,10 @@ worker_create :: proc(
 	}
 	if len(task_queue) == 0 {
 		error.message = bytes.clone(transmute([]u8)string("task queue must not be empty"))
+		return
+	}
+	if max_activity_slots <= 0 {
+		error.message = bytes.clone(transmute([]u8)string("max activity slots must be positive"))
 		return
 	}
 
@@ -170,7 +175,7 @@ worker_create :: proc(
 		},
 		tuner = raw.Tuner_Holder{
 			workflow_slot_supplier       = fixed_slot_supplier(1),
-			activity_slot_supplier       = fixed_slot_supplier(10),
+			activity_slot_supplier       = fixed_slot_supplier(uintptr(max_activity_slots)),
 			local_activity_slot_supplier = fixed_slot_supplier(1),
 			nexus_task_slot_supplier     = fixed_slot_supplier(1),
 		},
@@ -318,6 +323,19 @@ worker_complete_activity :: proc(worker: ^Worker, completion: []u8) -> Error {
 	}
 	error := Error{message = copy_core_bytes(state.fail)}
 	raw.byte_array_free(worker.runtime.handle, state.fail)
+	return error
+}
+
+worker_record_activity_heartbeat :: proc(worker: ^Worker, heartbeat: []u8) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("worker is not initialized"))}
+	}
+	fail := raw.worker_record_activity_heartbeat(worker.handle, bytes_ref(heartbeat))
+	if fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(fail)}
+	raw.byte_array_free(worker.runtime.handle, fail)
 	return error
 }
 

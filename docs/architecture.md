@@ -101,6 +101,7 @@ The bridge exposes opaque handles plus C-layout options and callback APIs:
 | Worker | `TemporalCoreWorker*` | C worker option structs |
 | Activity poll | async callback | binary `coresdk.activity_task.ActivityTask` |
 | Activity completion | async callback | binary `coresdk.ActivityTaskCompletion` |
+| Activity heartbeat | synchronous error return | binary `coresdk.ActivityHeartbeat` |
 | Workflow poll | async callback | binary `coresdk.workflow_activation.WorkflowActivation` |
 | Workflow completion | async callback | binary `coresdk.workflow_completion.WorkflowActivationCompletion` |
 | Errors | `TemporalCoreByteArray*` | UTF-8 message, with gRPC status/details where applicable |
@@ -247,7 +248,8 @@ represented as their generated repeated entry messages. Generated decoders use
 unknown fields, and reject malformed wire data. Encoders produce standard
 protobuf wire data and omit default-valued singular fields.
 
-The current roots are `coresdk.activity_task.ActivityTask`,
+The current roots are `coresdk.ActivityHeartbeat`,
+`coresdk.activity_task.ActivityTask`,
 `coresdk.ActivityTaskCompletion`,
 `coresdk.workflow_activation.WorkflowActivation`, and
 `coresdk.workflow_completion.WorkflowActivationCompletion`. Their reachable
@@ -322,6 +324,9 @@ as ABI requirements:
   returned byte array may outlive the runtime.
 - Worker poll callbacks return both pointers null for poll shutdown. Otherwise
   any non-null success/failure byte array must be freed.
+- `temporal_core_worker_record_activity_heartbeat` borrows its protobuf bytes
+  only for the synchronous call. A non-null return is a Core-allocated UTF-8
+  error and must be freed exactly once with the worker runtime.
 - Forwarded-log references are valid only inside the log callback. Similar
   callback-borrowed data must be copied before returning when it must persist.
 - Callback thread identity is unspecified. Odin callbacks must not assume they
@@ -334,9 +339,11 @@ API yet. Generated protobuf decoding allocates nested messages and repeated
 fields in a per-task virtual-memory arena while string and byte fields remain
 views into the copied poll buffer. Both therefore stay alive through Activity
 dispatch and completion encoding, then the arena and poll buffer are released.
-Each Activity invocation has a separate temporary arena; allocations made by
-the Activity, including its returned string, are released after result
-encoding.
+Each Activity invocation has a heap-stable execution record plus a separate
+temporary arena; allocations made by the Activity, including its returned
+string, are released after result encoding. Its owned task token, input, and
+activity ID remain alive until the callback thread is joined, which also keeps
+heartbeat byte references and cancel routing valid.
 
 Shutdown exposed an important lifecycle detail in practice: after
 `temporal_core_worker_initiate_shutdown`, an active poll must observe the
@@ -404,6 +411,7 @@ temporal_core_worker_new
 temporal_core_worker_validate
 temporal_core_worker_poll_activity_task
 temporal_core_worker_complete_activity_task
+temporal_core_worker_record_activity_heartbeat
 temporal_core_worker_poll_workflow_activation
 temporal_core_worker_complete_workflow_activation
 temporal_core_worker_request_workflow_eviction
@@ -818,16 +826,29 @@ worker.run
     |      RemoveFromCache -> destroy fiber and route
     |
     `-- Activity poll thread
-           decode task -> registered Activity -> complete task
+           decode task -> task-token route -> bounded callback thread
+                                      |-> heartbeat Core synchronously
+                                      `-> complete success/failure/cancel
 ```
 
 The blocking C calls can run concurrently against the same Core worker. The
 Workflow registry itself is frozen while `run` is active, and only the Workflow
 poll thread accesses its fiber runtimes and run-ID table. This preserves
 single-threaded fiber affinity while allowing a Workflow-produced Activity to
-execute without stopping Workflow polling. The Activity side is still one
-poller executing one procedure synchronously; this is orchestration
-concurrency, not yet concurrent Activity execution.
+execute without stopping Workflow polling. Activity start tasks own
+heap-stable execution/context state until their callback thread joins. Core's
+fixed slot supplier bounds concurrency; the single poll thread continues to
+receive prioritized cancel tasks and atomically marks the matching context.
+Core explicitly permits Activity completions to be called concurrently.
+
+Cancellation cannot forcibly unwind arbitrary Odin code. User code must return
+after observing `activity.is_cancellation_requested`; the worker then emits an
+`ActivityExecutionResult.cancelled` carrying `CanceledFailureInfo`. Heartbeat
+calls are synchronous only at the C decode/queue boundary. Core throttles the
+server heartbeat RPC, and a server cancellation response later interrupts the
+Activity poll as a separate cancel task. The live suite verifies this exact
+sequence and preserves Core's reason, including the valid `NotFound` race after
+the Workflow has already closed.
 
 `register_workflow(name, proc)` owns one `Fiber_Runtime` per Workflow type. A
 unit test initializes two types under different run IDs, verifies dispatch to
@@ -869,11 +890,11 @@ Workflows are enabled.
    wire-compatible with `prost`. Unknown fields are skipped rather than
    retained. Every new root graph still needs generation, compile, unit, and
    live `prost` interoperability checks.
-3. **Worker concurrency.** Dedicated Workflow and Activity poll threads now
-   integrate the blocking callbacks and preserve Workflow fiber affinity, but
-   the Activity side remains synchronous. A production worker needs a bounded
-   Activity executor, heap-stable in-flight state, cancellation delivery,
-   heartbeats, and backpressure tests.
+3. **Worker concurrency.** The fixed-slot Activity executor, heap-stable
+   task-token routes, cooperative cancellation, and heartbeat transport pass
+   live tests. It currently creates one OS thread per Core slot rather than a
+   reusable pool, uses a linear in-flight lookup, and lacks load/backpressure,
+   panic-containment, deadline, and shutdown-timeout stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -888,9 +909,10 @@ Workflows are enabled.
    Generated Odin types and the native artifact must ship as one versioned unit.
 7. **Error/cancellation completeness.** The Workflow runtime preserves the raw
    Temporal failure protobuf for propagation, but the catchable experimental API
-   exposes only status and message. A public API must model typed causes/details,
-   Activity-side cancellation delivery, heartbeats, deadlines, panics, and
-   codec failures.
+   exposes only status and message. Activity cancellation preserves Core's
+   reason but not all detail flags or user cancellation details in its result.
+   A public API must model typed causes/details, deadlines, panics, and codec
+   failures.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -910,27 +932,21 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-Workflow and Activity orchestration now lives in `temporal/worker`, and the live
-example no longer polls Core or dispatches activations itself. The next vertical
-milestone should make Activity execution genuinely asynchronous: one poll loop,
-a small bounded executor, task-token keyed in-flight state, `ActivityTask`
-cancellation delivery, and heartbeat support through `Activity_Context`. This
-tests the next unproven Core/language lifecycle boundary and removes the largest
-gap in the Activity worker without coupling it to Workflow cancellation-scope
-syntax.
-
-Alongside that slice, delay Core worker construction until `run` so registered
+Activity concurrency, task-token routing, cooperative cancel delivery, and
+heartbeat transport are now proven live. The next vertical milestone should
+delay Core worker construction until `run` so registered
 task types determine Core options and the public API no longer exposes
-`enable_workflows`. Unknown Workflow types must also produce a language-facing
-failed activation without terminating the worker. Generic payload APIs and
-user Workflow cancellation scopes should follow as separate changes.
+`enable_workflows`. It should also replace the one-thread-per-slot executor with
+a small reusable pool and stress shutdown/cancel/heartbeat interleavings using
+`pbt`; a statechart oracle becomes worthwhile once retries and deadlines join
+that model. Unknown Workflow types must produce a language-facing failed
+activation without terminating the worker. Generic payload APIs and user
+Workflow cancellation scopes should follow as separate changes.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
 dependency. Keep queries and updates deferred until cancellation semantics are
-grounded at the user-code boundary. Activity concurrency, heartbeats, and
-Activity-side cancellation delivery remain the next worker-side production
-work, but the Activity Worker vertical milestone itself is already complete.
+grounded at the user-code boundary.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

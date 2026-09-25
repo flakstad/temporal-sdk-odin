@@ -13,7 +13,25 @@ TASK_QUEUE :: "odin-hello-workflow"
 WORKFLOW_TYPE :: "odin_hello_workflow"
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
-	_ = ctx
+	if name == "cancel-activity" {
+		first_heartbeat := true
+		for !activity.is_cancellation_requested(ctx) {
+			status := activity.heartbeat(ctx, "waiting for cancellation")
+			if first_heartbeat && status == .Recorded {
+				fmt.println("cancel-activity heartbeat recorded")
+				first_heartbeat = false
+			}
+			if status == .Cancellation_Requested {
+				break
+			}
+			time.sleep(100 * time.Millisecond)
+		}
+		fmt.printf(
+			"cancel-activity observed cancellation reason=%v\n",
+			activity.cancellation_reason(ctx),
+		)
+		return "cancellation acknowledged"
+	}
 	greeting, allocation_error := strings.concatenate({"Hello ", name})
 	if allocation_error != nil {
 		return ""
@@ -120,7 +138,7 @@ main :: proc() {
 		{
 			max_activity_tasks = expect_cancel ? 0 : 1,
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel,
+			disable_activity_polling = expect_cancel_timer,
 			on_workflow_activation = observe_activation,
 		},
 	)
@@ -145,12 +163,18 @@ main :: proc() {
 				failed = true
 			}
 		} else if expect_cancel_activity {
-			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
-				fmt.eprintln("Workflow spike did not cancel its pending Activity and Workflow Execution")
+			if run_stats.activity_tasks_completed != 1 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
+				fmt.eprintln("Workflow spike did not deliver and acknowledge Activity cancellation")
 				failed = true
 			}
 		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 {
-			fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
+			fmt.eprintf(
+				"Workflow spike stats mismatch: activities=%d signals=%d timers_canceled=%d replay_activations=%d\n",
+				run_stats.activity_tasks_completed,
+				run_stats.workflow_signals_received,
+				run_stats.timers_canceled,
+				run_stats.workflow_replay_activations,
+			)
 			failed = true
 		}
 	}
@@ -170,7 +194,7 @@ main :: proc() {
 	if expect_cancel_timer {
 		fmt.println("Workflow cancellation canceled the pending timer and closed the execution")
 	} else if expect_cancel_activity {
-		fmt.println("Workflow cancellation requested pending Activity cancellation and closed the execution")
+		fmt.println("Activity heartbeat delivered cancellation and Odin acknowledged it")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

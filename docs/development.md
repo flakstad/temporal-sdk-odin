@@ -120,9 +120,21 @@ fiber and removes that route.
 The C wrapper currently presents blocking poll calls. When both task types are
 registered, `worker.run` creates one Workflow poll thread and one Activity poll
 thread. Only the Workflow thread reads or mutates Workflow runtimes, so a fiber
-never migrates between threads. The Activity thread still invokes one Activity
-synchronously at a time. `worker.request_shutdown` is safe to call from a
-coordinating thread; `worker.close` must only be called after `run` returns.
+never migrates between threads. The Activity poll thread instead creates one
+heap-stable execution record and Odin thread per start task. Core's fixed-size
+Activity slot supplier bounds these at `max_concurrent_activities` (10 by
+default), while the poll thread remains free to deliver task-token-matched
+cancel tasks. `worker.request_shutdown` is safe to call from a coordinating
+thread; `worker.close` must only be called after `run` returns.
+
+Activity cancellation is cooperative. `activity.is_cancellation_requested`
+and `activity.cancellation_reason` expose the state Core delivered; returning
+from the callback after a request makes the worker send a cancellation result
+with `CanceledFailureInfo`. `activity.heartbeat(ctx, details)` sends one
+`json/plain` string payload through
+`temporal_core_worker_record_activity_heartbeat`. Core owns heartbeat
+throttling, and any server cancellation response returns later through the
+normal Activity poll stream.
 
 `Run_Options.max_activity_tasks` and `max_workflow_executions` are bounded
 test/example controls. Zero means unbounded. Normal workers call `run` without
@@ -166,6 +178,20 @@ not part of the distributed Odin SDK and not an Odin workflow runtime. This is
 also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
 
+The script then schedules two Activities in one upstream-driver Workflow. Each
+callback waits at an atomic barrier, so the expected results are possible only
+if both Odin callbacks overlap. The run scripts build and `exec` their binaries
+rather than using `odin run`; this keeps the process PID identical to the
+worker PID so integration cleanup cannot orphan a task-queue poller.
+
+`./scripts/test.sh` uses the pinned `test-deps/pbt` submodule by default. During
+local PBT library development, run `PBT_ROOT=~/Projects/pbt ./scripts/test.sh`
+to compile the SDK properties against that checkout without changing the
+reproducible repository pin. The Activity property suite generates in-flight
+set sizes, target task tokens, cancel reasons, and heartbeat counts, then checks
+that cancellation never leaks across tokens and no heartbeat is transported
+after cancellation becomes visible.
+
 Finally, the script starts `examples/hello_workflow` and invokes it directly
 with `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
@@ -178,9 +204,11 @@ succeeds. It then runs two cancellation cases through
 `temporal workflow cancel`: a Workflow blocked on a timer must emit
 `CancelTimer` plus `CancelWorkflowExecution`, and a Workflow blocked on an
 Activity must emit `RequestCancelActivity` plus `CancelWorkflowExecution`.
-Core delivers the Activity's terminal cancellation resolution in one final
-activation before eviction; Odin acknowledges it with an empty successful
-completion and does not repeat the terminal command.
+For the Activity case, polling remains enabled: the callback first heartbeats,
+the test cancels the Workflow, Core emits an Activity cancel task, and the Odin
+callback returns a valid canceled completion. Core then delivers the terminal
+Activity resolution in one final activation before eviction; Odin acknowledges
+it with an empty successful completion and does not repeat the terminal command.
 
 ## Manual run
 

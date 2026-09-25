@@ -43,6 +43,7 @@ Run_Options :: struct {
 
 Run_Stats :: struct {
 	activity_tasks_completed:             int,
+	activity_cancellations_received:      int,
 	workflow_activations_completed:       int,
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
@@ -60,6 +61,7 @@ Worker :: struct {
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
 	running:                bool,
+	max_concurrent_activities: int,
 }
 
 Error :: struct {
@@ -92,8 +94,15 @@ create :: proc(
 	task_queue: string,
 	namespace := "default",
 	enable_workflows := false,
+	max_concurrent_activities := 10,
 ) -> (worker: Worker, error: Error) {
-	core_worker, core_error := temporal_core.worker_create(client, task_queue, namespace, enable_workflows)
+	core_worker, core_error := temporal_core.worker_create(
+		client,
+		task_queue,
+		namespace,
+		enable_workflows,
+		max_concurrent_activities,
+	)
 	if core_error.message != nil {
 		return {}, error_from_core(&core_error)
 	}
@@ -105,6 +114,7 @@ create :: proc(
 	}
 	worker.core = core_worker
 	worker.task_queue = owned_task_queue
+	worker.max_concurrent_activities = max_concurrent_activities
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.workflow_registrations = make([dynamic]Workflow_Registration)
 	worker.workflow_runs = make([dynamic]Workflow_Run)
@@ -199,9 +209,8 @@ execute_start :: proc(worker: ^Worker, task: ^proto.Activity_Task) -> (completio
 	defer delete(input)
 
 	activity_context := activity.Context{
-		activity_id = task.activity_id,
-		attempt = task.attempt,
 	}
+	activity.context_init(&activity_context, task.activity_id, task.attempt, nil, nil)
 	// Activity-local allocations, including the returned string, live only until
 	// its payload has been copied into the completion.
 	arena: virtual.Arena
@@ -221,6 +230,150 @@ execute_start :: proc(worker: ^Worker, task: ^proto.Activity_Task) -> (completio
 	}
 	defer delete(result_data)
 	return proto.encode_activity_success(task.task_token, result_data), {}
+}
+
+Activity_Execution :: struct {
+	worker:     ^Worker,
+	callback:   String_Activity_Proc,
+	task_token: []u8,
+	activity_id: string,
+	input:       string,
+	ctx:         activity.Context,
+	thread:      ^thread.Thread,
+	error:       Error,
+}
+
+activity_cancel_reason :: proc(reason: proto.Coresdk_Activity_Task_ActivityCancelReason) -> activity.Cancel_Reason {
+	switch reason {
+	case .NOT_FOUND:
+		return .Not_Found
+	case .CANCELLED:
+		return .Cancelled
+	case .TIMED_OUT:
+		return .Timed_Out
+	case .WORKER_SHUTDOWN:
+		return .Worker_Shutdown
+	case .PAUSED:
+		return .Paused
+	case .RESET:
+		return .Reset
+	}
+	return .Cancelled
+}
+
+activity_heartbeat_recorder :: proc(user_data: rawptr, details: string) -> activity.Heartbeat_Status {
+	execution := cast(^Activity_Execution)user_data
+	if execution == nil || execution.worker == nil {
+		return .Invalid_Context
+	}
+	details_data, encode_error := codec.encode_string(details)
+	if encode_error != .None {
+		return .Encoding_Failed
+	}
+	defer delete(details_data)
+	heartbeat := proto.encode_activity_heartbeat(execution.task_token, details_data)
+	defer delete(heartbeat)
+	core_error := temporal_core.worker_record_activity_heartbeat(&execution.worker.core, heartbeat[:])
+	if core_error.message != nil {
+		temporal_core.error_free(&core_error)
+		return .Core_Error
+	}
+	return .Recorded
+}
+
+activity_execution_main :: proc(execution: ^Activity_Execution) {
+	// Activity-local allocations, including the returned string, live only until
+	// its payload has been copied into the completion.
+	arena: virtual.Arena
+	arena_error := virtual.arena_init_growing(&arena)
+	if arena_error != nil {
+		execution.error = error_from_string("could not initialize activity allocation arena")
+		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	output := execution.callback(&execution.ctx, execution.input)
+	context.allocator = previous_allocator
+
+	completion: [dynamic]u8
+	if activity.is_cancellation_requested(&execution.ctx) {
+		completion = proto.encode_activity_cancellation(execution.task_token)
+	} else {
+		result_data, encode_error := codec.encode_string(output)
+		if encode_error != .None {
+			execution.error = error_from_string("could not encode activity result")
+			temporal_core.worker_initiate_shutdown(&execution.worker.core)
+			return
+		}
+		defer delete(result_data)
+		completion = proto.encode_activity_success(execution.task_token, result_data)
+	}
+	defer delete(completion)
+	core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
+	if core_error.message != nil {
+		execution.error = error_from_core(&core_error)
+		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+	}
+}
+
+activity_execution_destroy :: proc(execution: ^Activity_Execution) {
+	if execution == nil {
+		return
+	}
+	delete(execution.task_token)
+	delete(execution.activity_id)
+	delete(execution.input)
+	error_free(&execution.error)
+	free(execution)
+}
+
+activity_execution_start :: proc(
+	worker: ^Worker,
+	task: ^proto.Activity_Task,
+) -> (execution: ^Activity_Execution, error: Error) {
+	callback, found := find_activity(worker, task.activity_type)
+	if !found {
+		message := fmt.aprintf("activity %q is not registered", task.activity_type)
+		defer delete(message)
+		completion := completion_failure(task.task_token, message)
+		defer delete(completion)
+		core_error := temporal_core.worker_complete_activity(&worker.core, completion[:])
+		return nil, error_from_core(&core_error)
+	}
+
+	input, decode_error := codec.decode_string(task.input.data, task.input.encoding)
+	if decode_error != .None {
+		completion := completion_failure(task.task_token, "activity input must be one json/plain string")
+		defer delete(completion)
+		core_error := temporal_core.worker_complete_activity(&worker.core, completion[:])
+		return nil, error_from_core(&core_error)
+	}
+	execution = new(Activity_Execution)
+	execution.worker = worker
+	execution.callback = callback
+	execution.task_token = bytes.clone(task.task_token)
+	execution.input = input
+	owned_activity_id, allocation_error := strings.clone(task.activity_id)
+	if allocation_error != nil {
+		activity_execution_destroy(execution)
+		return nil, error_from_string("could not allocate Activity execution")
+	}
+	execution.activity_id = owned_activity_id
+	activity.context_init(
+		&execution.ctx,
+		execution.activity_id,
+		task.attempt,
+		cast(rawptr)execution,
+		activity_heartbeat_recorder,
+	)
+	execution.thread = thread.create_and_start_with_poly_data(execution, activity_execution_main)
+	if execution.thread == nil {
+		activity_execution_destroy(execution)
+		return nil, error_from_string("could not start Activity execution thread")
+	}
+	return execution, {}
 }
 
 Workflow_Activation_Route :: struct {
@@ -341,11 +494,69 @@ process_workflow_activation :: proc(
 	return
 }
 
-run_activity_loop :: proc(worker: ^Worker, max_tasks: int) -> (completed: int, error: Error) {
-	for max_tasks <= 0 || completed < max_tasks {
+find_activity_execution :: proc(
+	executions: []^Activity_Execution,
+	task_token: []u8,
+) -> (^Activity_Execution, bool) {
+	for execution in executions {
+		if bytes.equal(execution.task_token, task_token) {
+			return execution, true
+		}
+	}
+	return nil, false
+}
+
+reap_activity_executions :: proc(
+	executions: ^[dynamic]^Activity_Execution,
+	wait_for_all: bool,
+) -> (completed: int, error: Error) {
+	for index := len(executions^) - 1; index >= 0; index -= 1 {
+		execution := executions^[index]
+		if !wait_for_all && !thread.is_done(execution.thread) {
+			continue
+		}
+		thread.join(execution.thread)
+		thread.destroy(execution.thread)
+		execution.thread = nil
+		if execution.error.message != nil {
+			if error.message == nil {
+				error = execution.error
+				execution.error = {}
+			}
+		} else {
+			completed += 1
+		}
+		activity_execution_destroy(execution)
+		unordered_remove(executions, index)
+	}
+	return
+}
+
+run_activity_loop :: proc(
+	worker: ^Worker,
+	max_tasks: int,
+) -> (completed: int, cancellations: int, error: Error) {
+	executions := make([dynamic]^Activity_Execution)
+	defer delete(executions)
+	defer {
+		reaped, cleanup_error := reap_activity_executions(&executions, true)
+		completed += reaped
+		if error.message == nil {
+			error = cleanup_error
+		} else {
+			error_free(&cleanup_error)
+		}
+	}
+	started := 0
+	for max_tasks <= 0 || started < max_tasks {
+		reaped, reap_error := reap_activity_executions(&executions, false)
+		completed += reaped
+		if reap_error.message != nil {
+			return completed, cancellations, reap_error
+		}
 		poll := temporal_core.worker_poll_activity(&worker.core)
 		if poll.error.message != nil {
-			return completed, error_from_core(&poll.error)
+			return completed, cancellations, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
 			break
@@ -355,7 +566,7 @@ run_activity_loop :: proc(worker: ^Worker, max_tasks: int) -> (completed: int, e
 		arena_error := virtual.arena_init_growing(&decode_arena)
 		if arena_error != nil {
 			delete(poll.protobuf)
-			return completed, error_from_string("could not initialize protobuf decode arena")
+			return completed, cancellations, error_from_string("could not initialize protobuf decode arena")
 		}
 		previous_allocator := context.allocator
 		context.allocator = virtual.arena_allocator(&decode_arena)
@@ -364,30 +575,38 @@ run_activity_loop :: proc(worker: ^Worker, max_tasks: int) -> (completed: int, e
 		if decode_error != .None {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, error_from_string("Core returned a malformed ActivityTask protobuf")
+			return completed, cancellations, error_from_string("Core returned a malformed ActivityTask protobuf")
 		}
 		if task.kind == .Cancel {
-			// Concurrent Activity execution and cancellation delivery are deferred.
+			execution, found := find_activity_execution(executions[:], task.task_token)
+			if found {
+				activity.context_request_cancellation(
+					&execution.ctx,
+					activity_cancel_reason(task.cancel_reason),
+				)
+				cancellations += 1
+			}
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
 			continue
 		}
 
-		completion, execute_error := execute_start(worker, &task)
+		execution, execute_error := activity_execution_start(worker, &task)
 		virtual.arena_destroy(&decode_arena)
-		if execute_error.message != nil {
-			delete(poll.protobuf)
-			return completed, execute_error
-		}
-		complete_error := temporal_core.worker_complete_activity(&worker.core, completion[:])
-		delete(completion)
 		delete(poll.protobuf)
-		if complete_error.message != nil {
-			return completed, error_from_core(&complete_error)
+		if execute_error.message != nil {
+			return completed, cancellations, execute_error
 		}
-		completed += 1
+		started += 1
+		if execution == nil {
+			completed += 1
+		} else {
+			append(&executions, execution)
+		}
 	}
-	return
+	reaped, reap_error := reap_activity_executions(&executions, true)
+	completed += reaped
+	return completed, cancellations, reap_error
 }
 
 record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
@@ -475,6 +694,7 @@ Activity_Thread_State :: struct {
 	worker:    ^Worker,
 	max_tasks: int,
 	completed: int,
+	cancellations: int,
 	error:     Error,
 }
 
@@ -486,7 +706,7 @@ Workflow_Thread_State :: struct {
 }
 
 activity_thread_main :: proc(state: ^Activity_Thread_State) {
-	state.completed, state.error = run_activity_loop(state.worker, state.max_tasks)
+	state.completed, state.cancellations, state.error = run_activity_loop(state.worker, state.max_tasks)
 	if state.error.message != nil {
 		temporal_core.worker_initiate_shutdown(&state.worker.core)
 	}
@@ -523,7 +743,9 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	}
 
 	if poll_activities && !poll_workflows {
-		stats.activity_tasks_completed, error = run_activity_loop(worker, options.max_activity_tasks)
+		stats.activity_tasks_completed,
+		stats.activity_cancellations_received,
+		error = run_activity_loop(worker, options.max_activity_tasks)
 		return
 	}
 	if poll_workflows && !poll_activities {
@@ -548,12 +770,18 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		return {}, error_from_string("could not start Activity poll thread")
 	}
 	thread.join(workflow_thread)
+	// Bounded Workflow runs are an example/test facility. Once that target has
+	// evicted, stop the otherwise-unbounded Activity poll so both loops can join.
+	if options.max_workflow_executions > 0 && workflow_state.error.message == nil {
+		temporal_core.worker_initiate_shutdown(&worker.core)
+	}
 	thread.join(activity_thread)
 	thread.destroy(workflow_thread)
 	thread.destroy(activity_thread)
 
 	stats = workflow_state.stats
 	stats.activity_tasks_completed = activity_state.completed
+	stats.activity_cancellations_received = activity_state.cancellations
 	if workflow_state.error.message != nil {
 		error = workflow_state.error
 		error_free(&activity_state.error)
@@ -600,5 +828,6 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.workflow_runs = nil
 	worker.task_queue = ""
 	worker.running = false
+	worker.max_concurrent_activities = 0
 	return error_from_core(&core_error)
 }

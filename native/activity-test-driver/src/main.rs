@@ -72,6 +72,30 @@ impl FailureDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct ConcurrentActivityDriverWorkflow;
+
+#[workflow_methods]
+impl ConcurrentActivityDriverWorkflow {
+    #[run(name = "odin_concurrent_activity_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let activities = ["concurrent-a", "concurrent-b"].map(|name| {
+            ctx.execute_activity(
+                HelloActivity,
+                name.to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+        });
+        let results = temporalio_sdk::workflows::join_all(activities).await;
+        let mut outputs = Vec::with_capacity(results.len());
+        for result in results {
+            outputs.push(result?);
+        }
+        Ok(outputs.join(" & "))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -80,7 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("TEMPORAL_TASK_QUEUE").unwrap_or_else(|_| "odin-hello-activity".to_string());
     let input = std::env::var("ACTIVITY_INPUT").unwrap_or_else(|_| "Odin".to_string());
     let expect_failure = std::env::var_os("ACTIVITY_EXPECT_FAILURE").is_some();
-    let expected = format!("Hello {input}");
+    let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
+    let expected = if concurrent {
+        "Hello concurrent-a & Hello concurrent-b".to_string()
+    } else {
+        format!("Hello {input}")
+    };
 
     let runtime = Runtime::from_current_tokio(Default::default())?;
     let connection =
@@ -89,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = WorkerOptions::new(queue.clone())
         .register_workflow::<ActivityDriverWorkflow>()?
         .register_workflow::<FailureDriverWorkflow>()?
+        .register_workflow::<ConcurrentActivityDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -101,6 +131,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .start_workflow(
                     FailureDriverWorkflow::run,
                     input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await?
+        } else if concurrent {
+            let handle = client
+                .start_workflow(
+                    ConcurrentActivityDriverWorkflow::run,
+                    (),
                     WorkflowStartOptions::new(queue, workflow_id).build(),
                 )
                 .await?;

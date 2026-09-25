@@ -13,10 +13,13 @@ replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 eviction. It also translates Workflow cancellation into deterministic cleanup
 of a pending timer or Activity and `CancelWorkflowExecution`. A reusable worker
 now registers both Activity and Workflow procedures, routes run IDs to the
-correct fiber runtime, and polls both Core task streams concurrently. It does
-**not** provide user cancellation scopes/cleanup, signal handlers,
-queries/updates, concurrent Activity execution/cancellation/heartbeats, or a
-stable public API. Do not use it in production.
+correct fiber runtime, and polls both Core task streams concurrently. Its
+bounded Activity executor runs callbacks concurrently, exposes cooperative
+cancellation and string heartbeat details through `activity.Context`, and has
+live tests for overlap and heartbeat-driven cancellation. It does **not**
+provide user Workflow cancellation scopes/cleanup, signal handlers,
+queries/updates, generic payloads, panic containment, or a stable public API.
+Do not use it in production.
 
 ```text
 Temporal CLI dev server
@@ -103,8 +106,10 @@ Workflow result after delivering an `approval` signal while the fiber is blocked
 on a durable timer, cancelling that timer, evicting the fiber, and requiring
 replay to reproduce the timer cancellation and following Activity command.
 Two more executions use `temporal workflow cancel` to verify pending-timer and
-pending-Activity cleanup through Core. The latter also verifies the late
-terminal `ResolveActivity` activation that Core sends before cache eviction.
+pending-Activity cleanup through Core. The Activity case waits for an Odin
+heartbeat, observes Core's cancel task in the in-flight context, and replies
+with a cancellation completion. A separate fan-out case proves two Odin
+Activity callbacks overlap rather than merely being queued concurrently.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
