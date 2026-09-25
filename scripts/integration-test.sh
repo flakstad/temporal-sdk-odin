@@ -127,19 +127,19 @@ temporal workflow execute \
 workflow_cli_pid=$!
 
 for _ in {1..30}; do
-  if grep -Eq "scheduled=1 last_activity=1 .*waiting_activity=1" "$worker_log" 2>/dev/null; then
+  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
-    echo "Workflow did not reach its Activity await before signaling" >&2
+    echo "Workflow did not reach its signal-or-timeout await before signaling" >&2
     cat "$worker_log" >&2
     exit 1
   fi
   sleep 1
 done
 
-if ! grep -Eq "scheduled=1 last_activity=1 .*waiting_activity=1" "$worker_log" 2>/dev/null; then
-  echo "Workflow did not expose its Activity await before signaling" >&2
+if ! grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+  echo "Workflow did not expose its signal-or-timeout await before signaling" >&2
   exit 1
 fi
 
@@ -155,11 +155,11 @@ workflow_cli_pid=""
 workflow_output="$(<"$workflow_output_file")"
 echo "$workflow_output"
 grep -q '"status": "COMPLETED"' <<<"$workflow_output"
-grep -q '"result": "Hello Odin / Approved"' <<<"$workflow_output"
+grep -q '"result": "Hello Approved"' <<<"$workflow_output"
 
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq "replay=true .*signal=true .*waiting_activity=1" "$worker_log"
-grep -Eq "replay=false .*signal=true .*waiting_activity=1" "$worker_log"
-grep -q "signal buffered during Activity await and consumed after replay" "$worker_log"
+grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
+grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
+grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"

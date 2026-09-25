@@ -22,6 +22,7 @@ Fiber_Phase :: enum {
 	Waiting_Activity,
 	Waiting_Timer,
 	Waiting_Signal,
+	Waiting_Signal_Or_Timer,
 	Completed,
 	Failed,
 }
@@ -31,6 +32,8 @@ Fiber_Operation_State :: enum {
 	Commanded,
 	Resolved,
 	Failed,
+	Cancel_Requested,
+	Canceled,
 }
 
 Activity_Future :: struct {
@@ -46,6 +49,16 @@ Activity_Result :: struct {
 	status:          Activity_Result_Status,
 	value:           string,
 	failure_message: string,
+}
+
+Signal_Wait_Status :: enum {
+	Received,
+	Timed_Out,
+}
+
+Signal_Wait_Result :: struct {
+	status: Signal_Wait_Status,
+	value:  string,
 }
 
 Fiber_Activity_Operation :: struct {
@@ -413,6 +426,63 @@ await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
 	return signal.payload
 }
 
+// await_signal_or_timeout races a named signal against a durable Temporal
+// timer. Core orders signal jobs before timer jobs in the same activation, so a
+// buffered matching signal wins that tie without cancelling an already-fired
+// timer.
+await_signal_or_timeout :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	duration: time.Duration,
+) -> Signal_Wait_Result {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 || duration <= 0 {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return {status = .Timed_Out}
+	}
+	instance := ctx.instance
+	signal, signal_found := find_buffered_signal(instance, name)
+	if signal_found {
+		signal.consumed = true
+		return {status = .Received, value = signal.payload}
+	}
+	waiting_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		instance.phase = .Failed
+		return {status = .Timed_Out}
+	}
+	instance.next_timer_seq += 1
+	operation := Fiber_Timer_Operation{
+		seq = instance.next_timer_seq,
+		duration = duration,
+		state = .Scheduled,
+	}
+	append(&instance.timers, operation)
+	instance.waiting_signal_name = waiting_name
+	instance.waiting_timer_seq = operation.seq
+	instance.phase = .Waiting_Signal_Or_Timer
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		instance.phase = .Failed
+		return {status = .Timed_Out}
+	}
+
+	signal, signal_found = find_buffered_signal(instance, name)
+	timer, timer_found := find_timer_operation(instance, operation.seq)
+	if signal_found {
+		signal.consumed = true
+		if timer_found && timer.state == .Commanded {
+			timer.state = .Cancel_Requested
+		}
+		return {status = .Received, value = signal.payload}
+	}
+	if timer_found && timer.state == .Resolved {
+		return {status = .Timed_Out}
+	}
+	instance.phase = .Failed
+	return {status = .Timed_Out}
+}
+
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
 // It never reads wall-clock time in the language runtime.
 sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
@@ -510,6 +580,39 @@ append_fiber_timer_command :: proc(
 	result.timer_seq = operation.seq
 }
 
+append_fiber_cancel_timer_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	operation: ^Fiber_Timer_Operation,
+) {
+	cancel_timer := new(proto.Coresdk_Workflow_Commands_CancelTimer)
+	cancel_timer.seq = operation.seq
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Timer{
+				value = cancel_timer,
+			},
+		},
+	)
+	operation.state = .Canceled
+	result.canceled_timer = true
+	result.canceled_timer_seq = operation.seq
+}
+
+append_fiber_timer_cancellations :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) {
+	for index in 0..<len(instance.timers) {
+		operation := &instance.timers[index]
+		if operation.state == .Cancel_Requested {
+			append_fiber_cancel_timer_command(result, commands, operation)
+		}
+	}
+}
+
 append_fiber_pending_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -528,12 +631,16 @@ append_fiber_pending_commands :: proc(
 			append_fiber_timer_command(result, commands, operation)
 		}
 	}
+	append_fiber_timer_cancellations(result, commands, instance)
 	switch instance.phase {
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
 	case .Waiting_Timer:
 	case .Waiting_Signal:
 		result.waiting_signal = true
+	case .Waiting_Signal_Or_Timer:
+		result.waiting_signal = true
+		result.waiting_timer_seq = instance.waiting_timer_seq
 	case .Ready, .Completed, .Failed:
 		return error_from_string("Workflow fiber suspended without a supported pending operation")
 	}
@@ -549,6 +656,7 @@ append_fiber_completion_command :: proc(
 	if len(commands^) != 0 {
 		return error_from_string("fiber spike emitted completion after another command")
 	}
+	append_fiber_timer_cancellations(result, commands, instance)
 	completion_output, encode_error := codec.encode_string(instance.output)
 	if encode_error != .None {
 		return error_from_string("could not encode Workflow result")
@@ -811,6 +919,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		case .Waiting_Signal:
 			_, found := find_buffered_signal(instance, instance.waiting_signal_name)
 			should_resume = found
+		case .Waiting_Signal_Or_Timer:
+			_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
+			timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
+			should_resume = signal_found || (timer_found && timer.state == .Resolved)
 		case .Ready, .Completed, .Failed:
 		}
 		if should_resume {

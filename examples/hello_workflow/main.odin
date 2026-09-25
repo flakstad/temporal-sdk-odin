@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:time"
 import activity "../../temporal/activity"
 import temporal_core "../../temporal/core"
 import worker "../../temporal/worker"
@@ -21,13 +22,12 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	greeting := workflow.execute_activity(ctx, "hello", name)
-	approval := workflow.await_signal(ctx, "approval")
-	result, allocation_error := strings.concatenate({greeting, " / ", approval})
-	if allocation_error != nil {
-		return ""
+	_ = name
+	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
+	if approval.status == .Timed_Out {
+		return "Approval timed out"
 	}
-	return result
+	return workflow.execute_activity(ctx, "hello", approval.value)
 }
 
 main :: proc() {
@@ -102,6 +102,8 @@ main :: proc() {
 	live_resolutions := 0
 	live_signals := 0
 	replayed_signal := false
+	live_timer_cancellations := 0
+	replayed_timer_cancellation := false
 	workflow_completed := false
 	final_eviction := false
 	failed := false
@@ -138,7 +140,7 @@ main :: proc() {
 		}
 
 		fmt.printf(
-			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v waiting_activity=%d waiting_signal=%v completed=%v evicted=%v\n",
+			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v started_timer=%v canceled_timer=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
 			processed.history_length,
 			processed.is_replaying,
 			processed.scheduled_activity_count,
@@ -146,7 +148,10 @@ main :: proc() {
 			processed.resolved_activity_seq,
 			processed.resolved_activity_failed,
 			processed.received_signal,
+			processed.started_timer,
+			processed.canceled_timer,
 			processed.waiting_activity_seq,
+			processed.waiting_timer_seq,
 			processed.waiting_signal,
 			processed.completed,
 			processed.evicted,
@@ -166,6 +171,12 @@ main :: proc() {
 		}
 		if processed.received_signal && processed.is_replaying {
 			replayed_signal = true
+		}
+		if processed.canceled_timer && !processed.is_replaying {
+			live_timer_cancellations += 1
+		}
+		if processed.canceled_timer && processed.is_replaying {
+			replayed_timer_cancellation = true
 		}
 		request_eviction := evictions_requested == 0 && processed.received_signal && !processed.is_replaying
 		if request_eviction {
@@ -203,8 +214,8 @@ main :: proc() {
 		}
 	}
 
-	if !failed && (evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || !replayed_signal || !workflow_completed || !final_eviction) {
-		fmt.eprintln("Workflow spike did not buffer and replay a signal received while awaiting an Activity")
+	if !failed && (evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || live_timer_cancellations != 1 || !replayed_signal || !replayed_timer_cancellation || !workflow_completed || !final_eviction) {
+		fmt.eprintln("Workflow spike did not deterministically replay the signal-wins timer race")
 		failed = true
 	}
 	if !failed && (workflow_runtime.replay_initializations < 1 || workflow_runtime.evictions < 2) {
@@ -229,5 +240,5 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("signal buffered during Activity await and consumed after replay")
+	fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 }

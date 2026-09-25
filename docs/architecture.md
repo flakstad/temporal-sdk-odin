@@ -3,8 +3,8 @@
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
 Activity Worker slice, schema-derived Core protobuf bindings, a bounded
 Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
-spikes covering serial operations, two outstanding Activities, and handled
-Activity failure plus buffered Workflow signals, 2026-09-25.
+spikes covering serial operations, two outstanding Activities, handled Activity
+failure, buffered Workflow signals, and a durable signal/timer race, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -692,6 +692,42 @@ completions, proving the signal does not create a command or wake the Activity
 await. A second test covers the direct path where a fiber already in
 `Waiting_Signal` resumes when the matching signal arrives.
 
+### Durable signal/timer race
+
+The pinned Core schema already exposes `StartTimer`, `FireTimer`, and
+`CancelTimer`; no C ABI addition is required. `CancelTimer.seq` must match the
+language-assigned sequence from `StartTimer`. Core's activation preparation
+[orders signals and updates before ordinary jobs such as `FireTimer`](https://github.com/temporalio/sdk-rust/blob/main/crates/sdk-core/src/worker/workflow/mod.rs),
+while the TypeScript SDK only emits
+[timer cancellation while its timer completion is still pending](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/workflow.ts).
+
+The Odin spike now exposes
+`await_signal_or_timeout(ctx, name, duration) -> Signal_Wait_Result`. With no
+matching signal already buffered, it assigns a timer sequence, emits
+`StartTimer`, and suspends in `Waiting_Signal_Or_Timer`. A later matching signal
+wins and marks the still-commanded timer for cancellation. A `FireTimer` with no
+matching signal wins the timeout branch. If Core supplies both jobs in one
+activation, the signal wins according to Core's ordering, but the runtime sees
+that the timer has also fired and does not emit an invalid late cancellation.
+
+The live acceptance sequence was:
+
+| History | Replay | Odin command/job |
+| ---: | :---: | --- |
+| 3 | no | initialize -> `StartTimer(seq=1)`; wait for signal or timer |
+| 8 | no | receive `approval` -> `ScheduleActivity(seq=1)` + `CancelTimer(seq=1)` |
+| 8 | no | forced eviction |
+| 3 | yes | initialize -> reproduce `StartTimer(seq=1)` |
+| 8 | yes | replay signal -> reproduce Activity and timer-cancel commands |
+| 15 | no | resolve Activity 1 -> complete |
+| 15 | no | completion eviction |
+
+Temporal CLI returned `"Hello Approved"`. The offline replay test additionally
+requires the initial timer completion and signal-winner completion to be
+byte-identical before and after eviction. Separate tests prove the timeout
+branch emits no cancellation and the same-activation signal/timer tie selects
+the signal without attempting to cancel the fired timer.
+
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
@@ -725,9 +761,9 @@ Workflows are enabled.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
-   fresh-stack replay. It does not yet prove timer/signal races, updates,
-   cancellation, panic containment, nondeterminism diagnostics, bounded stack
-   policy, or a production deterministic scheduler.
+   a durable timer/signal race across fresh-stack replay. It does not yet prove
+   Workflow cancellation, updates, panic containment, nondeterminism
+   diagnostics, bounded stack policy, or a production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -746,7 +782,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, eviction, and replay on macOS arm64 | Race a durable timer against a signal and cancel the loser deterministically |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, eviction, and replay on macOS arm64 | Deliver Workflow cancellation while suspended and clean up the pending operation deterministically |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -756,19 +792,19 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The named-signal buffer works. The next bounded runtime milestone should race a
-**durable timer against a signal**. A small `await_signal_or_timeout` primitive
-would schedule one timer, wait on both sources, choose the history-determined
-winner, and emit `CancelTimer` when the signal wins. Force eviction after the
-winner is recorded and require replay to choose the same branch and reproduce
-the cancellation command. This tests multi-source wait state and deterministic
-loser cancellation without introducing general select syntax, updates, or a
-multi-fiber scheduler.
+The signal/timer race works. The next bounded runtime milestone should handle a
+**Workflow cancellation request while suspended**. Start with one deliberately
+narrow policy: deliver `CancelWorkflow`, terminate a fiber waiting on the
+signal/timer primitive without running user cleanup, cancel its still-pending
+timer, and emit `CancelWorkflowExecution`. Force eviction and require replay to
+reproduce the same cleanup commands. This would test external cancellation and
+runtime-owned pending-operation cleanup before designing user-visible
+cancellation scopes or exception syntax.
 
 In parallel with that small language-runtime slice, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Keep queries and updates deferred until multi-source wait state is
-sound. Activity concurrency, heartbeats, and cancellation remain the next
+dependency. Keep queries and updates deferred until cancellation semantics are
+grounded. Activity concurrency, heartbeats, and cancellation remain the next
 worker-side production work, but the Activity Worker vertical milestone itself
 is already complete.
 

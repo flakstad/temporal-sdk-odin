@@ -7,12 +7,13 @@ Current status: Milestones 0–2 plus bounded explicit-state-machine and stackfu
 fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and proves multiple outstanding Activities, catchable Activity failure,
-and buffered Workflow signals across fresh-stack replay. The live Workflow
-receives a signal while blocked on an Activity, is evicted, replays both events,
-then consumes the buffered signal in sequential Odin code. It does **not**
-provide general Workflow registration, signal handlers, queries/updates,
-Activity concurrency/cancellation/heartbeats, or a stable public API. Do not use
-it in production.
+buffered Workflow signals, and a durable signal/timer race across fresh-stack
+replay. The live Workflow starts a timer, lets an `approval` signal win, emits
+`CancelTimer` alongside an Activity command, and reproduces both commands after
+eviction. It does **not** provide general Workflow registration, signal
+handlers, queries/updates, Workflow cancellation, Activity
+concurrency/cancellation/heartbeats, or a stable public API. Do not use it in
+production.
 
 ```text
 Temporal CLI dev server
@@ -77,8 +78,8 @@ The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
 also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
 Workflow result after delivering an `approval` signal while the fiber is blocked
-on an Activity, evicting the fiber, and requiring replay to restore the buffered
-signal before the Activity resolves.
+on a durable timer, cancelling that timer, evicting the fiber, and requiring
+replay to reproduce the timer cancellation and following Activity command.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
