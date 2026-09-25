@@ -3,12 +3,12 @@
 An experimental Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
 not a reimplementation of Temporal Server or its gRPC protocol.
 
-Current status: Milestones 0–2 plus a bounded Milestone 3 explicit-state-machine
-Workflow spike. The repository builds the official Rust Core C bridge, connects
-to a Temporal CLI dev server, executes a remote Activity in Odin, and can run
-one experimental Workflow through activation, forced eviction, replay,
-Activity resolution, and completion. It does **not** provide the intended
-sequential Odin Workflow API, general Workflow registration, Activity
+Current status: Milestones 0–2 plus bounded explicit-state-machine and stackful
+fiber Workflow experiments. The repository builds the official Rust Core C
+bridge, connects to a Temporal CLI dev server, executes a remote Activity in
+Odin, and runs one sequential-looking Workflow through suspension, forced
+eviction, fresh-stack replay, Activity resolution, and completion. It does
+**not** provide general Workflow registration, timers/signals/updates, Activity
 concurrency/cancellation/heartbeats, or a stable public API. Do not use it in
 production.
 
@@ -20,7 +20,7 @@ Temporal SDK Core
           ^ C ABI
           |
 Odin raw bindings -> generated Core protobuf types -> Activity dispatch
-                                            `-----> explicit Workflow state machine
+                                            `-----> experimental Workflow fiber
 ```
 
 ## Quick start
@@ -32,6 +32,10 @@ Prerequisites:
 - `protoc`
 - Temporal CLI (tested with CLI 1.5.1 / Server 1.29.1)
 - Clang/linker tooling for the target platform
+
+The fiber experiment also builds pinned
+[minicoro](https://github.com/edubart/minicoro) through a six-symbol local C
+shim. It is a research dependency, not yet a frozen SDK choice.
 
 Clone submodules and build the pinned Core bridge:
 
@@ -70,7 +74,8 @@ Run it with:
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
 also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
-Workflow result after a forced eviction and replay.
+Workflow result after destroying a suspended fiber, recreating it during
+replay, and resuming it with an Activity result.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
@@ -85,7 +90,7 @@ See [architecture](docs/architecture.md) for the researched boundary and
 
 ```text
 docs/                     architecture and development notes
-native/                   pinned sdk-core submodule and Cargo lockfile
+native/                   pinned sdk-core/minicoro and native bridge sources
 temporal/core/raw/        near-1:1 subset of the C ABI
 temporal/core/            blocking ownership/lifecycle wrapper
 temporal/core/proto/      generated Core Activity and Workflow schema types
@@ -93,12 +98,12 @@ temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/worker/          synchronous Activity registry and run loop
 temporal/codec/           isolated json/plain user payload codec
-temporal/workflow/        explicit state-machine experiment, not public API
+temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/client/          planned public client package
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/hello_activity/  Odin hello Activity Worker
-examples/hello_workflow/  activation/replay/eviction Workflow proof
-tests/                    lifecycle, codec, protobuf, and state-machine tests
+examples/hello_workflow/  sequential suspension/replay/eviction proof
+tests/                    lifecycle, codec, protobuf, replay, and fiber tests
 ```
 
 ## License

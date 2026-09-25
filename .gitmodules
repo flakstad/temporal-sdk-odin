@@ -1,3 +1,6 @@
 [submodule "native/sdk-core"]
 	path = native/sdk-core
 	url = https://github.com/temporalio/sdk-rust.git
+[submodule "native/minicoro"]
+	path = native/minicoro
+	url = https://github.com/edubart/minicoro.git

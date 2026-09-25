@@ -38,6 +38,13 @@ then linked with an explicit library search path and runtime path by the run/tes
 scripts. The current upstream crate declares only `cdylib`; static linking is
 not an upstream-supported output of this bridge.
 
+The same command runs `scripts/build-fiber.sh`, which compiles the pinned
+single-header minicoro dependency and the project-owned C shim into
+`native/target/release/libtemporal_odin_fiber.a`. The shim is statically linked
+into the Odin executable; it is separate from Core's dynamic library. Building
+it directly requires `cc` and `ar`, normally supplied by Clang/Xcode tools on
+macOS and the standard compiler toolchain on Linux.
+
 The first native build is substantial because it compiles Core and its Rust
 dependency graph. Incremental builds are fast.
 
@@ -71,7 +78,8 @@ all decoded views. String and byte values borrow the input buffer.
 ## Tests
 
 Fast tests check generated-code freshness, initialize and close a real Core
-runtime, and do not require a server:
+runtime, and exercise fiber suspension, destruction, fresh-stack replay, and
+resumption without requiring a server:
 
 ```bash
 ./scripts/test.sh
@@ -114,10 +122,12 @@ also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
-with `temporal workflow execute`. The Odin worker schedules and executes its own
-`hello` Activity, while the example forces a Core eviction between scheduling
-and resolution. The test requires a replay initialization and a final eviction
-before it succeeds.
+with `temporal workflow execute`. The Odin worker's sequential Workflow
+suspends inside `workflow.execute_activity`, while the example forces a Core
+eviction between scheduling and resolution. The suspended fiber is destroyed,
+recreated from the beginning during replay, and resumed with the Activity
+result. The test requires a replay initialization and a final eviction before
+it succeeds.
 
 ## Manual run
 
@@ -147,8 +157,8 @@ temporal workflow execute \
   --input '"Odin"'
 ```
 
-This example is intentionally a hard-coded state machine, not the proposed
-sequential Workflow API.
+This example is intentionally a one-Activity fiber experiment, not a stable or
+general sequential Workflow API.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
@@ -172,6 +182,7 @@ configuration profiles are not exposed yet.
 
 ## Current platform evidence
 
-Milestones 1–3 were built and run end-to-end on macOS arm64. Linux
-source/build paths are present but were not executed in this environment.
-Cross-platform release packaging is intentionally deferred.
+Milestones 1–3 and the stackful-fiber experiment were built and run end-to-end
+on macOS arm64. Linux source/build paths and minicoro assembly targets are
+present but were not executed in this environment. Cross-platform release
+packaging is intentionally deferred.

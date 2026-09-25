@@ -9,6 +9,11 @@ import proto "../temporal/core/proto"
 import protobuf "../temporal/protobuf"
 import workflow "../temporal/workflow"
 
+fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	greeting := workflow.execute_activity(ctx, "hello", name)
+	return greeting
+}
+
 @(test)
 runtime_init_and_shutdown :: proc(t: ^testing.T) {
 	runtime, error := temporal_core.runtime_create()
@@ -238,6 +243,140 @@ workflow_state_machine_recreates_after_eviction :: proc(t: ^testing.T) {
 	)
 	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
 	processed = workflow.process_activation(&runtime, encoded[:])
+	delete(encoded)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, processed.history_length, u32(9))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_recreates_stack_after_eviction :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_hello_workflow",
+		"test-queue",
+		fiber_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_hello_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-run-1",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed := workflow.process_fiber_activation(&runtime, encoded[:])
+	delete(encoded)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, len(runtime.instances), 1)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed = workflow.process_fiber_activation(&runtime, encoded[:])
+	delete(encoded)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	testing.expect_value(t, len(runtime.instances), 0)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed = workflow.process_fiber_activation(&runtime, encoded[:])
+	delete(encoded)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect(t, processed.is_replaying)
+	testing.expect_value(t, runtime.replay_initializations, 1)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 9
+	output := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Hello Odin"`)}
+	defer delete(output.metadata)
+	append(
+		&output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &output}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed = workflow.process_fiber_activation(&runtime, encoded[:])
 	delete(encoded)
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.completed)

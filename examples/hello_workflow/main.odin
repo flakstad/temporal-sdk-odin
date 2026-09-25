@@ -20,6 +20,11 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	return greeting
 }
 
+hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	greeting := workflow.execute_activity(ctx, "hello", name)
+	return greeting
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -59,8 +64,13 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	workflow_runtime := workflow.Runtime{}
-	workflow_init_error := workflow.runtime_init(&workflow_runtime, WORKFLOW_TYPE, TASK_QUEUE)
+	workflow_runtime := workflow.Fiber_Runtime{}
+	workflow_init_error := workflow.fiber_runtime_init(
+		&workflow_runtime,
+		WORKFLOW_TYPE,
+		TASK_QUEUE,
+		hello_workflow,
+	)
 	if workflow_init_error.message != nil {
 		fmt.eprintf("Workflow runtime initialization failed: %s\n", string(workflow_init_error.message))
 		workflow.error_free(&workflow_init_error)
@@ -74,7 +84,7 @@ main :: proc() {
 	if validate_error.message != nil {
 		fmt.eprintf("Worker validation failed: %s\n", string(validate_error.message))
 		temporal_core.error_free(&validate_error)
-		workflow.runtime_close(&workflow_runtime)
+		workflow.fiber_runtime_close(&workflow_runtime)
 		_ = worker.close(&activity_worker)
 		temporal_core.client_close(&client)
 		temporal_core.runtime_close(&runtime)
@@ -102,7 +112,7 @@ main :: proc() {
 			break
 		}
 
-		processed := workflow.process_activation(&workflow_runtime, poll.protobuf)
+		processed := workflow.process_fiber_activation(&workflow_runtime, poll.protobuf)
 		delete(poll.protobuf)
 		if processed.completion != nil {
 			completion_error := temporal_core.worker_complete_workflow(
@@ -180,7 +190,7 @@ main :: proc() {
 		failed = true
 	}
 
-	workflow.runtime_close(&workflow_runtime)
+	workflow.fiber_runtime_close(&workflow_runtime)
 	close_error := worker.close(&activity_worker)
 	if close_error.message != nil {
 		fmt.eprintf("Worker shutdown failed: %s\n", string(close_error.message))
@@ -193,5 +203,5 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("explicit Workflow state machine completed after eviction and replay")
+	fmt.println("sequential Workflow fiber completed after eviction and replay")
 }

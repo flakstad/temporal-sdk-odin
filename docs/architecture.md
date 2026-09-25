@@ -1,8 +1,9 @@
 # Architecture: Temporal SDK for Odin
 
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
-Activity Worker slice, schema-derived Core protobuf bindings, and a bounded
-Milestone 3 explicit-state-machine Workflow spike, 2026-09-25.
+Activity Worker slice, schema-derived Core protobuf bindings, a bounded
+Milestone 3 explicit-state-machine Workflow spike, and a stackful-fiber
+feasibility spike, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -323,7 +324,7 @@ as ABI requirements:
 - Callback thread identity is unspecified. Odin callbacks must not assume they
   run on the main thread or use an uninitialized thread-local context.
 
-The current wrapper blocks the caller on an Odin one-shot event. This keeps
+The current Core wrapper blocks the caller on an Odin one-shot event. This keeps
 stack-backed options and callback state alive, copies all returned bytes, and
 frees them before returning. It deliberately exposes no general asynchronous
 API yet. Generated protobuf decoding allocates nested messages and repeated
@@ -369,6 +370,16 @@ system frameworks/libraries (IOKit, CoreFoundation, Security, iconv, and
 libSystem). Linux still needs target-specific validation, including glibc vs
 musl policy and certificate-store behavior. Static linking would require an
 upstream/project modification and is not part of this spike.
+
+The Workflow fiber experiment adds a separate, project-owned static archive,
+`libtemporal_odin_fiber.a`. It contains a six-operation C shim over
+[`minicoro`](https://github.com/edubart/minicoro) pinned at
+`02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b`. The shim deliberately keeps
+`mco_coro` and `mco_desc` private so their C layout does not become part of the
+Odin ABI. `scripts/build-fiber.sh` compiles the single-header implementation
+with the platform C compiler and archives it with `ar`; the Core bridge remains
+a separate dynamic library. Minicoro is available under Unlicense or MIT No
+Attribution terms.
 
 ## Milestones 1–3 implementation and evidence
 
@@ -483,6 +494,86 @@ identical. This does not demonstrate sequential-looking Workflow code, timers,
 multiple outstanding operations, signals, queries, updates, concurrency, or
 nondeterminism detection in the language layer.
 
+### Stackful Workflow fiber experiment
+
+Odin `dev-2026-05` has no official portable fiber/coroutine package. The
+standard `core:nbio` package is a callback-based non-blocking I/O layer; Odin's
+[Q1 2026 newsletter](https://odin-lang.org/news/newsletter-2026-q1/) explicitly
+describes native or Lua-style coroutines as something that can be built above
+it, not functionality it already provides. Three small-runtime candidates were
+checked before implementation:
+
+- Laytan's [Odin minicoro port](https://gist.github.com/laytan/1c9887a3c9847ed7073dd632d9114229)
+  is attractive because it is pure Odin, but the current target switch supports
+  only Darwin arm64 and Linux amd64. That misses Darwin amd64 and Linux arm64
+  from this project's initial matrix.
+- [`foldcat/oasync`](https://github.com/foldcat/oasync) is a complete M:N task
+  runtime. Its own documentation says it is incompatible with `core:sync`.
+  Adopting a scheduler and replacement synchronization layer is too broad for
+  the question this spike needs to answer.
+- Upstream [minicoro](https://github.com/edubart/minicoro) is a single-header,
+  dependency-free asymmetric stackful coroutine implementation. Its documented
+  assembly targets include x86_64 and ARM64 on macOS and Linux, covering all
+  four planned artifacts. It also exposes explicit create/resume/yield/destroy
+  operations and configurable stack ownership.
+
+Minicoro is therefore an experimental implementation dependency, not yet a
+permanent public-SDK commitment. The Odin side sees only these project-owned C
+symbols:
+
+```text
+temporal_odin_fiber_create
+temporal_odin_fiber_resume
+temporal_odin_fiber_yield
+temporal_odin_fiber_status
+temporal_odin_fiber_destroy
+temporal_odin_fiber_result_description
+```
+
+Each cached Workflow instance owns a 128 KiB C-allocated fiber stack and an
+Odin arena. The instance is heap-stable because the C trampoline retains its
+address. The trampoline restores a captured Odin `runtime.Context`, with the
+instance arena as allocator, before calling user code. Inputs, Activity request
+payloads, resolved values, and arbitrary Workflow allocations can therefore
+survive suspension without borrowing an activation decode arena. Command
+storage itself remains alive for the full activation encode; an early version
+of the spike found that pointers to helper-local command structs become invalid
+before protobuf encoding, a concrete reason to keep this ownership rule
+explicit.
+
+The author-facing proof is genuinely sequential:
+
+```odin
+hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+    greeting := workflow.execute_activity(ctx, "hello", name)
+    return greeting
+}
+```
+
+`execute_activity` encodes the request, records deterministic sequence 1, and
+yields from inside the nested Odin call. The activation driver emits the Core
+command. On resolution it decodes into the instance arena and resumes the same
+stack, so the call returns normally to user code.
+
+The forced-eviction acceptance test now runs this fiber implementation. On the
+first initialization it creates fiber A and suspends at `execute_activity`.
+Eviction destroys fiber A and its arena. Replay creates a fresh fiber B from
+the original input, runs from the top, and produces a byte-for-byte identical
+`ScheduleActivity(seq=1)` completion. The Activity result then resumes fiber B,
+the Workflow returns `"Hello Odin"`, and the final eviction destroys the dead
+fiber. Both the offline test under Odin's memory tracker and the live Temporal
+CLI dev-server path pass on macOS arm64.
+
+This answers the narrow feasibility question: stackful suspension and
+history-driven reconstruction work across the Odin/C boundary without a large
+runtime. It does not yet answer scheduling at scale. A coroutine object is not
+thread-safe, fixed stacks can overflow, and minicoro cautions against migrating
+coroutines that use thread-local state. The production runtime should drive a
+Workflow instance from one deterministic executor thread at a time, prohibit
+concurrent resume/eviction, decide whether fixed or virtual-memory-backed stacks
+are acceptable, and test sanitizers and all four target builds. Panics crossing
+the C trampoline also need an explicit containment policy.
+
 The blocking wrapper now drains both enabled poll streams during shutdown.
 Core requires every enabled workflow/activity poll stream to observe shutdown
 before finalization; draining only the Activity stream is insufficient once
@@ -503,10 +594,11 @@ Workflows are enabled.
    but not scalable. A real worker needs a callback-to-channel/event loop with
    heap-stable state, concurrent Activity execution, cancellation, and
    heartbeats.
-4. **Workflow runtime.** The explicit state machine proves activation replay,
-   not Odin suspension, deterministic coroutine scheduling, or a usable author
-   API. Fibers remain promising but must restart from a fresh stack after
-   eviction and reproduce the same commands.
+4. **Workflow runtime.** The fiber proves nested Odin suspension, resumption,
+   fresh-stack replay, and a first sequential author API. It does not yet prove
+   multiple outstanding operations, timers, signal/update ordering, panic
+   containment, nondeterminism diagnostics, bounded stack policy, or a
+   production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -524,30 +616,33 @@ Workflows are enabled.
 
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
-| Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Add a timer only if another transport/state-machine uncertainty appears |
-| Stackful coroutine/fiber | Best match for sequential Odin syntax; stack is cache-only, never durable | Reproduce this same forced-eviction test from a fresh fiber stack |
+| Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
+| Stackful coroutine/fiber | Proven for one sequential Activity await, eviction, fresh-stack replay, resumption, and completion on macOS arm64 | Add a timer between two Activity awaits and compare all replayed commands |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
-Activity transport, protobuf, worker lifecycle, command matching, and a first
-replay path are now proven. That is enough evidence to investigate the authoring
-runtime without pretending that the explicit state machine is the final API.
+Activity transport, protobuf, worker lifecycle, command matching, the replay
+path, and the minimum fiber authoring boundary are now proven. This is enough
+evidence to continue with fibers while retaining the explicit state machine as
+a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The explicit-state-machine milestone is complete. The next bounded milestone
-should investigate a **stackful coroutine/fiber** implementation of this same
-Workflow shape. The acceptance test should remain unchanged: schedule the
-Activity, force eviction, destroy the cached execution, restart the Workflow on
-a fresh stack during replay, reproduce `ScheduleActivity(seq=1)`, then resume
-with the result. Add one timer suspension only after the Activity await works.
+The fiber Activity await works. The next bounded vertical milestone should be
+one Workflow with **Activity -> timer -> Activity**, with forced eviction at
+each suspension boundary. That requires only the `FireTimer` activation and
+`StartTimer` command already present in the generated graph, but it tests the
+important generalization from one hard-coded await to multiple operation kinds
+and sequence counters. The replay assertion should compare every completion
+byte-for-byte and prove that a new fiber walks through prior resolutions before
+suspending at the current frontier.
 
-Before adopting a dependency, inspect Odin's current runtime and maintained
-fiber libraries for stack ownership, allocator behavior, sanitizer/platform
-support, and whether execution can be driven deterministically on one worker
-thread. If the smallest portable fiber experiment cannot recreate cleanly on
-replay, use that result to compare CPS/code generation rather than expanding a
-fragile runtime. Activity concurrency, heartbeats, and cancellation remain
-important follow-up slices but do not block this experiment.
+In parallel with that small language-runtime slice, add CI compile/smoke jobs
+for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
+dependency. Do not add a scheduler, general futures framework, signals,
+queries, or updates until the two-operation replay model is sound. Activity
+concurrency, heartbeats, and cancellation remain the next worker-side
+production work, but the Activity Worker vertical milestone itself is already
+complete.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and
