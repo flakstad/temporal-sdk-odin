@@ -3,7 +3,8 @@
 Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
 Activity Worker slice, schema-derived Core protobuf bindings, a bounded
 Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
-spikes covering serial operations plus two outstanding Activities, 2026-09-25.
+spikes covering serial operations, two outstanding Activities, and handled
+Activity failure, 2026-09-25.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -619,6 +620,44 @@ jobs before resuming the fiber. This is the narrow `apply-all-before-resume`
 rule required at the language/runtime boundary; it is not yet a general ready
 queue or multi-fiber scheduler.
 
+### Activity failure as a Workflow result
+
+Core reports an exhausted Activity failure as the failed variant of
+`ResolveActivity`; whether Workflow code catches it or lets it fail the
+Workflow is language-runtime policy. This matches current SDK behavior:
+TypeScript [rejects the seq-keyed Activity completion with a converted
+failure](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts),
+and .NET documents that
+[Activity failures throw and fail the Workflow only when uncaught](https://github.com/temporalio/sdk-dotnet#invoking-activities).
+
+The Odin spike now records that resolution as `Fiber_Operation_State.Failed`.
+It copies the human-readable message and re-encodes the complete Temporal
+`Failure` protobuf into the Workflow instance arena before the activation
+decode arena is released. `execute_activity_result` returns an experimental
+`Activity_Result`, allowing Workflow code to branch. The existing
+`execute_activity` convenience treats the same result as unhandled; the runtime
+decodes the preserved protobuf and emits `FailWorkflowExecution`, retaining the
+Temporal failure rather than synthesizing a new one.
+
+The live failure-recovery sequence was:
+
+| History | Replay | Odin command/job |
+| ---: | :---: | --- |
+| 3 | no | initialize -> schedule missing Activity 1 |
+| 3 | no | forced eviction |
+| 3 | yes | initialize -> reproduce Activity 1 command |
+| 9 | no | Activity 1 fails -> catch -> schedule recovery Activity 2 |
+| 9 | no | forced eviction |
+| 3 | yes | initialize -> reproduce Activity 1 command |
+| 9 | yes | replay failure -> take same catch branch -> reproduce Activity 2 command |
+| 15 | no | Activity 2 resolves -> complete normally |
+| 15 | no | completion eviction |
+
+Temporal CLI returned `"Hello Recovered Odin"`. The offline replay test asserts
+that the recovery command is byte-identical before and after eviction. A
+separate test verifies that the non-result convenience still emits a
+`FailWorkflowExecution` command containing the preserved failure message.
+
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
@@ -651,19 +690,19 @@ Workflows are enabled.
    heartbeats.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
-   apply-all-before-resume, and fresh-stack replay. It does not yet prove
-   signal/update ordering, catchable Activity failures, cancellation, panic
-   containment, nondeterminism diagnostics, bounded stack policy, or a
-   production deterministic scheduler.
+   apply-all-before-resume, catchable Activity failures, and fresh-stack replay.
+   It does not yet prove signal/update ordering, cancellation, panic containment,
+   nondeterminism diagnostics, bounded stack policy, or a production
+   deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.
-7. **Error/cancellation completeness.** The spike copies messages and frees all
-   buffers and emits an application failure for dispatch/codec errors, but a
-   public API must preserve gRPC status/details, Activity cancellation,
-   heartbeats, deadlines, panics, and richer Temporal failures.
+7. **Error/cancellation completeness.** The Workflow runtime preserves the raw
+   Temporal failure protobuf for propagation, but the catchable experimental API
+   exposes only status and message. A public API must model typed causes/details,
+   Activity cancellation, heartbeats, deadlines, panics, and codec failures.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -673,7 +712,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial Activity/timer/Activity plus two outstanding Activities, multi-command completion, out-of-order resolution, eviction, and replay on macOS arm64 | Make Activity failure a resumable result and replay it across eviction |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, eviction, and replay on macOS arm64 | Buffer and await a Workflow signal across replay |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -683,20 +722,21 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The multi-outstanding operation table works. The next bounded runtime milestone
-should make **Activity failure a resumable Workflow result** instead of
-immediately failing the whole Workflow. The acceptance test should schedule a
-failing Activity, evict before its resolution, replay the failure, let Workflow
-code branch on the result, and then complete normally. This tests failure
-ownership and replay semantics without introducing signals, cancellation, or a
-general futures framework.
+The resumable Activity failure path works. The next bounded runtime milestone
+should add **one named Workflow signal with a string payload**. The
+discriminating case is a signal that arrives while the Workflow is blocked on
+an Activity: the runtime must buffer it without spuriously resuming the fiber,
+then consume it synchronously when source control flow reaches `await_signal`.
+Force eviction after both events are recorded and require replay to reproduce
+the same command/result. This tests external-event ordering without yet adding
+queries, updates, cancellation, or a general multi-fiber scheduler.
 
 In parallel with that small language-runtime slice, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Do not add signals, queries, or updates until the Activity result
-and failure model is sound. Activity concurrency, heartbeats, and cancellation
-remain the next worker-side production work, but the Activity Worker vertical
-milestone itself is already complete.
+dependency. Keep queries and updates deferred until the signal-buffering model
+is sound. Activity concurrency, heartbeats, and cancellation remain the next
+worker-side production work, but the Activity Worker vertical milestone itself
+is already complete.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

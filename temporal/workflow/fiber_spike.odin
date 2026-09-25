@@ -29,10 +29,22 @@ Fiber_Operation_State :: enum {
 	Scheduled,
 	Commanded,
 	Resolved,
+	Failed,
 }
 
 Activity_Future :: struct {
 	seq: u32,
+}
+
+Activity_Result_Status :: enum {
+	Succeeded,
+	Failed,
+}
+
+Activity_Result :: struct {
+	status:          Activity_Result_Status,
+	value:           string,
+	failure_message: string,
 }
 
 Fiber_Activity_Operation :: struct {
@@ -41,6 +53,8 @@ Fiber_Activity_Operation :: struct {
 	activity_type: string,
 	input:         []u8,
 	result:        string,
+	failure_message: string,
+	failure_proto:   []u8,
 	state:         Fiber_Operation_State,
 }
 
@@ -60,6 +74,7 @@ Fiber_Instance :: struct {
 	timers:           [dynamic]Fiber_Timer_Operation,
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
+	unhandled_activity_seq: u32,
 	next_activity_seq: u32,
 	next_timer_seq:    u32,
 	phase:           Fiber_Phase,
@@ -274,43 +289,73 @@ start_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Act
 	return Activity_Future{seq = operation.seq}
 }
 
-// await_activity suspends the whole Odin call stack only while the selected
-// operation is unresolved. A result applied earlier in the same activation is
-// consumed synchronously.
-await_activity :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> string {
+activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Activity_Result {
+	if operation.state == .Resolved {
+		return Activity_Result{status = .Succeeded, value = operation.result}
+	}
+	if operation.state == .Failed {
+		return Activity_Result{status = .Failed, failure_message = operation.failure_message}
+	}
+	return Activity_Result{status = .Failed, failure_message = "Activity has not resolved"}
+}
+
+// await_activity_result suspends the whole Odin call stack only while the
+// selected operation is unresolved. Success and failure applied earlier in the
+// same activation are consumed synchronously.
+await_activity_result :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> Activity_Result {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
-		return ""
+		return Activity_Result{status = .Failed, failure_message = "invalid Activity await"}
 	}
 	instance := ctx.instance
 	operation, found := find_activity_operation(instance, future.seq)
 	if !found {
 		instance.phase = .Failed
-		return ""
+		return Activity_Result{status = .Failed, failure_message = "Activity operation was not found"}
 	}
-	if operation.state == .Resolved {
-		return operation.result
+	if operation.state == .Resolved || operation.state == .Failed {
+		return activity_result_from_operation(operation)
 	}
 	instance.waiting_activity_seq = future.seq
 	instance.phase = .Waiting_Activity
 	yield_result := fiber_raw.yield(instance.fiber)
 	if yield_result != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
-		return ""
+		return Activity_Result{status = .Failed, failure_message = "could not resume Activity await"}
 	}
 	operation, found = find_activity_operation(instance, future.seq)
-	if !found || operation.state != .Resolved {
+	if !found || (operation.state != .Resolved && operation.state != .Failed) {
 		instance.phase = .Failed
+		return Activity_Result{status = .Failed, failure_message = "Activity resumed without a resolution"}
+	}
+	return activity_result_from_operation(operation)
+}
+
+// await_activity is the convenience form for Workflows that want an unhandled
+// Activity failure to fail the Workflow Execution.
+await_activity :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> string {
+	result := await_activity_result(ctx, future)
+	if result.status == .Failed {
+		if ctx != nil && ctx.instance != nil {
+			if future.seq != 0 {
+				ctx.instance.unhandled_activity_seq = future.seq
+			}
+			ctx.instance.phase = .Failed
+		}
 		return ""
 	}
-	return operation.result
+	return result.value
 }
 
 // execute_activity is the sequential convenience form.
 execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> string {
 	return await_activity(ctx, start_activity(ctx, activity_type, input))
+}
+
+execute_activity_result :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Result {
+	return await_activity_result(ctx, start_activity(ctx, activity_type, input))
 }
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
@@ -354,6 +399,10 @@ append_fiber_schedule_command :: proc(
 	)
 	timeout := new(proto.Google_Protobuf_Duration)
 	timeout.seconds = 20
+	// The bounded spike has no Activity options yet. One attempt makes failure
+	// handling observable without waiting through Temporal's default retries.
+	retry_policy := new(proto.Temporal_Api_Common_V1_RetryPolicy)
+	retry_policy.maximum_attempts = 1
 	schedule := new(proto.Coresdk_Workflow_Commands_ScheduleActivity)
 	schedule^ = proto.Coresdk_Workflow_Commands_ScheduleActivity{
 		seq = operation.seq,
@@ -361,6 +410,7 @@ append_fiber_schedule_command :: proc(
 		activity_type = operation.activity_type,
 		task_queue = task_queue,
 		start_to_close_timeout = timeout,
+		retry_policy = retry_policy,
 		do_not_eagerly_execute = true,
 	}
 	append(&schedule.arguments, payload^)
@@ -470,6 +520,37 @@ append_fiber_completion_command :: proc(
 	return {}
 }
 
+append_fiber_failure_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) -> Error {
+	if len(commands^) != 0 {
+		return error_from_string("fiber spike emitted failure after another command")
+	}
+	operation, found := find_activity_operation(instance, instance.unhandled_activity_seq)
+	if !found || operation.state != .Failed || len(operation.failure_proto) == 0 {
+		return error_from_string("Workflow fiber failed without a preserved Activity failure")
+	}
+	failure := new(proto.Temporal_Api_Failure_V1_Failure)
+	if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
+		return error_from_string("could not restore unhandled Activity failure")
+	}
+	fail := new(proto.Coresdk_Workflow_Commands_FailWorkflowExecution)
+	fail.failure = failure
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Fail_Workflow_Execution{
+				value = fail,
+			},
+		},
+	)
+	result.completed = true
+	result.run_id = instance.run_id
+	return {}
+}
+
 append_fiber_progress_command :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -482,6 +563,9 @@ append_fiber_progress_command :: proc(
 	case .Dead:
 		if instance.phase == .Completed {
 			return append_fiber_completion_command(result, commands, instance)
+		}
+		if instance.phase == .Failed {
+			return append_fiber_failure_command(result, commands, instance)
 		}
 	case .Normal, .Running:
 	}
@@ -519,7 +603,6 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	}
 
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
-	failed_activity: ^proto.Temporal_Api_Failure_V1_Failure
 	for job in activation.jobs {
 		handled := false
 		#partial switch variant in job.variant {
@@ -582,8 +665,19 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					process_error(&result, activation.run_id, "failed Activity has no failure")
 					return
 				}
-				failed_activity = status.value.failure
-				instance.phase = .Failed
+				context.allocator = instance.odin_context.allocator
+				failure_message, allocation_error := strings.clone(status.value.failure.message)
+				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+				context.allocator = previous_allocator
+				if allocation_error != nil || len(failure_proto) == 0 {
+					process_error(&result, activation.run_id, "could not preserve Activity failure")
+					return
+				}
+				operation.failure_message = failure_message
+				operation.failure_proto = failure_proto[:]
+				operation.state = .Failed
+				result.resolved_activity_seq = operation.seq
+				result.resolved_activity_failed = true
 			}
 			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
@@ -626,12 +720,12 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		}
 	}
 
-	if instance_found && failed_activity == nil {
+	if instance_found {
 		should_resume := false
 		switch instance.phase {
 		case .Waiting_Activity:
 			operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
-			should_resume = found && operation.state == .Resolved
+			should_resume = found && (operation.state == .Resolved || operation.state == .Failed)
 		case .Waiting_Timer:
 			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
 			should_resume = found && operation.state == .Resolved
@@ -651,18 +745,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
-	if failed_activity != nil {
-		fail := new(proto.Coresdk_Workflow_Commands_FailWorkflowExecution)
-		fail.failure = failed_activity
-		append(
-			&commands,
-			proto.Coresdk_Workflow_Commands_WorkflowCommand{
-				variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Fail_Workflow_Execution{value = fail},
-			},
-		)
-		result.completed = true
-		result.run_id = instance.run_id
-	} else if instance_found {
+	if instance_found {
 		progress_error := append_fiber_progress_command(&result, &commands, instance, runtime.task_queue)
 		if progress_error.message != nil {
 			message := string(progress_error.message)

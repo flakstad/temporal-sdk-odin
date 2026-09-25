@@ -21,15 +21,15 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	first := workflow.start_activity(ctx, "hello", name)
-	second := workflow.start_activity(ctx, "hello", "Temporal")
-	first_greeting := workflow.await_activity(ctx, first)
-	second_greeting := workflow.await_activity(ctx, second)
-	result, allocation_error := strings.concatenate({first_greeting, " & ", second_greeting})
+	failed := workflow.execute_activity_result(ctx, "missing", name)
+	if failed.status != .Failed {
+		return "unexpected Activity success"
+	}
+	recovery_input, allocation_error := strings.concatenate({"Recovered ", name})
 	if allocation_error != nil {
 		return ""
 	}
-	return result
+	return workflow.execute_activity(ctx, "hello", recovery_input)
 }
 
 main :: proc() {
@@ -103,6 +103,7 @@ main :: proc() {
 	evictions_observed := 0
 	activities_completed := 0
 	live_resolutions := 0
+	replayed_failure := false
 	workflow_completed := false
 	final_eviction := false
 	failed := false
@@ -139,12 +140,13 @@ main :: proc() {
 		}
 
 		fmt.printf(
-			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d waiting=%d completed=%v evicted=%v\n",
+			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v waiting=%d completed=%v evicted=%v\n",
 			processed.history_length,
 			processed.is_replaying,
 			processed.scheduled_activity_count,
 			processed.activity_seq,
 			processed.resolved_activity_seq,
+			processed.resolved_activity_failed,
 			processed.waiting_activity_seq,
 			processed.completed,
 			processed.evicted,
@@ -159,9 +161,12 @@ main :: proc() {
 		if processed.resolved_activity_seq != 0 && !processed.is_replaying {
 			live_resolutions += 1
 		}
+		if processed.resolved_activity_failed && processed.is_replaying {
+			replayed_failure = true
+		}
 		request_eviction :=
-			(evictions_requested == 0 && processed.scheduled_activity_count == 2) ||
-			(evictions_requested == 1 && processed.resolved_activity_seq != 0 && !processed.is_replaying && !processed.completed)
+			(evictions_requested == 0 && processed.scheduled_activity && processed.activity_seq == 1) ||
+			(evictions_requested == 1 && processed.resolved_activity_failed && processed.scheduled_activity && processed.activity_seq == 2 && !processed.is_replaying)
 		if request_eviction {
 			eviction_error := temporal_core.worker_request_workflow_eviction(
 				&activity_worker.core,
@@ -198,8 +203,8 @@ main :: proc() {
 		}
 	}
 
-	if !failed && (evictions_requested != 2 || activities_completed != 2 || live_resolutions != 2 || !workflow_completed || !final_eviction) {
-		fmt.eprintln("Workflow spike did not observe two outstanding Activities with eviction before and between resolutions")
+	if !failed && (evictions_requested != 2 || activities_completed != 2 || live_resolutions != 2 || !replayed_failure || !workflow_completed || !final_eviction) {
+		fmt.eprintln("Workflow spike did not recover from and replay an Activity failure across eviction")
 		failed = true
 	}
 	if !failed && (workflow_runtime.replay_initializations < 2 || workflow_runtime.evictions < 3) {
@@ -224,5 +229,5 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("two outstanding Activities completed across evictions before and between resolutions")
+	fmt.println("handled Activity failure replayed across eviction before recovery completed")
 }

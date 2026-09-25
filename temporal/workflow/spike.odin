@@ -39,6 +39,7 @@ Process_Result :: struct {
 	scheduled_activity_count: int,
 	activity_seq:       u32,
 	resolved_activity_seq: u32,
+	resolved_activity_failed: bool,
 	waiting_activity_seq: u32,
 	started_timer:      bool,
 	timer_seq:          u32,

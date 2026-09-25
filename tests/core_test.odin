@@ -34,6 +34,18 @@ fiber_parallel_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string)
 	return result
 }
 
+fiber_failure_recovery_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	failed := workflow.execute_activity_result(ctx, "missing", name)
+	if failed.status != .Failed {
+		return "unexpected Activity success"
+	}
+	recovery_input, allocation_error := strings.concatenate({"Recovered ", name})
+	if allocation_error != nil {
+		return ""
+	}
+	return workflow.execute_activity(ctx, "hello", recovery_input)
+}
+
 process_fiber_test_activation :: proc(
 	runtime: ^workflow.Fiber_Runtime,
 	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
@@ -694,6 +706,281 @@ workflow_fiber_applies_all_activity_resolutions_before_resume :: proc(t: ^testin
 	testing.expect(t, processed.completed)
 	testing.expect(t, !processed.scheduled_activity)
 	testing.expect_value(t, processed.resolved_activity_seq, u32(1))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_replays_handled_activity_failure :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_failure_recovery_workflow",
+		"test-queue",
+		fiber_failure_recovery_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_failure_recovery_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-failure-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activity_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "activity missing",
+		source = "OdinSDK",
+	}
+	failed_result := proto.Coresdk_Activity_Result_Failure{failure = &activity_failure}
+	failure_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed{value = &failed_result},
+	}
+	resolve_failure := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &failure_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_failure,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "handled failure failed: %s", string(processed.error.message))
+	testing.expect(t, processed.resolved_activity_failed)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(1))
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(2))
+	testing.expect(t, !processed.completed)
+	failure_branch_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_failure,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.resolved_activity_failed)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(2))
+	testing.expect(t, bytes.equal(failure_branch_completion[:], processed.completion[:]))
+	delete(failure_branch_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	recovery_output := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Hello Recovered Odin"`),
+	}
+	defer delete(recovery_output.metadata)
+	append(
+		&recovery_output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	recovery_success := proto.Coresdk_Activity_Result_Success{result = &recovery_output}
+	recovery_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &recovery_success,
+		},
+	}
+	resolve_recovery := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 2,
+		result = &recovery_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 15
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_recovery,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(2))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_propagates_unhandled_activity_failure :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_unhandled_failure_workflow",
+		"test-queue",
+		fiber_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_unhandled_failure_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{run_id = "fiber-unhandled-run"}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "preserved Activity failure",
+		source = "OdinSDK",
+	}
+	failed_result := proto.Coresdk_Activity_Result_Failure{failure = &failure}
+	resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed{value = &failed_result},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{seq = 1, result = &resolution}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "unhandled failure failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect(t, processed.resolved_activity_failed)
+
+	decode_arena: virtual.Arena
+	arena_error := virtual.arena_init_growing(&decode_arena)
+	testing.expect(t, arena_error == nil)
+	if arena_error == nil {
+		previous_allocator := context.allocator
+		context.allocator = virtual.arena_allocator(&decode_arena)
+		completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+		completion_ok := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+			processed.completion[:],
+			&completion,
+		)
+		context.allocator = previous_allocator
+		testing.expect(t, completion_ok)
+		preserved_message := ""
+		#partial switch status in completion.status {
+		case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+			if status.value != nil && len(status.value.commands) == 1 {
+				#partial switch command in status.value.commands[0].variant {
+				case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Fail_Workflow_Execution:
+					if command.value != nil && command.value.failure != nil {
+						preserved_message = command.value.failure.message
+					}
+				}
+			}
+		}
+		testing.expect_value(t, preserved_message, "preserved Activity failure")
+		virtual.arena_destroy(&decode_arena)
+	}
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
