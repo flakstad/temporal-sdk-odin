@@ -9,7 +9,9 @@ cargo test --quiet \
 "$repo_root/scripts/build-core.sh"
 
 lib_dir="$repo_root/native/target/release"
+odin_thread_count="${ODIN_THREAD_COUNT:-1}"
 odin test "$repo_root/tests" \
+	-thread-count:"$odin_thread_count" \
 	-vet \
 	-strict-style \
 	-warnings-as-errors \
@@ -25,5 +27,6 @@ fi
 # Keep SDK tests warning-clean above, but do not promote dependency warnings to
 # errors in this separately compiled property suite.
 odin test "$repo_root/tests_pbt" \
+	-thread-count:"$odin_thread_count" \
 	-collection:pbt="$pbt_root" \
 	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"

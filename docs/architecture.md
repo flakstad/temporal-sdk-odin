@@ -878,6 +878,25 @@ successful run is one-shot (`Running -> Stopped`) because Core shutdown and
 poll-stream state are not reusable. Closing before `run` releases only the
 language-owned configuration and is safe.
 
+### Activation failure is not worker failure
+
+The language boundary has three materially different failure outcomes:
+
+| Outcome | C/Core representation | Odin worker action |
+| --- | --- | --- |
+| Workflow code completes unsuccessfully | Successful activation containing `FailWorkflowExecution` | Keep polling; Workflow Execution becomes failed |
+| Activation cannot be executed, including an unknown Workflow type | Failed `WorkflowActivationCompletion` with `WorkflowWorkerUnhandledFailure` | Keep polling; retain the rejected run until Core eviction |
+| Bridge/protocol invariant prevents any valid completion | Poll/decode/routing/Core completion error | Stop `worker.run` and initiate shutdown |
+
+The second row matches the pinned Rust SDK's
+[`worker_handles_unknown_workflow_types_gracefully`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core/tests/integ_tests/worker_tests.rs)
+behavior. It is intentionally a retryable Workflow Task failure, not a terminal
+Workflow Execution failure. Core follows the failed completion with
+`RemoveFromCache`; Odin keeps a small rejected-run table so it can acknowledge
+that exact eviction without weakening routing checks for arbitrary unknown run
+IDs. The live suite verifies the server history event, eviction, and subsequent
+execution of a registered Workflow on the same worker.
+
 This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
@@ -953,9 +972,9 @@ makes the registered task types the single source of worker capabilities. The
 Activity executor now uses a small reusable pool; the next vertical milestone
 should stress pool shutdown/cancel/heartbeat interleavings and callback failure
 using `pbt`. A statechart oracle becomes worthwhile once retries and deadlines
-join that model. Unknown Workflow types must produce a language-facing failed
-activation without terminating the worker. Generic payload APIs and user
-Workflow cancellation scopes should follow as separate changes.
+join that model. Unknown Workflow types now produce a failed activation without
+terminating the worker. Generic payload APIs, Workflow panic containment, and
+user Workflow cancellation scopes should follow as separate changes.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

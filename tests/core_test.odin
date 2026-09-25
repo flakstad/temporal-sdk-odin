@@ -117,6 +117,9 @@ process_fiber_test_activation :: proc(
 
 Workflow_Completion_Inspection :: struct {
 	decoded:          bool,
+	failed:           bool,
+	failure_message:  []u8,
+	failure_cause:    proto.Temporal_Api_Enums_V1_WorkflowTaskFailedCause,
 	command_count:    int,
 	scheduled_activity_seq: u32,
 	canceled_timer_seq:     u32,
@@ -170,6 +173,16 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 				if variant.value != nil && variant.value.result != nil {
 					inspection.completion_result = bytes.clone(variant.value.result.data)
 				}
+			}
+		}
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Failed:
+		inspection.failed = status.value != nil
+		if status.value != nil {
+			inspection.failure_cause = status.value.force_cause
+			if status.value.failure != nil {
+				inspection.failure_message = bytes.clone(
+					transmute([]u8)status.value.failure.message,
+				)
 			}
 		}
 	}
@@ -415,6 +428,95 @@ worker_routes_registered_workflow_types_and_evictions :: proc(t: ^testing.T) {
 	workflow.error_free(&processed.error)
 	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
 	testing.expect_value(t, sdk_worker.workflow_runs[0].run_id, "registry-run-second")
+
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message != nil)
+	worker.error_free(&dispatch_error)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+worker_fails_unknown_workflow_activation_without_losing_poll_loop_state :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		task_queue = "test-queue",
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		workflow_runs = make([dynamic]worker.Workflow_Run),
+		rejected_workflow_runs = make([dynamic]worker.Rejected_Workflow_Run),
+	}
+	defer {
+		for rejected_run in sdk_worker.rejected_workflow_runs {
+			delete(rejected_run.run_id)
+		}
+		delete(sdk_worker.workflow_registrations)
+		delete(sdk_worker.workflow_runs)
+		delete(sdk_worker.rejected_workflow_runs)
+	}
+
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "missing_workflow",
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "unknown-workflow-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error := worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expectf(t, dispatch_error.message == nil, "unknown Workflow dispatch failed worker: %s", string(dispatch_error.message))
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.activation_failed)
+	testing.expect(t, processed.error.message != nil)
+	testing.expect_value(t, len(sdk_worker.rejected_workflow_runs), 1)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect(t, inspection.failed)
+	testing.expect_value(t, string(inspection.failure_message), "Workflow type missing_workflow not found")
+	testing.expect(
+		t,
+		inspection.failure_cause == .WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE,
+	)
+	delete(inspection.failure_message)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{message = "activation failed"}
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expectf(t, dispatch_error.message == nil, "unknown Workflow eviction failed: %s", string(dispatch_error.message))
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	testing.expect_value(t, len(sdk_worker.rejected_workflow_runs), 0)
+	inspection = inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect(t, !inspection.failed)
+	testing.expect_value(t, inspection.command_count, 0)
+	delete(inspection.failure_message)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
 
 	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
 	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])

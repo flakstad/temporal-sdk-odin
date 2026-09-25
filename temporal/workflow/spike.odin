@@ -35,6 +35,7 @@ Process_Result :: struct {
 	completion:         [dynamic]u8,
 	run_id:             string,
 	error:              Error,
+	activation_failed:  bool,
 	scheduled_activity: bool,
 	scheduled_activity_count: int,
 	activity_seq:       u32,
@@ -146,7 +147,10 @@ encode_activation_failure :: proc(run_id, message: string) -> [dynamic]u8 {
 			value = &application_info,
 		},
 	}
-	failed := proto.Coresdk_Workflow_Completion_Failure{failure = &failure}
+	failed := proto.Coresdk_Workflow_Completion_Failure{
+		failure = &failure,
+		force_cause = .WORKFLOW_TASK_FAILED_CAUSE_WORKFLOW_WORKER_UNHANDLED_FAILURE,
+	}
 	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{
 		run_id = run_id,
 		status = proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Failed{
@@ -156,8 +160,28 @@ encode_activation_failure :: proc(run_id, message: string) -> [dynamic]u8 {
 	return proto.encode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(&completion)
 }
 
+encode_empty_activation_success :: proc(run_id: string) -> [dynamic]u8 {
+	success := proto.Coresdk_Workflow_Completion_Success{}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{
+		run_id = run_id,
+		status = proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful{
+			value = &success,
+		},
+	}
+	return proto.encode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(&completion)
+}
+
+activation_failure_result :: proc(run_id, message: string) -> Process_Result {
+	return Process_Result{
+		completion = encode_activation_failure(run_id, message),
+		error = error_from_string(message),
+		activation_failed = true,
+	}
+}
+
 process_error :: proc(result: ^Process_Result, run_id, message: string) {
 	result.error = error_from_string(message)
+	result.activation_failed = true
 	if len(run_id) > 0 {
 		result.completion = encode_activation_failure(run_id, message)
 	}
@@ -222,6 +246,7 @@ process_activation :: proc(runtime: ^Runtime, data: []u8) -> (result: Process_Re
 			if add_error.message != nil {
 				result.error = add_error
 				result.completion = encode_activation_failure(activation.run_id, string(add_error.message))
+				result.activation_failed = true
 				return
 			}
 			instance_found = true

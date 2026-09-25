@@ -31,6 +31,10 @@ Workflow_Run :: struct {
 	registration_index: int,
 }
 
+Rejected_Workflow_Run :: struct {
+	run_id: string,
+}
+
 Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
 
 Run_Options :: struct {
@@ -46,6 +50,7 @@ Run_Stats :: struct {
 	activity_tasks_completed:             int,
 	activity_cancellations_received:      int,
 	workflow_activations_completed:       int,
+	workflow_activation_failures:         int,
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,
@@ -71,6 +76,7 @@ Worker :: struct {
 	activity_registrations: [dynamic]Activity_Registration,
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
+	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
 }
@@ -135,6 +141,7 @@ create :: proc(
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.workflow_registrations = make([dynamic]Workflow_Registration)
 	worker.workflow_runs = make([dynamic]Workflow_Run)
+	worker.rejected_workflow_runs = make([dynamic]Rejected_Workflow_Run)
 	return
 }
 
@@ -394,6 +401,8 @@ Workflow_Activation_Route :: struct {
 	run_id:        string,
 	workflow_type: string,
 	initializes:   bool,
+	evicts:        bool,
+	job_count:     int,
 }
 
 decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activation_Route, ok: bool) {
@@ -412,6 +421,7 @@ decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activat
 		return
 	}
 	route.run_id = activation.run_id
+	route.job_count = len(activation.jobs)
 	for job in activation.jobs {
 		#partial switch variant in job.variant {
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow:
@@ -421,6 +431,8 @@ decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activat
 			}
 			route.initializes = true
 			route.workflow_type = variant.value.workflow_type
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
+			route.evicts = variant.value != nil
 		}
 	}
 	return
@@ -449,6 +461,20 @@ remove_workflow_run :: proc(worker: ^Worker, index: int) {
 	ordered_remove(&worker.workflow_runs, index)
 }
 
+find_rejected_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, bool) {
+	for rejected_run, index in worker.rejected_workflow_runs {
+		if rejected_run.run_id == run_id {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+remove_rejected_workflow_run :: proc(worker: ^Worker, index: int) {
+	delete(worker.rejected_workflow_runs[index].run_id)
+	ordered_remove(&worker.rejected_workflow_runs, index)
+}
+
 process_workflow_activation :: proc(
 	worker: ^Worker,
 	data: []u8,
@@ -460,6 +486,7 @@ process_workflow_activation :: proc(
 
 	registration_index := 0
 	run_index, run_found := find_workflow_run(worker, route.run_id)
+	rejected_index, rejected_found := find_rejected_workflow_run(worker, route.run_id)
 	owned_run_id := ""
 	if route.initializes {
 		if run_found {
@@ -468,15 +495,36 @@ process_workflow_activation :: proc(
 		registration_found: bool
 		registration_index, registration_found = find_workflow_registration(worker, route.workflow_type)
 		if !registration_found {
-			message := fmt.aprintf("workflow %q is not registered", route.workflow_type)
+			message := fmt.aprintf("Workflow type %s not found", route.workflow_type)
 			defer delete(message)
-			return {}, error_from_string(message)
+			if !rejected_found {
+				cloned_run_id, allocation_error := strings.clone(route.run_id)
+				if allocation_error != nil {
+					return {}, error_from_string("could not allocate rejected Workflow run route")
+				}
+				append(
+					&worker.rejected_workflow_runs,
+					Rejected_Workflow_Run{run_id = cloned_run_id},
+				)
+			}
+			return workflow.activation_failure_result(route.run_id, message), {}
 		}
 		cloned_run_id, allocation_error := strings.clone(route.run_id)
 		if allocation_error != nil {
 			return {}, error_from_string("could not allocate Workflow run route")
 		}
 		owned_run_id = cloned_run_id
+	} else if rejected_found {
+		if !route.evicts || route.job_count != 1 {
+			return workflow.activation_failure_result(
+				route.run_id,
+				"rejected Workflow run received a non-eviction activation",
+			), {}
+		}
+		remove_rejected_workflow_run(worker, rejected_index)
+		processed.completion = workflow.encode_empty_activation_success(route.run_id)
+		processed.evicted = true
+		return processed, {}
 	} else {
 		if !run_found {
 			return {}, error_from_string("Workflow activation does not match a registered run")
@@ -494,6 +542,12 @@ process_workflow_activation :: proc(
 					run_id = owned_run_id,
 					registration_index = registration_index,
 				},
+			)
+			owned_run_id = ""
+		} else if processed.activation_failed {
+			append(
+				&worker.rejected_workflow_runs,
+				Rejected_Workflow_Run{run_id = owned_run_id},
 			)
 			owned_run_id = ""
 		}
@@ -646,6 +700,9 @@ run_activity_loop :: proc(
 
 record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
 	stats.workflow_activations_completed += 1
+	if processed.activation_failed {
+		stats.workflow_activation_failures += 1
+	}
 	if processed.completed {
 		stats.workflow_executions_completed += 1
 	}
@@ -705,10 +762,14 @@ run_workflow_loop :: proc(
 		}
 		record_workflow_result(&stats, &processed)
 		if processed.error.message != nil {
-			message := string(processed.error.message)
-			result := error_from_string(message)
+			if !processed.activation_failed {
+				message := string(processed.error.message)
+				result := error_from_string(message)
+				workflow.error_free(&processed.error)
+				return stats, result
+			}
 			workflow.error_free(&processed.error)
-			return stats, result
+			continue
 		}
 		workflow.error_free(&processed.error)
 
@@ -879,14 +940,19 @@ close :: proc(worker: ^Worker) -> Error {
 	for workflow_run in worker.workflow_runs {
 		delete(workflow_run.run_id)
 	}
+	for rejected_run in worker.rejected_workflow_runs {
+		delete(rejected_run.run_id)
+	}
 	delete(worker.activity_registrations)
 	delete(worker.workflow_registrations)
 	delete(worker.workflow_runs)
+	delete(worker.rejected_workflow_runs)
 	delete(worker.namespace)
 	delete(worker.task_queue)
 	worker.activity_registrations = nil
 	worker.workflow_registrations = nil
 	worker.workflow_runs = nil
+	worker.rejected_workflow_runs = nil
 	worker.client = nil
 	worker.namespace = ""
 	worker.task_queue = ""

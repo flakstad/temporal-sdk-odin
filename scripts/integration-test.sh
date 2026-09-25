@@ -5,11 +5,20 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 server_pid=""
 worker_pid=""
 workflow_cli_pid=""
+unknown_workflow_id=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
+unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
 
 cleanup() {
+  if [[ -n "$unknown_workflow_id" ]]; then
+    temporal workflow terminate \
+      --workflow-id "$unknown_workflow_id" \
+      --reason "Temporal Odin SDK integration cleanup" \
+      --command-timeout 2s \
+      --output none >/dev/null 2>&1 || true
+  fi
   if [[ -n "$workflow_cli_pid" ]]; then
     kill "$workflow_cli_pid" 2>/dev/null || true
     wait "$workflow_cli_pid" 2>/dev/null || true
@@ -22,7 +31,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file"
+  rm -f "$workflow_output_file" "$unknown_history_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -142,6 +151,44 @@ if ! grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
   echo "Odin Workflow Worker did not become ready; see $worker_log" >&2
   exit 1
 fi
+
+unknown_workflow_id="odin-sdk-unknown-workflow-$$-$(date +%s)"
+temporal workflow start \
+  --workflow-id "$unknown_workflow_id" \
+  --type odin_missing_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Odin"' \
+  --command-timeout 10s \
+  --output none
+
+for _ in {1..30}; do
+  temporal workflow show \
+    --workflow-id "$unknown_workflow_id" \
+    --command-timeout 2s \
+    --output json >"$unknown_history_file" 2>/dev/null || true
+  if grep -q 'activation_failed=true error="Workflow type odin_missing_workflow not found"' "$worker_log" 2>/dev/null && \
+     grep -q 'activation_failed=false .*evicted=true' "$worker_log" 2>/dev/null && \
+     grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Unknown Workflow type terminated the Odin worker" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+grep -q 'activation_failed=true error="Workflow type odin_missing_workflow not found"' "$worker_log"
+grep -q 'activation_failed=false .*evicted=true' "$worker_log"
+grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file"
+kill -0 "$worker_pid"
+temporal workflow terminate \
+  --workflow-id "$unknown_workflow_id" \
+  --reason "unknown Workflow type test completed" \
+  --command-timeout 10s \
+  --output none
+unknown_workflow_id=""
 
 workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
 temporal workflow execute \

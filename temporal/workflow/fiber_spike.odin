@@ -888,6 +888,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			if add_error.message != nil {
 				result.error = add_error
 				result.completion = encode_activation_failure(activation.run_id, string(add_error.message))
+				result.activation_failed = true
 				return
 			}
 			instance_found = true
@@ -1034,6 +1035,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			if destroy_error.message != nil {
 				result.error = destroy_error
 				result.completion = encode_activation_failure(activation.run_id, string(destroy_error.message))
+				result.activation_failed = true
 				return
 			}
 			instance = nil
@@ -1087,6 +1089,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			context.allocator = previous_allocator
 			result.error = error_from_string(message)
 			result.completion = encode_activation_failure(activation.run_id, message)
+			result.activation_failed = true
 			return
 		}
 	}

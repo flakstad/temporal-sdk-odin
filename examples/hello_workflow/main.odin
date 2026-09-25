@@ -52,10 +52,16 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 }
 
 observe_activation :: proc(processed: ^workflow.Process_Result) {
+	error_message := ""
+	if processed.error.message != nil {
+		error_message = string(processed.error.message)
+	}
 	fmt.printf(
-		"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
+		processed.activation_failed,
+		error_message,
 		processed.scheduled_activity_count,
 		processed.activity_seq,
 		processed.resolved_activity_seq,

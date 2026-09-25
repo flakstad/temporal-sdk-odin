@@ -4,9 +4,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 lib_dir="$repo_root/native/target/release"
 binary="$lib_dir/temporal-odin-core-connect"
+odin_thread_count="${ODIN_THREAD_COUNT:-1}"
 if [[ "${TEMPORAL_ODIN_SKIP_BUILD:-}" != "1" ]]; then
   "$repo_root/scripts/build-core.sh"
   odin build "$repo_root/examples/core_connect" \
+    -thread-count:"$odin_thread_count" \
     -out:"$binary" \
     -extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
 elif [[ ! -x "$binary" ]]; then

@@ -17,8 +17,9 @@ correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and string heartbeat details through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
-cancellation. It does **not**
-provide user Workflow cancellation scopes/cleanup, signal handlers,
+cancellation. Unknown Workflow types fail the retryable Workflow Task without
+terminating the worker. It does **not** provide user Workflow cancellation
+scopes/cleanup, signal handlers,
 queries/updates, generic payloads, panic containment, or a stable public API.
 Do not use it in production.
 
@@ -118,7 +119,10 @@ Two more executions use `temporal workflow cancel` to verify pending-timer and
 pending-Activity cleanup through Core. The Activity case waits for an Odin
 heartbeat, observes Core's cancel task in the in-flight context, and replies
 with a cancellation completion. A separate fan-out case proves two Odin
-Activity callbacks overlap rather than merely being queued concurrently.
+Activity callbacks overlap rather than merely being queued concurrently. The
+suite also starts an unregistered Workflow type, verifies a retryable
+`WorkflowTaskFailed` event and Core eviction, then proves that the same Odin
+worker can complete a registered Workflow afterward.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 

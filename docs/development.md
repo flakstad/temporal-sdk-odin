@@ -99,6 +99,14 @@ test-only dependency. Its own package tests currently contain an upstream
 unused-variable warning, so dependency warnings are not promoted to errors in
 that second compilation; SDK-owned tests remain strict.
 
+The tested Odin development compiler has intermittently asserted internally
+while parallel type checking instantiated the standard-library
+`queue.Queue(Task)` and `pbt.State_Model` types. Eight consecutive
+single-threaded PBT compilations
+passed after reproducing the parallel failure, so repository scripts default
+to `-thread-count:1`. This affects compiler parallelism only, not the worker or
+test runtime. Set `ODIN_THREAD_COUNT` to experiment with a newer compiler.
+
 If the property dependency is absent, initialize it with:
 
 ```bash
@@ -159,6 +167,16 @@ it is idempotent after closing. If Core validation fails, `run` closes the
 newly-created Core worker and leaves the language worker configurable so the
 failure does not leak a native handle.
 
+Workflow activation failures are distinct from worker-fatal failures. An
+unknown Workflow type produces a failed `WorkflowActivationCompletion` with
+`WorkflowWorkerUnhandledFailure`; Core reports a retryable Workflow Task
+failure and evicts the rejected run. The language worker retains only that run
+ID until `RemoveFromCache`, answers the eviction with an empty successful
+completion, and keeps polling. Errors that cannot produce a valid completion—
+such as malformed protobuf or an impossible run route—still stop `run`.
+`Run_Stats.workflow_activation_failures` counts the nonfatal failed
+completions.
+
 The integration test uses Temporal CLI directly—no Docker, PostgreSQL, or
 Elasticsearch:
 
@@ -197,6 +215,15 @@ if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
 then the run scripts `exec` those binaries without rebuilding. Standalone use
 still builds by default. Keeping the process PID identical to the worker PID
 lets integration cleanup avoid orphaning a task-queue poller.
+
+Before the registered Workflow scenario, the live suite starts
+`odin_missing_workflow` on the same queue. It requires both an
+`EVENT_TYPE_WORKFLOW_TASK_FAILED` event in server history and a following Core
+cache eviction, confirms that the worker process is still alive, terminates the
+intentionally stuck execution, and then runs the registered Workflow. Temporal
+[documents unknown Workflow Tasks](https://docs.temporal.io/task-queue) as
+retryable Task failures rather than Workflow Execution failures, so the
+explicit termination is test cleanup, not SDK behavior.
 
 `./scripts/test.sh` uses the pinned `test-deps/pbt` submodule by default. During
 local PBT library development, run `PBT_ROOT=~/Projects/pbt ./scripts/test.sh`
