@@ -1,0 +1,3 @@
+[submodule "native/sdk-core"]
+	path = native/sdk-core
+	url = https://github.com/temporalio/sdk-rust.git
