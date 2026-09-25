@@ -122,13 +122,13 @@ also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
-with `temporal workflow execute`. The Odin Workflow schedules an unregistered
-Activity with one attempt, handles its failure, and schedules a registered
-recovery Activity. The test forces Core eviction before the failure and again
-after the recovery command. Each suspended fiber is destroyed; replay must
-recreate the handled failure branch before the recovery Activity result is
-applied. The test requires two replay initializations and the final completion
-eviction before it succeeds.
+with `temporal workflow execute` in the background. After the Workflow is
+visibly blocked on its Activity, the script sends an `approval` signal through
+Temporal CLI. The Odin runtime buffers the signal without resuming the wrong
+await, requests eviction, and runs the Activity only after that eviction. Replay
+must restore the Activity command and buffered signal before the live Activity
+result lets sequential code consume both. The final completion eviction is
+required before the test succeeds.
 
 ## Manual run
 
@@ -158,7 +158,7 @@ temporal workflow execute \
   --input '"Odin"'
 ```
 
-This example is intentionally a handled-failure/replay fiber experiment, not a
+This example is intentionally a buffered-signal/replay fiber experiment, not a
 stable or general Workflow API.
 
 The default endpoint is `http://localhost:7233` inside the Core connection

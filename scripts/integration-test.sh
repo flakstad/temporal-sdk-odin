@@ -4,10 +4,16 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 server_pid=""
 worker_pid=""
+workflow_cli_pid=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
+workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
 
 cleanup() {
+  if [[ -n "$workflow_cli_pid" ]]; then
+    kill "$workflow_cli_pid" 2>/dev/null || true
+    wait "$workflow_cli_pid" 2>/dev/null || true
+  fi
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
@@ -16,6 +22,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
+  rm -f "$workflow_output_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -110,20 +117,49 @@ if ! grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
 fi
 
 workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
-workflow_output="$(temporal workflow execute \
+temporal workflow execute \
   --workflow-id "$workflow_id" \
   --type odin_hello_workflow \
   --task-queue odin-hello-workflow \
   --input '"Odin"' \
   --command-timeout 30s \
-  --output json)"
+  --output json >"$workflow_output_file" &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "scheduled=1 last_activity=1 .*waiting_activity=1" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Workflow did not reach its Activity await before signaling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! grep -Eq "scheduled=1 last_activity=1 .*waiting_activity=1" "$worker_log" 2>/dev/null; then
+  echo "Workflow did not expose its Activity await before signaling" >&2
+  exit 1
+fi
+
+temporal workflow signal \
+  --workflow-id "$workflow_id" \
+  --name approval \
+  --input '"Approved"' \
+  --command-timeout 10s \
+  --output none
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+workflow_output="$(<"$workflow_output_file")"
 echo "$workflow_output"
 grep -q '"status": "COMPLETED"' <<<"$workflow_output"
-grep -q '"result": "Hello Recovered Odin"' <<<"$workflow_output"
+grep -q '"result": "Hello Odin / Approved"' <<<"$workflow_output"
 
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq "replay=true .*resolved=1 failed=true" "$worker_log"
-grep -q "scheduled=1 last_activity=2 resolved=1 failed=true" "$worker_log"
-grep -q "handled Activity failure replayed across eviction before recovery completed" "$worker_log"
+grep -Eq "replay=true .*signal=true .*waiting_activity=1" "$worker_log"
+grep -Eq "replay=false .*signal=true .*waiting_activity=1" "$worker_log"
+grep -q "signal buffered during Activity await and consumed after replay" "$worker_log"

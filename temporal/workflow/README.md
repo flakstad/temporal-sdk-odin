@@ -6,18 +6,16 @@
 initialize -> schedule hello Activity -> resolve Activity -> complete
 ```
 
-`fiber_spike.odin` drives serial commands, multiple outstanding Activities, and
-handled Activity failures through a stackful coroutine. The current live
-example is:
+`fiber_spike.odin` drives serial commands, multiple outstanding Activities,
+handled Activity failures, and buffered signals through a stackful coroutine.
+The current live example is:
 
 ```odin
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-    failed := workflow.execute_activity_result(ctx, "missing", name)
-    if failed.status != .Failed {
-        return "unexpected Activity success"
-    }
-    recovery_input, _ := strings.concatenate({"Recovered ", name})
-    return workflow.execute_activity(ctx, "hello", recovery_input)
+    greeting := workflow.execute_activity(ctx, "hello", name)
+    approval := workflow.await_signal(ctx, "approval")
+    result, _ := strings.concatenate({greeting, " / ", approval})
+    return result
 }
 ```
 
@@ -31,6 +29,7 @@ operation tables, emits multiple commands in one completion, and applies every
 resolution job before resuming the single Workflow fiber. Activity failures are
 arena-owned resolutions: `execute_activity_result` makes them handleable, while
 the simpler `execute_activity` propagates an unhandled failure to Temporal.
-Neither
-implementation is a stable registration API or a complete Workflow runtime. Do
-not build application Workflows against them.
+Named string signals are queued in arrival order and do not resume a fiber that
+is waiting on another operation. Neither implementation is a stable
+registration API or a complete Workflow runtime. Do not build application
+Workflows against them.

@@ -21,6 +21,7 @@ Fiber_Phase :: enum {
 	Ready,
 	Waiting_Activity,
 	Waiting_Timer,
+	Waiting_Signal,
 	Completed,
 	Failed,
 }
@@ -64,6 +65,12 @@ Fiber_Timer_Operation :: struct {
 	state:    Fiber_Operation_State,
 }
 
+Fiber_Signal :: struct {
+	name:     string,
+	payload:  string,
+	consumed: bool,
+}
+
 Fiber_Instance :: struct {
 	run_id:          string,
 	input:           string,
@@ -72,8 +79,10 @@ Fiber_Instance :: struct {
 	workflow_context: Fiber_Context,
 	activities:       [dynamic]Fiber_Activity_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
+	signals:          [dynamic]Fiber_Signal,
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
+	waiting_signal_name:  string,
 	unhandled_activity_seq: u32,
 	next_activity_seq: u32,
 	next_timer_seq:    u32,
@@ -219,6 +228,7 @@ add_fiber_instance :: proc(
 	instance.input = decoded_input
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
+	instance.signals = make([dynamic]Fiber_Signal)
 	context.allocator = previous_allocator
 	if run_id_error != nil || decode_error != .None {
 		virtual.arena_destroy(&instance.arena)
@@ -257,6 +267,16 @@ find_timer_operation :: proc(instance: ^Fiber_Instance, seq: u32) -> (^Fiber_Tim
 	for index in 0..<len(instance.timers) {
 		if instance.timers[index].seq == seq {
 			return &instance.timers[index], true
+		}
+	}
+	return nil, false
+}
+
+find_buffered_signal :: proc(instance: ^Fiber_Instance, name: string) -> (^Fiber_Signal, bool) {
+	for index in 0..<len(instance.signals) {
+		signal := &instance.signals[index]
+		if !signal.consumed && signal.name == name {
+			return signal, true
 		}
 	}
 	return nil, false
@@ -356,6 +376,41 @@ execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> s
 
 execute_activity_result :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Result {
 	return await_activity_result(ctx, start_activity(ctx, activity_type, input))
+}
+
+// await_signal consumes the oldest buffered signal with the requested name, or
+// suspends until Core delivers one. Signals with other names stay buffered.
+await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return ""
+	}
+	instance := ctx.instance
+	signal, found := find_buffered_signal(instance, name)
+	if found {
+		signal.consumed = true
+		return signal.payload
+	}
+	waiting_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		instance.phase = .Failed
+		return ""
+	}
+	instance.waiting_signal_name = waiting_name
+	instance.phase = .Waiting_Signal
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		instance.phase = .Failed
+		return ""
+	}
+	signal, found = find_buffered_signal(instance, name)
+	if !found {
+		instance.phase = .Failed
+		return ""
+	}
+	signal.consumed = true
+	return signal.payload
 }
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
@@ -477,6 +532,8 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
 	case .Waiting_Timer:
+	case .Waiting_Signal:
+		result.waiting_signal = true
 	case .Ready, .Completed, .Failed:
 		return error_from_string("Workflow fiber suspended without a supported pending operation")
 	}
@@ -684,6 +741,28 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow:
+			handled = true
+			if variant.value == nil || !instance_found || len(variant.value.signal_name) == 0 || len(variant.value.input) != 1 {
+				process_error(&result, activation.run_id, "Workflow signal must have a name and one payload")
+				return
+			}
+			payload := proto.payload_view(&variant.value.input[0])
+			context.allocator = instance.odin_context.allocator
+			signal_name, name_error := strings.clone(variant.value.signal_name)
+			signal_payload, decode_error := codec.decode_string(payload.data, payload.encoding)
+			context.allocator = previous_allocator
+			if name_error != nil || decode_error != .None {
+				process_error(&result, activation.run_id, "could not preserve Workflow signal as json/plain string")
+				return
+			}
+			append(
+				&instance.signals,
+				Fiber_Signal{name = signal_name, payload = signal_payload},
+			)
+			result.received_signal = true
+			result.received_signal_count += 1
+
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer:
 			handled = true
 			if variant.value == nil || !instance_found {
@@ -729,12 +808,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		case .Waiting_Timer:
 			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
 			should_resume = found && operation.state == .Resolved
+		case .Waiting_Signal:
+			_, found := find_buffered_signal(instance, instance.waiting_signal_name)
+			should_resume = found
 		case .Ready, .Completed, .Failed:
 		}
 		if should_resume {
 			instance.phase = .Ready
 			instance.waiting_activity_seq = 0
 			instance.waiting_timer_seq = 0
+			instance.waiting_signal_name = ""
 			resume_result := fiber_raw.resume(instance.fiber)
 			if resume_result != .Success {
 				process_error(&result, activation.run_id, "could not resume Workflow fiber after applying activation jobs")

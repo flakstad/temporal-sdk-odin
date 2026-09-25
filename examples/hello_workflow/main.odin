@@ -21,15 +21,13 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	failed := workflow.execute_activity_result(ctx, "missing", name)
-	if failed.status != .Failed {
-		return "unexpected Activity success"
-	}
-	recovery_input, allocation_error := strings.concatenate({"Recovered ", name})
+	greeting := workflow.execute_activity(ctx, "hello", name)
+	approval := workflow.await_signal(ctx, "approval")
+	result, allocation_error := strings.concatenate({greeting, " / ", approval})
 	if allocation_error != nil {
 		return ""
 	}
-	return workflow.execute_activity(ctx, "hello", recovery_input)
+	return result
 }
 
 main :: proc() {
@@ -100,10 +98,10 @@ main :: proc() {
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
 	evictions_requested := 0
-	evictions_observed := 0
 	activities_completed := 0
 	live_resolutions := 0
-	replayed_failure := false
+	live_signals := 0
+	replayed_signal := false
 	workflow_completed := false
 	final_eviction := false
 	failed := false
@@ -140,14 +138,16 @@ main :: proc() {
 		}
 
 		fmt.printf(
-			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v waiting=%d completed=%v evicted=%v\n",
+			"activation history=%d replay=%v scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v waiting_activity=%d waiting_signal=%v completed=%v evicted=%v\n",
 			processed.history_length,
 			processed.is_replaying,
 			processed.scheduled_activity_count,
 			processed.activity_seq,
 			processed.resolved_activity_seq,
 			processed.resolved_activity_failed,
+			processed.received_signal,
 			processed.waiting_activity_seq,
+			processed.waiting_signal,
 			processed.completed,
 			processed.evicted,
 		)
@@ -161,12 +161,13 @@ main :: proc() {
 		if processed.resolved_activity_seq != 0 && !processed.is_replaying {
 			live_resolutions += 1
 		}
-		if processed.resolved_activity_failed && processed.is_replaying {
-			replayed_failure = true
+		if processed.received_signal && !processed.is_replaying {
+			live_signals += processed.received_signal_count
 		}
-		request_eviction :=
-			(evictions_requested == 0 && processed.scheduled_activity && processed.activity_seq == 1) ||
-			(evictions_requested == 1 && processed.resolved_activity_failed && processed.scheduled_activity && processed.activity_seq == 2 && !processed.is_replaying)
+		if processed.received_signal && processed.is_replaying {
+			replayed_signal = true
+		}
+		request_eviction := evictions_requested == 0 && processed.received_signal && !processed.is_replaying
 		if request_eviction {
 			eviction_error := temporal_core.worker_request_workflow_eviction(
 				&activity_worker.core,
@@ -182,8 +183,7 @@ main :: proc() {
 		}
 
 		if processed.evicted {
-			evictions_observed += 1
-			if evictions_observed == 1 || evictions_observed == 2 {
+			if activities_completed < evictions_requested {
 				activity_error := worker.run(&activity_worker, max_tasks = 1)
 				if activity_error.message != nil {
 					fmt.eprintf("Activity execution failed: %s\n", string(activity_error.message))
@@ -203,13 +203,13 @@ main :: proc() {
 		}
 	}
 
-	if !failed && (evictions_requested != 2 || activities_completed != 2 || live_resolutions != 2 || !replayed_failure || !workflow_completed || !final_eviction) {
-		fmt.eprintln("Workflow spike did not recover from and replay an Activity failure across eviction")
+	if !failed && (evictions_requested != 1 || activities_completed != 1 || live_resolutions != 1 || live_signals != 1 || !replayed_signal || !workflow_completed || !final_eviction) {
+		fmt.eprintln("Workflow spike did not buffer and replay a signal received while awaiting an Activity")
 		failed = true
 	}
-	if !failed && (workflow_runtime.replay_initializations < 2 || workflow_runtime.evictions < 3) {
+	if !failed && (workflow_runtime.replay_initializations < 1 || workflow_runtime.evictions < 2) {
 		fmt.eprintf(
-			"Workflow spike expected two replays and three evictions; replay_initializations=%d evictions=%d\n",
+			"Workflow spike expected one replay and two evictions; replay_initializations=%d evictions=%d\n",
 			workflow_runtime.replay_initializations,
 			workflow_runtime.evictions,
 		)
@@ -229,5 +229,5 @@ main :: proc() {
 	if failed {
 		os.exit(1)
 	}
-	fmt.println("handled Activity failure replayed across eviction before recovery completed")
+	fmt.println("signal buffered during Activity await and consumed after replay")
 }
