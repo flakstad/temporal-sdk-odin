@@ -7,7 +7,8 @@ spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
 registry and poll loop, 2026-09-25. The Activity slice now also has a generic
-Temporal Payload boundary and typed JSON Activity registration.
+Temporal Payload boundary, typed JSON Activity registration, and structured
+Application Failures proven through a live retry.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -229,6 +230,9 @@ The implemented language boundary distinguishes borrowed and owned values:
   requiring the Temporal `encoding=json/plain` metadata contract;
 - `worker.register_json_activity` specializes a compile-time trampoline from
   `proc(Context, Input) -> Output` to the worker's uniform payload callback;
+- `worker.register_json_activity_result` maps
+  `proc(Context, Input) -> activity.Result(Output)` to success or a structured
+  Temporal Application Failure;
 - `worker.register_payload_activity` exposes the lower-level payload boundary
   without coupling custom codecs to Core protobuf types.
 
@@ -880,6 +884,30 @@ Activity poll as a separate cancel task. The live suite verifies this exact
 sequence and preserves Core's reason, including the valid `NotFound` race after
 the Workflow has already closed.
 
+Expected Activity failures are values, not panics. Temporal's
+[Application Failure contract](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/application-failures.mdx)
+defines these wire fields, and its
+[Retry Policy contract](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/retry-policies.mdx)
+makes Activities retryable by default. `activity.Result(T)` carries
+either a typed success value or an `Application_Failure` with message, type,
+retryability, one optional codec Payload of details, and an optional next retry
+delay. The worker maps that directly to the generated
+`ApplicationFailureInfo` protobuf inside `ActivityExecutionResult.failed`.
+Core and the Service—not the callback thread—apply the Activity Retry Policy.
+The live test returns retryable `TransientGreetingError` plus typed details and
+a 10 ms delay on attempt 1; the next task reaches Odin with attempt 2 and
+completes successfully. A 500-case property test varies type, retryability,
+details, and delay and requires exact protobuf preservation.
+
+This is deliberately separate from panic containment. The tested Odin runtime
+defines both [`panic`](https://github.com/odin-lang/Odin/blob/ea5175d86/base/runtime/core_builtin.odin#L1573)
+and [`Assertion_Failure_Proc`](https://github.com/odin-lang/Odin/blob/ea5175d86/base/runtime/core.odin#L299)
+as non-returning (`-> !`) and offers no supported unwind/recover mechanism.
+Jumping out through C would skip
+Odin `defer`s and allocator cleanup. Consequently an unexpected callback panic
+still terminates the worker process; honest containment requires a process
+boundary or future Odin runtime support, not a `longjmp` shim.
+
 `register_workflow(name, proc)` owns one `Fiber_Runtime` per Workflow type. A
 unit test initializes two types under different run IDs, verifies dispatch to
 the correct procedure, evicts one, and proves that the other route remains.
@@ -954,8 +982,10 @@ Workflows are enabled.
 3. **Worker concurrency.** The fixed-slot Activity executor, heap-stable
    task-token routes, cooperative cancellation, and heartbeat transport pass
    live tests. It now reuses a standard-library thread pool sized to the same
-   limit as Core's Activity slot supplier. It still uses a linear in-flight
-   lookup and lacks load/backpressure, panic-containment, deadline, and
+   limit as Core's Activity slot supplier. Structured retryable/non-retryable
+   failures now pass generated and live retry tests. It still uses a linear
+   in-flight lookup and lacks load/backpressure, process-level panic
+   containment, deadline, and
    shutdown-timeout stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
@@ -973,9 +1003,10 @@ Workflows are enabled.
    Temporal failure protobuf for propagation, but the catchable experimental API
    exposes only status and message. Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
-   A public API must model typed causes/details, deadlines, panics, and richer
-   codec failures. Typed JSON Activities now turn decode/encode errors into
-   non-retryable Activity failures instead of worker-fatal errors.
+   The Activity API now models typed success, retryability, failure type,
+   details, and next-retry delay, but still needs deadline/execution metadata
+   and a process-isolation policy for panics. Typed JSON decode/encode errors
+   become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -996,14 +1027,22 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 Activity concurrency, task-token routing, cooperative cancel delivery,
-heartbeat transport, and typed JSON Payloads are now proven live. The PBT suite
-also generates 500 struct values, clones their arbitrary metadata, releases the
-source, and requires an identical decode from the clone. The next vertical
-milestone should add Activity callback panic containment and retryable user
-failures, then stress pool shutdown/cancel/heartbeat/failure interleavings. A
-statechart oracle becomes worthwhile once retry policy and deadlines join that
-model. User Workflow cancellation scopes remain a separate Workflow-runtime
-change.
+heartbeat transport, typed JSON Payloads, and structured user failures with a
+real server-directed retry are now proven live. The PBT suites generate 500
+Payload values and 500 Application Failure contracts against both the pinned
+library and `~/Projects/pbt`.
+
+The next smallest vertical milestone should carry generic `codec.Payload`
+values through Workflow initialization, Activity scheduling/resolution, and
+Workflow completion, then add typed JSON Workflow registration on top. Today
+that path is string-only even though the underlying generated protobuf graph is
+already generic. This removes a real SDK limitation without prematurely
+freezing the fiber scheduler. Follow it with Activity deadline/execution-info
+fields and pool shutdown/cancel/failure stress. Panic containment should be
+designed as subprocess isolation unless Odin gains supported recovery; it must
+not block ordinary explicit failures. A statechart oracle becomes worthwhile
+when deadlines and retry/cancellation interleavings create additional states.
+User Workflow cancellation scopes remain a separate Workflow-runtime change.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

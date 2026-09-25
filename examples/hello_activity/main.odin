@@ -22,6 +22,20 @@ Greeting_Output :: struct {
 	name_length: int,
 }
 
+Retry_Greeting_Input :: struct {
+	name: string,
+}
+
+Retry_Greeting_Output :: struct {
+	message: string,
+	attempt: u32,
+}
+
+Retry_Failure_Details :: struct {
+	dependency: string,
+	attempt:    u32,
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	_ = ctx
 	if strings.has_prefix(name, "concurrent-") {
@@ -58,6 +72,34 @@ typed_greeting :: proc(_: ^activity.Context, input: Greeting_Input) -> Greeting_
 		return {}
 	}
 	return {message = message, name_length = len(input.name)}
+}
+
+retry_greeting :: proc(
+	ctx: ^activity.Context,
+	input: Retry_Greeting_Input,
+) -> activity.Result(Retry_Greeting_Output) {
+	current_attempt := activity.attempt(ctx)
+	if current_attempt == 1 {
+		return activity.result_failure_json(
+			Retry_Greeting_Output,
+			"greeting dependency is temporarily unavailable",
+			Retry_Failure_Details{dependency = "greeting-service", attempt = current_attempt},
+			failure_type = "TransientGreetingError",
+			next_retry_delay = 10 * time.Millisecond,
+		)
+	}
+	message, allocation_error := strings.concatenate({"Hello after retry, ", input.name, "!"})
+	if allocation_error != nil {
+		return activity.result_failure(
+			Retry_Greeting_Output,
+			"could not allocate greeting result",
+			failure_type = "OdinAllocationError",
+			non_retryable = true,
+		)
+	}
+	return activity.result_success(
+		Retry_Greeting_Output{message = message, attempt = current_attempt},
+	)
 }
 
 main :: proc() {
@@ -102,13 +144,26 @@ main :: proc() {
 		_ = worker.close(&activity_worker)
 		os.exit(1)
 	}
+	register_retry_error := worker.register_json_activity_result(
+		&activity_worker,
+		"retry_greeting",
+		retry_greeting,
+	)
+	if register_retry_error.message != nil {
+		fmt.eprintf("Retry Activity registration failed: %s\n", string(register_retry_error.message))
+		worker.error_free(&register_retry_error)
+		_ = worker.close(&activity_worker)
+		os.exit(1)
+	}
 
 	fmt.println("Odin Activity Worker is polling task queue odin-hello-activity")
 	env_buffer: [64]u8
 	concurrency_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_CONCURRENT")
 	concurrency_case := concurrency_value != ""
+	retry_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_RETRY")
+	retry_case := retry_value != ""
 	max_tasks := 1
-	if concurrency_case {
+	if concurrency_case || retry_case {
 		max_tasks = 2
 	}
 	_, run_error := worker.run(
@@ -129,6 +184,8 @@ main :: proc() {
 	}
 	if concurrency_case {
 		fmt.println("two Activity callbacks overlapped and worker shut down cleanly")
+	} else if retry_case {
+		fmt.println("retryable Activity failed once, then completed and worker shut down cleanly")
 	} else {
 		fmt.println("one Activity Task completed and worker shut down cleanly")
 	}

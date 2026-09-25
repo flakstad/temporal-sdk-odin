@@ -157,11 +157,12 @@ three send one Temporal Payload through
 throttling, and any server cancellation response returns later through the
 normal Activity poll stream.
 
-Activities can be registered at three levels:
+Activities can be registered at four levels:
 
 ```odin
 worker.register_activity(&w, "hello", hello_string)
 worker.register_json_activity(&w, "typed_greeting", typed_greeting)
+worker.register_json_activity_result(&w, "charge", charge_with_failure)
 worker.register_payload_activity(&w, "custom", custom_payload_activity)
 ```
 
@@ -170,6 +171,25 @@ callbacks receive one decoded Odin value and return one encoded value. Payload
 callbacks borrow their input only for the callback and return an owned
 `codec.Payload`; the executor frees that result with its recorded allocator
 after Core completion bytes have been constructed.
+
+The result adapter accepts
+`proc(Context, Input) -> activity.Result(Output)`. A successful result is
+encoded like the ordinary JSON adapter. A failure becomes a Temporal
+`ApplicationFailureInfo` and preserves `message`, `type`, `non_retryable`, one
+optional details Payload, and an optional positive `next_retry_delay`.
+`result_failure` is retryable by default; use `non_retryable = true` only for a
+permanent condition. `result_failure_json` owns its encoded details until the
+executor has built the completion. A negative retry delay is rejected as a
+non-retryable `OdinActivityFailureContractError` rather than emitting an
+invalid protobuf duration.
+
+Activity panics are not caught in-process. In the tested Odin toolchain,
+`panic` delegates to `context.assertion_failure_proc`, whose type returns `!`;
+there is no supported unwind/recover boundary. A `setjmp`/`longjmp` shim would
+skip Odin `defer`s and allocator cleanup, so the SDK intentionally does not
+present it as containment. Until subprocess-isolated Activity executors or
+language/runtime support is designed, deploy workers under a process supervisor
+and return `activity.Result(T)` for expected failures.
 
 `Run_Options.max_activity_tasks` and `max_workflow_executions` are bounded
 test/example controls. Zero means unbounded. Normal workers call `run` without
@@ -215,8 +235,9 @@ runtime_new -> client_connect -> GetSystemInfo RPC -> client_free -> runtime_fre
 The request protobuf is empty by definition. The response is intentionally kept
 opaque; receiving and freeing it proves the network and ABI path.
 
-The same script then runs `examples/hello_activity` twice. A small workflow-only
-driver under `native/activity-test-driver` uses the pinned upstream Rust SDK to
+The same script then runs `examples/hello_activity` for several focused cases.
+A small workflow-only driver under `native/activity-test-driver` uses the
+pinned upstream Rust SDK to
 schedule a real Activity because Temporal CLI Server 1.29.1 does not implement
 the newer standalone-Activity start RPC. The first run verifies `"Odin"` ->
 `"Hello Odin"`; the second schedules an unknown type and verifies that Odin's
@@ -224,6 +245,12 @@ application failure reaches the Workflow. The driver is test infrastructure,
 not part of the distributed Odin SDK and not an Odin workflow runtime. This is
 also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
+
+The typed retry case returns a retryable `TransientGreetingError` with JSON
+details and `next_retry_delay = 10 ms` on attempt 1. Core and the dev server
+schedule attempt 2; the Odin callback observes `activity.attempt(ctx) == 2`,
+returns success, and the driver receives the typed result. The bounded test
+worker therefore consumes two Activity Tasks before shutdown.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
@@ -247,7 +274,10 @@ to compile the SDK properties against that checkout without changing the
 reproducible repository pin. The Activity property suite generates in-flight
 set sizes, target task tokens, cancel reasons, and heartbeat counts, then checks
 that cancellation never leaks across tokens and no heartbeat is transported
-after cancellation becomes visible.
+after cancellation becomes visible. A second 500-case property generates
+retryable/non-retryable Application Failures, type strings, JSON details, and
+default/explicit retry delays, then round-trips every field through the Core
+completion protobuf. Both suites pass against the pin and `~/Projects/pbt`.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
 with `temporal workflow execute` in the background. After the Workflow has

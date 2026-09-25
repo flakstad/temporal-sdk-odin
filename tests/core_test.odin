@@ -73,6 +73,35 @@ typed_activity_test :: proc(
 	}
 }
 
+Activity_Failure_Details :: struct {
+	dependency: string,
+	attempt:    u32,
+}
+
+typed_activity_result_test :: proc(
+	_: ^activity.Context,
+	input: Codec_Test_Value,
+) -> activity.Result(Codec_Test_Value) {
+	if input.count == 0 {
+		return activity.result_failure(
+			Codec_Test_Value,
+			"input count must not be zero",
+			failure_type = "InvalidCount",
+			non_retryable = true,
+		)
+	}
+	if input.count < 0 {
+		return activity.result_failure_json(
+			Codec_Test_Value,
+			"dependency is temporarily unavailable",
+			Activity_Failure_Details{dependency = "test", attempt = 1},
+			failure_type = "TransientTestFailure",
+			next_retry_delay = 250 * time.Millisecond,
+		)
+	}
+	return activity.result_success(typed_activity_test(nil, input))
+}
+
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	return greeting
@@ -421,7 +450,8 @@ worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T
 	)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
-	testing.expect_value(t, result.failure_message, "")
+	defer activity.application_failure_free(&result.failure)
+	testing.expect(t, result.status == .Completed)
 
 	output: Codec_Test_Value
 	decode_error := codec.decode_json(codec.payload_view(&result.payload), &output)
@@ -441,8 +471,68 @@ worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T
 		codec.Payload_View{metadata = unsupported_metadata[:], data = transmute([]u8)string("raw")},
 	)
 	defer codec.payload_free(&failed.payload)
-	testing.expect(t, len(failed.failure_message) > 0)
-	testing.expect(t, failed.non_retryable)
+	defer activity.application_failure_free(&failed.failure)
+	testing.expect(t, failed.status == .Failed)
+	testing.expect(t, len(failed.failure.message) > 0)
+	testing.expect_value(t, failed.failure.type, "OdinPayloadConversionError")
+	testing.expect(t, failed.failure.non_retryable)
+}
+
+@(test)
+worker_json_activity_result_preserves_application_failure_fields :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+
+	register_error := worker.register_json_activity_result(
+		&sdk_worker,
+		"typed_result",
+		typed_activity_result_test,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	if len(sdk_worker.activity_registrations) != 1 {
+		return
+	}
+
+	input_payload, encode_error := codec.encode_json(
+		Codec_Test_Value{name = "Temporal", count = -1},
+	)
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&input_payload)
+	registration := &sdk_worker.activity_registrations[0]
+	callback_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&callback_arena) == nil)
+	defer virtual.arena_destroy(&callback_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&callback_arena)
+	result := registration.invoke(
+		registration.callback_data,
+		&activity.Context{},
+		codec.payload_view(&input_payload),
+	)
+	context.allocator = previous_allocator
+	defer codec.payload_free(&result.payload)
+	defer activity.application_failure_free(&result.failure)
+
+	testing.expect(t, result.status == .Failed)
+	testing.expect_value(t, result.failure.message, "dependency is temporarily unavailable")
+	testing.expect_value(t, result.failure.type, "TransientTestFailure")
+	testing.expect(t, !result.failure.non_retryable)
+	testing.expect(t, result.failure.has_details)
+	testing.expect_value(t, result.failure.next_retry_delay, 250 * time.Millisecond)
+	details: Activity_Failure_Details
+	details_error := codec.decode_json(codec.payload_view(&result.failure.details), &details)
+	testing.expect(t, details_error == .None)
+	testing.expect_value(t, details.dependency, "test")
+	testing.expect_value(t, details.attempt, u32(1))
+	delete(details.dependency)
 }
 
 @(test)
@@ -872,6 +962,77 @@ activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, cancelled)
+}
+
+@(test)
+activity_application_failure_protobuf_preserves_retry_contract :: proc(t: ^testing.T) {
+	details, details_error := codec.encode_json(
+		Activity_Failure_Details{dependency = "payments", attempt = 3},
+	)
+	testing.expect(t, details_error == .None)
+	defer codec.payload_free(&details)
+	completion := proto.encode_activity_failure(
+		transmute([]u8)string("failure-token"),
+		"payments are temporarily unavailable",
+		"PaymentsUnavailable",
+		false,
+		codec.payload_view(&details),
+		true,
+		250 * time.Millisecond,
+	)
+	defer delete(completion)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Coresdk_ActivityTaskCompletion{}
+	ok := proto.decode_Coresdk_ActivityTaskCompletion(completion[:], &decoded)
+	context.allocator = previous_allocator
+	testing.expect(t, ok)
+	testing.expect_value(t, string(decoded.task_token), "failure-token")
+	if !ok || decoded.result == nil {
+		return
+	}
+
+	found_failure := false
+	#partial switch status in decoded.result.status {
+	case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Failed:
+		if status.value == nil || status.value.failure == nil {
+			break
+		}
+		failure := status.value.failure
+		testing.expect_value(t, failure.message, "payments are temporarily unavailable")
+		testing.expect_value(t, failure.source, "OdinSDK")
+		#partial switch failure_info in failure.failure_info {
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+			if failure_info.value == nil {
+				break
+			}
+			info := failure_info.value
+			found_failure = true
+			testing.expect_value(t, info.type, "PaymentsUnavailable")
+			testing.expect(t, !info.non_retryable)
+			testing.expect(t, info.details != nil)
+			if info.details != nil {
+				testing.expect_value(t, len(info.details.payloads), 1)
+				if len(info.details.payloads) == 1 {
+					testing.expect_value(
+						t,
+						string(info.details.payloads[0].data),
+						`{"dependency":"payments","attempt":3}`,
+					)
+				}
+			}
+			testing.expect(t, info.next_retry_delay != nil)
+			if info.next_retry_delay != nil {
+				testing.expect_value(t, info.next_retry_delay.seconds, i64(0))
+				testing.expect_value(t, info.next_retry_delay.nanos, i32(250_000_000))
+			}
+		}
+	}
+	testing.expect(t, found_failure)
 }
 
 @(test)

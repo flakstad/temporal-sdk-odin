@@ -2,6 +2,7 @@
 package activity
 
 import "core:sync"
+import "core:time"
 import codec "../codec"
 
 Cancel_Reason :: enum u32 {
@@ -24,18 +25,111 @@ Heartbeat_Status :: enum {
 
 Heartbeat_Recorder :: #type proc(user_data: rawptr, details: codec.Payload_View) -> Heartbeat_Status
 
+Result_Status :: enum {
+	Completed,
+	Failed,
+}
+
+Application_Failure :: struct {
+	message:          string,
+	type:             string,
+	non_retryable:    bool,
+	details:          codec.Payload,
+	has_details:      bool,
+	next_retry_delay: time.Duration,
+}
+
+Result :: struct(T: typeid) {
+	status:  Result_Status,
+	value:   T,
+	failure: Application_Failure,
+}
+
+result_success :: proc(value: $T) -> Result(T) {
+	return {status = .Completed, value = value}
+}
+
+result_failure :: proc(
+	$T: typeid,
+	message: string,
+	failure_type := "OdinActivityError",
+	non_retryable := false,
+	next_retry_delay: time.Duration = 0,
+) -> Result(T) {
+	return {
+		status = .Failed,
+		failure = {
+			message = message,
+			type = failure_type,
+			non_retryable = non_retryable,
+			next_retry_delay = next_retry_delay,
+		},
+	}
+}
+
+result_failure_json :: proc(
+	$T: typeid,
+	message: string,
+	details: $Details,
+	failure_type := "OdinActivityError",
+	non_retryable := false,
+	next_retry_delay: time.Duration = 0,
+) -> Result(T) {
+	payload, encode_error := codec.encode_json(details)
+	if encode_error != .None {
+		return result_failure(
+			T,
+			"could not encode Activity failure details as json/plain",
+			failure_type = "OdinPayloadConversionError",
+			non_retryable = true,
+		)
+	}
+	return {
+		status = .Failed,
+		failure = {
+			message = message,
+			type = failure_type,
+			non_retryable = non_retryable,
+			details = payload,
+			has_details = true,
+			next_retry_delay = next_retry_delay,
+		},
+	}
+}
+
+application_failure_free :: proc(failure: ^Application_Failure) {
+	if failure == nil {
+		return
+	}
+	codec.payload_free(&failure.details)
+	failure^ = {}
+}
+
 Payload_Result :: struct {
-	payload:       codec.Payload,
-	failure_message: string,
-	non_retryable: bool,
+	status:  Result_Status,
+	payload: codec.Payload,
+	failure: Application_Failure,
 }
 
 payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
-	return {payload = payload}
+	return {status = .Completed, payload = payload}
 }
 
-payload_fail :: proc(message: string, non_retryable := true) -> Payload_Result {
-	return {failure_message = message, non_retryable = non_retryable}
+payload_fail :: proc(
+	message: string,
+	failure_type := "OdinActivityError",
+	non_retryable := true,
+	next_retry_delay: time.Duration = 0,
+) -> Payload_Result {
+	return {
+		status = .Failed,
+		failure = {
+			message = message,
+			type = failure_type,
+			non_retryable = non_retryable,
+			next_retry_delay = next_retry_delay,
+		},
+	}
 }
 
 Context :: struct {

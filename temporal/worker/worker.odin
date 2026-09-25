@@ -239,13 +239,68 @@ register_json_activity :: proc(
 			value: Input
 			decode_error := codec.decode_json(input, &value)
 			if decode_error != .None {
-				return activity.payload_fail("activity input is not valid json/plain for its Odin type")
+				return activity.payload_fail(
+					"activity input is not valid json/plain for its Odin type",
+					failure_type = "OdinPayloadConversionError",
+				)
 			}
 			callback := cast(^Callback)data
 			output := callback^(ctx, value)
 			payload, encode_error := codec.encode_json(output)
 			if encode_error != .None {
-				return activity.payload_fail("could not encode Activity result as json/plain")
+				return activity.payload_fail(
+					"could not encode Activity result as json/plain",
+					failure_type = "OdinPayloadConversionError",
+				)
+			}
+			return activity.payload_complete(payload)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_json_activity_result :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: proc(ctx: ^activity.Context, input: $Input) -> activity.Result($Output),
+) -> Error {
+	Callback :: #type proc(ctx: ^activity.Context, input: Input) -> activity.Result(Output)
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Callback, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate activity callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_activity_invoker(
+		worker,
+		name,
+		owned_callback,
+		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+			value: Input
+			decode_error := codec.decode_json(input, &value)
+			if decode_error != .None {
+				return activity.payload_fail(
+					"activity input is not valid json/plain for its Odin type",
+					failure_type = "OdinPayloadConversionError",
+				)
+			}
+			callback := cast(^Callback)data
+			result := callback^(ctx, value)
+			if result.status == .Failed {
+				return {
+					status = .Failed,
+					failure = result.failure,
+				}
+			}
+			payload, encode_error := codec.encode_json(result.value)
+			if encode_error != .None {
+				return activity.payload_fail(
+					"could not encode Activity result as json/plain",
+					failure_type = "OdinPayloadConversionError",
+				)
 			}
 			return activity.payload_complete(payload)
 		},
@@ -378,16 +433,34 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
+	defer activity.application_failure_free(&result.failure)
 
 	completion: [dynamic]u8
 	if activity.is_cancellation_requested(&execution.ctx) {
 		completion = proto.encode_activity_cancellation(execution.task_token)
-	} else if len(result.failure_message) > 0 {
-		completion = proto.encode_activity_failure(
-			execution.task_token,
-			result.failure_message,
-			result.non_retryable,
-		)
+	} else if result.status == .Failed {
+		failure_type := result.failure.type
+		if len(failure_type) == 0 {
+			failure_type = "OdinActivityError"
+		}
+		if result.failure.next_retry_delay < 0 {
+			completion = proto.encode_activity_failure(
+				execution.task_token,
+				"Activity returned a negative next retry delay",
+				"OdinActivityFailureContractError",
+				true,
+			)
+		} else {
+			completion = proto.encode_activity_failure(
+				execution.task_token,
+				result.failure.message,
+				failure_type,
+				result.failure.non_retryable,
+				codec.payload_view(&result.failure.details),
+				result.failure.has_details,
+				result.failure.next_retry_delay,
+			)
+		}
 	} else {
 		completion = proto.encode_activity_success_payload(
 			execution.task_token,

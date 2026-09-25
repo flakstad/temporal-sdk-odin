@@ -70,8 +70,14 @@ TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
 run_activity_case() {
   local mode="$1"
-  TEMPORAL_ODIN_SKIP_BUILD=1 \
-    "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  if [[ "$mode" == "retry" ]]; then
+    ACTIVITY_EXPECT_RETRY=1 \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  else
+    TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  fi
   worker_pid=$!
   for _ in {1..30}; do
     if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
@@ -98,6 +104,10 @@ run_activity_case() {
     ACTIVITY_TYPED=1 cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
+  elif [[ "$mode" == "retry" ]]; then
+    ACTIVITY_RETRY=1 cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
   else
     cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
@@ -107,12 +117,17 @@ run_activity_case() {
   wait "$worker_pid"
   worker_pid=""
   cat "$worker_log"
-  grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
+  if [[ "$mode" == "retry" ]]; then
+    grep -q "retryable Activity failed once, then completed and worker shut down cleanly" "$worker_log"
+  else
+    grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
+  fi
 }
 
 run_activity_case string
 run_activity_case failure
 run_activity_case typed
+run_activity_case retry
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

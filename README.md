@@ -18,9 +18,12 @@ bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
 cancellation. Unknown Workflow types fail the retryable Workflow Task without
-terminating the worker. It does **not** provide user Workflow cancellation
+terminating the worker. Typed Activities can return explicit retryable or
+non-retryable Application Failures with a failure type, JSON details, and an
+optional next-retry delay; the live suite proves Core/Server redelivery from
+attempt 1 to attempt 2. It does **not** provide user Workflow cancellation
 scopes/cleanup, signal handlers, queries/updates, multiple Activity arguments,
-panic containment, or a stable public API.
+in-process panic containment, or a stable public API.
 Do not use it in production.
 
 ```text
@@ -111,6 +114,28 @@ adapter encodes one `json/plain` Temporal Payload; the lower-level
 and can return any allocator-owned `codec.Payload`. Existing string Activities
 remain source-compatible through `register_activity`.
 
+Callbacks that need application failures use the result adapter:
+
+```odin
+charge :: proc(ctx: ^activity.Context, input: Charge) -> activity.Result(Receipt) {
+    if input.amount <= 0 {
+        return activity.result_failure(
+            Receipt,
+            "amount must be positive",
+            failure_type = "InvalidCharge",
+            non_retryable = true,
+        )
+    }
+    return activity.result_success(Receipt{transaction_id = "example"})
+}
+
+_ = worker.register_json_activity_result(&temporal_worker, "charge", charge)
+```
+
+`result_failure_json` additionally attaches typed `json/plain` details and can
+override the next retry delay. Retryable is the default for this explicit
+result API. Payload-conversion failures are non-retryable SDK failures.
+
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
 registered Activities and Workflows. A worker is intentionally single-run;
@@ -132,7 +157,8 @@ suite also starts an unregistered Workflow type, verifies a retryable
 `WorkflowTaskFailed` event and Core eviction, then proves that the same Odin
 worker can complete a registered Workflow afterward. Its Activity cases include
 a structured JSON object round trip between a Rust Workflow and a typed Odin
-Activity.
+Activity, plus a retryable typed failure whose 10 ms `next_retry_delay` is
+honored before the same Activity succeeds with `activity.attempt(ctx) == 2`.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 

@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:bytes"
+import "core:mem/virtual"
 import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
@@ -90,6 +91,99 @@ json_payloads_preserve_generated_values_and_metadata :: proc(t: ^testing.T) {
 		"JSON payloads preserve generated Odin values and metadata",
 		json_payload_round_trip_property,
 		{num_tests = 500, seed = 0x5041_594c_4f41_4453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+activity_failure_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
+	failure_type := pbt.draw(t, pbt.string_ascii(1, 32))
+	non_retryable := pbt.draw(t, pbt.boolean())
+	has_retry_delay := pbt.draw(t, pbt.boolean())
+	delay_milliseconds := 0
+	if has_retry_delay {
+		delay_milliseconds = pbt.draw(t, pbt.int_range(1, 60_000))
+	}
+	detail_value := pbt.draw(t, pbt.int_range(-100_000, 100_000))
+	pbt.cover(t, non_retryable, 30.0, "non-retryable")
+	pbt.cover(t, !non_retryable, 30.0, "retryable")
+	pbt.cover(t, delay_milliseconds == 0, 30.0, "default retry delay")
+	pbt.cover(t, delay_milliseconds > 0, 30.0, "explicit retry delay")
+
+	details, details_error := codec.encode_json(detail_value)
+	if details_error != .None {
+		return pbt.error("could not encode generated failure details")
+	}
+	defer codec.payload_free(&details)
+	delay := time.Duration(delay_milliseconds) * time.Millisecond
+	completion := proto.encode_activity_failure(
+		transmute([]u8)string("generated-token"),
+		"generated failure",
+		failure_type,
+		non_retryable,
+		codec.payload_view(&details),
+		true,
+		delay,
+	)
+	defer delete(completion)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize failure decode arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Coresdk_ActivityTaskCompletion{}
+	decoded_ok := proto.decode_Coresdk_ActivityTaskCompletion(completion[:], &decoded)
+	context.allocator = previous_allocator
+	if !decoded_ok || decoded.result == nil {
+		return pbt.fail("generated Activity failure did not decode")
+	}
+
+	found := false
+	valid := false
+	#partial switch status in decoded.result.status {
+	case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Failed:
+		if status.value == nil || status.value.failure == nil {
+			break
+		}
+		#partial switch failure_info in status.value.failure.failure_info {
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+			if failure_info.value == nil {
+				break
+			}
+			found = true
+			info := failure_info.value
+			valid = info.type == failure_type &&
+				info.non_retryable == non_retryable &&
+				info.details != nil &&
+				len(info.details.payloads) == 1 &&
+				bytes.equal(info.details.payloads[0].data, details.data)
+			if delay_milliseconds == 0 {
+				valid = valid && info.next_retry_delay == nil
+			} else {
+				valid = valid && info.next_retry_delay != nil
+				if info.next_retry_delay != nil {
+					actual_nanoseconds := info.next_retry_delay.seconds * i64(time.Second) +
+						i64(info.next_retry_delay.nanos)
+					valid = valid && actual_nanoseconds == i64(delay)
+				}
+			}
+		}
+	}
+	if !found || !valid {
+		return pbt.fail("ApplicationFailure fields changed across protobuf encoding")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_failures_preserve_generated_retry_contracts :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity failures preserve generated retry contracts",
+		activity_failure_wire_property,
+		{num_tests = 500, seed = 0x5245_5452_595f_4641},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

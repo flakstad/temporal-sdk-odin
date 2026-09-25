@@ -6,7 +6,7 @@ use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowGetResultOptions,
     WorkflowStartOptions,
 };
-use temporalio_common::ActivityDefinition;
+use temporalio_common::{ActivityDefinition, RetryPolicy};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
@@ -42,6 +42,17 @@ impl ActivityDefinition for TypedGreetingActivity {
 
     fn name(&self) -> &str {
         "typed_greeting"
+    }
+}
+
+struct RetryGreetingActivity;
+
+impl ActivityDefinition for RetryGreetingActivity {
+    type Input = serde_json::Value;
+    type Output = serde_json::Value;
+
+    fn name(&self) -> &str {
+        "retry_greeting"
     }
 }
 
@@ -129,6 +140,30 @@ impl TypedActivityDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct RetryActivityDriverWorkflow;
+
+#[workflow_methods]
+impl RetryActivityDriverWorkflow {
+    #[run(name = "odin_retry_activity_driver")]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        input: serde_json::Value,
+    ) -> WorkflowResult<serde_json::Value> {
+        let result = ctx
+            .execute_activity(
+                RetryGreetingActivity,
+                input,
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                    .retry_policy(RetryPolicy::builder().maximum_attempts(2).build())
+                    .build(),
+            )
+            .await?;
+        Ok(result)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -139,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expect_failure = std::env::var_os("ACTIVITY_EXPECT_FAILURE").is_some();
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
+    let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
     let expected = if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
     } else {
@@ -154,6 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<FailureDriverWorkflow>()?
         .register_workflow::<ConcurrentActivityDriverWorkflow>()?
         .register_workflow::<TypedActivityDriverWorkflow>()?
+        .register_workflow::<RetryActivityDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -161,6 +198,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let workflow_id = format!("odin-sdk-activity-spike-{}-{unique}", std::process::id());
     let driver = async move {
+        if retry {
+            let retry_input = serde_json::json!({"name": "Odin"});
+            let expected = serde_json::json!({
+                "message": "Hello after retry, Odin!",
+                "attempt": 2,
+            });
+            let handle = client
+                .start_workflow(
+                    RetryActivityDriverWorkflow::run,
+                    retry_input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != expected {
+                return Err(format!(
+                    "unexpected retried Activity result: {result}; expected {expected}"
+                )
+                .into());
+            }
+            println!("Workflow observed retried Odin Activity result: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
         if typed {
             let typed_input = serde_json::json!({
                 "name": "Odin",

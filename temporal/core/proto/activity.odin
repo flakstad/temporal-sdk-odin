@@ -1,6 +1,7 @@
 // Activity-facing adapters over the schema-generated protobuf types.
 package proto
 
+import "core:time"
 import codec "../../codec"
 
 Task_Kind :: enum {
@@ -176,10 +177,39 @@ encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
 	)
 }
 
-encode_activity_failure :: proc(task_token: []u8, message: string, non_retryable := true) -> [dynamic]u8 {
+encode_activity_failure :: proc(
+	task_token: []u8,
+	message: string,
+	failure_type := "OdinActivityError",
+	non_retryable := true,
+	details := codec.Payload_View{},
+	has_details := false,
+	next_retry_delay: time.Duration = 0,
+) -> [dynamic]u8 {
+	details_payload := encode_payload(details)
+	defer delete(details_payload.metadata)
+	defer delete(details_payload.external_payloads)
+	detail_payloads := Temporal_Api_Common_V1_Payloads{}
+	defer delete(detail_payloads.payloads)
+	if has_details {
+		append(&detail_payloads.payloads, details_payload)
+	}
+
+	retry_delay := Google_Protobuf_Duration{}
+	if next_retry_delay > 0 {
+		nanoseconds := i64(next_retry_delay)
+		retry_delay.seconds = nanoseconds / i64(time.Second)
+		retry_delay.nanos = i32(nanoseconds % i64(time.Second))
+	}
 	application_info := Temporal_Api_Failure_V1_ApplicationFailureInfo{
-		type = "OdinActivityError",
+		type = failure_type,
 		non_retryable = non_retryable,
+	}
+	if has_details {
+		application_info.details = &detail_payloads
+	}
+	if next_retry_delay > 0 {
+		application_info.next_retry_delay = &retry_delay
 	}
 	failure := Temporal_Api_Failure_V1_Failure{
 		message = message,
