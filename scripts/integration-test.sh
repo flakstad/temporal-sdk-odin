@@ -9,6 +9,7 @@ unknown_workflow_id=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
+workflow_control_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-control.XXXXXX")"
 unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
 typed_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-typed-history.XXXXXX")"
 
@@ -32,7 +33,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file" "$unknown_history_file" "$typed_history_file"
+  rm -f "$workflow_output_file" "$workflow_control_output_file" "$unknown_history_file" "$typed_history_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -229,7 +230,8 @@ worker_pid=""
 cat "$worker_log"
 grep -q "structured Activity failure details reached Workflow code" "$worker_log"
 
-TEMPORAL_ODIN_SKIP_BUILD=1 \
+TEMPORAL_ODIN_SCENARIO=query \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
 for _ in {1..30}; do
@@ -314,6 +316,16 @@ if ! grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worke
   exit 1
 fi
 
+TEMPORAL_CLIENT_ACTION=query \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_QUERY_NAME=greeting_status \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file"
+query_output="$(<"$workflow_control_output_file")"
+echo "$query_output"
+grep -q "Odin client query=greeting_status workflow_id=$workflow_id" <<<"$query_output"
+grep -q 'phase="waiting-for-approval" name="Odin"' <<<"$query_output"
+
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
   TEMPORAL_CLIENT_SIGNAL_NAME=approval \
@@ -333,6 +345,7 @@ worker_pid=""
 cat "$worker_log"
 grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
 grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
+grep -Eq "replay=(true|false) .*queries=1 query_failures=0 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 
 run_workflow_cancellation_case() {

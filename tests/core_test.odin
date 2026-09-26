@@ -275,6 +275,59 @@ fiber_cancellation_cleanup_test_workflow :: proc(
 	return ""
 }
 
+Query_Test_State :: struct {
+	phase: string,
+	count: int,
+}
+
+Query_Test_Input :: struct {
+	prefix: string,
+}
+
+Query_Test_Output :: struct {
+	message: string,
+	count:   int,
+}
+
+Query_Mutation_State :: struct {
+	ctx: ^workflow.Fiber_Context,
+}
+
+fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	state := Query_Test_State{phase = "waiting", count = len(name)}
+	registered := workflow.set_query_handler_json(
+		ctx,
+		"status",
+		&state,
+		proc(state: Query_Test_State, input: Query_Test_Input) -> Query_Test_Output {
+			message, allocation_error := strings.concatenate({input.prefix, state.phase})
+			if allocation_error != nil {
+				return {}
+			}
+			return {message = message, count = state.count}
+		},
+	)
+	if !registered {
+		return "query registration failed"
+	}
+	mutation_state := Query_Mutation_State{ctx = ctx}
+	mutation_registered := workflow.set_query_handler_json(
+		ctx,
+		"mutate",
+		&mutation_state,
+		proc(state: Query_Mutation_State, _: Query_Test_Input) -> Query_Test_Output {
+			_ = workflow.start_activity(state.ctx, "illegal-query-activity", "input")
+			return {message = "mutation was not rejected"}
+		},
+	)
+	if !mutation_registered {
+		return "query mutation handler registration failed"
+	}
+	approval := workflow.await_signal(ctx, "finish")
+	state.phase = "finished"
+	return approval
+}
+
 fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	approval := workflow.await_signal(ctx, "approval")
@@ -406,6 +459,79 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 				inspection.failure_message = bytes.clone(
 					transmute([]u8)status.value.failure.message,
 				)
+			}
+		}
+	}
+	return
+}
+
+Query_Response_Inspection :: struct {
+	found:           bool,
+	failed:          bool,
+	command_count:   int,
+	payload:         codec.Payload,
+	failure_message: []u8,
+	failure_type:    []u8,
+}
+
+inspect_query_response :: proc(
+	data: []u8,
+	query_id: string,
+) -> (inspection: Query_Response_Inspection) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		inspection.command_count = len(status.value.commands)
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Respond_To_Query:
+				if variant.value == nil || variant.value.query_id != query_id {
+					continue
+				}
+				inspection.found = true
+				#partial switch query_variant in variant.value.variant {
+				case proto.Coresdk_Workflow_Commands_QueryResult_Variant_Succeeded:
+					if query_variant.value != nil && query_variant.value.response != nil {
+						cloned, clone_error := proto.clone_payload(query_variant.value.response)
+						if clone_error == .None {
+							inspection.payload = cloned
+						}
+					}
+				case proto.Coresdk_Workflow_Commands_QueryResult_Variant_Failed:
+					inspection.failed = query_variant.value != nil
+					if query_variant.value != nil {
+						inspection.failure_message = bytes.clone(
+							transmute([]u8)query_variant.value.message,
+						)
+						#partial switch failure_info in query_variant.value.failure_info {
+						case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+							if failure_info.value != nil {
+								inspection.failure_type = bytes.clone(
+									transmute([]u8)failure_info.value.type,
+								)
+							}
+						}
+					}
+				}
+				return
 			}
 		}
 	}
@@ -2947,6 +3073,269 @@ workflow_fiber_preserves_structured_activity_failure_across_activations :: proc(
 		delete(message)
 	}
 	codec.payload_free(&completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_query_workflow",
+		"test-queue",
+		fiber_query_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_query_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-query-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	query_input, query_input_error := codec.encode_json(Query_Test_Input{prefix = "Before "})
+	testing.expect(t, query_input_error == .None)
+	defer codec.payload_free(&query_input)
+	query_input_proto := proto.encode_payload(codec.payload_view(&query_input))
+	defer delete(query_input_proto.metadata)
+	defer delete(query_input_proto.external_payloads)
+	query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "query-1",
+		query_type = "status",
+	}
+	defer delete(query.arguments)
+	append(&query.arguments, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "typed query failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.queries_answered, 1)
+	testing.expect_value(t, processed.queries_failed, 0)
+	testing.expect(t, processed.waiting_signal)
+	query_inspection := inspect_query_response(processed.completion[:], "query-1")
+	testing.expect(t, query_inspection.found)
+	testing.expect(t, !query_inspection.failed)
+	testing.expect_value(t, query_inspection.command_count, 1)
+	query_output: Query_Test_Output
+	query_decode_error := codec.decode_json(codec.payload_view(&query_inspection.payload), &query_output)
+	testing.expect(t, query_decode_error == .None)
+	testing.expect_value(t, query_output.message, "Before waiting")
+	testing.expect_value(t, query_output.count, 4)
+	delete(query_output.message)
+	codec.payload_free(&query_inspection.payload)
+	delete(query_inspection.failure_message)
+	delete(query_inspection.failure_type)
+	query_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(query_completion[:], processed.completion[:]))
+	delete(query_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	unknown_query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "query-missing",
+		query_type = "missing",
+	}
+	defer delete(unknown_query.arguments)
+	append(&unknown_query.arguments, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &unknown_query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.queries_answered, 1)
+	testing.expect_value(t, processed.queries_failed, 1)
+	missing_inspection := inspect_query_response(processed.completion[:], "query-missing")
+	testing.expect(t, missing_inspection.found)
+	testing.expect(t, missing_inspection.failed)
+	testing.expect_value(t, string(missing_inspection.failure_type), "OdinWorkflowQueryNotFound")
+	codec.payload_free(&missing_inspection.payload)
+	delete(missing_inspection.failure_message)
+	delete(missing_inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	mutation_query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "query-mutation",
+		query_type = "mutate",
+	}
+	defer delete(mutation_query.arguments)
+	append(&mutation_query.arguments, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &mutation_query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	testing.expect(t, !processed.scheduled_activity)
+	testing.expect_value(t, processed.queries_failed, 1)
+	mutation_inspection := inspect_query_response(processed.completion[:], "query-mutation")
+	testing.expect(t, mutation_inspection.found)
+	testing.expect(t, mutation_inspection.failed)
+	testing.expect_value(
+		t,
+		string(mutation_inspection.failure_type),
+		"OdinWorkflowQueryMutationError",
+	)
+	codec.payload_free(&mutation_inspection.payload)
+	delete(mutation_inspection.failure_message)
+	delete(mutation_inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	query.query_id = "query-with-signal"
+	signal_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Approved"`),
+	}
+	defer delete(signal_payload.metadata)
+	append(
+		&signal_payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(signal.input)
+	append(&signal.input, signal_payload)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "query plus signal failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect(t, processed.received_signal)
+	testing.expect_value(t, processed.queries_answered, 1)
+	combined_inspection := inspect_query_response(processed.completion[:], "query-with-signal")
+	testing.expect(t, combined_inspection.found)
+	testing.expect(t, !combined_inspection.failed)
+	testing.expect_value(t, combined_inspection.command_count, 2)
+	combined_output: Query_Test_Output
+	combined_decode_error := codec.decode_json(
+		codec.payload_view(&combined_inspection.payload),
+		&combined_output,
+	)
+	testing.expect(t, combined_decode_error == .None)
+	testing.expect_value(t, combined_output.message, "Before waiting")
+	delete(combined_output.message)
+	codec.payload_free(&combined_inspection.payload)
+	delete(combined_inspection.failure_message)
+	delete(combined_inspection.failure_type)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

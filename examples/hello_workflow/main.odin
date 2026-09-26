@@ -40,6 +40,31 @@ Failure_Details :: struct {
 	code:       int,
 }
 
+Greeting_Query_State :: struct {
+	phase: string,
+	name:  string,
+}
+
+Greeting_Query_Input :: struct {
+	include_name: bool,
+}
+
+Greeting_Query_Output :: struct {
+	phase: string,
+	name:  string,
+}
+
+greeting_status_query :: proc(
+	state: Greeting_Query_State,
+	input: Greeting_Query_Input,
+) -> Greeting_Query_Output {
+	result := Greeting_Query_Output{phase = state.phase}
+	if input.include_name {
+		result.name = state.name
+	}
+	return result
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	if name == "cancel-activity" || name == "cancel-cleanup" {
 		first_heartbeat := true
@@ -132,10 +157,20 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		return "cleanup completed before cancellation"
 	}
 
+	query_state := Greeting_Query_State{phase = "waiting-for-approval", name = name}
+	if !workflow.set_query_handler_json(
+		ctx,
+		"greeting_status",
+		&query_state,
+		greeting_status_query,
+	) {
+		return "could not register greeting status query"
+	}
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
 	}
+	query_state.phase = "running-activity"
 	return workflow.execute_activity(ctx, "hello", approval.value)
 }
 
@@ -210,7 +245,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -220,6 +255,8 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.resolved_activity_seq,
 		processed.resolved_activity_failed,
 		processed.received_signal,
+		processed.queries_answered,
+		processed.queries_failed,
 		processed.received_cancellation,
 		processed.canceled_workflow,
 		processed.started_timer,
@@ -343,6 +380,7 @@ main :: proc() {
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
+	expect_query := scenario == "query"
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
@@ -390,11 +428,14 @@ main :: proc() {
 				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
 				failed = true
 			}
-		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 {
+		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
+		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) {
 			fmt.eprintf(
-				"Workflow spike stats mismatch: activities=%d signals=%d timers_canceled=%d replay_activations=%d\n",
+				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d timers_canceled=%d replay_activations=%d\n",
 				run_stats.activity_tasks_completed,
 				run_stats.workflow_signals_received,
+				run_stats.workflow_queries_answered,
+				run_stats.workflow_queries_failed,
 				run_stats.timers_canceled,
 				run_stats.workflow_replay_activations,
 			)

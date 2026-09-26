@@ -44,6 +44,8 @@ Process_Result :: struct {
 	waiting_activity_seq: u32,
 	received_signal:     bool,
 	received_signal_count: int,
+	queries_answered:    int,
+	queries_failed:      int,
 	waiting_signal:      bool,
 	started_timer:      bool,
 	timer_seq:          u32,

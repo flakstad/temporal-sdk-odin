@@ -275,6 +275,133 @@ activity_failures_preserve_generated_retry_contracts :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+query_response_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
+	query_id := pbt.draw(t, pbt.string_ascii(1, 32))
+	succeed := pbt.draw(t, pbt.boolean())
+	expected := Generated_Payload_Value{
+		name = pbt.draw(t, pbt.string_ascii(0, 24)),
+		count = pbt.draw(t, pbt.int_range(-10_000, 10_000)),
+		enabled = pbt.draw(t, pbt.boolean()),
+	}
+	failure_type := pbt.draw(t, pbt.string_ascii(1, 24))
+	pbt.cover(t, succeed, 30.0, "successful query")
+	pbt.cover(t, !succeed, 30.0, "failed query")
+
+	payload: codec.Payload
+	has_payload := false
+	defer {
+		if has_payload {
+			codec.payload_free(&payload)
+		}
+	}
+	result: workflow.Payload_Result
+	if succeed {
+		encode_error: codec.Error
+		payload, encode_error = codec.encode_json(expected)
+		if encode_error != .None {
+			return pbt.error("could not encode generated query result")
+		}
+		has_payload = true
+		result = workflow.payload_complete(payload)
+	} else {
+		result = workflow.payload_fail("generated query failure", failure_type)
+	}
+
+	command_arena: virtual.Arena
+	if virtual.arena_init_growing(&command_arena) != nil {
+		return pbt.error("could not initialize query command arena")
+	}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&command_arena)
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	response := workflow.Pending_Query_Response{query_id = query_id, result = result}
+	workflow.append_query_response_command(&commands, &response)
+	context.allocator = previous_allocator
+	success := proto.Coresdk_Workflow_Completion_Success{commands = commands}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{
+		run_id = "generated-query-run",
+		status = proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful{
+			value = &success,
+		},
+	}
+	encoded := proto.encode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(&completion)
+	virtual.arena_destroy(&command_arena)
+	defer delete(encoded)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize query response decode arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded_ok := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		encoded[:],
+		&decoded,
+	)
+	context.allocator = previous_allocator
+	if !decoded_ok {
+		return pbt.fail("generated query response did not decode")
+	}
+
+	found := false
+	valid := false
+	#partial switch status in decoded.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			break
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Respond_To_Query:
+			if variant.value == nil || variant.value.query_id != query_id {
+				break
+			}
+			found = true
+			#partial switch query_variant in variant.value.variant {
+			case proto.Coresdk_Workflow_Commands_QueryResult_Variant_Succeeded:
+				if !succeed || query_variant.value == nil || query_variant.value.response == nil {
+					break
+				}
+				owned, clone_error := proto.clone_payload(query_variant.value.response)
+				if clone_error != .None {
+					break
+				}
+				actual: Generated_Payload_Value
+				decode_error := codec.decode_json(codec.payload_view(&owned), &actual)
+				valid = decode_error == .None && actual.name == expected.name &&
+					actual.count == expected.count && actual.enabled == expected.enabled
+				delete(actual.name)
+				codec.payload_free(&owned)
+			case proto.Coresdk_Workflow_Commands_QueryResult_Variant_Failed:
+				if succeed || query_variant.value == nil {
+					break
+				}
+				valid = query_variant.value.message == "generated query failure"
+				#partial switch failure_info in query_variant.value.failure_info {
+				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+					valid = valid && failure_info.value != nil &&
+						failure_info.value.type == failure_type && failure_info.value.non_retryable
+				}
+			}
+		}
+	}
+	if !found || !valid {
+		return pbt.fail("generated Workflow query response changed across protobuf encoding")
+	}
+	return pbt.pass()
+}
+
+@(test)
+query_responses_preserve_generated_payloads_and_failures :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow query responses preserve generated payloads and failures",
+		query_response_wire_property,
+		{num_tests = 500, seed = 0x5155_4552_595f_5253},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 activity_deadline_property :: proc(t: ^pbt.T) -> pbt.Result {
 	scheduled_seconds := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
 	started_offset := i64(pbt.draw(t, pbt.int_range(0, 2_000)))

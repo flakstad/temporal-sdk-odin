@@ -23,6 +23,7 @@ Error_Kind :: enum {
 	Workflow_Terminated,
 	Workflow_Timed_Out,
 	Workflow_Continued_As_New,
+	Workflow_Query_Rejected,
 }
 
 Error :: struct {
@@ -423,6 +424,107 @@ signal_workflow_json :: proc(
 		codec.payload_view(&payload),
 		explicit_request_id,
 	)
+}
+
+query_workflow_payload :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: codec.Payload_View,
+) -> (payload: codec.Payload, error: Error) {
+	if !workflow_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if len(query_type) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow query type must not be empty")
+	}
+	execution := workflow_execution(handle)
+	encoded_input := proto.encode_payload(input)
+	defer delete(encoded_input.metadata)
+	defer delete(encoded_input.external_payloads)
+	arguments := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(arguments.payloads)
+	append(&arguments.payloads, encoded_input)
+	query := proto.Temporal_Api_Query_V1_WorkflowQuery{
+		query_type = query_type,
+		query_args = &arguments,
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{
+		namespace = handle.client.namespace,
+		execution = &execution,
+		query = &query,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(&request)
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"QueryWorkflow",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		return {}, error_from_core(&rpc_result.error)
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize query response arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_QueryWorkflowResponse(
+		rpc_result.protobuf,
+		&response,
+	)
+	context.allocator = previous_allocator
+	if !decoded {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed query response")
+	}
+	if response.query_rejected != nil {
+		return {}, error_from_string(
+			.Workflow_Query_Rejected,
+			"Temporal rejected the Workflow query for the current execution status",
+		)
+	}
+	if response.query_result == nil || len(response.query_result.payloads) != 1 {
+		return {}, error_from_string(.Malformed_Response, "Workflow query response must contain one Payload")
+	}
+	cloned_payload, clone_error := proto.clone_payload(&response.query_result.payloads[0])
+	if clone_error != .None {
+		return {}, error_from_string(.Malformed_Response, "could not preserve Workflow query result")
+	}
+	return cloned_payload, {}
+}
+
+query_workflow_json :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: $Input,
+	value: ^$Output,
+) -> Error {
+	if value == nil {
+		return error_from_string(.Invalid_Argument, "Workflow query output pointer is required")
+	}
+	payload, encode_error := codec.encode_json(input)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow query input")
+	}
+	defer codec.payload_free(&payload)
+	result, query_error := query_workflow_payload(
+		handle,
+		query_type,
+		codec.payload_view(&payload),
+	)
+	if query_error.message != nil {
+		return query_error
+	}
+	defer codec.payload_free(&result)
+	if codec.decode_json(codec.payload_view(&result), value) != .None {
+		return error_from_string(.Payload_Conversion, "could not decode Workflow query result")
+	}
+	return {}
 }
 
 cancel_workflow :: proc(

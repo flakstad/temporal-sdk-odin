@@ -28,5 +28,6 @@ fi
 # errors in this separately compiled property suite.
 odin test "$repo_root/tests_pbt" \
 	-thread-count:"$odin_thread_count" \
+	-no-threaded-checker \
 	-collection:pbt="$pbt_root" \
 	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"

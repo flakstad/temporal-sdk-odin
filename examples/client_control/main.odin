@@ -19,6 +19,15 @@ print_error :: proc(operation: string, error: ^temporal_client.Error) {
 	temporal_client.error_free(error)
 }
 
+Greeting_Query_Input :: struct {
+	include_name: bool,
+}
+
+Greeting_Query_Output :: struct {
+	phase: string,
+	name:  string,
+}
+
 run :: proc() -> int {
 	action_buffer: [32]u8
 	id_buffer: [256]u8
@@ -57,6 +66,32 @@ run :: proc() -> int {
 	case "cancel":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.cancel_workflow(&handle, reason)
+	case "query":
+		query_name := env("TEMPORAL_CLIENT_QUERY_NAME", name_buffer[:])
+		if len(query_name) == 0 {
+			query_name = "greeting_status"
+		}
+		output: Greeting_Query_Output
+		operation_error = temporal_client.query_workflow_json(
+			&handle,
+			query_name,
+			Greeting_Query_Input{include_name = true},
+			&output,
+		)
+		if operation_error.message != nil {
+			print_error(action, &operation_error)
+			return 1
+		}
+		defer delete(output.phase)
+		defer delete(output.name)
+		fmt.printf(
+			"Odin client query=%s workflow_id=%s phase=%q name=%q\n",
+			query_name,
+			workflow_id,
+			output.phase,
+			output.name,
+		)
+		return 0
 	case "terminate":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.terminate_workflow(&handle, reason)

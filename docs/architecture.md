@@ -886,6 +886,58 @@ completions, proving the signal does not create a command or wake the Activity
 await. A second test covers the direct path where a fiber already in
 `Waiting_Signal` resumes when the matching signal arrives.
 
+### Read-only Workflow queries
+
+Queries cross two distinct protobuf boundaries. The public Client sends
+[`QueryWorkflowRequest`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/api_upstream/temporal/api/workflowservice/v1/request_response.proto#L1179)
+through the C bridge's generic WorkflowService RPC call. Core then delivers a
+[`QueryWorkflow`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L282)
+activation job with query ID/type, repeated argument Payloads, and headers. The
+language SDK must return a
+[`QueryResult`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L179)
+command with the same ID and either one success Payload or a Temporal Failure.
+Core owns query transport and server coordination; handler registration,
+dispatch, codec conversion, state access, and failure construction belong to
+Odin.
+
+The fiber runtime now registers handlers while Workflow code executes. A typed
+handler receives a top-level copy of caller-selected state and cannot receive a
+`Fiber_Context`, which removes the normal command-scheduling API from its
+surface. A query activation invokes the handler synchronously without resuming
+the suspended Workflow fiber, appends `RespondToQuery`, and leaves the Workflow
+at the same suspension point. The runtime snapshots phase, sequence counters,
+and operation counts around the callback; an observed Temporal-command-state
+mutation becomes a failed query with `OdinWorkflowQueryMutationError`. This is
+runtime defense, not a general memory-purity proof: a handler can still mutate
+state reachable through pointers embedded inside its copied value. The API and
+determinism documentation therefore continue to define handlers as read-only.
+
+Current query serialization is deliberately narrow: exactly one argument
+Payload and one result Payload. The public `query_workflow_payload` method is
+codec-neutral, while `query_workflow_json` and `set_query_handler_json` use the
+isolated `json/plain` codec layer. Unknown handlers, argument-count mismatches,
+and codec errors are returned as failed query results; they do not fail the
+Workflow Task or terminate the worker. Query state pointers are borrowed from
+the live Workflow stack and remain valid because handlers execute only while
+that fiber instance is cached. Eviction destroys both together; replay creates
+a fresh stack and deterministically registers a fresh handler.
+
+The live CLI-devserver run exposed an important detail: Core may mark the
+activation containing the externally requested query as `is_replaying=true`
+while reconstructing Workflow state for that query. Query accounting therefore
+cannot use the ordinary "ignore replay work" stats filter. Query jobs are
+ephemeral deliveries and are counted once when Odin answers them, even on such
+an activation. The test then observes Core eviction, reconstructs a new fiber,
+and continues normally after the subsequent signal. Offline tests require
+byte-identical query completions across forced eviction/replay and cover a
+query delivered alongside a signal-producing completion.
+
+Core reserves `legacy_query` as `LEGACY_QUERY_ID`: a legacy query completion
+may contain no other commands. The current runtime produces the correct
+query-only completion when Core sends such an activation, but it does not yet
+reject a malformed mixed legacy activation itself. Query headers and
+Client-side reject-condition selection are also not exposed yet.
+
 ### Durable signal/timer race
 
 The pinned Core schema already exposes `StartTimer`, `FireTimer`, and
@@ -1163,9 +1215,9 @@ Workflows are enabled.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
-   a durable timer/signal race, generic/typed Payload flow, root cancellation,
-   and detached Activity cleanup across fresh-stack replay. It does not yet
-   prove general nested cancellation scopes, updates, panic containment,
+   a durable timer/signal race, generic/typed Payload flow, read-only queries,
+   root cancellation, and detached Activity cleanup across fresh-stack replay.
+   It does not yet prove general nested cancellation scopes, updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -1183,10 +1235,10 @@ Workflows are enabled.
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
-8. **Client/server feature skew.** Workflow start/result, signals,
+8. **Client/server feature skew.** Workflow start/result, signals, queries,
    cancellation, and termination are live-proven, but the public Client still
-   lacks queries, updates, describe/history iteration, headers, search
-   attributes, memo, retry/options completeness, and failure-detail conversion.
+   lacks updates, describe/history iteration, query reject conditions, headers,
+   search attributes, memo, retry/options completeness, and failure-detail conversion.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -1196,7 +1248,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Add query dispatch and test multiple live Workflow runs without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Add Update dispatch and test multiple live Workflow runs without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1214,14 +1266,17 @@ Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
 proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
-500 Client close-event/result round trips,
+500 Client close-event/result round trips and 500 query response round trips,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should add typed Workflow query handlers.
-Core already delivers `QueryWorkflow` activation jobs and expects
-`RespondToQuery` commands; the Odin layer must register handlers, provide a
-read-only Workflow-state boundary, encode success/failure Payloads, and prove
-that queries do not mutate deterministic command history.
+The next smallest feature milestone should add typed Workflow Update handlers.
+Core already delivers update jobs and expects language-side validation,
+acceptance/rejection, and completion commands. Unlike queries, Updates are
+durable and may suspend while running, so this slice should first prove one
+synchronous typed validator plus one synchronous handler before admitting
+awaiting handlers or widening the authoring API. The query work establishes the
+handler registry, codec-neutral result boundary, and non-resuming read-only
+dispatch needed as a comparison point.
 
 Before widening cancellation further, model root cancellation, late
 resolutions, detached cleanup, eviction, and replay with an independent
@@ -1237,8 +1292,8 @@ statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Updates remain deferred until query delivery and handler isolation
-are grounded at the user-code boundary.
+dependency. Awaiting Updates remain deferred until synchronous Update delivery,
+validation, and replay are grounded at the user-code boundary.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

@@ -66,6 +66,8 @@ Run_Stats :: struct {
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,
 	workflow_signals_received:            int,
+	workflow_queries_answered:            int,
+	workflow_queries_failed:              int,
 	workflow_cancellations_received:      int,
 	timers_canceled:                      int,
 	activity_cancellations_requested:     int,
@@ -1142,6 +1144,10 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 	if processed.evicted {
 		stats.workflow_evictions += 1
 	}
+	// Queries are ephemeral requests delivered once, even when Core marks the
+	// activation replaying while reconstructing Workflow state for the query.
+	stats.workflow_queries_answered += processed.queries_answered
+	stats.workflow_queries_failed += processed.queries_failed
 	if !processed.is_replaying {
 		stats.workflow_signals_received += processed.received_signal_count
 		if processed.received_cancellation {

@@ -99,13 +99,18 @@ test-only dependency. Its own package tests currently contain an upstream
 unused-variable warning, so dependency warnings are not promoted to errors in
 that second compilation; SDK-owned tests remain strict.
 
-The tested Odin development compiler has intermittently asserted internally
-while parallel type checking instantiated the standard-library
-`queue.Queue(Task)` and `pbt.State_Model` types. Eight consecutive
-single-threaded PBT compilations
-passed after reproducing the parallel failure, so repository scripts default
-to `-thread-count:1`. This affects compiler parallelism only, not the worker or
-test runtime. Set `ODIN_THREAD_COUNT` to experiment with a newer compiler.
+The tested Odin development compiler has intermittently asserted at
+`src/check_type.cpp:598` or exited with signal 11 while type checking
+`pbt.State_Model`, including with `-thread-count:1`. The smallest observed
+command is the `odin test tests_pbt ...` invocation in `scripts/test.sh`; an
+immediate identical retry succeeds, so this is compiler instability rather
+than a shrinking/property failure. The property compilation therefore also
+uses Odin's narrower `-no-threaded-checker` workaround. Repository scripts keep
+`-thread-count:1` as the default for the separate `queue.Queue(Task)` parallel
+compiler failure seen earlier. These flags affect compilation only, not worker
+or test runtime concurrency. Set `ODIN_THREAD_COUNT` to experiment with a newer
+compiler, but retain `-no-threaded-checker` until the `State_Model` regression
+is fixed upstream.
 
 If the property dependency is absent, initialize it with:
 
@@ -360,6 +365,32 @@ generate UUIDv4 deduplication IDs by default. Signal and termination have
 codec-neutral Payload forms, plus typed JSON helpers. The live suite invokes
 all three operations through `examples/client_control`.
 
+Queries use the same borrowed handle and Core generic-RPC path:
+
+```odin
+status: Greeting_Query_Output
+query_error := temporal_client.query_workflow_json(
+    &existing,
+    "greeting_status",
+    Greeting_Query_Input{include_name = true},
+    &status,
+)
+```
+
+`query_workflow_payload` returns an owned Payload that the caller frees with
+`codec.payload_free`; the JSON helper owns that intermediate value and decodes
+it into the caller's output pointer. The request currently sends exactly one
+argument Payload. A server `QueryRejected` response maps to
+`.Workflow_Query_Rejected`; handler failures remain normal Core RPC failures
+with the server's gRPC status/details.
+
+Workflow code installs the matching typed handler with
+`workflow.set_query_handler_json`. Its state pointer is borrowed from the
+Workflow fiber and the callback receives a top-level state copy. The callback
+must be read-only, must not retain the input/state values, and cannot suspend.
+Unknown query names and codec failures become failed `RespondToQuery` commands
+without failing the Workflow Task.
+
 Workflow-side signal buffering is codec-neutral. Use
 `workflow.await_signal_payload` for the borrowed Payload or
 `workflow.await_signal_json(ctx, name, T)` for a typed value. The
@@ -478,13 +509,19 @@ every encoded `ScheduleActivity` field and requires byte-identical commands
 after eviction and fresh-stack replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
-the generated value.
+the generated value. The query property generates 500 success/failure
+responses, destroys the command arena after encoding, and verifies query IDs,
+typed success Payloads, and non-retryable Application Failure types after a
+fresh decode.
 
 Finally, the script starts `examples/hello_workflow` and invokes it with
 `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
-`approval` signal, `examples/client_control` sends a typed JSON signal through
-Core. The signal wins, so the Odin runtime emits `CancelTimer` and schedules an
+`approval` signal, `examples/client_control` first sends a typed JSON query
+through Core. The worker returns phase `waiting-for-approval` and name `Odin`
+without resuming the fiber; the activation can be marked replaying while Core
+reconstructs query state. The Client then sends the typed signal. The signal
+wins, so the Odin runtime emits `CancelTimer` and schedules an
 Activity in the
 same completion. The reusable worker's Activity poll thread completes that
 Activity while its Workflow poll thread handles Core-directed eviction and
@@ -542,6 +579,15 @@ temporal workflow cancel --workflow-id odin-workflow-manual
 The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
 request reason, runs a second Activity in `detached_cancellation_scope`, and
 closes the Workflow as canceled only after that Activity resolves.
+
+For the default scenario, query the running execution from another terminal
+before sending the approval signal:
+
+```bash
+TEMPORAL_CLIENT_ACTION=query \
+TEMPORAL_CLIENT_WORKFLOW_ID=odin-workflow-manual \
+./scripts/run-client-control.sh
+```
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and

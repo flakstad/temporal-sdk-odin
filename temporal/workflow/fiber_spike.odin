@@ -24,6 +24,10 @@ Workflow_Invoke_Proc :: #type proc(
 	input: codec.Payload_View,
 ) -> Payload_Result
 Workflow_Callback_Destroy_Proc :: #type proc(callback_data: rawptr)
+Query_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	input: codec.Payload_View,
+) -> Payload_Result
 
 Payload_Result_Status :: enum {
 	Completed,
@@ -208,6 +212,17 @@ Cancellation_Scope :: struct {
 	active:   bool,
 }
 
+Fiber_Query_Handler :: struct {
+	name:          string,
+	callback_data: rawptr,
+	invoke:        Query_Invoke_Proc,
+}
+
+Pending_Query_Response :: struct {
+	query_id: string,
+	result:   Payload_Result,
+}
+
 Fiber_Activity_Operation :: struct {
 	seq:           u32,
 	activity_id:   string,
@@ -245,6 +260,7 @@ Fiber_Instance :: struct {
 	activities:       [dynamic]Fiber_Activity_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
+	query_handlers:   [dynamic]Fiber_Query_Handler,
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
@@ -527,6 +543,7 @@ add_fiber_instance :: proc(
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
+	instance.query_handlers = make([dynamic]Fiber_Query_Handler)
 	context.allocator = previous_allocator
 	if run_id_error != nil || clone_error != .None {
 		virtual.arena_destroy(&instance.arena)
@@ -579,6 +596,119 @@ find_buffered_signal :: proc(instance: ^Fiber_Instance, name: string) -> (^Fiber
 		}
 	}
 	return nil, false
+}
+
+find_query_handler :: proc(
+	instance: ^Fiber_Instance,
+	name: string,
+) -> (^Fiber_Query_Handler, bool) {
+	if instance == nil {
+		return nil, false
+	}
+	for index in 0..<len(instance.query_handlers) {
+		handler := &instance.query_handlers[index]
+		if handler.name == name {
+			return handler, true
+		}
+	}
+	return nil, false
+}
+
+query_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
+	if instance == nil {
+		return
+	}
+	instance.failure_message = message
+	instance.failure_type = "OdinWorkflowQueryRegistrationError"
+	instance.phase = .Failed
+}
+
+set_query_handler_payload :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Query_Invoke_Proc,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(ctx.instance, "invalid Workflow query handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_query_handler(instance, name)
+	if duplicate {
+		query_registration_failed(instance, "Workflow query handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(instance, "could not preserve Workflow query handler name")
+		return false
+	}
+	append(
+		&instance.query_handlers,
+		Fiber_Query_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke = callback,
+		},
+	)
+	return true
+}
+
+// set_query_handler_json registers a synchronous, read-only query view over
+// Workflow-owned state. The callback receives a top-level copy of State and no
+// Fiber_Context, so it cannot schedule Temporal commands through the normal API.
+set_query_handler_json :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	callback: proc(state: State, input: $Input) -> $Output,
+) -> bool {
+	Callback :: #type proc(state: State, input: Input) -> Output
+	Data :: struct {
+		state:    ^State,
+		callback: Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(ctx.instance, "invalid typed Workflow query handler")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(ctx.instance, "could not allocate typed Workflow query handler")
+		return false
+	}
+	data.state = state
+	data.callback = callback
+	return set_query_handler_payload(
+		ctx,
+		name,
+		data,
+		proc(callback_data: rawptr, input: codec.Payload_View) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow query input as json/plain",
+					"OdinWorkflowQueryPayloadConversionError",
+				)
+			}
+			output := owned.callback(owned.state^, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow query result as json/plain",
+					"OdinWorkflowQueryPayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
 }
 
 apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
@@ -1689,6 +1819,101 @@ append_fiber_activity_cancellations :: proc(
 	}
 }
 
+invoke_workflow_query :: proc(
+	instance: ^Fiber_Instance,
+	query: ^proto.Coresdk_Workflow_Activation_QueryWorkflow,
+) -> Payload_Result {
+	if instance == nil || query == nil || len(query.query_id) == 0 || len(query.query_type) == 0 {
+		return payload_fail("Workflow query is malformed", "OdinWorkflowQueryError")
+	}
+	if len(query.arguments) != 1 {
+		return payload_fail(
+			"Workflow query requires exactly one argument",
+			"OdinWorkflowQueryArgumentError",
+		)
+	}
+	handler, found := find_query_handler(instance, query.query_type)
+	if !found {
+		message := fmt.aprintf("Workflow query handler %s is not registered", query.query_type)
+		return payload_fail(message, "OdinWorkflowQueryNotFound")
+	}
+	phase := instance.phase
+	next_activity_seq := instance.next_activity_seq
+	next_timer_seq := instance.next_timer_seq
+	activity_count := len(instance.activities)
+	timer_count := len(instance.timers)
+	input, clone_error := proto.clone_payload(&query.arguments[0])
+	if clone_error != .None {
+		return payload_fail(
+			"could not preserve Workflow query input",
+			"OdinWorkflowQueryPayloadConversionError",
+		)
+	}
+	defer codec.payload_free(&input)
+	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
+	if instance.phase != phase || instance.next_activity_seq != next_activity_seq ||
+	   instance.next_timer_seq != next_timer_seq || len(instance.activities) != activity_count ||
+	   len(instance.timers) != timer_count {
+		codec.payload_free(&result.payload)
+		instance.phase = phase
+		instance.next_activity_seq = next_activity_seq
+		instance.next_timer_seq = next_timer_seq
+		for len(instance.activities) > activity_count {
+			ordered_remove(&instance.activities, len(instance.activities) - 1)
+		}
+		for len(instance.timers) > timer_count {
+			ordered_remove(&instance.timers, len(instance.timers) - 1)
+		}
+		return payload_fail(
+			"Workflow query handler attempted to mutate runtime command state",
+			"OdinWorkflowQueryMutationError",
+		)
+	}
+	return result
+}
+
+append_query_response_command :: proc(
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	response: ^Pending_Query_Response,
+) {
+	query_result := new(proto.Coresdk_Workflow_Commands_QueryResult)
+	query_result.query_id = response.query_id
+	if response.result.status == .Completed {
+		payload := new(proto.Temporal_Api_Common_V1_Payload)
+		payload^ = proto.encode_payload(codec.payload_view(&response.result.payload))
+		success := new(proto.Coresdk_Workflow_Commands_QuerySuccess)
+		success.response = payload
+		query_result.variant = proto.Coresdk_Workflow_Commands_QueryResult_Variant_Succeeded{
+			value = success,
+		}
+	} else {
+		failure_type := response.result.failure_type
+		if len(failure_type) == 0 {
+			failure_type = "OdinWorkflowQueryError"
+		}
+		application_info := new(proto.Temporal_Api_Failure_V1_ApplicationFailureInfo)
+		application_info.type = failure_type
+		application_info.non_retryable = true
+		failure := new(proto.Temporal_Api_Failure_V1_Failure)
+		failure.message = response.result.failure_message
+		failure.source = "OdinSDK"
+		failure.failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = application_info,
+		}
+		query_result.variant = proto.Coresdk_Workflow_Commands_QueryResult_Variant_Failed{
+			value = failure,
+		}
+	}
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Respond_To_Query{
+				value = query_result,
+			},
+		},
+	)
+}
+
 append_fiber_pending_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -1889,6 +2114,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		runtime.replay_activations += 1
 	}
 
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	pending_query_responses := make([dynamic]Pending_Query_Response)
+	context.allocator = previous_allocator
+	defer {
+		for &query_response in pending_query_responses {
+			codec.payload_free(&query_response.result.payload)
+		}
+	}
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
 	for job in activation.jobs {
 		handled := false
@@ -1989,6 +2222,23 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
 				return
 			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "Workflow query has no active Workflow fiber")
+				return
+			}
+			context.allocator = virtual.arena_allocator(&decode_arena)
+			query_result := invoke_workflow_query(instance, variant.value)
+			append(
+				&pending_query_responses,
+				Pending_Query_Response{
+					query_id = variant.value.query_id,
+					result = query_result,
+				},
+			)
+			context.allocator = previous_allocator
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow:
 			handled = true
@@ -2118,6 +2368,13 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			result.completion = encode_activation_failure(activation.run_id, message)
 			result.activation_failed = true
 			return
+		}
+	}
+	for &query_response in pending_query_responses {
+		append_query_response_command(&commands, &query_response)
+		result.queries_answered += 1
+		if query_response.result.status == .Failed {
+			result.queries_failed += 1
 		}
 	}
 	context.allocator = previous_allocator

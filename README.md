@@ -9,6 +9,8 @@ bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
 sends typed signals, requests cancellation, and terminates executions. It proves
+typed read-only Workflow queries through the public Odin Client, including
+query failure responses, eviction, and fresh-stack replay. It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
@@ -33,7 +35,7 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-scope trees, signal handlers, queries/updates,
+nested/child cancellation-scope trees, signal handlers, updates,
 multiple Activity arguments, in-process panic containment, or a stable public
 API.
 Do not use it in production.
@@ -145,6 +147,13 @@ handle, err := temporal_client.get_workflow_handle(&client, "order-42")
 defer temporal_client.workflow_handle_free(&handle)
 
 err = temporal_client.signal_workflow_json(&handle, "approve", approval)
+status: Order_Status
+err = temporal_client.query_workflow_json(
+    &handle,
+    "order_status",
+    Order_Status_Query{},
+    &status,
+)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 ```
 
@@ -270,6 +279,31 @@ generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
 typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
 the `json/plain` string compatibility adapter.
 
+Typed query handlers are registered from inside Workflow code so replay builds
+the same handler set and callback state:
+
+```odin
+Status_State :: struct { phase: string, order_id: string }
+Status_Query :: struct {}
+Status_Result :: struct { phase: string, order_id: string }
+
+status_query :: proc(state: Status_State, _: Status_Query) -> Status_Result {
+    return {phase = state.phase, order_id = state.order_id}
+}
+
+state := Status_State{phase = "waiting", order_id = input.order_id}
+if !workflow.set_query_handler_json(ctx, "order_status", &state, status_query) {
+    return {}
+}
+```
+
+The runtime answers a `QueryWorkflow` activation without resuming the suspended
+fiber. Handler state is borrowed from the live Workflow stack, passed to the
+callback by value, and must remain valid while the Workflow runs. The current
+experimental boundary accepts exactly one input Payload and one result Payload.
+Unknown handlers and codec errors become failed query responses rather than
+failed Workflow Tasks.
+
 Catchable Activity failures expose both the outer Activity metadata and the
 nested Application Failure:
 
@@ -317,9 +351,11 @@ that close completes.
 
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
-also starts `examples/hello_workflow`; the Odin Client delivers an `approval`
-signal while the fiber is blocked on a durable timer, cancelling that timer,
-evicting the fiber, and requiring replay to reproduce the timer cancellation
+also starts `examples/hello_workflow`; before the signal, the Odin Client
+performs a typed `greeting_status` query and receives live Workflow state
+without waking the fiber. The Client then delivers an `approval` signal while
+the fiber is blocked on a durable timer, cancelling that timer, evicting the
+fiber, and requiring replay to reproduce the timer cancellation
 and following Activity command. Two executions use Odin Client cancellation
 to verify direct pending-timer and pending-Activity cleanup through Core. A
 third resumes Workflow code, requests cancellation of its in-flight Activity,
