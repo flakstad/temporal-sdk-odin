@@ -199,6 +199,36 @@ worker_pid=""
 cat "$worker_log"
 grep -q "typed Workflow and Activity Payloads completed end-to-end" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=failure-details \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Failure-details Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+failure_workflow_id="odin-sdk-failure-details-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=failure-details \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$failure_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+failure_workflow_output="$(<"$workflow_output_file")"
+echo "$failure_workflow_output"
+grep -q "Odin client completed failure-details workflow_id=$failure_workflow_id" <<<"$failure_workflow_output"
+grep -q 'result="Observed structured Activity failure"' <<<"$failure_workflow_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "structured Activity failure details reached Workflow code" "$worker_log"
+
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!

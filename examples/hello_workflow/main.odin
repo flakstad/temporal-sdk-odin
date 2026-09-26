@@ -12,6 +12,7 @@ import workflow "../../temporal/workflow"
 TASK_QUEUE :: "odin-hello-workflow"
 WORKFLOW_TYPE :: "odin_hello_workflow"
 TYPED_WORKFLOW_TYPE :: "odin_typed_workflow"
+FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
 
 Typed_Greeting_Input :: struct {
 	name:       string,
@@ -32,6 +33,11 @@ Typed_Greeting_Output :: struct {
 	has_deadline:                   bool,
 	retry_maximum_attempts:         i32,
 	heartbeat_timeout_milliseconds: i64,
+}
+
+Failure_Details :: struct {
+	dependency: string,
+	code:       int,
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
@@ -88,6 +94,20 @@ typed_greeting :: proc(ctx: ^activity.Context, input: Typed_Greeting_Input) -> T
 	}
 }
 
+failure_details_activity :: proc(
+	_: ^activity.Context,
+	name: string,
+) -> activity.Result(string) {
+	_ = name
+	return activity.result_failure_json(
+		string,
+		"billing dependency rejected request",
+		Failure_Details{dependency = "billing", code = 409},
+		failure_type = "DependencyRejected",
+		next_retry_delay = 250 * time.Millisecond,
+	)
+}
+
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if name == "cancel-activity" {
 		return workflow.execute_activity(ctx, "hello", name)
@@ -129,6 +149,40 @@ typed_workflow :: proc(
 			disable_eager_execution = true,
 		},
 	)
+}
+
+failure_details_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	result := workflow.execute_activity_result_with_options(
+		ctx,
+		"failure_details",
+		name,
+		{
+			activity_id = "failure-details-activity",
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+		},
+	)
+	if result.status != .Failed {
+		return "unexpected Activity success"
+	}
+	details: Failure_Details
+	detail_found, detail_error := workflow.activity_failure_detail_json(
+		&result.failure,
+		0,
+		&details,
+	)
+	application := result.failure.application
+	if result.failure.activity_id != "failure-details-activity" ||
+	   result.failure.activity_type != "failure_details" ||
+	   result.failure.retry_state != .Maximum_Attempts_Reached ||
+	   !application.present || application.message != "billing dependency rejected request" ||
+	   application.type != "DependencyRejected" || application.non_retryable ||
+	   !application.has_next_retry_delay || application.next_retry_delay != 250 * time.Millisecond ||
+	   !detail_found || detail_error != .None || details.dependency != "billing" || details.code != 409 {
+		return "structured Activity failure mismatch"
+	}
+	return "Observed structured Activity failure"
 }
 
 observe_activation :: proc(processed: ^workflow.Process_Result) {
@@ -210,6 +264,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	register_failure_activity_error := worker.register_json_activity_result(
+		&activity_worker,
+		"failure_details",
+		failure_details_activity,
+	)
+	if register_failure_activity_error.message != nil {
+		fmt.eprintf("Failure Activity registration failed: %s\n", string(register_failure_activity_error.message))
+		worker.error_free(&register_failure_activity_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	workflow_register_error := worker.register_workflow(
 		&activity_worker,
@@ -237,6 +304,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	failure_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		FAILURE_DETAILS_WORKFLOW_TYPE,
+		failure_details_workflow,
+	)
+	if failure_workflow_register_error.message != nil {
+		fmt.eprintf("Failure Workflow registration failed: %s\n", string(failure_workflow_register_error.message))
+		worker.error_free(&failure_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
 	env_buffer: [64]u8
@@ -244,6 +324,7 @@ main :: proc() {
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_typed_payload := scenario == "typed-payload"
+	expect_failure_details := scenario == "failure-details"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity
 	run_stats, run_error := worker.run(
 		&activity_worker,
@@ -279,7 +360,7 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not deliver and acknowledge Activity cancellation")
 				failed = true
 			}
-		} else if expect_typed_payload {
+		} else if expect_typed_payload || expect_failure_details {
 			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
 				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
 				failed = true
@@ -314,6 +395,8 @@ main :: proc() {
 		fmt.println("Activity heartbeat delivered cancellation and Odin acknowledged it")
 	} else if expect_typed_payload {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
+	} else if expect_failure_details {
+		fmt.println("structured Activity failure details reached Workflow code")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

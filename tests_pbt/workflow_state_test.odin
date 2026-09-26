@@ -239,6 +239,23 @@ activity_failure_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 					valid = valid && actual_nanoseconds == i64(delay)
 				}
 			}
+			operation := workflow.Fiber_Activity_Operation{}
+			context.allocator = virtual.arena_allocator(&decode_arena)
+			preserved := workflow.preserve_activity_failure(&operation, status.value.failure)
+			context.allocator = previous_allocator
+			preserved_detail := 0
+			detail_found, detail_error := workflow.activity_failure_detail_json(
+				&operation.failure,
+				0,
+				&preserved_detail,
+			)
+			valid = valid && preserved && operation.failure.application.present &&
+				operation.failure.application.message == "generated failure" &&
+				operation.failure.application.type == failure_type &&
+				operation.failure.application.non_retryable == non_retryable &&
+				operation.failure.application.has_next_retry_delay == has_retry_delay &&
+				operation.failure.application.next_retry_delay == delay &&
+				detail_found && detail_error == .None && preserved_detail == detail_value
 		}
 	}
 	if !found || !valid {

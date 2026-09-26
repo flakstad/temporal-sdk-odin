@@ -42,6 +42,51 @@ run :: proc() -> int {
 	if len(workflow_id) == 0 {
 		workflow_id = uuid.to_string_buffer(uuid.generate_v4(), generated_id_buffer[:])
 	}
+	scenario_buffer: [64]u8
+	scenario := os.get_env(scenario_buffer[:], "TEMPORAL_CLIENT_SCENARIO")
+	if scenario == "failure-details" {
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_failure_details_workflow",
+			"Odin",
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf(
+				"Failure-details Workflow start failed (status=%d): %s\n",
+				start_error.status_code,
+				string(start_error.message),
+			)
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf(
+				"Failure-details Workflow result failed (kind=%v status=%d): %s\n",
+				result_error.kind,
+				result_error.status_code,
+				string(result_error.message),
+			)
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed failure-details workflow_id=%s result=%q\n",
+			workflow_id,
+			result,
+		)
+		return 0
+	}
 	handle, start_error := temporal_client.start_workflow_json(
 		&client,
 		"odin_typed_workflow",

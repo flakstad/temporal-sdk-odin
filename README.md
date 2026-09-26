@@ -269,6 +269,27 @@ generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
 typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
 the `json/plain` string compatibility adapter.
 
+Catchable Activity failures expose both the outer Activity metadata and the
+nested Application Failure:
+
+```odin
+result := workflow.execute_activity_result(ctx, "charge", order_id)
+if result.status == .Failed {
+    app := result.failure.application
+    details: Charge_Failure
+    found, decode_error := workflow.activity_failure_detail_json(
+        &result.failure,
+        0,
+        &details,
+    )
+    // result.failure: Activity ID/type, identity, retry state
+    // app: message, type, retryability, category, details, next retry delay
+}
+```
+
+These values are borrowed from the Workflow instance and remain valid for that
+run. Unhandled failures still propagate the preserved Temporal Failure protobuf.
+
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
 registered Activities and Workflows. A worker is intentionally single-run;

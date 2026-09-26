@@ -122,22 +122,63 @@ Activity_Result_Status :: enum {
 	Failed,
 }
 
+Activity_Retry_State :: enum {
+	Unspecified,
+	In_Progress,
+	Non_Retryable_Failure,
+	Timed_Out,
+	Maximum_Attempts_Reached,
+	Retry_Policy_Not_Set,
+	Internal_Server_Error,
+	Cancel_Requested,
+}
+
+Application_Error_Category :: enum {
+	Unspecified,
+	Benign,
+}
+
+Application_Failure :: struct {
+	present:              bool,
+	message:              string,
+	type:                 string,
+	non_retryable:        bool,
+	category:             Application_Error_Category,
+	details:              []codec.Payload_View,
+	next_retry_delay:     time.Duration,
+	has_next_retry_delay: bool,
+}
+
+Activity_Failure :: struct {
+	message:       string,
+	source:        string,
+	stack_trace:   string,
+	activity_id:   string,
+	activity_type: string,
+	identity:      string,
+	retry_state:   Activity_Retry_State,
+	application:   Application_Failure,
+}
+
 Activity_Result :: struct {
 	status:          Activity_Result_Status,
 	value:           string,
 	failure_message: string,
+	failure:         Activity_Failure,
 }
 
 Payload_Activity_Result :: struct {
 	status:          Activity_Result_Status,
 	value:           codec.Payload_View,
 	failure_message: string,
+	failure:         Activity_Failure,
 }
 
 Json_Activity_Result :: struct(T: typeid) {
 	status:          Activity_Result_Status,
 	value:           T,
 	failure_message: string,
+	failure:         Activity_Failure,
 }
 
 Signal_Wait_Status :: enum {
@@ -169,6 +210,9 @@ Fiber_Activity_Operation :: struct {
 	result:        codec.Payload,
 	failure_message: string,
 	failure_proto:   []u8,
+	failure:         Activity_Failure,
+	failure_detail_payloads: [dynamic]codec.Payload,
+	failure_detail_views:    []codec.Payload_View,
 	state:         Fiber_Operation_State,
 }
 
@@ -359,6 +403,9 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	for &operation in instance.activities {
 		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
+		for &detail in operation.failure_detail_payloads {
+			codec.payload_free(&detail)
+		}
 	}
 	for &signal in instance.signals {
 		codec.payload_free(&signal.payload)
@@ -788,12 +835,158 @@ start_activity_with_options :: proc(
 	return start_activity_json_with_options(ctx, activity_type, input, options)
 }
 
+activity_retry_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_RetryState,
+) -> Activity_Retry_State {
+	switch value {
+	case .RETRY_STATE_IN_PROGRESS:
+		return .In_Progress
+	case .RETRY_STATE_NON_RETRYABLE_FAILURE:
+		return .Non_Retryable_Failure
+	case .RETRY_STATE_TIMEOUT:
+		return .Timed_Out
+	case .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED:
+		return .Maximum_Attempts_Reached
+	case .RETRY_STATE_RETRY_POLICY_NOT_SET:
+		return .Retry_Policy_Not_Set
+	case .RETRY_STATE_INTERNAL_SERVER_ERROR:
+		return .Internal_Server_Error
+	case .RETRY_STATE_CANCEL_REQUESTED:
+		return .Cancel_Requested
+	case .RETRY_STATE_UNSPECIFIED:
+		return .Unspecified
+	}
+	return .Unspecified
+}
+
+application_error_category_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_ApplicationErrorCategory,
+) -> Application_Error_Category {
+	if value == .APPLICATION_ERROR_CATEGORY_BENIGN {
+		return .Benign
+	}
+	return .Unspecified
+}
+
+failure_duration_from_proto :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {
+	if value == nil {
+		return 0
+	}
+	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+}
+
+clone_failure_string :: proc(value: string) -> (string, bool) {
+	owned, allocation_error := strings.clone(value)
+	return owned, allocation_error == nil
+}
+
+preserve_activity_failure :: proc(
+	operation: ^Fiber_Activity_Operation,
+	value: ^proto.Temporal_Api_Failure_V1_Failure,
+) -> bool {
+	if operation == nil || value == nil {
+		return false
+	}
+	message_ok, source_ok, stack_ok: bool
+	operation.failure.message, message_ok = clone_failure_string(value.message)
+	operation.failure.source, source_ok = clone_failure_string(value.source)
+	operation.failure.stack_trace, stack_ok = clone_failure_string(value.stack_trace)
+	if !message_ok || !source_ok || !stack_ok {
+		return false
+	}
+
+	current := value
+	for current != nil {
+		#partial switch info in current.failure_info {
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info:
+			if info.value != nil && len(operation.failure.activity_id) == 0 {
+				id_ok, type_ok, identity_ok: bool
+				operation.failure.activity_id, id_ok = clone_failure_string(info.value.activity_id)
+				if info.value.activity_type != nil {
+					operation.failure.activity_type, type_ok = clone_failure_string(info.value.activity_type.name)
+				} else {
+					type_ok = true
+				}
+				operation.failure.identity, identity_ok = clone_failure_string(info.value.identity)
+				if !id_ok || !type_ok || !identity_ok {
+					return false
+				}
+				operation.failure.retry_state = activity_retry_state_from_proto(info.value.retry_state)
+			}
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+			if info.value != nil && !operation.failure.application.present {
+				application := &operation.failure.application
+				application.present = true
+				app_message_ok, app_type_ok: bool
+				application.message, app_message_ok = clone_failure_string(current.message)
+				application.type, app_type_ok = clone_failure_string(info.value.type)
+				if !app_message_ok || !app_type_ok {
+					return false
+				}
+				application.non_retryable = info.value.non_retryable
+				application.category = application_error_category_from_proto(info.value.category)
+				if info.value.next_retry_delay != nil {
+					application.has_next_retry_delay = true
+					application.next_retry_delay = failure_duration_from_proto(info.value.next_retry_delay)
+				}
+				operation.failure_detail_payloads = make([dynamic]codec.Payload)
+				if info.value.details != nil {
+					for &detail in info.value.details.payloads {
+						owned, clone_error := proto.clone_payload(&detail)
+						if clone_error != .None {
+							return false
+						}
+						append(&operation.failure_detail_payloads, owned)
+					}
+				}
+				operation.failure_detail_views = make(
+					[]codec.Payload_View,
+					len(operation.failure_detail_payloads),
+				)
+				for &detail, index in operation.failure_detail_payloads {
+					operation.failure_detail_views[index] = codec.payload_view(&detail)
+				}
+				application.details = operation.failure_detail_views
+			}
+		}
+		current = current.cause
+	}
+	return true
+}
+
+activity_failure_detail_payload :: proc(
+	failure: ^Activity_Failure,
+	index: int,
+) -> (payload: codec.Payload_View, found: bool) {
+	if failure == nil || !failure.application.present || index < 0 ||
+	   index >= len(failure.application.details) {
+		return
+	}
+	return failure.application.details[index], true
+}
+
+activity_failure_detail_json :: proc(
+	failure: ^Activity_Failure,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := activity_failure_detail_payload(failure, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
 payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
 	if operation.state == .Resolved {
 		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
 	}
 	if operation.state == .Failed {
-		return {status = .Failed, failure_message = operation.failure_message}
+		return {
+			status = .Failed,
+			failure_message = operation.failure_message,
+			failure = operation.failure,
+		}
 	}
 	return {status = .Failed, failure_message = "Activity has not resolved"}
 }
@@ -845,6 +1038,7 @@ await_activity_json_result :: proc(
 		return {
 			status = .Failed,
 			failure_message = payload_result.failure_message,
+			failure = payload_result.failure,
 		}
 	}
 	value: T
@@ -865,6 +1059,7 @@ await_activity_result :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> A
 		status = result.status,
 		value = result.value,
 		failure_message = result.failure_message,
+		failure = result.failure,
 	}
 }
 
@@ -1667,8 +1862,9 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				context.allocator = instance.odin_context.allocator
 				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+				failure_preserved := preserve_activity_failure(operation, status.value.failure)
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 {
+				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve Activity failure")
 					return
 				}

@@ -201,16 +201,56 @@ fiber_parallel_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string)
 	return result
 }
 
+Failure_Test_Details :: struct {
+	dependency: string,
+	code:       int,
+}
+
+failure_test_matches :: proc(failure: ^workflow.Activity_Failure) -> bool {
+	application := failure.application
+	details: Failure_Test_Details
+	detail_found, detail_error := workflow.activity_failure_detail_json(
+		failure,
+		0,
+		&details,
+	)
+	return failure.message == "Activity task failed" &&
+	       failure.activity_id == "failure-activity" &&
+	       failure.activity_type == "missing" &&
+	       failure.identity == "test-worker" &&
+	       failure.retry_state == .Maximum_Attempts_Reached &&
+	       application.present && application.message == "dependency rejected request" &&
+	       application.type == "DependencyRejected" && !application.non_retryable &&
+	       application.category == .Benign && application.has_next_retry_delay &&
+	       application.next_retry_delay == 250 * time.Millisecond &&
+	       detail_found && detail_error == .None &&
+	       details.dependency == "billing" && details.code == 409
+}
+
 fiber_failure_recovery_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	failed := workflow.execute_activity_result(ctx, "missing", name)
 	if failed.status != .Failed {
 		return "unexpected Activity success"
+	}
+	if !failure_test_matches(&failed.failure) {
+		return "structured Activity failure did not survive"
 	}
 	recovery_input, allocation_error := strings.concatenate({"Recovered ", name})
 	if allocation_error != nil {
 		return ""
 	}
 	return workflow.execute_activity(ctx, "hello", recovery_input)
+}
+
+fiber_delayed_failure_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	first := workflow.start_activity(ctx, "hello", name)
+	second := workflow.start_activity(ctx, "missing", name)
+	_ = workflow.await_activity(ctx, first)
+	failed := workflow.await_activity_result(ctx, second)
+	if failed.status == .Failed && failure_test_matches(&failed.failure) {
+		return "preserved"
+	}
+	return "lost"
 }
 
 fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -2719,6 +2759,177 @@ workflow_fiber_applies_all_activity_resolutions_before_resume :: proc(t: ^testin
 }
 
 @(test)
+workflow_fiber_preserves_structured_activity_failure_across_activations :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_delayed_failure_workflow",
+		"test-queue",
+		fiber_delayed_failure_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_delayed_failure_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-delayed-failure-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.scheduled_activity_count, 2)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	failure_details, failure_details_error := codec.encode_json(
+		Failure_Test_Details{dependency = "billing", code = 409},
+	)
+	testing.expect(t, failure_details_error == .None)
+	defer codec.payload_free(&failure_details)
+	failure_details_proto := proto.encode_payload(codec.payload_view(&failure_details))
+	defer delete(failure_details_proto.metadata)
+	defer delete(failure_details_proto.external_payloads)
+	failure_detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(failure_detail_payloads.payloads)
+	append(&failure_detail_payloads.payloads, failure_details_proto)
+	next_retry_delay := proto.Google_Protobuf_Duration{nanos = 250_000_000}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "DependencyRejected",
+		details = &failure_detail_payloads,
+		next_retry_delay = &next_retry_delay,
+		category = .APPLICATION_ERROR_CATEGORY_BENIGN,
+	}
+	application_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "dependency rejected request",
+		source = "OdinSDK",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "missing"}
+	activity_info := proto.Temporal_Api_Failure_V1_ActivityFailureInfo{
+		identity = "test-worker",
+		activity_type = &activity_type,
+		activity_id = "failure-activity",
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+	activity_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Activity task failed",
+		source = "TemporalServer",
+		cause = &application_failure,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{
+			value = &activity_info,
+		},
+	}
+	failed_result := proto.Coresdk_Activity_Result_Failure{failure = &activity_failure}
+	failure_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed{
+			value = &failed_result,
+		},
+	}
+	resolve_failure := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 2,
+		result = &failure_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_failure,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "delayed failure failed: %s", string(processed.error.message))
+	testing.expect(t, processed.resolved_activity_failed)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(2))
+	testing.expect(t, !processed.completed)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	// process_fiber_test_activation has now deleted its encoded activation and
+	// process_fiber_activation has destroyed its protobuf decode arena. The
+	// Workflow still cannot inspect seq 2 because it remains suspended on seq 1.
+	first_output := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Hello Odin"`),
+	}
+	defer delete(first_output.metadata)
+	append(
+		&first_output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	first_success := proto.Coresdk_Activity_Result_Success{result = &first_output}
+	first_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &first_success,
+		},
+	}
+	resolve_first := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &first_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_first,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "delayed failure resume failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	completion, completion_found := clone_workflow_completion_payload(processed.completion[:])
+	testing.expect(t, completion_found)
+	if completion_found {
+		message, decode_error := codec.decode_string(
+			completion.data,
+			codec.encoding(codec.payload_view(&completion)),
+		)
+		testing.expect(t, decode_error == .None)
+		testing.expect_value(t, message, "preserved")
+		delete(message)
+	}
+	codec.payload_free(&completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
 workflow_fiber_replays_handled_activity_failure :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2765,9 +2976,45 @@ workflow_fiber_replays_handled_activity_failure :: proc(t: ^testing.T) {
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
-	activity_failure := proto.Temporal_Api_Failure_V1_Failure{
-		message = "activity missing",
+	failure_details, failure_details_error := codec.encode_json(
+		Failure_Test_Details{dependency = "billing", code = 409},
+	)
+	testing.expect(t, failure_details_error == .None)
+	defer codec.payload_free(&failure_details)
+	failure_details_proto := proto.encode_payload(codec.payload_view(&failure_details))
+	defer delete(failure_details_proto.metadata)
+	defer delete(failure_details_proto.external_payloads)
+	failure_detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(failure_detail_payloads.payloads)
+	append(&failure_detail_payloads.payloads, failure_details_proto)
+	next_retry_delay := proto.Google_Protobuf_Duration{nanos = 250_000_000}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "DependencyRejected",
+		details = &failure_detail_payloads,
+		next_retry_delay = &next_retry_delay,
+		category = .APPLICATION_ERROR_CATEGORY_BENIGN,
+	}
+	application_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "dependency rejected request",
 		source = "OdinSDK",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "missing"}
+	activity_info := proto.Temporal_Api_Failure_V1_ActivityFailureInfo{
+		identity = "test-worker",
+		activity_type = &activity_type,
+		activity_id = "failure-activity",
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+	activity_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Activity task failed",
+		source = "TemporalServer",
+		cause = &application_failure,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{
+			value = &activity_info,
+		},
 	}
 	failed_result := proto.Coresdk_Activity_Result_Failure{failure = &activity_failure}
 	failure_resolution := proto.Coresdk_Activity_Result_ActivityResolution{

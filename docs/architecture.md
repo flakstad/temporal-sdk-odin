@@ -20,6 +20,8 @@ handle, long-polls its close event, follows new runs, returns a generic or typed
 Payload result, sends typed signals, requests cancellation, and terminates
 executions. The Workflow runtime now preserves signal Payloads generically and
 offers raw, typed JSON, and string await adapters.
+Catchable Activity results now expose the outer Activity failure metadata and a
+typed view of nested Application Failure fields and details.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -808,10 +810,14 @@ and .NET documents that
 [Activity failures throw and fail the Workflow only when uncaught](https://github.com/temporalio/sdk-dotnet#invoking-activities).
 
 The Odin spike now records that resolution as `Fiber_Operation_State.Failed`.
-It copies the human-readable message and re-encodes the complete Temporal
-`Failure` protobuf into the Workflow instance arena before the activation
-decode arena is released. `execute_activity_result` returns an experimental
-`Activity_Result`, allowing Workflow code to branch. The existing
+It copies the outer message/source/stack, Activity ID/type/identity/retry state,
+and the first nested Application Failure's message, type, retryability,
+category, Payload details, and next-retry delay into the Workflow instance
+arena before the activation decode arena is released. It also re-encodes the
+complete Temporal `Failure` protobuf for lossless propagation.
+`execute_activity_result` returns an experimental `Activity_Result`, allowing
+Workflow code to branch. `activity_failure_detail_payload/json` provides raw or
+typed access to borrowed details. The existing
 `execute_activity` convenience treats the same result as unhandled; the runtime
 decodes the preserved protobuf and emits `FailWorkflowExecution`, retaining the
 Temporal failure rather than synthesizing a new one.
@@ -834,6 +840,13 @@ Temporal CLI returned `"Hello Recovered Odin"`. The offline replay test asserts
 that the recovery command is byte-identical before and after eviction. A
 separate test verifies that the non-result convenience still emits a
 `FailWorkflowExecution` command containing the preserved failure message.
+
+A live Core/Server case schedules an Odin Activity with one maximum attempt.
+The Activity returns retryable `DependencyRejected` details and a 250 ms
+next-retry override. The Workflow observes the server-produced Activity wrapper
+with `Maximum_Attempts_Reached`, decodes `{dependency: "billing", code: 409}`
+from the nested Application Failure, and completes normally. Core eviction and
+fresh-stack replay occur before that resolution.
 
 ### Buffered Workflow signal
 
@@ -1140,8 +1153,9 @@ Workflows are enabled.
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.
 7. **Error/cancellation completeness.** The Workflow runtime preserves the raw
-   Temporal failure protobuf for propagation, but the catchable experimental API
-   exposes only status and message. Activity cancellation preserves Core's
+   Temporal failure protobuf for propagation and exposes Activity plus nested
+   Application Failure metadata/details to catchable code. Other nested failure
+   kinds and encoded failure attributes are not yet converted. Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
    The Activity API now models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
@@ -1182,19 +1196,17 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest vertical milestone should expose structured Activity failure
-details to Workflow code. The runtime already preserves the complete failure
-protobuf across the activation arena boundary, but the catchable API exposes
-only status and message. Decode Application Failure type, retryability, details,
-and next-retry delay behind an owned/view boundary without changing command
-replay.
+The next smallest vertical milestone should introduce user cancellation scopes
+and cleanup. The current runtime-owned policy closes the Workflow immediately;
+Workflow code needs a root cancellation state plus an unlinked cleanup scope so
+it can catch cancellation, run Temporal-safe cleanup, and then acknowledge it
+deterministically.
 
-After that, introduce user cancellation scopes and cleanup, then stress pool
+After that, stress pool
 shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
 designed as subprocess isolation unless Odin gains supported recovery. A
-statechart oracle becomes worthwhile when retry/cancellation/shutdown
-interleavings create additional states. User Workflow
-cancellation scopes remain a separate Workflow-runtime change.
+statechart oracle becomes worthwhile as cancellation scopes add new
+retry/cancellation/shutdown interleavings.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

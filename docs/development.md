@@ -420,6 +420,16 @@ retry attempt limit observed by the Activity callback. Temporal CLI then reads
 history independently from the Service and verifies the configured Activity ID, four timeouts, retry timing,
 attempt limit, and non-retryable failure type.
 
+Another Odin Client-started execution runs
+`odin_failure_details_workflow`. Its Odin Activity returns a retryable
+`DependencyRejected` Application Failure with typed JSON details and a 250 ms
+next-retry override, while the Workflow configures one maximum attempt. After
+Core eviction and replay, Workflow code observes the server wrapper's Activity
+ID/type and `Maximum_Attempts_Reached` retry state, then decodes the nested
+Application Failure message, type, retryability, details, and delay. It
+completes with `"Observed structured Activity failure"`; this proves the fields
+crossed both Core and the Service rather than only the local completion encoder.
+
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
 if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
@@ -445,7 +455,8 @@ that cancellation never leaks across tokens and no heartbeat is transported
 after cancellation becomes visible. A second 500-case property generates
 retryable/non-retryable Application Failures, type strings, JSON details, and
 default/explicit retry delays, then round-trips every field through the Core
-completion protobuf. Both suites pass against the pin and `~/Projects/pbt`.
+completion protobuf and the Workflow-facing structured failure adapter. Both
+suites pass against the pin and `~/Projects/pbt`.
 The Activity-context property adds 500 timestamp/timeout combinations and
 requires the derived deadline to be the earliest applicable endpoint. A unit
 test separately destroys the protobuf decode arena before reading every copied
