@@ -33,7 +33,8 @@ fi
   --include_imports \
   --descriptor_set_out="$descriptor_set" \
   temporal/sdk/core/activity_task/activity_task.proto \
-  temporal/sdk/core/core_interface.proto
+  temporal/sdk/core/core_interface.proto \
+  temporal/api/workflowservice/v1/request_response.proto
 
 cargo run --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
@@ -44,7 +45,11 @@ cargo run --quiet \
   coresdk.activity_task.ActivityTask \
   coresdk.ActivityTaskCompletion \
   coresdk.workflow_activation.WorkflowActivation \
-  coresdk.workflow_completion.WorkflowActivationCompletion
+  coresdk.workflow_completion.WorkflowActivationCompletion \
+  temporal.api.workflowservice.v1.StartWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.StartWorkflowExecutionResponse \
+  temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryRequest \
+  temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse
 
 if [[ "$mode" == "--check" ]]; then
   if ! cmp -s "$generated" "$destination"; then

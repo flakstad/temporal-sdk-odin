@@ -7,7 +7,9 @@ import "core:sync"
 import raw "./raw"
 
 Error :: struct {
-	message: []u8,
+	message:     []u8,
+	status_code: u32,
+	details:     []u8,
 }
 
 Runtime :: struct {
@@ -58,11 +60,14 @@ copy_core_bytes :: proc(value: ^raw.Byte_Array) -> []u8 {
 }
 
 error_free :: proc(error: ^Error) {
-	if error == nil || error.message == nil {
+	if error == nil {
 		return
 	}
 	delete(error.message)
+	delete(error.details)
 	error.message = nil
+	error.details = nil
+	error.status_code = 0
 }
 
 runtime_create :: proc() -> (runtime: Runtime, error: Error) {
@@ -432,6 +437,11 @@ Rpc_State :: struct {
 	failure_details: ^raw.Byte_Array,
 }
 
+Rpc_Result :: struct {
+	protobuf: []u8,
+	error:    Error,
+}
+
 rpc_callback :: proc "c" (
 	user_data: rawptr,
 	success: ^raw.Byte_Array,
@@ -448,19 +458,37 @@ rpc_callback :: proc "c" (
 }
 
 client_get_system_info :: proc(client: ^Client) -> Get_System_Info_Result {
-	result := Get_System_Info_Result{}
+	rpc_result := client_rpc_call(
+		client,
+		.Workflow,
+		"GetSystemInfo",
+		nil,
+		retry = true,
+		timeout_millis = 10_000,
+	)
+	return {protobuf = rpc_result.protobuf, error = rpc_result.error}
+}
+
+client_rpc_call :: proc(
+	client: ^Client,
+	service: raw.Rpc_Service,
+	rpc: string,
+	request: []u8,
+	retry := true,
+	timeout_millis: u32 = 10_000,
+) -> Rpc_Result {
+	result := Rpc_Result{}
 	if client == nil || client.handle == nil || client.runtime == nil {
 		result.error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
 		return result
 	}
 
 	options := raw.Rpc_Call_Options{
-		service = .Workflow,
-		rpc = byte_ref("GetSystemInfo"),
-		// GetSystemInfoRequest is an empty protobuf message.
-		req = raw.Byte_Array_Ref{},
-		retry = true,
-		timeout_millis = 10_000,
+		service = service,
+		rpc = byte_ref(rpc),
+		req = bytes_ref(request),
+		retry = retry,
+		timeout_millis = timeout_millis,
 	}
 	state := Rpc_State{}
 	raw.client_rpc_call(client.handle, &options, &state, rpc_callback)
@@ -469,10 +497,16 @@ client_get_system_info :: proc(client: ^Client) -> Get_System_Info_Result {
 	runtime := client.runtime.handle
 	if state.failure_message != nil {
 		result.error.message = copy_core_bytes(state.failure_message)
+		result.error.status_code = state.status_code
 		raw.byte_array_free(runtime, state.failure_message)
 		if state.failure_details != nil {
+			result.error.details = copy_core_bytes(state.failure_details)
 			raw.byte_array_free(runtime, state.failure_details)
 		}
+		return result
+	}
+	if state.success == nil {
+		result.error.message = bytes.clone(transmute([]u8)string("Core RPC returned neither success nor failure"))
 		return result
 	}
 

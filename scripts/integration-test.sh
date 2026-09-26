@@ -170,29 +170,16 @@ for _ in {1..30}; do
 done
 
 typed_workflow_id="odin-sdk-typed-workflow-$$-$(date +%s)"
-temporal workflow execute \
-  --workflow-id "$typed_workflow_id" \
-  --type odin_typed_workflow \
-  --task-queue odin-hello-workflow \
-  --input '{"name":"Odin","salutation":"Hello"}' \
-  --command-timeout 30s \
-  --output json >"$workflow_output_file"
+TEMPORAL_CLIENT_WORKFLOW_ID="$typed_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
 workflow_output="$(<"$workflow_output_file")"
 echo "$workflow_output"
-grep -q '"status": "COMPLETED"' <<<"$workflow_output"
-grep -q '"message": "Hello, Odin!"' <<<"$workflow_output"
-grep -q '"name_length": 4' <<<"$workflow_output"
-grep -q '"activity_id": "typed-greeting-options"' <<<"$workflow_output"
-grep -q '"activity_type": "typed_greeting"' <<<"$workflow_output"
-grep -q '"task_queue": "odin-hello-workflow"' <<<"$workflow_output"
-grep -q '"namespace": "default"' <<<"$workflow_output"
-grep -q "\"workflow_id\": \"$typed_workflow_id\"" <<<"$workflow_output"
-grep -q '"workflow_type": "odin_typed_workflow"' <<<"$workflow_output"
-grep -q '"attempt": 1' <<<"$workflow_output"
-grep -q '"is_workflow_activity": true' <<<"$workflow_output"
-grep -q '"has_deadline": true' <<<"$workflow_output"
-grep -q '"retry_maximum_attempts": 3' <<<"$workflow_output"
-grep -q '"heartbeat_timeout_milliseconds": 2000' <<<"$workflow_output"
+grep -q "Odin client completed workflow_id=$typed_workflow_id" <<<"$workflow_output"
+grep -q 'message="Hello, Odin!"' <<<"$workflow_output"
+grep -q 'activity_id=typed-greeting-options' <<<"$workflow_output"
+grep -q 'task_queue=odin-hello-workflow' <<<"$workflow_output"
+grep -q 'retry_attempts=3' <<<"$workflow_output"
 temporal workflow show \
   --workflow-id "$typed_workflow_id" \
   --command-timeout 10s \

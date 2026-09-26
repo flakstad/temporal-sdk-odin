@@ -306,6 +306,43 @@ such as malformed protobuf or an impossible run route—still stop `run`.
 `Run_Stats.workflow_activation_failures` counts the nonfatal failed
 completions.
 
+## Client start/result slice
+
+`temporal/client` now owns the high-level connection lifecycle:
+
+```odin
+client, connect_error := temporal_client.connect(
+    target_url = "http://localhost:7233",
+    namespace = "default",
+)
+defer temporal_client.close(&client)
+
+handle, start_error := temporal_client.start_workflow_json(
+    &client,
+    "greeting_workflow",
+    Greeting_Input{name = "Odin"},
+    {id = "greeting-42", task_queue = "greetings"},
+)
+defer temporal_client.workflow_handle_free(&handle)
+
+result: Greeting_Output
+result_error := temporal_client.get_result_json(&handle, &result)
+```
+
+`connect` heap-owns a Core runtime, Core connection, and namespace. The handle
+owns its Workflow ID, result run ID, and first execution run ID, while borrowing
+the Client. Free handles before closing the Client. `start_workflow_payload`
+and `get_result_payload` are the codec-neutral forms; JSON helpers currently
+represent one Workflow argument and one result Payload.
+
+Start uses a UUIDv4 request ID when the caller omits one. Zero duration means
+unspecified; negative execution/run/task timeouts are rejected before RPC.
+Result retrieval issues a blocking close-event long poll with no local timeout,
+maps every terminal Workflow event, and follows retry/cron/Continue-As-New run
+IDs by default. Set `follow_runs = false` to receive
+`Workflow_Continued_As_New` instead. RPC failures retain the gRPC status code
+and binary status-details protobuf.
+
 The integration test uses Temporal CLI directly—no Docker, PostgreSQL, or
 Elasticsearch:
 
@@ -347,14 +384,15 @@ receives the typed result. This proves heartbeat progress crossed Core and the
 Service rather than remaining in Odin memory. The bounded test
 worker therefore consumes two Activity Tasks before shutdown.
 
-A separate live case starts `odin_typed_workflow` with
+A separate live case uses `examples/client_start` to start
+`odin_typed_workflow` with
 `{name: "Odin", salutation: "Hello"}`. Odin preserves that Payload into a
 typed Activity command, Core evicts the Workflow, fresh-stack replay reproduces
 the same command, and the resolved object becomes the Workflow completion.
-Temporal CLI receives the greeting plus the Activity/Workflow identity, task
+The Odin Client receives the greeting plus the Activity/Workflow identity, task
 queue, namespace, deadline presence, heartbeat timeout, attempt, and effective
-retry attempt limit observed by the Activity callback. The test reads history back from the
-Service and verifies the configured Activity ID, four timeouts, retry timing,
+retry attempt limit observed by the Activity callback. Temporal CLI then reads
+history independently from the Service and verifies the configured Activity ID, four timeouts, retry timing,
 attempt limit, and non-retryable failure type.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each
@@ -392,7 +430,10 @@ evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,
 retry, queue, ID, cancellation, and eager-execution combinations. It checks
 every encoded `ScheduleActivity` field and requires byte-identical commands
-after eviction and fresh-stack replay.
+after eviction and fresh-stack replay. The Client property generates another
+500 typed Workflow results, wraps each in a real close-event history response,
+destroys the encoded response, and requires the owned result Payload to retain
+the generated value.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
 with `temporal workflow execute` in the background. After the Workflow has

@@ -15,6 +15,9 @@ above that boundary. Workflow Activity options are represented explicitly and
 preserved across fresh-stack replay. Activity context now carries heap-stable
 execution identity, timestamps/timeouts, effective Retry Policy, priority, and
 generic heartbeat details copied from Core before the poll decode arena dies.
+The first public Client slice owns Core connection lifecycle, starts a Workflow,
+long-polls its close event, follows new runs, and returns a generic or typed
+Payload result.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -133,6 +136,22 @@ Core provides transport, TLS, metadata, retry/keepalive, API key, DNS balancing,
 compression, and cancellation mechanics. The Odin layer must still provide
 typed client methods, generate request IDs where required, encode the Temporal
 API protobuf messages, convert user payloads, and map errors into an Odin API.
+
+The implemented Client slice calls `StartWorkflowExecution` and
+`GetWorkflowExecutionHistory` through `temporal_core_client_rpc_call`. Odin
+constructs the WorkflowService request protobufs, generates a UUIDv4 request
+ID, and uses `HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT` with `wait_new_event =
+true`. Core owns gRPC transport and retries. The handle result loop maps
+completed, failed, canceled, terminated, timed-out, and Continue-As-New close
+events, following the next run by default as the current .NET SDK does.
+
+`client.Client` heap-owns a stable Core runtime and connection because
+`core.Client` retains a pointer to its runtime. It also owns its namespace.
+`Workflow_Handle` owns Workflow/run ID strings and borrows the Client. Closing
+the handle before the Client is therefore an explicit lifetime requirement.
+RPC success/failure buffers are copied out of Core and freed through
+`temporal_core_byte_array_free`; gRPC status code and binary status details are
+preserved in the Odin error.
 
 ### Worker and activity tasks
 
@@ -1080,7 +1099,8 @@ Workflows are enabled.
    and evolves with Core. Pinning plus ABI assertions is mandatory. We should
    ask upstream whether third-party language SDK consumption has compatibility
    guarantees or a preferred release channel.
-2. **Protobuf generator scope.** The Activity and Workflow boundary graphs,
+2. **Protobuf generator scope.** The Activity, Workflow activation, and first
+   WorkflowService client graphs,
    including imports, maps, presence, and `oneof`s, are generated and
    wire-compatible with `prost`. Unknown fields are skipped rather than
    retained. Every new root graph still needs generation, compile, unit, and
@@ -1114,7 +1134,10 @@ Workflows are enabled.
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
-8. **Client/server feature skew.** The pinned standalone-Activity client API is
+8. **Client/server feature skew.** Workflow start/result is live-proven, but the
+   public Client still lacks signals, queries, updates, cancellation,
+   termination, headers, retry/options completeness, and failure-detail
+   conversion. The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
 
@@ -1141,17 +1164,17 @@ Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
 proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
+500 Client close-event/result round trips,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest vertical milestone should be a minimal public Client slice:
-generate the required Temporal API request/response graph, start a Workflow
-from Odin through Core's generic RPC call, and obtain its result without the
-Temporal CLI or Rust test driver. Keep request IDs and Payload conversion in
-the language layer and do not expand into a broad client API until this one
-operation is proven live.
+The next smallest vertical milestone should extend the now-proven Client with
+`SignalWorkflowExecution` and use it to replace Temporal CLI in the durable
+signal/timer integration case. This exercises a running handle, request-ID
+generation, and another Payload-bearing RPC without prematurely growing a
+broad client surface.
 
-After that, extend the same Payload adapter pattern to typed signals and typed
-Activity failure details in Workflow code, then stress pool
+After that, extend the same Payload adapter pattern to typed Activity failure
+details in Workflow code, then stress pool
 shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
 designed as subprocess isolation unless Odin gains supported recovery. A
 statechart oracle becomes worthwhile when retry/cancellation/shutdown

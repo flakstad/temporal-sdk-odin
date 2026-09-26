@@ -6,6 +6,7 @@ import "core:mem/virtual"
 import "core:strings"
 import "core:time"
 import activity "../temporal/activity"
+import temporal_client "../temporal/client"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 import codec "../temporal/codec"
@@ -643,10 +644,107 @@ language_worker_rejects_run_without_materializing_empty_core_worker :: proc(t: ^
 
 @(test)
 error_free_is_idempotent :: proc(t: ^testing.T) {
-	error := temporal_core.Error{message = bytes.clone(transmute([]u8)string("owned"))}
+	error := temporal_core.Error{
+		message = bytes.clone(transmute([]u8)string("owned")),
+		status_code = 13,
+		details = bytes.clone(transmute([]u8)string("grpc-status-details")),
+	}
 	temporal_core.error_free(&error)
 	testing.expect(t, error.message == nil)
+	testing.expect(t, error.details == nil)
+	testing.expect_value(t, error.status_code, u32(0))
 	temporal_core.error_free(&error)
+}
+
+@(test)
+client_close_event_result_owns_payload_after_decode :: proc(t: ^testing.T) {
+	expected := Codec_Test_Value{name = "client-result", count = 41, enabled = true}
+	owned_payload, encode_error := codec.encode_json(expected)
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&owned_payload)
+	proto_payload := proto.encode_payload(codec.payload_view(&owned_payload))
+	defer delete(proto_payload.metadata)
+	defer delete(proto_payload.external_payloads)
+	payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(payloads.payloads)
+	append(&payloads.payloads, proto_payload)
+	completed := proto.Temporal_Api_History_V1_WorkflowExecutionCompletedEventAttributes{
+		result = &payloads,
+	}
+	event := proto.Temporal_Api_History_V1_HistoryEvent{
+		event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+		attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Completed_Event_Attributes{
+			value = &completed,
+		},
+	}
+	history := proto.Temporal_Api_History_V1_History{}
+	defer delete(history.events)
+	append(&history.events, event)
+	response := proto.Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse{
+		history = &history,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse(&response)
+
+	page, page_error := temporal_client.decode_result_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.result_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expect(t, page_error.message == nil)
+	testing.expect(t, page.kind == .Completed)
+	testing.expect(t, page.has_payload)
+	actual: Codec_Test_Value
+	decode_error := codec.decode_json(codec.payload_view(&page.payload), &actual)
+	defer delete(actual.name)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, actual.name, expected.name)
+	testing.expect_value(t, actual.count, expected.count)
+	testing.expect_value(t, actual.enabled, expected.enabled)
+}
+
+@(test)
+client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
+	failure := proto.Temporal_Api_Failure_V1_Failure{message = "order workflow failed"}
+	failed := proto.Temporal_Api_History_V1_WorkflowExecutionFailedEventAttributes{
+		failure = &failure,
+	}
+	event := proto.Temporal_Api_History_V1_HistoryEvent{
+		event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_FAILED,
+		attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Failed_Event_Attributes{
+			value = &failed,
+		},
+	}
+	history := proto.Temporal_Api_History_V1_History{}
+	defer delete(history.events)
+	append(&history.events, event)
+	response := proto.Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse{
+		history = &history,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse(&response)
+	page, page_error := temporal_client.decode_result_page(encoded[:])
+	delete(encoded)
+	testing.expect(t, page_error.message == nil)
+	testing.expect(t, page.kind == .Failed)
+	testing.expect_value(t, page.message, "order workflow failed")
+	temporal_client.result_page_free(&page)
+	temporal_client.error_free(&page_error)
+
+	continued := proto.Temporal_Api_History_V1_WorkflowExecutionContinuedAsNewEventAttributes{
+		new_execution_run_id = "continued-run-id",
+	}
+	history.events[0] = proto.Temporal_Api_History_V1_HistoryEvent{
+		event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW,
+		attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Continued_As_New_Event_Attributes{
+			value = &continued,
+		},
+	}
+	encoded = proto.encode_Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse(&response)
+	page, page_error = temporal_client.decode_result_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.result_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expect(t, page_error.message == nil)
+	testing.expect(t, page.kind == .Continued_As_New)
+	testing.expect_value(t, page.next_run_id, "continued-run-id")
 }
 
 @(test)

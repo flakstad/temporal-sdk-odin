@@ -6,7 +6,9 @@ not a reimplementation of Temporal Server or its gRPC protocol.
 Current status: Milestones 0–2 plus bounded explicit-state-machine and stackful
 fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
-Odin, and proves multiple outstanding Activities, catchable Activity failure,
+Odin, and now starts a Workflow and obtains its typed result through a public
+Odin Client over Core's generic WorkflowService RPC bridge. It also proves
+multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 `CancelTimer` alongside an Activity command, and reproduces both commands after
@@ -102,6 +104,37 @@ Run it with:
 ```bash
 ./scripts/integration-test.sh
 ```
+
+With `examples/hello_workflow` polling, the public Client example performs
+`StartWorkflowExecution`, long-polls `GetWorkflowExecutionHistory` for the
+close event, and decodes the result Payload without Temporal CLI:
+
+```bash
+./scripts/run-client-start.sh
+```
+
+The core API is intentionally small:
+
+```odin
+client, err := temporal_client.connect()
+defer temporal_client.close(&client)
+
+handle, err := temporal_client.start_workflow_json(
+    &client,
+    "order_workflow",
+    order,
+    {id = "order-42", task_queue = "orders"},
+)
+defer temporal_client.workflow_handle_free(&handle)
+
+result: Order_Result
+err = temporal_client.get_result_json(&handle, &result)
+```
+
+The Client owns its Core runtime, connection, and namespace. A Workflow handle
+owns its ID/run-ID strings but borrows the Client, so handles must be freed
+before `client.close`. The Payload variants expose the codec-neutral boundary;
+the JSON variants currently send and receive exactly one Payload.
 
 The combined example now uses the reusable registration boundary:
 
@@ -244,10 +277,12 @@ Activity, plus a retryable typed failure whose 10 ms `next_retry_delay` is
 honored before the same Activity succeeds with `activity.attempt(ctx) == 2`.
 Attempt 1 also records typed heartbeat progress; the result from attempt 2 is
 accepted only if the server-redelivered heartbeat detail decodes in Odin.
-It also starts a typed Odin Workflow with a structured object, schedules a typed
-Odin Activity, observes Core eviction and replay, and receives the structured
-Workflow result through Temporal CLI. That live path uses explicit Activity
-timeouts, retry/cancellation policy, task queue, and Activity ID; the Activity
+It also uses the new Odin Client to start a typed Odin Workflow with a
+structured object, schedules a typed Odin Activity, observes Core eviction and
+replay, and receives the structured
+Workflow result through `GetWorkflowExecutionHistory`. Temporal CLI is used
+only afterward for an independent history assertion. That live path uses
+explicit Activity timeouts, retry/cancellation policy, task queue, and Activity ID; the Activity
 returns the server-delivered Activity/Workflow identity, task queue, namespace,
 deadline presence, timeout, attempt, and effective Retry Policy as part of the
 result.
@@ -274,8 +309,9 @@ temporal/activity/        Activity context
 temporal/worker/          Activity/Workflow registry and concurrent Core polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/workflow/        explicit-state and stackful-fiber experiments
-temporal/client/          planned public client package
+temporal/client/          owned Client, Workflow handle, start/result APIs
 examples/core_connect/    Odin -> Core -> Temporal proof
+examples/client_start/    Odin Client start-and-result proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests

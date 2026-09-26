@@ -7,6 +7,7 @@ import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
 import activity "../temporal/activity"
+import temporal_client "../temporal/client"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import worker "../temporal/worker"
@@ -92,6 +93,73 @@ json_payloads_preserve_generated_values_and_metadata :: proc(t: ^testing.T) {
 		"JSON payloads preserve generated Odin values and metadata",
 		json_payload_round_trip_property,
 		{num_tests = 500, seed = 0x5041_594c_4f41_4453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+client_close_result_property :: proc(t: ^pbt.T) -> pbt.Result {
+	expected := Generated_Payload_Value{
+		name = pbt.draw(t, pbt.string_ascii(0, 32)),
+		count = pbt.draw(t, pbt.int_range(-100000, 100000)),
+		enabled = pbt.draw(t, pbt.boolean()),
+	}
+	pbt.cover(t, len(expected.name) == 0, 2.0, "empty result string")
+	pbt.cover(t, expected.enabled, 30.0, "enabled result")
+
+	owned_payload, encode_error := codec.encode_json(expected)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Client result")
+	}
+	defer codec.payload_free(&owned_payload)
+	proto_payload := proto.encode_payload(codec.payload_view(&owned_payload))
+	defer delete(proto_payload.metadata)
+	defer delete(proto_payload.external_payloads)
+	payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(payloads.payloads)
+	append(&payloads.payloads, proto_payload)
+	completed := proto.Temporal_Api_History_V1_WorkflowExecutionCompletedEventAttributes{
+		result = &payloads,
+	}
+	event := proto.Temporal_Api_History_V1_HistoryEvent{
+		event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+		attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Completed_Event_Attributes{
+			value = &completed,
+		},
+	}
+	history := proto.Temporal_Api_History_V1_History{}
+	defer delete(history.events)
+	append(&history.events, event)
+	response := proto.Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse{
+		history = &history,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse(&response)
+	page, page_error := temporal_client.decode_result_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.result_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	if page_error.message != nil || page.kind != .Completed || !page.has_payload {
+		return pbt.fail("generated close event did not produce a Client result")
+	}
+
+	actual: Generated_Payload_Value
+	decode_error := codec.decode_json(codec.payload_view(&page.payload), &actual)
+	if decode_error != .None {
+		return pbt.fail("generated Client result could not be decoded")
+	}
+	defer delete(actual.name)
+	if actual.name != expected.name || actual.count != expected.count || actual.enabled != expected.enabled {
+		return pbt.fail("Client close-event decoding changed the generated result")
+	}
+	return pbt.pass()
+}
+
+@(test)
+client_close_events_preserve_generated_results :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Client close events preserve generated results",
+		client_close_result_property,
+		{num_tests = 500, seed = 0x434c_4945_4e54_5253},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
