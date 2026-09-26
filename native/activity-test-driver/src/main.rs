@@ -156,6 +156,7 @@ impl RetryActivityDriverWorkflow {
                 RetryGreetingActivity,
                 input,
                 ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                    .heartbeat_timeout(Duration::from_secs(5))
                     .retry_policy(RetryPolicy::builder().maximum_attempts(2).build())
                     .build(),
             )
@@ -203,6 +204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let expected = serde_json::json!({
                 "message": "Hello after retry, Odin!",
                 "attempt": 2,
+                "heartbeat_completed": 17,
             });
             let handle = client
                 .start_workflow(

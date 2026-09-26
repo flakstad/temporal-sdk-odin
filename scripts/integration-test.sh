@@ -183,6 +183,16 @@ grep -q '"status": "COMPLETED"' <<<"$workflow_output"
 grep -q '"message": "Hello, Odin!"' <<<"$workflow_output"
 grep -q '"name_length": 4' <<<"$workflow_output"
 grep -q '"activity_id": "typed-greeting-options"' <<<"$workflow_output"
+grep -q '"activity_type": "typed_greeting"' <<<"$workflow_output"
+grep -q '"task_queue": "odin-hello-workflow"' <<<"$workflow_output"
+grep -q '"namespace": "default"' <<<"$workflow_output"
+grep -q "\"workflow_id\": \"$typed_workflow_id\"" <<<"$workflow_output"
+grep -q '"workflow_type": "odin_typed_workflow"' <<<"$workflow_output"
+grep -q '"attempt": 1' <<<"$workflow_output"
+grep -q '"is_workflow_activity": true' <<<"$workflow_output"
+grep -q '"has_deadline": true' <<<"$workflow_output"
+grep -q '"retry_maximum_attempts": 3' <<<"$workflow_output"
+grep -q '"heartbeat_timeout_milliseconds": 2000' <<<"$workflow_output"
 temporal workflow show \
   --workflow-id "$typed_workflow_id" \
   --command-timeout 10s \

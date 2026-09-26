@@ -17,6 +17,32 @@ Payload_View :: struct {
 	external_payloads: []Temporal_Api_Common_V1_Payload_ExternalPayloadDetails,
 }
 
+Timestamp_Value :: struct {
+	value:   time.Time,
+	present: bool,
+}
+
+Duration_Value :: struct {
+	value:   time.Duration,
+	present: bool,
+}
+
+Retry_Policy_View :: struct {
+	initial_interval:          Duration_Value,
+	backoff_coefficient:       f64,
+	maximum_interval:          Duration_Value,
+	maximum_attempts:          i32,
+	non_retryable_error_types: []string,
+	present:                   bool,
+}
+
+Priority_View :: struct {
+	priority_key:    i32,
+	fairness_key:    string,
+	fairness_weight: f32,
+	present:         bool,
+}
+
 Activity_Task :: struct {
 	kind:          Task_Kind,
 	task_token:    []u8,
@@ -24,6 +50,21 @@ Activity_Task :: struct {
 	activity_type: string,
 	attempt:       u32,
 	input:         Payload_View,
+	heartbeat_details:              []Payload_View,
+	workflow_namespace:             string,
+	workflow_type:                  string,
+	workflow_id:                    string,
+	workflow_run_id:                string,
+	activity_run_id:                string,
+	scheduled_time:                 Timestamp_Value,
+	current_attempt_scheduled_time: Timestamp_Value,
+	started_time:                   Timestamp_Value,
+	schedule_to_close_timeout:      Duration_Value,
+	start_to_close_timeout:         Duration_Value,
+	heartbeat_timeout:              Duration_Value,
+	retry_policy:                   Retry_Policy_View,
+	priority:                       Priority_View,
+	is_local:                       bool,
 	cancel_reason: Coresdk_Activity_Task_ActivityCancelReason,
 	cancel_details: Activity_Cancel_Details,
 }
@@ -60,6 +101,50 @@ payload_view :: proc(payload: ^Temporal_Api_Common_V1_Payload) -> Payload_View {
 	return result
 }
 
+timestamp_value :: proc(value: ^Google_Protobuf_Timestamp) -> Timestamp_Value {
+	if value == nil {
+		return {}
+	}
+	return {
+		value = time.unix(value.seconds, i64(value.nanos)),
+		present = true,
+	}
+}
+
+duration_value :: proc(value: ^Google_Protobuf_Duration) -> Duration_Value {
+	if value == nil {
+		return {}
+	}
+	duration := time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+	return {value = duration, present = duration > 0}
+}
+
+retry_policy_view :: proc(value: ^Temporal_Api_Common_V1_RetryPolicy) -> Retry_Policy_View {
+	if value == nil {
+		return {}
+	}
+	return {
+		initial_interval = duration_value(value.initial_interval),
+		backoff_coefficient = value.backoff_coefficient,
+		maximum_interval = duration_value(value.maximum_interval),
+		maximum_attempts = value.maximum_attempts,
+		non_retryable_error_types = value.non_retryable_error_types[:],
+		present = true,
+	}
+}
+
+priority_view :: proc(value: ^Temporal_Api_Common_V1_Priority) -> Priority_View {
+	if value == nil {
+		return {}
+	}
+	return {
+		priority_key = value.priority_key,
+		fairness_key = value.fairness_key,
+		fairness_weight = value.fairness_weight,
+		present = true,
+	}
+}
+
 clone_payload :: proc(
 	payload: ^Temporal_Api_Common_V1_Payload,
 ) -> (owned: codec.Payload, error: codec.Error) {
@@ -74,6 +159,26 @@ clone_payload :: proc(
 		}
 	}
 	for external in payload.external_payloads {
+		if codec.payload_add_external(&owned, external.size_bytes) != .None {
+			codec.payload_free(&owned)
+			return {}, .Allocation_Failed
+		}
+	}
+	return owned, .None
+}
+
+clone_payload_view :: proc(
+	view: Payload_View,
+	allocator := context.allocator,
+) -> (owned: codec.Payload, error: codec.Error) {
+	owned = codec.payload_create(view.data, allocator)
+	for entry in view.metadata {
+		if codec.payload_add_metadata(&owned, entry.key, entry.value) != .None {
+			codec.payload_free(&owned)
+			return {}, .Allocation_Failed
+		}
+	}
+	for external in view.external_payloads {
 		if codec.payload_add_external(&owned, external.size_bytes) != .None {
 			codec.payload_free(&owned)
 			return {}, .Allocation_Failed
@@ -104,8 +209,33 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 		task.activity_id = variant.value.activity_id
 		task.activity_type = variant.value.activity_type
 		task.attempt = variant.value.attempt
+		task.workflow_namespace = variant.value.workflow_namespace
+		task.workflow_type = variant.value.workflow_type
+		if variant.value.workflow_execution != nil {
+			task.workflow_id = variant.value.workflow_execution.workflow_id
+			task.workflow_run_id = variant.value.workflow_execution.run_id
+		}
+		task.activity_run_id = variant.value.run_id
+		task.scheduled_time = timestamp_value(variant.value.scheduled_time)
+		task.current_attempt_scheduled_time = timestamp_value(
+			variant.value.current_attempt_scheduled_time,
+		)
+		task.started_time = timestamp_value(variant.value.started_time)
+		task.schedule_to_close_timeout = duration_value(variant.value.schedule_to_close_timeout)
+		task.start_to_close_timeout = duration_value(variant.value.start_to_close_timeout)
+		task.heartbeat_timeout = duration_value(variant.value.heartbeat_timeout)
+		task.retry_policy = retry_policy_view(variant.value.retry_policy)
+		task.priority = priority_view(variant.value.priority)
+		task.is_local = variant.value.is_local
 		if len(variant.value.input) > 0 {
 			task.input = payload_view(&variant.value.input[0])
+		}
+		if len(variant.value.heartbeat_details) > 0 {
+			details := make([]Payload_View, len(variant.value.heartbeat_details))
+			for &payload, index in variant.value.heartbeat_details {
+				details[index] = payload_view(&payload)
+			}
+			task.heartbeat_details = details
 		}
 	case Coresdk_Activity_Task_ActivityTask_Variant_Cancel:
 		task.kind = .Cancel

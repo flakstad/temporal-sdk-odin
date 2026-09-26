@@ -17,7 +17,10 @@ correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
-cancellation. Unknown Workflow types fail the retryable Workflow Task without
+cancellation. `activity.info(ctx)` now exposes the Core-delivered execution
+identity, timestamps/timeouts, effective Retry Policy, priority, and previous
+heartbeat details as callback-scoped borrowed values; a retry integration test
+recovers typed heartbeat progress on attempt 2. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
@@ -143,6 +146,28 @@ _ = worker.register_json_activity_result(&temporal_worker, "charge", charge)
 override the next retry delay. Retryable is the default for this explicit
 result API. Payload-conversion failures are non-retryable SDK failures.
 
+Activity execution metadata is available only while the callback is running:
+
+```odin
+charge :: proc(ctx: ^activity.Context, input: Charge) -> Receipt {
+    info := activity.info(ctx)
+    fmt.printf("%s attempt %d on %s\n", info.activity_id, info.attempt, info.task_queue)
+
+    previous: Progress
+    found, decode_error := activity.heartbeat_detail_json(ctx, 0, &previous)
+    // `info`, its strings/slices, and the raw Payload view are borrowed from ctx.
+    _ = found
+    _ = decode_error
+    return process_charge(input, previous)
+}
+```
+
+Core supplies the Activity task fields, but the task queue comes from worker
+configuration. The effective Retry Policy may differ from the scheduling
+request because the Service can apply defaults or limits. `activity.deadline`
+returns the earlier applicable Schedule-to-Close and Start-to-Close deadline.
+Use `heartbeat_detail_payload` when a non-JSON codec owns the data.
+
 Typed Workflows use the same codec boundary:
 
 ```odin
@@ -217,11 +242,15 @@ worker can complete a registered Workflow afterward. Its Activity cases include
 a structured JSON object round trip between a Rust Workflow and a typed Odin
 Activity, plus a retryable typed failure whose 10 ms `next_retry_delay` is
 honored before the same Activity succeeds with `activity.attempt(ctx) == 2`.
+Attempt 1 also records typed heartbeat progress; the result from attempt 2 is
+accepted only if the server-redelivered heartbeat detail decodes in Odin.
 It also starts a typed Odin Workflow with a structured object, schedules a typed
 Odin Activity, observes Core eviction and replay, and receives the structured
 Workflow result through Temporal CLI. That live path uses explicit Activity
 timeouts, retry/cancellation policy, task queue, and Activity ID; the Activity
-returns the server-delivered ID as part of the result.
+returns the server-delivered Activity/Workflow identity, task queue, namespace,
+deadline presence, timeout, attempt, and effective Retry Policy as part of the
+result.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 

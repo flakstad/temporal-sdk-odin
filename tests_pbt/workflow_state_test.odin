@@ -190,6 +190,67 @@ activity_failures_preserve_generated_retry_contracts :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+activity_deadline_property :: proc(t: ^pbt.T) -> pbt.Result {
+	scheduled_seconds := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	started_offset := i64(pbt.draw(t, pbt.int_range(0, 2_000)))
+	schedule_timeout_seconds := i64(pbt.draw(t, pbt.int_range(1, 20_000)))
+	start_timeout_seconds := i64(pbt.draw(t, pbt.int_range(1, 20_000)))
+	has_schedule_deadline := pbt.draw(t, pbt.boolean())
+	has_attempt_deadline := pbt.draw(t, pbt.boolean())
+	if !has_schedule_deadline && !has_attempt_deadline {
+		has_attempt_deadline = true
+	}
+	scheduled := time.unix(scheduled_seconds, 0)
+	started := time.unix(scheduled_seconds + started_offset, 0)
+	schedule_timeout := time.Duration(schedule_timeout_seconds) * time.Second
+	start_timeout := time.Duration(start_timeout_seconds) * time.Second
+	schedule_deadline_ns := time.to_unix_nanoseconds(time.time_add(scheduled, schedule_timeout))
+	attempt_deadline_ns := time.to_unix_nanoseconds(time.time_add(started, start_timeout))
+	pbt.cover(
+		t,
+		has_schedule_deadline && has_attempt_deadline && schedule_deadline_ns < attempt_deadline_ns,
+		10.0,
+		"Schedule-to-Close wins",
+	)
+	pbt.cover(
+		t,
+		has_schedule_deadline && has_attempt_deadline && attempt_deadline_ns <= schedule_deadline_ns,
+		10.0,
+		"Start-to-Close wins",
+	)
+	pbt.cover(t, has_schedule_deadline && !has_attempt_deadline, 10.0, "only Schedule-to-Close")
+	pbt.cover(t, !has_schedule_deadline && has_attempt_deadline, 10.0, "only Start-to-Close")
+
+	actual, present := worker.activity_deadline(
+		{value = scheduled, present = has_schedule_deadline},
+		{value = started, present = has_attempt_deadline},
+		{value = schedule_timeout, present = has_schedule_deadline},
+		{value = start_timeout, present = has_attempt_deadline},
+	)
+	if !present {
+		return pbt.fail("a generated Activity deadline unexpectedly disappeared")
+	}
+	expected_ns := attempt_deadline_ns
+	if has_schedule_deadline && (!has_attempt_deadline || schedule_deadline_ns < attempt_deadline_ns) {
+		expected_ns = schedule_deadline_ns
+	}
+	if time.to_unix_nanoseconds(actual) != expected_ns {
+		return pbt.fail("Activity deadline was not the earliest applicable timeout")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_deadline_is_earliest_applicable_timeout :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity deadline is the earliest applicable timeout",
+		activity_deadline_property,
+		{num_tests = 500, seed = 0x4143_5449_5649_5459},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Generated_Workflow_Output :: struct {
 	name:    string,
 	count:   int,

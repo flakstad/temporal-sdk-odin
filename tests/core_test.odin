@@ -1719,6 +1719,145 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 }
 
 @(test)
+activity_context_info_survives_task_decode_arena :: proc(t: ^testing.T) {
+	heartbeat_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`{"completed":17}`),
+	}
+	defer delete(heartbeat_payload.metadata)
+	append(
+		&heartbeat_payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	scheduled_time := proto.Google_Protobuf_Timestamp{seconds = 1_000, nanos = 123}
+	attempt_scheduled_time := proto.Google_Protobuf_Timestamp{seconds = 1_019, nanos = 456}
+	started_time := proto.Google_Protobuf_Timestamp{seconds = 1_020, nanos = 789}
+	schedule_to_close := proto.Google_Protobuf_Duration{seconds = 60}
+	start_to_close := proto.Google_Protobuf_Duration{seconds = 20}
+	heartbeat_timeout := proto.Google_Protobuf_Duration{seconds = 5}
+	retry_initial := proto.Google_Protobuf_Duration{seconds = 1}
+	retry_maximum := proto.Google_Protobuf_Duration{seconds = 30}
+	retry_policy := proto.Temporal_Api_Common_V1_RetryPolicy{
+		initial_interval = &retry_initial,
+		backoff_coefficient = 2.5,
+		maximum_interval = &retry_maximum,
+		maximum_attempts = 7,
+	}
+	defer delete(retry_policy.non_retryable_error_types)
+	append(&retry_policy.non_retryable_error_types, "PermanentFailure")
+	priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 42,
+		fairness_key = "account-7",
+		fairness_weight = 1.5,
+	}
+	workflow_execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "workflow-id",
+		run_id = "workflow-run-id",
+	}
+	start := proto.Coresdk_Activity_Task_Start{
+		workflow_namespace = "business-namespace",
+		workflow_type = "OrderWorkflow",
+		workflow_execution = &workflow_execution,
+		activity_id = "charge-card-17",
+		activity_type = "charge_card",
+		scheduled_time = &scheduled_time,
+		current_attempt_scheduled_time = &attempt_scheduled_time,
+		started_time = &started_time,
+		attempt = 3,
+		schedule_to_close_timeout = &schedule_to_close,
+		start_to_close_timeout = &start_to_close,
+		heartbeat_timeout = &heartbeat_timeout,
+		retry_policy = &retry_policy,
+		priority = &priority,
+	}
+	defer delete(start.heartbeat_details)
+	append(&start.heartbeat_details, heartbeat_payload)
+	raw_task := proto.Coresdk_Activity_Task_ActivityTask{
+		task_token = transmute([]u8)string("context-task-token"),
+		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Start{value = &start},
+	}
+	encoded := proto.encode_Coresdk_Activity_Task_ActivityTask(&raw_task)
+	defer delete(encoded)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		testing.expect(t, false)
+		return
+	}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded_task, decode_error := proto.decode_activity_task(encoded[:])
+	context.allocator = previous_allocator
+	testing.expect(t, decode_error == .None)
+	task_token := bytes.clone(decoded_task.task_token)
+	defer delete(task_token)
+	sdk_worker := worker.Worker{
+		namespace = "fallback-namespace",
+		task_queue = "activity-task-queue",
+	}
+	owner := worker.Activity_Info_Owner{}
+	owner_error := worker.activity_info_owner_init(
+		&owner,
+		&sdk_worker,
+		&decoded_task,
+		task_token,
+	)
+	virtual.arena_destroy(&decode_arena)
+	defer worker.activity_info_owner_destroy(&owner)
+	testing.expect(t, owner_error.message == nil)
+	defer worker.error_free(&owner_error)
+	if owner_error.message != nil {
+		return
+	}
+
+	ctx := activity.Context{}
+	activity.context_init_info(&ctx, owner.info, nil, nil)
+	info := activity.info(&ctx)
+	testing.expect_value(t, info.activity_id, "charge-card-17")
+	testing.expect_value(t, info.activity_type, "charge_card")
+	testing.expect_value(t, info.attempt, u32(3))
+	testing.expect_value(t, info.namespace, "business-namespace")
+	testing.expect_value(t, info.task_queue, "activity-task-queue")
+	testing.expect_value(t, string(info.task_token), "context-task-token")
+	testing.expect_value(t, info.workflow_id, "workflow-id")
+	testing.expect_value(t, info.workflow_run_id, "workflow-run-id")
+	testing.expect_value(t, info.workflow_type, "OrderWorkflow")
+	testing.expect(t, activity.is_workflow_activity(&ctx))
+	testing.expect(t, info.has_scheduled_time)
+	testing.expect(t, info.has_current_attempt_scheduled_time)
+	testing.expect(t, info.has_started_time)
+	testing.expect_value(t, time.to_unix_nanoseconds(info.scheduled_time), i64(1_000_000_000_123))
+	testing.expect_value(t, info.schedule_to_close_timeout, 60 * time.Second)
+	testing.expect_value(t, info.start_to_close_timeout, 20 * time.Second)
+	testing.expect_value(t, info.heartbeat_timeout, 5 * time.Second)
+	deadline, deadline_present := activity.deadline(&ctx)
+	testing.expect(t, deadline_present)
+	testing.expect_value(t, time.to_unix_nanoseconds(deadline), i64(1_040_000_000_789))
+	testing.expect(t, info.has_retry_policy)
+	testing.expect_value(t, info.retry_policy.initial_interval, time.Second)
+	testing.expect_value(t, info.retry_policy.backoff_coefficient, 2.5)
+	testing.expect_value(t, info.retry_policy.maximum_interval, 30 * time.Second)
+	testing.expect_value(t, info.retry_policy.maximum_attempts, i32(7))
+	testing.expect_value(t, len(info.retry_policy.non_retryable_error_types), 1)
+	if len(info.retry_policy.non_retryable_error_types) == 1 {
+		testing.expect_value(t, info.retry_policy.non_retryable_error_types[0], "PermanentFailure")
+	}
+	testing.expect(t, info.has_priority)
+	testing.expect_value(t, info.priority.priority_key, i32(42))
+	testing.expect_value(t, info.priority.fairness_key, "account-7")
+	testing.expect_value(t, info.priority.fairness_weight, f32(1.5))
+	progress: Heartbeat_Progress
+	found, detail_error := activity.heartbeat_detail_json(&ctx, 0, &progress)
+	testing.expect(t, found)
+	testing.expect(t, detail_error == .None)
+	testing.expect_value(t, progress.completed, 17)
+	_, missing := activity.heartbeat_detail_payload(&ctx, 1)
+	testing.expect(t, !missing)
+}
+
+@(test)
 activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 	cancel_details := proto.Coresdk_Activity_Task_ActivityCancellationDetails{
 		is_cancelled = true,

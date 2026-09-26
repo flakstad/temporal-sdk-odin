@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
 import "core:thread"
+import "core:time"
 import activity "../activity"
 import codec "../codec"
 import temporal_core "../core"
@@ -484,10 +485,178 @@ Activity_Execution :: struct {
 	callback_data: rawptr,
 	invoke:        Activity_Invoke_Proc,
 	task_token:    []u8,
-	activity_id: string,
-	input:       codec.Payload,
-	ctx:         activity.Context,
-	error:       Error,
+	input:         codec.Payload,
+	info_owner:    Activity_Info_Owner,
+	ctx:           activity.Context,
+	error:         Error,
+}
+
+Activity_Info_Owner :: struct {
+	info:                    activity.Info,
+	owned_strings:           [dynamic]string,
+	heartbeat_details:       [dynamic]codec.Payload,
+	heartbeat_detail_views:  [dynamic]codec.Payload_View,
+	retry_error_type_views:  [dynamic]string,
+}
+
+activity_info_owner_clone_string :: proc(
+	owner: ^Activity_Info_Owner,
+	value: string,
+) -> (owned: string, ok: bool) {
+	if len(value) == 0 {
+		return "", true
+	}
+	cloned, allocation_error := strings.clone(value, allocator_runtime.heap_allocator())
+	if allocation_error != nil {
+		return "", false
+	}
+	owned = cloned
+	append(&owner.owned_strings, owned)
+	return owned, true
+}
+
+activity_deadline :: proc(
+	scheduled_time: proto.Timestamp_Value,
+	started_time: proto.Timestamp_Value,
+	schedule_to_close_timeout: proto.Duration_Value,
+	start_to_close_timeout: proto.Duration_Value,
+) -> (deadline: time.Time, present: bool) {
+	if scheduled_time.present && schedule_to_close_timeout.present {
+		deadline = time.time_add(scheduled_time.value, schedule_to_close_timeout.value)
+		present = true
+	}
+	if started_time.present && start_to_close_timeout.present {
+		attempt_deadline := time.time_add(started_time.value, start_to_close_timeout.value)
+		if !present || time.to_unix_nanoseconds(attempt_deadline) < time.to_unix_nanoseconds(deadline) {
+			deadline = attempt_deadline
+			present = true
+		}
+	}
+	return
+}
+
+activity_info_owner_destroy :: proc(owner: ^Activity_Info_Owner) {
+	if owner == nil {
+		return
+	}
+	for &payload in owner.heartbeat_details {
+		codec.payload_free(&payload)
+	}
+	for value in owner.owned_strings {
+		delete(value, allocator_runtime.heap_allocator())
+	}
+	delete(owner.heartbeat_details)
+	delete(owner.heartbeat_detail_views)
+	delete(owner.retry_error_type_views)
+	delete(owner.owned_strings)
+	owner^ = {}
+}
+
+activity_info_owner_init :: proc(
+	owner: ^Activity_Info_Owner,
+	worker: ^Worker,
+	task: ^proto.Activity_Task,
+	task_token: []u8,
+) -> Error {
+	if owner == nil || worker == nil || task == nil {
+		return error_from_string("could not initialize Activity info")
+	}
+	heap := allocator_runtime.heap_allocator()
+	owner.owned_strings = make([dynamic]string, heap)
+	owner.heartbeat_details = make([dynamic]codec.Payload, heap)
+	owner.heartbeat_detail_views = make([dynamic]codec.Payload_View, heap)
+	owner.retry_error_type_views = make([dynamic]string, heap)
+
+	clone_ok: bool
+	owner.info.activity_id, clone_ok = activity_info_owner_clone_string(owner, task.activity_id)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	owner.info.activity_type, clone_ok = activity_info_owner_clone_string(owner, task.activity_type)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	owner.info.activity_run_id, clone_ok = activity_info_owner_clone_string(owner, task.activity_run_id)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	owner.info.namespace, clone_ok = activity_info_owner_clone_string(owner, task.workflow_namespace)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	if len(owner.info.namespace) == 0 {
+		owner.info.namespace, clone_ok = activity_info_owner_clone_string(owner, worker.namespace)
+		if !clone_ok do return error_from_string("could not allocate Activity info")
+	}
+	owner.info.task_queue, clone_ok = activity_info_owner_clone_string(owner, worker.task_queue)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	owner.info.workflow_id, clone_ok = activity_info_owner_clone_string(owner, task.workflow_id)
+	if !clone_ok do return error_from_string("could not allocate Activity info")
+	if len(owner.info.workflow_id) > 0 {
+		owner.info.workflow_namespace, clone_ok = activity_info_owner_clone_string(
+			owner,
+			task.workflow_namespace,
+		)
+		if !clone_ok do return error_from_string("could not allocate Activity info")
+		owner.info.workflow_run_id, clone_ok = activity_info_owner_clone_string(owner, task.workflow_run_id)
+		if !clone_ok do return error_from_string("could not allocate Activity info")
+		owner.info.workflow_type, clone_ok = activity_info_owner_clone_string(owner, task.workflow_type)
+		if !clone_ok do return error_from_string("could not allocate Activity info")
+	}
+	owner.info.attempt = task.attempt
+	owner.info.task_token = task_token
+	owner.info.is_local = task.is_local
+	owner.info.scheduled_time = task.scheduled_time.value
+	owner.info.has_scheduled_time = task.scheduled_time.present
+	owner.info.current_attempt_scheduled_time = task.current_attempt_scheduled_time.value
+	owner.info.has_current_attempt_scheduled_time = task.current_attempt_scheduled_time.present
+	owner.info.started_time = task.started_time.value
+	owner.info.has_started_time = task.started_time.present
+	owner.info.schedule_to_close_timeout = task.schedule_to_close_timeout.value
+	owner.info.has_schedule_to_close_timeout = task.schedule_to_close_timeout.present
+	owner.info.start_to_close_timeout = task.start_to_close_timeout.value
+	owner.info.has_start_to_close_timeout = task.start_to_close_timeout.present
+	owner.info.heartbeat_timeout = task.heartbeat_timeout.value
+	owner.info.has_heartbeat_timeout = task.heartbeat_timeout.present
+	owner.info.deadline, owner.info.has_deadline = activity_deadline(
+		task.scheduled_time,
+		task.started_time,
+		task.schedule_to_close_timeout,
+		task.start_to_close_timeout,
+	)
+
+	owner.info.has_retry_policy = task.retry_policy.present
+	if task.retry_policy.present {
+		owner.info.retry_policy = activity.Retry_Policy{
+			initial_interval = task.retry_policy.initial_interval.value,
+			has_initial_interval = task.retry_policy.initial_interval.present,
+			backoff_coefficient = task.retry_policy.backoff_coefficient,
+			maximum_interval = task.retry_policy.maximum_interval.value,
+			has_maximum_interval = task.retry_policy.maximum_interval.present,
+			maximum_attempts = task.retry_policy.maximum_attempts,
+		}
+		for error_type in task.retry_policy.non_retryable_error_types {
+			owned_error_type, type_ok := activity_info_owner_clone_string(owner, error_type)
+			if !type_ok do return error_from_string("could not allocate Activity Retry Policy")
+			append(&owner.retry_error_type_views, owned_error_type)
+		}
+		owner.info.retry_policy.non_retryable_error_types = owner.retry_error_type_views[:]
+	}
+	owner.info.has_priority = task.priority.present
+	if task.priority.present {
+		fairness_key, fairness_ok := activity_info_owner_clone_string(owner, task.priority.fairness_key)
+		if !fairness_ok do return error_from_string("could not allocate Activity priority")
+		owner.info.priority = activity.Priority{
+			priority_key = task.priority.priority_key,
+			fairness_key = fairness_key,
+			fairness_weight = task.priority.fairness_weight,
+		}
+	}
+
+	for detail in task.heartbeat_details {
+		owned_detail, clone_error := proto.clone_payload_view(detail, heap)
+		if clone_error != .None {
+			return error_from_string("could not allocate Activity heartbeat details")
+		}
+		append(&owner.heartbeat_details, owned_detail)
+	}
+	for &detail in owner.heartbeat_details {
+		append(&owner.heartbeat_detail_views, codec.payload_view(&detail))
+	}
+	owner.info.heartbeat_details = owner.heartbeat_detail_views[:]
+	return {}
 }
 
 activity_cancel_reason :: proc(reason: proto.Coresdk_Activity_Task_ActivityCancelReason) -> activity.Cancel_Reason {
@@ -597,8 +766,8 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 		return
 	}
 	delete(execution.task_token)
-	delete(execution.activity_id)
 	codec.payload_free(&execution.input)
+	activity_info_owner_destroy(&execution.info_owner)
 	error_free(&execution.error)
 	free(execution)
 }
@@ -638,16 +807,19 @@ activity_execution_start :: proc(
 	execution.invoke = registration.invoke
 	execution.task_token = bytes.clone(task.task_token)
 	execution.input = input
-	owned_activity_id, allocation_error := strings.clone(task.activity_id)
-	if allocation_error != nil {
+	info_error := activity_info_owner_init(
+		&execution.info_owner,
+		worker,
+		task,
+		execution.task_token,
+	)
+	if info_error.message != nil {
 		activity_execution_destroy(execution)
-		return nil, error_from_string("could not allocate Activity execution")
+		return nil, info_error
 	}
-	execution.activity_id = owned_activity_id
-	activity.context_init(
+	activity.context_init_info(
 		&execution.ctx,
-		execution.activity_id,
-		task.attempt,
+		execution.info_owner.info,
 		cast(rawptr)execution,
 		activity_heartbeat_recorder,
 	)

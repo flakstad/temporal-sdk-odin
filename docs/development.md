@@ -157,6 +157,29 @@ three send one Temporal Payload through
 throttling, and any server cancellation response returns later through the
 normal Activity poll stream.
 
+`activity.info(ctx)` returns callback-scoped execution metadata copied from
+Core's `ActivityTask.Start`: Activity and Workflow identity, namespace, attempt,
+timestamps, timeouts, effective Retry Policy, priority, local/remote state, and
+previous heartbeat details. The worker supplies its configured task queue
+because that value is not part of the Core start message. All strings, slices,
+task-token bytes, and Payload views are borrowed from the context and must not
+escape the callback.
+
+```odin
+info := activity.info(ctx)
+deadline, has_deadline := activity.deadline(ctx)
+
+progress: Progress
+found, decode_error := activity.heartbeat_detail_json(ctx, 0, &progress)
+raw_detail, raw_found := activity.heartbeat_detail_payload(ctx, 0)
+```
+
+Missing heartbeat indexes return `found = false` without a codec error. JSON
+decode failures return `found = true` plus the codec error. The raw accessor is
+the codec-neutral boundary. Deadline is derived from the earliest applicable
+Schedule-to-Close and Start-to-Close endpoint; `has_deadline` is false only
+when Core omitted the required timestamp/timeout pairs.
+
 Activities can be registered at four levels:
 
 ```odin
@@ -319,15 +342,18 @@ encode Activity Tasks and decode Odin's success/failure completions.
 The typed retry case returns a retryable `TransientGreetingError` with JSON
 details and `next_retry_delay = 10 ms` on attempt 1. Core and the dev server
 schedule attempt 2; the Odin callback observes `activity.attempt(ctx) == 2`,
-returns success, and the driver receives the typed result. The bounded test
+decodes the previous typed heartbeat detail, returns success, and the driver
+receives the typed result. This proves heartbeat progress crossed Core and the
+Service rather than remaining in Odin memory. The bounded test
 worker therefore consumes two Activity Tasks before shutdown.
 
 A separate live case starts `odin_typed_workflow` with
 `{name: "Odin", salutation: "Hello"}`. Odin preserves that Payload into a
 typed Activity command, Core evicts the Workflow, fresh-stack replay reproduces
 the same command, and the resolved object becomes the Workflow completion.
-Temporal CLI receives `{message: "Hello, Odin!", name_length: 4,
-activity_id: "typed-greeting-options"}`. The test reads history back from the
+Temporal CLI receives the greeting plus the Activity/Workflow identity, task
+queue, namespace, deadline presence, heartbeat timeout, attempt, and effective
+retry attempt limit observed by the Activity callback. The test reads history back from the
 Service and verifies the configured Activity ID, four timeouts, retry timing,
 attempt limit, and non-retryable failure type.
 
@@ -357,6 +383,10 @@ after cancellation becomes visible. A second 500-case property generates
 retryable/non-retryable Application Failures, type strings, JSON details, and
 default/explicit retry delays, then round-trips every field through the Core
 completion protobuf. Both suites pass against the pin and `~/Projects/pbt`.
+The Activity-context property adds 500 timestamp/timeout combinations and
+requires the derived deadline to be the earliest applicable endpoint. A unit
+test separately destroys the protobuf decode arena before reading every copied
+context field and decoding a heartbeat detail.
 The Workflow Payload property adds another 500 generated structs, creates and
 evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,

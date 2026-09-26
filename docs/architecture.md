@@ -12,7 +12,9 @@ structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
 commands/results, completion, eviction, and replay, with typed JSON adapters
 above that boundary. Workflow Activity options are represented explicitly and
-preserved across fresh-stack replay.
+preserved across fresh-stack replay. Activity context now carries heap-stable
+execution identity, timestamps/timeouts, effective Retry Policy, priority, and
+generic heartbeat details copied from Core before the poll decode arena dies.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -151,6 +153,50 @@ failed, cancelled, or asynchronously completing. Heartbeats are a separate
 protobuf call. Core sends the correct server RPC and manages server-facing
 activity mechanics; Odin owns procedure invocation, cancellation delivery,
 heartbeat API surface, payload conversion, failures, and activity concurrency.
+
+### Activity execution context boundary
+
+Core's `coresdk.activity_task.Start` is also the source of Activity execution
+metadata. The Odin adapter now maps it as follows:
+
+| Odin `activity.Info` value | Source |
+| --- | --- |
+| Activity ID/type/attempt and standalone Activity run ID | `Start` |
+| Workflow ID/run ID/type/namespace | `Start.workflow_execution` and adjacent fields |
+| Scheduled/current-attempt-scheduled/started timestamps | protobuf timestamps in `Start` |
+| Schedule-to-Close, Start-to-Close, and heartbeat timeouts | protobuf durations in `Start` |
+| Retry Policy | `Start.retry_policy`; this is the Service's effective policy, not necessarily the request |
+| Priority and local/remote flag | `Start.priority` and `Start.is_local` |
+| Previous heartbeat details | repeated generic Temporal Payloads in `Start.heartbeat_details` |
+| Task queue | language worker configuration; it is not present in `Start` |
+| Namespace fallback | worker/client namespace when Core sends an empty workflow namespace |
+
+This matches the construction boundary used by the current
+[.NET](https://github.com/temporalio/sdk-dotnet/blob/f8b622e45ec553cbfeee8c508c4a7a989a1292c6/src/Temporalio/Worker/ActivityWorker.cs)
+and [Python](https://github.com/temporalio/sdk-python/blob/main/temporalio/worker/_activity.py)
+SDKs: they decode Core's start message and add the worker task queue. Both also
+preserve heartbeat details as generic payloads and surface the effective Retry
+Policy. Core does not send one explicit deadline. Odin derives one when enough
+data is present by taking the earlier of `scheduled_time +
+schedule_to_close_timeout` and `started_time + start_to_close_timeout`. The
+`started_time` field is explicitly defined by Core as the instant Core received
+the attempt through polling.
+
+All generated protobuf strings, repeated fields, and payload bytes initially
+borrow the per-poll decode arena. Before that arena is destroyed, the worker
+copies every value used by the callback into a heap-stable Activity execution
+record and its `Activity_Info_Owner`. `activity.Info`, its nested slices, `task_token`, and
+values returned by `heartbeat_detail_payload` are borrowed from that owner and
+are valid only until the callback returns. Destruction frees heartbeat Payload
+metadata/data, retry-type strings, identity strings, and the execution-owned
+task token exactly once. A unit test destroys the decode arena before reading the full context to
+exercise this ownership boundary.
+
+`heartbeat_detail_json` is only a convenience over the generic Payload view.
+The live retry case records JSON progress on attempt 1, fails retryably, and
+requires attempt 2 to recover the server-redelivered detail. Thus the tested
+path is Odin → Core → Service → Core → a fresh Odin Activity context, rather
+than only an in-process codec round trip.
 
 ### Workflow activations and completions
 
@@ -1045,7 +1091,7 @@ Workflows are enabled.
    limit as Core's Activity slot supplier. Structured retryable/non-retryable
    failures now pass generated and live retry tests. It still uses a linear
    in-flight lookup and lacks load/backpressure, process-level panic
-   containment, deadline, and
+   containment and
    shutdown-timeout stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
@@ -1064,8 +1110,9 @@ Workflows are enabled.
    exposes only status and message. Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
    The Activity API now models typed success, retryability, failure type,
-   details, and next-retry delay, but still needs deadline/execution metadata
-   and a process-isolation policy for panics. Typed JSON decode/encode errors
+   details, next-retry delay, deadline/execution metadata, effective Retry
+   Policy, and prior heartbeat details, but still needs a process-isolation
+   policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
@@ -1089,24 +1136,26 @@ a comparison point; it is not yet enough to freeze the public API.
 Activity concurrency, task-token routing, cooperative cancel delivery,
 heartbeat transport, typed JSON Payloads, structured user failures with a real
 server-directed retry, generic Workflow Payloads, and replay-safe Activity
-options are now proven live. The PBT suites generate 500 Payload values, 500
+options are now proven live. Activity context identity, timeouts, effective
+Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
+proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
-Activity-option command/replay cases against both the pinned library and
-`~/Projects/pbt`.
+Activity-option command/replay cases, plus 500 Activity deadline combinations,
+against both the pinned library and `~/Projects/pbt`.
 
-The next vertical milestone should populate Activity context from Core's
-`ActivityTask.Start`: deadline, all execution timestamps/timeouts, effective
-Retry Policy, heartbeat details, Workflow identity, namespace, Activity type,
-and task queue. The worker must copy every borrowed protobuf field before its
-decode arena is destroyed, and heartbeat details should use the generic Payload
-boundary rather than assume JSON.
+The next smallest vertical milestone should be a minimal public Client slice:
+generate the required Temporal API request/response graph, start a Workflow
+from Odin through Core's generic RPC call, and obtain its result without the
+Temporal CLI or Rust test driver. Keep request IDs and Payload conversion in
+the language layer and do not expand into a broad client API until this one
+operation is proven live.
 
 After that, extend the same Payload adapter pattern to typed signals and typed
 Activity failure details in Workflow code, then stress pool
 shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
 designed as subprocess isolation unless Odin gains supported recovery. A
-statechart oracle becomes worthwhile when option-driven deadlines and
-retry/cancellation interleavings create additional states. User Workflow
+statechart oracle becomes worthwhile when retry/cancellation/shutdown
+interleavings create additional states. User Workflow
 cancellation scopes remain a separate Workflow-runtime change.
 
 In parallel, add CI compile/smoke jobs

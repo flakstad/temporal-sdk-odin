@@ -19,9 +19,19 @@ Typed_Greeting_Input :: struct {
 }
 
 Typed_Greeting_Output :: struct {
-	message:     string,
-	name_length: int,
-	activity_id: string,
+	message:                        string,
+	name_length:                    int,
+	activity_id:                    string,
+	activity_type:                  string,
+	task_queue:                     string,
+	namespace:                      string,
+	workflow_id:                    string,
+	workflow_type:                  string,
+	attempt:                        u32,
+	is_workflow_activity:           bool,
+	has_deadline:                   bool,
+	retry_maximum_attempts:         i32,
+	heartbeat_timeout_milliseconds: i64,
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
@@ -56,10 +66,25 @@ typed_greeting :: proc(ctx: ^activity.Context, input: Typed_Greeting_Input) -> T
 	if allocation_error != nil {
 		return {}
 	}
+	info := activity.info(ctx)
+	heartbeat_timeout_milliseconds := i64(0)
+	if info.has_heartbeat_timeout {
+		heartbeat_timeout_milliseconds = i64(info.heartbeat_timeout / time.Millisecond)
+	}
 	return {
 		message = message,
 		name_length = len(input.name),
-		activity_id = activity.activity_id(ctx),
+		activity_id = info.activity_id,
+		activity_type = info.activity_type,
+		task_queue = info.task_queue,
+		namespace = info.namespace,
+		workflow_id = info.workflow_id,
+		workflow_type = info.workflow_type,
+		attempt = info.attempt,
+		is_workflow_activity = activity.is_workflow_activity(ctx),
+		has_deadline = info.has_deadline,
+		retry_maximum_attempts = info.retry_policy.maximum_attempts,
+		heartbeat_timeout_milliseconds = heartbeat_timeout_milliseconds,
 	}
 }
 

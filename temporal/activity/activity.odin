@@ -111,6 +111,58 @@ Payload_Result :: struct {
 	failure: Application_Failure,
 }
 
+Retry_Policy :: struct {
+	initial_interval:          time.Duration,
+	has_initial_interval:      bool,
+	backoff_coefficient:       f64,
+	maximum_interval:          time.Duration,
+	has_maximum_interval:      bool,
+	maximum_attempts:          i32,
+	non_retryable_error_types: []string,
+}
+
+Priority :: struct {
+	priority_key:    i32,
+	fairness_key:    string,
+	fairness_weight: f32,
+}
+
+// Info and all nested slices borrow their backing storage from Context. They
+// are valid only for the duration of the Activity callback.
+Info :: struct {
+	activity_id:     string,
+	activity_type:   string,
+	activity_run_id: string,
+	attempt:         u32,
+	namespace:       string,
+	task_queue:      string,
+	task_token:      []u8,
+	workflow_id:        string,
+	workflow_namespace: string,
+	workflow_run_id:    string,
+	workflow_type:      string,
+	is_local: bool,
+	scheduled_time:                 time.Time,
+	has_scheduled_time:             bool,
+	current_attempt_scheduled_time: time.Time,
+	has_current_attempt_scheduled_time: bool,
+	started_time:     time.Time,
+	has_started_time: bool,
+	schedule_to_close_timeout:     time.Duration,
+	has_schedule_to_close_timeout: bool,
+	start_to_close_timeout:        time.Duration,
+	has_start_to_close_timeout:    bool,
+	heartbeat_timeout:     time.Duration,
+	has_heartbeat_timeout: bool,
+	deadline:     time.Time,
+	has_deadline: bool,
+	retry_policy:     Retry_Policy,
+	has_retry_policy: bool,
+	priority:     Priority,
+	has_priority: bool,
+	heartbeat_details: []codec.Payload_View,
+}
+
 payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
 	return {status = .Completed, payload = payload}
 }
@@ -133,8 +185,7 @@ payload_fail :: proc(
 }
 
 Context :: struct {
-	activity_id: string,
-	attempt:     u32,
+	info_value: Info,
 	cancel_requested: bool,
 	cancel_reason:    Cancel_Reason,
 	heartbeat_user_data: rawptr,
@@ -149,8 +200,23 @@ context_init :: proc(
 	heartbeat_recorder: Heartbeat_Recorder,
 ) {
 	ctx^ = Context{
-		activity_id = activity_id,
-		attempt = attempt,
+		info_value = Info{activity_id = activity_id, attempt = attempt},
+		heartbeat_user_data = heartbeat_user_data,
+		heartbeat_recorder = heartbeat_recorder,
+	}
+}
+
+context_init_info :: proc(
+	ctx: ^Context,
+	activity_info: Info,
+	heartbeat_user_data: rawptr,
+	heartbeat_recorder: Heartbeat_Recorder,
+) {
+	if ctx == nil {
+		return
+	}
+	ctx^ = Context{
+		info_value = activity_info,
 		heartbeat_user_data = heartbeat_user_data,
 		heartbeat_recorder = heartbeat_recorder,
 	}
@@ -179,14 +245,54 @@ activity_id :: proc(ctx: ^Context) -> string {
 	if ctx == nil {
 		return ""
 	}
-	return ctx.activity_id
+	return ctx.info_value.activity_id
 }
 
 attempt :: proc(ctx: ^Context) -> u32 {
 	if ctx == nil {
 		return 0
 	}
-	return ctx.attempt
+	return ctx.info_value.attempt
+}
+
+info :: proc(ctx: ^Context) -> Info {
+	if ctx == nil {
+		return {}
+	}
+	return ctx.info_value
+}
+
+is_workflow_activity :: proc(ctx: ^Context) -> bool {
+	return ctx != nil && len(ctx.info_value.workflow_id) > 0
+}
+
+deadline :: proc(ctx: ^Context) -> (value: time.Time, present: bool) {
+	if ctx == nil || !ctx.info_value.has_deadline {
+		return
+	}
+	return ctx.info_value.deadline, true
+}
+
+heartbeat_detail_payload :: proc(
+	ctx: ^Context,
+	index: int,
+) -> (payload: codec.Payload_View, found: bool) {
+	if ctx == nil || index < 0 || index >= len(ctx.info_value.heartbeat_details) {
+		return
+	}
+	return ctx.info_value.heartbeat_details[index], true
+}
+
+heartbeat_detail_json :: proc(
+	ctx: ^Context,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := heartbeat_detail_payload(ctx, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
 }
 
 heartbeat_payload :: proc(ctx: ^Context, details: codec.Payload_View) -> Heartbeat_Status {

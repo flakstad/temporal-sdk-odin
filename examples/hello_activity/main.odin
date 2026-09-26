@@ -27,13 +27,18 @@ Retry_Greeting_Input :: struct {
 }
 
 Retry_Greeting_Output :: struct {
-	message: string,
-	attempt: u32,
+	message:             string,
+	attempt:             u32,
+	heartbeat_completed: int,
 }
 
 Retry_Failure_Details :: struct {
 	dependency: string,
 	attempt:    u32,
+}
+
+Retry_Heartbeat_Details :: struct {
+	completed: int,
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
@@ -80,12 +85,31 @@ retry_greeting :: proc(
 ) -> activity.Result(Retry_Greeting_Output) {
 	current_attempt := activity.attempt(ctx)
 	if current_attempt == 1 {
+		heartbeat_status := activity.heartbeat_json(ctx, Retry_Heartbeat_Details{completed = 17})
+		if heartbeat_status != .Recorded {
+			return activity.result_failure(
+				Retry_Greeting_Output,
+				"could not record retry progress heartbeat",
+				failure_type = "OdinHeartbeatError",
+				non_retryable = true,
+			)
+		}
 		return activity.result_failure_json(
 			Retry_Greeting_Output,
 			"greeting dependency is temporarily unavailable",
 			Retry_Failure_Details{dependency = "greeting-service", attempt = current_attempt},
 			failure_type = "TransientGreetingError",
 			next_retry_delay = 10 * time.Millisecond,
+		)
+	}
+	heartbeat_details: Retry_Heartbeat_Details
+	detail_found, detail_error := activity.heartbeat_detail_json(ctx, 0, &heartbeat_details)
+	if !detail_found || detail_error != .None {
+		return activity.result_failure(
+			Retry_Greeting_Output,
+			"retry did not receive the previous heartbeat details",
+			failure_type = "OdinHeartbeatDetailsError",
+			non_retryable = true,
 		)
 	}
 	message, allocation_error := strings.concatenate({"Hello after retry, ", input.name, "!"})
@@ -98,7 +122,11 @@ retry_greeting :: proc(
 		)
 	}
 	return activity.result_success(
-		Retry_Greeting_Output{message = message, attempt = current_attempt},
+		Retry_Greeting_Output{
+			message = message,
+			attempt = current_attempt,
+			heartbeat_completed = heartbeat_details.completed,
+		},
 	)
 }
 
