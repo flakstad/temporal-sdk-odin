@@ -120,6 +120,7 @@ Activity_Future :: struct {
 Activity_Result_Status :: enum {
 	Succeeded,
 	Failed,
+	Canceled,
 }
 
 Activity_Retry_State :: enum {
@@ -184,6 +185,7 @@ Json_Activity_Result :: struct(T: typeid) {
 Signal_Wait_Status :: enum {
 	Received,
 	Timed_Out,
+	Canceled,
 }
 
 Signal_Wait_Result :: struct {
@@ -199,6 +201,11 @@ Payload_Signal_Wait_Result :: struct {
 Json_Signal_Wait_Result :: struct(T: typeid) {
 	status: Signal_Wait_Status,
 	value:  T,
+}
+
+Cancellation_Scope :: struct {
+	instance: ^Fiber_Instance,
+	active:   bool,
 }
 
 Fiber_Activity_Operation :: struct {
@@ -242,6 +249,8 @@ Fiber_Instance :: struct {
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	cancellation_reason:  string,
+	cancellation_requested: bool,
+	detached_scope_depth:   int,
 	terminal_command_sent: bool,
 	unhandled_activity_seq: u32,
 	failure_message:       string,
@@ -481,6 +490,11 @@ fiber_entry :: proc "c" (user_data: rawptr) {
 		instance.phase = .Failed
 		return
 	}
+	if instance.cancellation_requested {
+		codec.payload_free(&workflow_result.payload)
+		instance.phase = .Canceled
+		return
+	}
 	instance.output = workflow_result.payload
 	instance.phase = .Completed
 }
@@ -569,6 +583,7 @@ find_buffered_signal :: proc(instance: ^Fiber_Instance, name: string) -> (^Fiber
 
 apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	instance.cancellation_reason = reason
+	instance.cancellation_requested = true
 	for index in 0..<len(instance.activities) {
 		operation := &instance.activities[index]
 		switch operation.state {
@@ -589,7 +604,44 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
 		}
 	}
-	instance.phase = .Canceled
+}
+
+is_cancellation_requested :: proc(ctx: ^Fiber_Context) -> bool {
+	return ctx != nil && ctx.instance != nil && ctx.instance.cancellation_requested
+}
+
+cancellation_reason :: proc(ctx: ^Fiber_Context) -> string {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.cancellation_requested {
+		return ""
+	}
+	return ctx.instance.cancellation_reason
+}
+
+// detached_cancellation_scope allows Temporal-safe cleanup after root Workflow
+// cancellation. The scope is intentionally valid only after cancellation has
+// been delivered; operations outside it observe cancellation immediately.
+detached_cancellation_scope :: proc(ctx: ^Fiber_Context) -> Cancellation_Scope {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   !ctx.instance.cancellation_requested {
+		return {}
+	}
+	ctx.instance.detached_scope_depth += 1
+	return {instance = ctx.instance, active = true}
+}
+
+cancellation_scope_end :: proc(scope: ^Cancellation_Scope) {
+	if scope == nil || !scope.active || scope.instance == nil {
+		return
+	}
+	if scope.instance.detached_scope_depth > 0 {
+		scope.instance.detached_scope_depth -= 1
+	}
+	scope.active = false
+	scope.instance = nil
+}
+
+root_cancellation_applies :: proc(instance: ^Fiber_Instance) -> bool {
+	return instance != nil && instance.cancellation_requested && instance.detached_scope_depth == 0
 }
 
 activity_options_error :: proc(activity_type: string, options: Activity_Options) -> string {
@@ -698,6 +750,18 @@ start_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		codec.payload_free(&owned_input)
+		instance.next_activity_seq += 1
+		append(
+			&instance.activities,
+			Fiber_Activity_Operation{
+				seq = instance.next_activity_seq,
+				state = .Canceled,
+			},
+		)
+		return {seq = instance.next_activity_seq}
+	}
 	validation_error := activity_options_error(activity_type, options)
 	if len(validation_error) > 0 {
 		codec.payload_free(&owned_input)
@@ -988,6 +1052,9 @@ payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operat
 			failure = operation.failure,
 		}
 	}
+	if operation.state == .Cancel_Requested || operation.state == .Canceled {
+		return {status = .Canceled}
+	}
 	return {status = .Failed, failure_message = "Activity has not resolved"}
 }
 
@@ -1010,7 +1077,8 @@ await_activity_payload_result :: proc(
 		instance.phase = .Failed
 		return {status = .Failed, failure_message = "Activity operation was not found"}
 	}
-	if operation.state == .Resolved || operation.state == .Failed {
+	if operation.state == .Resolved || operation.state == .Failed ||
+	   operation.state == .Cancel_Requested || operation.state == .Canceled {
 		return payload_activity_result_from_operation(operation)
 	}
 	instance.waiting_activity_seq = future.seq
@@ -1021,7 +1089,8 @@ await_activity_payload_result :: proc(
 		return {status = .Failed, failure_message = "could not resume Activity await"}
 	}
 	operation, found = find_activity_operation(instance, future.seq)
-	if !found || (operation.state != .Resolved && operation.state != .Failed) {
+	if !found || (operation.state != .Resolved && operation.state != .Failed &&
+	   operation.state != .Cancel_Requested && operation.state != .Canceled) {
 		instance.phase = .Failed
 		return {status = .Failed, failure_message = "Activity resumed without a resolution"}
 	}
@@ -1034,9 +1103,9 @@ await_activity_json_result :: proc(
 	$T: typeid,
 ) -> Json_Activity_Result(T) {
 	payload_result := await_activity_payload_result(ctx, future)
-	if payload_result.status == .Failed {
+	if payload_result.status != .Succeeded {
 		return {
-			status = .Failed,
+			status = payload_result.status,
 			failure_message = payload_result.failure_message,
 			failure = payload_result.failure,
 		}
@@ -1072,6 +1141,9 @@ await_activity_payload :: proc(
 		mark_activity_failure_unhandled(ctx, future)
 		return {}
 	}
+	if result.status == .Canceled {
+		return {}
+	}
 	return result.value
 }
 
@@ -1094,6 +1166,9 @@ await_activity :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> string {
 	result := await_activity_result(ctx, future)
 	if result.status == .Failed {
 		mark_activity_failure_unhandled(ctx, future)
+		return ""
+	}
+	if result.status == .Canceled {
 		return ""
 	}
 	return result.value
@@ -1192,6 +1267,9 @@ execute_activity_json :: proc(
 		mark_activity_failure_unhandled(ctx, future)
 		return {}
 	}
+	if result.status == .Canceled {
+		return {}
+	}
 	return result.value
 }
 
@@ -1206,6 +1284,9 @@ execute_activity_json_with_options :: proc(
 	result := await_activity_json_result(ctx, future, Output)
 	if result.status == .Failed {
 		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	if result.status == .Canceled {
 		return {}
 	}
 	return result.value
@@ -1231,6 +1312,9 @@ await_signal_payload :: proc(ctx: ^Fiber_Context, name: string) -> codec.Payload
 		return {}
 	}
 	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		return {}
+	}
 	signal, found := find_buffered_signal(instance, name)
 	if found {
 		signal.consumed = true
@@ -1245,6 +1329,9 @@ await_signal_payload :: proc(ctx: ^Fiber_Context, name: string) -> codec.Payload
 	instance.phase = .Waiting_Signal
 	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
+		return {}
+	}
+	if root_cancellation_applies(instance) {
 		return {}
 	}
 	signal, found = find_buffered_signal(instance, name)
@@ -1262,6 +1349,9 @@ await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
 		return ""
 	}
+	if root_cancellation_applies(ctx.instance) {
+		return ""
+	}
 	value, decode_error := codec.decode_string(payload.data, codec.encoding(payload))
 	if decode_error != .None {
 		signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain string")
@@ -1274,6 +1364,9 @@ await_signal_json :: proc(ctx: ^Fiber_Context, name: string, $T: typeid) -> T {
 	payload := await_signal_payload(ctx, name)
 	value: T
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
+		return value
+	}
+	if root_cancellation_applies(ctx.instance) {
 		return value
 	}
 	if codec.decode_json(payload, &value) != .None {
@@ -1299,6 +1392,9 @@ await_signal_payload_or_timeout :: proc(
 		return {status = .Timed_Out}
 	}
 	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		return {status = .Canceled}
+	}
 	signal, signal_found := find_buffered_signal(instance, name)
 	if signal_found {
 		signal.consumed = true
@@ -1323,6 +1419,9 @@ await_signal_payload_or_timeout :: proc(
 		instance.phase = .Failed
 		return {status = .Timed_Out}
 	}
+	if root_cancellation_applies(instance) {
+		return {status = .Canceled}
+	}
 
 	signal, signal_found = find_buffered_signal(instance, name)
 	timer, timer_found := find_timer_operation(instance, operation.seq)
@@ -1346,8 +1445,8 @@ await_signal_or_timeout :: proc(
 	duration: time.Duration,
 ) -> Signal_Wait_Result {
 	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
-	if payload_result.status == .Timed_Out {
-		return {status = .Timed_Out}
+	if payload_result.status != .Received {
+		return {status = payload_result.status}
 	}
 	value, decode_error := codec.decode_string(
 		payload_result.value.data,
@@ -1369,8 +1468,8 @@ await_signal_json_or_timeout :: proc(
 	$T: typeid,
 ) -> Json_Signal_Wait_Result(T) {
 	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
-	if payload_result.status == .Timed_Out {
-		return {status = .Timed_Out}
+	if payload_result.status != .Received {
+		return {status = payload_result.status}
 	}
 	value: T
 	if codec.decode_json(payload_result.value, &value) != .None {
@@ -1392,6 +1491,9 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 		return
 	}
 	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		return
+	}
 	instance.next_timer_seq += 1
 	operation := Fiber_Timer_Operation{
 		seq = instance.next_timer_seq,
@@ -1605,6 +1707,7 @@ append_fiber_pending_commands :: proc(
 			append_fiber_timer_command(result, commands, operation)
 		}
 	}
+	append_fiber_activity_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
 	switch instance.phase {
 	case .Waiting_Activity:
@@ -1825,9 +1928,9 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, "Activity resolution does not match a pending Workflow operation")
 				return
 			}
-			if operation.state == .Canceled && instance.terminal_command_sent {
-				// Core may report the terminal cancellation of a requested Activity
-				// after accepting CancelWorkflowExecution but before cache eviction.
+			if operation.state == .Canceled {
+				// Core may report the terminal resolution of a requested Activity
+				// while detached cleanup is running or before cache eviction.
 				result.resolved_activity_seq = operation.seq
 				continue
 			}
@@ -1873,6 +1976,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				operation.state = .Failed
 				result.resolved_activity_seq = operation.seq
 				result.resolved_activity_failed = true
+			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Cancelled:
+				resolution_handled = true
+				if status.value == nil {
+					process_error(&result, activation.run_id, "canceled Activity has no result")
+					return
+				}
+				operation.state = .Canceled
+				result.resolved_activity_seq = operation.seq
 			}
 			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
@@ -1966,17 +2077,21 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		switch instance.phase {
 		case .Waiting_Activity:
 			operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
-			should_resume = found && (operation.state == .Resolved || operation.state == .Failed)
+			should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
+				operation.state == .Cancel_Requested || operation.state == .Canceled)
 		case .Waiting_Timer:
 			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
-			should_resume = found && operation.state == .Resolved
+			should_resume = found && (operation.state == .Resolved ||
+				operation.state == .Cancel_Requested || operation.state == .Canceled)
 		case .Waiting_Signal:
 			_, found := find_buffered_signal(instance, instance.waiting_signal_name)
-			should_resume = found
+			should_resume = found || root_cancellation_applies(instance)
 		case .Waiting_Signal_Or_Timer:
 			_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
 			timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
-			should_resume = signal_found || (timer_found && timer.state == .Resolved)
+			should_resume = signal_found || root_cancellation_applies(instance) ||
+				(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
+				timer.state == .Canceled))
 		case .Ready, .Canceled, .Completed, .Failed:
 		}
 		if should_resume {

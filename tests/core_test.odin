@@ -253,6 +253,28 @@ fiber_delayed_failure_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: 
 	return "lost"
 }
 
+fiber_cancellation_cleanup_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	pending := workflow.execute_activity_result(ctx, "hello", name)
+	if pending.status != .Canceled || !workflow.is_cancellation_requested(ctx) ||
+	   workflow.cancellation_reason(ctx) != "operator cleanup request" {
+		return ""
+	}
+	scope := workflow.detached_cancellation_scope(ctx)
+	if !scope.active {
+		return ""
+	}
+	defer workflow.cancellation_scope_end(&scope)
+	cleanup := workflow.execute_activity_result(ctx, "cleanup", name)
+	if cleanup.status != .Succeeded || cleanup.value != "Cleaned Odin" ||
+	   workflow.cancellation_reason(ctx) != "operator cleanup request" {
+		return ""
+	}
+	return ""
+}
+
 fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	approval := workflow.await_signal(ctx, "approval")
@@ -4142,6 +4164,188 @@ workflow_fiber_cancels_pending_activity :: proc(t: ^testing.T) {
 	testing.expectf(t, processed.error.message == nil, "replaying late Activity cancellation resolution failed: %s", string(processed.error.message))
 	testing.expect(t, bytes.equal(late_completion[:], processed.completion[:]))
 	delete(late_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_runs_detached_cleanup_before_acknowledging_cancellation :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_cancellation_cleanup_workflow",
+		"test-queue",
+		fiber_cancellation_cleanup_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_cancellation_cleanup_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-cancellation-cleanup-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	cancel := proto.Coresdk_Workflow_Activation_CancelWorkflow{
+		reason = "operator cleanup request",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "starting cancellation cleanup failed: %s", string(processed.error.message))
+	testing.expect(t, processed.received_cancellation)
+	testing.expect(t, processed.requested_activity_cancellation)
+	testing.expect_value(t, processed.canceled_activity_seq, u32(1))
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(2))
+	testing.expect(t, !processed.canceled_workflow)
+	testing.expect(t, !processed.completed)
+	cleanup_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, cleanup_inspection.decoded)
+	testing.expect_value(t, cleanup_inspection.command_count, 2)
+	testing.expect_value(t, cleanup_inspection.canceled_activity_seq, u32(1))
+	testing.expect_value(t, cleanup_inspection.scheduled_activity_seq, u32(2))
+	testing.expect(t, !cleanup_inspection.canceled_workflow)
+	delete(cleanup_inspection.failure_message)
+	delete(cleanup_inspection.completion_result)
+	cleanup_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "replaying cancellation cleanup failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(cleanup_completion[:], processed.completion[:]))
+	delete(cleanup_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	cleanup_output := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Cleaned Odin"`),
+	}
+	defer delete(cleanup_output.metadata)
+	append(
+		&cleanup_output.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	cleanup_success := proto.Coresdk_Activity_Result_Success{result = &cleanup_output}
+	cleanup_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &cleanup_success,
+		},
+	}
+	resolve_cleanup := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 2,
+		result = &cleanup_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_cleanup,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "finishing cancellation cleanup failed: %s", string(processed.error.message))
+	testing.expect(t, processed.canceled_workflow)
+	testing.expect(t, processed.completed)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded)
+	testing.expect_value(t, terminal_inspection.command_count, 1)
+	testing.expect(t, terminal_inspection.canceled_workflow)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

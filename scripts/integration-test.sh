@@ -427,3 +427,10 @@ run_workflow_cancellation_case \
   'cancel-activity heartbeat recorded' \
   'replay=false .*cancel=true canceled_workflow=true .*canceled_timer=false canceled_activity=true' \
   'Activity heartbeat delivered cancellation and Odin acknowledged it'
+
+run_workflow_cancellation_case \
+  cancel-cleanup \
+  '"cancel-cleanup"' \
+  'cancel-cleanup heartbeat recorded' \
+  'replay=false .*scheduled=1 last_activity=2 .*cancel=true canceled_workflow=false .*canceled_timer=false canceled_activity=true .*waiting_activity=2' \
+  'Workflow ran detached cleanup before acknowledging cancellation'

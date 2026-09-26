@@ -13,9 +13,10 @@ multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 `CancelTimer` alongside an Activity command, and reproduces both commands after
-eviction. It also translates Workflow cancellation into deterministic cleanup
-of a pending timer or Activity and `CancelWorkflowExecution`. A reusable worker
-now registers both Activity and Workflow procedures, routes run IDs to the
+eviction. Workflow cancellation now resumes suspended Odin code with a canceled
+result, exposes the owned reason, and permits deterministic Activity/timer
+cleanup in an explicit detached scope before `CancelWorkflowExecution`. A
+reusable worker now registers both Activity and Workflow procedures, routes run IDs to the
 correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
@@ -31,8 +32,8 @@ attempt 1 to attempt 2. Workflow initialization, Activity arguments/results,
 and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
-cancellation type, and eager-execution control. It does **not** provide user
-Workflow cancellation scopes/cleanup, signal handlers, queries/updates,
+cancellation type, and eager-execution control. It does **not** provide general
+nested/child cancellation-scope trees, signal handlers, queries/updates,
 multiple Activity arguments, in-process panic containment, or a stable public
 API.
 Do not use it in production.
@@ -290,6 +291,24 @@ if result.status == .Failed {
 These values are borrowed from the Workflow instance and remain valid for that
 run. Unhandled failures still propagate the preserved Temporal Failure protobuf.
 
+Cancellation is cooperative in Workflow code. Result-returning waits report
+`.Canceled`; cleanup that must outlive root cancellation runs in an explicit
+detached scope:
+
+```odin
+result := workflow.execute_activity_result(ctx, "charge", order_id)
+if result.status == .Canceled {
+    reason := workflow.cancellation_reason(ctx)
+    scope := workflow.detached_cancellation_scope(ctx)
+    defer workflow.cancellation_scope_end(&scope)
+    workflow.execute_activity(ctx, "release_reservation", order_id)
+    _ = reason
+}
+```
+
+Returning from the Workflow while root cancellation is pending acknowledges it
+with `CancelWorkflowExecution`; the return value is not completed successfully.
+
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
 registered Activities and Workflows. A worker is intentionally single-run;
@@ -301,8 +320,11 @@ service is not already running on `localhost:7233`; Docker is not involved. It
 also starts `examples/hello_workflow`; the Odin Client delivers an `approval`
 signal while the fiber is blocked on a durable timer, cancelling that timer,
 evicting the fiber, and requiring replay to reproduce the timer cancellation
-and following Activity command. Two more executions use Odin Client cancellation
-to verify pending-timer and pending-Activity cleanup through Core. Temporal CLI
+and following Activity command. Two executions use Odin Client cancellation
+to verify direct pending-timer and pending-Activity cleanup through Core. A
+third resumes Workflow code, requests cancellation of its in-flight Activity,
+schedules a detached cleanup Activity, survives eviction/replay, and only then
+acknowledges Workflow cancellation. Temporal CLI
 still starts/waits on these older test executions and reads their history. The
 Activity case waits for an Odin heartbeat, observes Core's cancel task in the
 in-flight context, and replies with a cancellation completion. A separate fan-out case proves two Odin

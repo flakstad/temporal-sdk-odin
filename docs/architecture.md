@@ -5,8 +5,8 @@ Activity Worker slice, schema-derived Core protobuf bindings, a bounded
 Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
-runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
-registry and poll loop, updated 2026-09-26. The Activity slice now also has a
+cooperative Workflow cancellation with detached cleanup, plus a reusable
+Activity/Workflow worker registry and poll loop, updated 2026-09-26. The Activity slice now also has a
 generic Temporal Payload boundary, typed JSON Activity registration, and
 structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
@@ -931,21 +931,27 @@ operations react. This matches the [.NET cancellation contract](https://github.c
 and the TypeScript runtime's
 [root cancellation-scope handling](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
 
-The current Odin policy is deliberately smaller than either public SDK:
+The Odin runtime now models the Workflow's root cancellation state explicitly:
 
-1. Preserve the cancellation reason in the Workflow-owned arena.
-2. Do not resume a suspended user fiber and do not run user cleanup.
-3. Drop operations that were only locally scheduled.
-4. Emit `RequestCancelActivity(seq)` and/or `CancelTimer(seq)` for commands
-   already sent to Core.
-5. Emit `CancelWorkflowExecution` in the same completion and mark the terminal
-   command as sent.
+1. Preserve the cancellation reason in the Workflow-owned arena and mark the
+   root scope canceled.
+2. Mark pending linked Activities/timers for cancellation and resume the
+   suspended user fiber.
+3. Result-returning Activity and signal/timer waits expose `.Canceled`.
+   Convenience waits return their zero value; returning from the Workflow while
+   root cancellation remains pending acknowledges cancellation rather than
+   completing successfully.
+4. New operations in the canceled root scope resolve locally as canceled.
+5. `detached_cancellation_scope` temporarily unlinks cleanup operations from
+   root cancellation. It may only be opened after cancellation delivery and
+   must be paired with `cancellation_scope_end` (normally through `defer`).
+6. The runtime emits `CancelWorkflowExecution` only after user code returns,
+   so detached Activities/timers may finish first.
 
-This policy keeps the external semantics correct while postponing user-visible
-cancellation tokens/scopes and cleanup syntax. It is not the intended final
-API. In particular, Activity cancellation remains cooperative at the Activity
-implementation boundary; the Workflow request does not forcibly stop arbitrary
-Odin code.
+This is a useful cleanup scope, not yet a general cancellation tree: there are
+no child scopes, user-created cancellation sources, or propagated deadlines.
+Activity cancellation remains cooperative at the Activity implementation
+boundary; the Workflow request does not forcibly stop arbitrary Odin code.
 
 The live timer path was:
 
@@ -964,13 +970,27 @@ The live Activity path exposed an additional lifecycle rule:
 | 8 | late terminal `ResolveActivity(seq=1)` -> empty successful completion |
 | 8 | final cache eviction |
 
+The live detached-cleanup path adds a non-terminal cancellation activation:
+
+| History | Odin command/job |
+| ---: | --- |
+| 3 | initialize -> `ScheduleActivity(seq=1)` |
+| 8 | `CancelWorkflow` -> `RequestCancelActivity(seq=1)` + `ScheduleActivity(seq=2)` |
+| 8 | terminal resolution of seq 1 is accepted while cleanup remains pending |
+| 3/8 | eviction -> fresh-stack replay reproduces both command batches |
+| 15 | `ResolveActivity(seq=2)` -> `CancelWorkflowExecution` |
+| 15 | final cache eviction |
+
 The late resolution is a Core-language-runtime handshake, not a second user
 event. The Workflow instance must remain alive until eviction, accept the
 terminal resolution idempotently, and never repeat `CancelWorkflowExecution`.
 Offline tests cover both pending-operation kinds, cancellation before an
 initial command is emitted, same-activation races, the late Activity
 resolution, and byte-identical replay of both timer and Activity cancellation
-sequences.
+sequences. A separate test proves cancellation delivery into user code,
+detached Activity cleanup, delayed acknowledgement, and byte-identical
+fresh-stack replay. The live CLI-devserver case proves the same command ordering
+through Core and the Service and finishes with Temporal status `CANCELED`.
 
 ### Generated lifecycle testing
 
@@ -981,13 +1001,13 @@ checked against a small event-outcome model, then evicted and replayed from a
 fresh fiber; the decisive completion must be byte-identical. Coverage
 constraints ensure every class appears in a successful run.
 
-The sibling `statecharts` library was evaluated as a possible independent
-model oracle. We are not adding it yet: the present model has one wait state and
-three event kinds, so a direct transition table is smaller and easier to audit.
-Revisit a statechart model when cancellation scopes, multiple simultaneous
-waits, or a real Workflow scheduler introduce orthogonal regions or nested
-states. At that point it can be valuable precisely because the model should be
-independent of the runtime implementation.
+The sibling `statecharts` library was initially deferred because the first
+model had one wait state and three event kinds. Root cancellation, detached
+cleanup, late Activity resolutions, eviction, and replay now create the
+orthogonal state threshold where an independent statechart oracle is useful.
+The next test-hardening slice should prototype that model against
+`~/Projects/statecharts` and generate event traces through `~/Projects/pbt`;
+the model must remain independent of the runtime implementation.
 
 ### Reusable worker registry and poll boundary
 
@@ -1143,10 +1163,11 @@ Workflows are enabled.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
-   a durable timer/signal race, generic/typed Payload flow, and runtime-owned
-   cancellation across fresh-stack replay. It does not yet prove user
-   cancellation scopes/cleanup, updates, panic containment, nondeterminism
-   diagnostics, bounded stack policy, or a production deterministic scheduler.
+   a durable timer/signal race, generic/typed Payload flow, root cancellation,
+   and detached Activity cleanup across fresh-stack replay. It does not yet
+   prove general nested cancellation scopes, updates, panic containment,
+   nondeterminism diagnostics, bounded stack policy, or a production
+   deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local
@@ -1175,7 +1196,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, runtime-owned cancellation, registered dispatch, eviction, and replay on macOS arm64 | Add user cancellation scopes and test multiple live Workflow runs without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Add query dispatch and test multiple live Workflow runs without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1196,23 +1217,28 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest vertical milestone should introduce user cancellation scopes
-and cleanup. The current runtime-owned policy closes the Workflow immediately;
-Workflow code needs a root cancellation state plus an unlinked cleanup scope so
-it can catch cancellation, run Temporal-safe cleanup, and then acknowledge it
-deterministically.
+The next smallest feature milestone should add typed Workflow query handlers.
+Core already delivers `QueryWorkflow` activation jobs and expects
+`RespondToQuery` commands; the Odin layer must register handlers, provide a
+read-only Workflow-state boundary, encode success/failure Payloads, and prove
+that queries do not mutate deterministic command history.
 
-After that, stress pool
-shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
-designed as subprocess isolation unless Odin gains supported recovery. A
-statechart oracle becomes worthwhile as cancellation scopes add new
-retry/cancellation/shutdown interleavings.
+Before widening cancellation further, model root cancellation, late
+resolutions, detached cleanup, eviction, and replay with an independent
+statechart oracle and drive it from `~/Projects/pbt`. The direct transition
+table remains useful, but cancellation cleanup now has enough orthogonal states
+to justify the sibling `~/Projects/statecharts` experiment suggested for this
+threshold.
+
+Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
+containment should be designed as subprocess isolation unless Odin gains
+supported recovery. A
+statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Query delivery should follow once typed signal dispatch and
-cancellation semantics are grounded at the user-code boundary; Updates remain
-deferred until then.
+dependency. Updates remain deferred until query delivery and handler isolation
+are grounded at the user-code boundary.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

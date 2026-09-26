@@ -41,12 +41,12 @@ Failure_Details :: struct {
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
-	if name == "cancel-activity" {
+	if name == "cancel-activity" || name == "cancel-cleanup" {
 		first_heartbeat := true
 		for !activity.is_cancellation_requested(ctx) {
 			status := activity.heartbeat(ctx, "waiting for cancellation")
 			if first_heartbeat && status == .Recorded {
-				fmt.println("cancel-activity heartbeat recorded")
+				fmt.printf("%s heartbeat recorded\n", name)
 				first_heartbeat = false
 			}
 			if status == .Cancellation_Requested {
@@ -55,7 +55,8 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 			time.sleep(100 * time.Millisecond)
 		}
 		fmt.printf(
-			"cancel-activity observed cancellation reason=%v\n",
+			"%s observed cancellation reason=%v\n",
+			name,
 			activity.cancellation_reason(ctx),
 		)
 		return "cancellation acknowledged"
@@ -111,6 +112,24 @@ failure_details_activity :: proc(
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if name == "cancel-activity" {
 		return workflow.execute_activity(ctx, "hello", name)
+	}
+	if name == "cancel-cleanup" {
+		pending := workflow.execute_activity_result(ctx, "hello", name)
+		if pending.status != .Canceled || !workflow.is_cancellation_requested(ctx) ||
+		   workflow.cancellation_reason(ctx) != "Odin Client integration cancellation" {
+			return "cancellation was not delivered to Workflow code"
+		}
+		scope := workflow.detached_cancellation_scope(ctx)
+		if !scope.active {
+			return "could not open detached cancellation scope"
+		}
+		defer workflow.cancellation_scope_end(&scope)
+		cleanup := workflow.execute_activity_result(ctx, "hello", "cleanup")
+		if cleanup.status != .Succeeded || cleanup.value != "Hello cleanup" ||
+		   workflow.cancellation_reason(ctx) != "Odin Client integration cancellation" {
+			return "cleanup Activity did not complete"
+		}
+		return "cleanup completed before cancellation"
 	}
 
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
@@ -323,9 +342,10 @@ main :: proc() {
 	scenario := os.get_env(env_buffer[:], "TEMPORAL_ODIN_SCENARIO")
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
+	expect_cancel_cleanup := scenario == "cancel-cleanup"
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
-	expect_cancel := expect_cancel_timer || expect_cancel_activity
+	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
@@ -358,6 +378,11 @@ main :: proc() {
 		} else if expect_cancel_activity {
 			if run_stats.activity_tasks_completed != 1 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
 				fmt.eprintln("Workflow spike did not deliver and acknowledge Activity cancellation")
+				failed = true
+			}
+		} else if expect_cancel_cleanup {
+			if run_stats.activity_tasks_completed != 2 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
+				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
 		} else if expect_typed_payload || expect_failure_details {
@@ -393,6 +418,8 @@ main :: proc() {
 		fmt.println("Workflow cancellation canceled the pending timer and closed the execution")
 	} else if expect_cancel_activity {
 		fmt.println("Activity heartbeat delivered cancellation and Odin acknowledged it")
+	} else if expect_cancel_cleanup {
+		fmt.println("Workflow ran detached cleanup before acknowledging cancellation")
 	} else if expect_typed_payload {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_failure_details {

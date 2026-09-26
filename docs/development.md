@@ -430,6 +430,15 @@ Application Failure message, type, retryability, details, and delay. It
 completes with `"Observed structured Activity failure"`; this proves the fields
 crossed both Core and the Service rather than only the local completion encoder.
 
+The `cancel-cleanup` live case blocks in an Odin Activity, requests Workflow
+cancellation through the public Odin Client, and requires the cancellation
+activation to emit `RequestCancelActivity(seq=1)` plus
+`ScheduleActivity(seq=2)` without a terminal command. Workflow code observes
+`.Canceled` and the owned reason, opens a detached cancellation scope, and waits
+for the cleanup Activity. Core evicts and replays both command batches. Only
+after cleanup resolves does Odin emit `CancelWorkflowExecution`; Temporal CLI
+must report the final execution as `CANCELED`.
+
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
 if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
@@ -521,17 +530,18 @@ temporal workflow execute \
 This example is intentionally a signal/timer-race replay experiment, not a
 stable or general Workflow API.
 
-To manually exercise the runtime-owned cancellation policy, start the example
-with `TEMPORAL_ODIN_SCENARIO=cancel-timer` or
-`TEMPORAL_ODIN_SCENARIO=cancel-activity`, execute it as above (use input
-`"cancel-activity"` for the latter), and then run:
+To manually exercise cancellation, start the example with
+`TEMPORAL_ODIN_SCENARIO=cancel-timer`, `cancel-activity`, or `cancel-cleanup`.
+Execute it as above, using the matching input string for either Activity case,
+and then run:
 
 ```bash
 temporal workflow cancel --workflow-id odin-workflow-manual
 ```
 
-This narrow policy cancels pending Core operations and closes the Workflow. It
-does not yet resume the user fiber to run cleanup code.
+The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
+request reason, runs a second Activity in `detached_cancellation_scope`, and
+closes the Workflow as canceled only after that Activity resolves.
 
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
