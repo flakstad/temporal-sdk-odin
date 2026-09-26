@@ -85,10 +85,12 @@ validate_greeting_name :: proc(
 }
 
 update_greeting_name :: proc(
+	ctx: ^workflow.Fiber_Context,
 	state: ^Greeting_Query_State,
 	input: Greeting_Update_Input,
 ) -> Greeting_Update_Output {
 	previous := state.name
+	_ = workflow.execute_activity(ctx, "hello", input.name)
 	state.name = input.name
 	return {previous_name = previous, current_name = state.name}
 }
@@ -194,7 +196,7 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register greeting status query"
 	}
-	if !workflow.set_validated_update_handler_json(
+	if !workflow.set_validated_update_routine_json(
 		ctx,
 		"set_greeting_name",
 		&query_state,
@@ -428,7 +430,7 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel ? 0 : 1,
+			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 2 : 1),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer,
 			on_workflow_activation = observe_activation,
@@ -469,7 +471,7 @@ main :: proc() {
 				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
 				failed = true
 			}
-		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
+		} else if run_stats.activity_tasks_completed != (expect_update ? 2 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 1 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 1)) {
 			fmt.eprintf(

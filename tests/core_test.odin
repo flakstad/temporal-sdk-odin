@@ -302,6 +302,53 @@ Update_Test_Output :: struct {
 	current:  int,
 }
 
+Update_Routine_Input :: struct {
+	name: string,
+}
+
+Update_Routine_Output :: struct {
+	previous:        string,
+	current:         string,
+	activity_result: string,
+}
+
+Update_Routine_State :: struct {
+	name: string,
+}
+
+fiber_update_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	state := Update_Routine_State{name = name}
+	registered := workflow.set_validated_update_routine_json(
+		ctx,
+		"rename_with_activity",
+		&state,
+		proc(_: Update_Routine_State, input: Update_Routine_Input) -> workflow.Update_Validation {
+			if len(input.name) == 0 {
+				return workflow.update_reject("name is required", "InvalidName")
+			}
+			return workflow.update_accept()
+		},
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			state: ^Update_Routine_State,
+			input: Update_Routine_Input,
+		) -> Update_Routine_Output {
+			previous := state.name
+			activity_result := workflow.execute_activity(routine_ctx, "decorate_name", input.name)
+			state.name = activity_result
+			return {
+				previous = previous,
+				current = state.name,
+				activity_result = activity_result,
+			}
+		},
+	)
+	if !registered {
+		return "Workflow Update routine registration failed"
+	}
+	return workflow.await_signal(ctx, "finish")
+}
+
 fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Query_Test_State{phase = "waiting", count = len(name)}
 	registered := workflow.set_query_handler_json(
@@ -3195,6 +3242,245 @@ workflow_fiber_preserves_structured_activity_failure_across_activations :: proc(
 		delete(message)
 	}
 	codec.payload_free(&completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_update_routine_workflow",
+		"test-queue",
+		fiber_update_routine_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_update_routine_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-update-routine-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	update_input, update_input_error := codec.encode_json(Update_Routine_Input{name = "Temporal"})
+	testing.expect(t, update_input_error == .None)
+	defer codec.payload_free(&update_input)
+	update_input_proto := proto.encode_payload(codec.payload_view(&update_input))
+	defer delete(update_input_proto.metadata)
+	defer delete(update_input_proto.external_payloads)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "rename-with-activity-1",
+		protocol_instance_id = "update-routine-protocol-1",
+		name = "rename_with_activity",
+		run_validator = true,
+	}
+	defer delete(update.input)
+	append(&update.input, update_input_proto)
+	finish_input, finish_input_error := codec.encode_json("done")
+	testing.expect(t, finish_input_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "finish",
+	}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update routine start failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect_value(t, processed.updates_completed, 0)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect(t, !processed.completed)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	started_update := inspect_update_responses(
+		processed.completion[:],
+		"update-routine-protocol-1",
+	)
+	testing.expect_value(t, started_update.command_count, 2)
+	testing.expect_value(t, started_update.accepted, 1)
+	testing.expect_value(t, started_update.completed, 0)
+	update_response_inspection_free(&started_update)
+	update_start_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	activity_output, activity_output_error := codec.encode_json("Hello Temporal")
+	testing.expect(t, activity_output_error == .None)
+	defer codec.payload_free(&activity_output)
+	activity_output_proto := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(activity_output_proto.metadata)
+	defer delete(activity_output_proto.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &activity_output_proto}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 10
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update routine completion failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_accepted, 0)
+	testing.expect_value(t, processed.updates_completed, 1)
+	testing.expect(t, processed.completed)
+	completed_update := inspect_update_responses(
+		processed.completion[:],
+		"update-routine-protocol-1",
+	)
+	testing.expect_value(t, completed_update.command_count, 2)
+	testing.expect_value(t, completed_update.accepted, 0)
+	testing.expect_value(t, completed_update.completed, 1)
+	testing.expect_value(t, completed_update.completed_index, 0)
+	output: Update_Routine_Output
+	decode_error := codec.decode_json(codec.payload_view(&completed_update.payload), &output)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, output.previous, "Odin")
+	testing.expect_value(t, output.current, "Hello Temporal")
+	testing.expect_value(t, output.activity_result, "Hello Temporal")
+	delete(output.previous)
+	delete(output.current)
+	delete(output.activity_result)
+	update_response_inspection_free(&completed_update)
+	update_finish_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	update.run_validator = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update routine replay start failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(update_start_completion[:], processed.completion[:]))
+	delete(update_start_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 10
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update routine replay completion failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(update_finish_completion[:], processed.completion[:]))
+	delete(update_finish_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

@@ -36,6 +36,11 @@ Update_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Update_Routine_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	input: codec.Payload_View,
+) -> Payload_Result
 
 Payload_Result_Status :: enum {
 	Completed,
@@ -252,6 +257,7 @@ Fiber_Update_Handler :: struct {
 	callback_data: rawptr,
 	validate:      Update_Validate_Proc,
 	invoke:        Update_Invoke_Proc,
+	invoke_routine: Update_Routine_Invoke_Proc,
 }
 
 Pending_Query_Response :: struct {
@@ -298,6 +304,26 @@ Fiber_Signal :: struct {
 	consumed: bool,
 }
 
+Fiber_Update_Routine :: struct {
+	instance:             ^Fiber_Instance,
+	protocol_instance_id: string,
+	input:                codec.Payload,
+	callback_data:        rawptr,
+	invoke:               Update_Routine_Invoke_Proc,
+	ctx:                  Fiber_Context,
+	result:               Payload_Result,
+	waiting_activity_seq: u32,
+	waiting_timer_seq:    u32,
+	waiting_signal_name:  string,
+	detached_scope_depth: int,
+	unhandled_activity_seq: u32,
+	failure_message:        string,
+	failure_type:           string,
+	phase:                  Fiber_Phase,
+	fiber:                  fiber_raw.Handle,
+	response_emitted:       bool,
+}
+
 Fiber_Instance :: struct {
 	run_id:          string,
 	input:           codec.Payload,
@@ -310,6 +336,7 @@ Fiber_Instance :: struct {
 	signals:          [dynamic]Fiber_Signal,
 	query_handlers:   [dynamic]Fiber_Query_Handler,
 	update_handlers:  [dynamic]Fiber_Update_Handler,
+	update_routines:  [dynamic]^Fiber_Update_Routine,
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
@@ -463,9 +490,136 @@ fiber_result_error :: proc(operation: string, result: fiber_raw.Result) -> Error
 	return error_from_string(message)
 }
 
+Fiber_Execution_State :: struct {
+	waiting_activity_seq: u32,
+	waiting_timer_seq:    u32,
+	waiting_signal_name:  string,
+	detached_scope_depth: int,
+	unhandled_activity_seq: u32,
+	failure_message:        string,
+	failure_type:           string,
+	phase:                  Fiber_Phase,
+	fiber:                  fiber_raw.Handle,
+}
+
+capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution_State {
+	return {
+		waiting_activity_seq = instance.waiting_activity_seq,
+		waiting_timer_seq = instance.waiting_timer_seq,
+		waiting_signal_name = instance.waiting_signal_name,
+		detached_scope_depth = instance.detached_scope_depth,
+		unhandled_activity_seq = instance.unhandled_activity_seq,
+		failure_message = instance.failure_message,
+		failure_type = instance.failure_type,
+		phase = instance.phase,
+		fiber = instance.fiber,
+	}
+}
+
+apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Execution_State) {
+	instance.waiting_activity_seq = state.waiting_activity_seq
+	instance.waiting_timer_seq = state.waiting_timer_seq
+	instance.waiting_signal_name = state.waiting_signal_name
+	instance.detached_scope_depth = state.detached_scope_depth
+	instance.unhandled_activity_seq = state.unhandled_activity_seq
+	instance.failure_message = state.failure_message
+	instance.failure_type = state.failure_type
+	instance.phase = state.phase
+	instance.fiber = state.fiber
+}
+
+update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execution_State {
+	return {
+		waiting_activity_seq = routine.waiting_activity_seq,
+		waiting_timer_seq = routine.waiting_timer_seq,
+		waiting_signal_name = routine.waiting_signal_name,
+		detached_scope_depth = routine.detached_scope_depth,
+		unhandled_activity_seq = routine.unhandled_activity_seq,
+		failure_message = routine.failure_message,
+		failure_type = routine.failure_type,
+		phase = routine.phase,
+		fiber = routine.fiber,
+	}
+}
+
+capture_update_routine_execution :: proc(
+	routine: ^Fiber_Update_Routine,
+	instance: ^Fiber_Instance,
+) {
+	routine.waiting_activity_seq = instance.waiting_activity_seq
+	routine.waiting_timer_seq = instance.waiting_timer_seq
+	routine.waiting_signal_name = instance.waiting_signal_name
+	routine.detached_scope_depth = instance.detached_scope_depth
+	routine.unhandled_activity_seq = instance.unhandled_activity_seq
+	routine.failure_message = instance.failure_message
+	routine.failure_type = instance.failure_type
+	routine.phase = instance.phase
+	routine.fiber = instance.fiber
+}
+
+resume_update_routine :: proc(routine: ^Fiber_Update_Routine) -> Error {
+	if routine == nil || routine.instance == nil || routine.fiber == nil {
+		return error_from_string("Workflow Update routine is not initialized")
+	}
+	instance := routine.instance
+	main_execution := capture_instance_execution(instance)
+	apply_instance_execution(instance, update_routine_execution(routine))
+	resume_result := fiber_raw.resume(routine.fiber)
+	capture_update_routine_execution(routine, instance)
+	apply_instance_execution(instance, main_execution)
+	if resume_result != .Success {
+		return fiber_result_error("could not resume Workflow Update routine", resume_result)
+	}
+	return {}
+}
+
+update_routine_entry :: proc "c" (user_data: rawptr) {
+	routine := cast(^Fiber_Update_Routine)user_data
+	instance := routine.instance
+	context = instance.odin_context
+	result := routine.invoke(
+		routine.callback_data,
+		&routine.ctx,
+		codec.payload_view(&routine.input),
+	)
+	if instance.phase == .Failed {
+		codec.payload_free(&result.payload)
+		message := instance.failure_message
+		failure_type := instance.failure_type
+		if instance.unhandled_activity_seq != 0 {
+			operation, found := find_activity_operation(instance, instance.unhandled_activity_seq)
+			if found {
+				message = operation.failure_message
+				failure_type = "OdinWorkflowUpdateActivityFailure"
+			}
+		}
+		if len(message) == 0 {
+			message = "Workflow Update routine failed"
+		}
+		routine.result = payload_fail(message, failure_type)
+		return
+	}
+	routine.result = result
+	if result.status == .Failed {
+		instance.phase = .Failed
+		return
+	}
+	instance.phase = .Completed
+}
+
 fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	if instance == nil {
 		return {}
+	}
+	for routine in instance.update_routines {
+		if routine.fiber == nil {
+			continue
+		}
+		routine_result := fiber_raw.destroy(routine.fiber)
+		if routine_result != .Success {
+			return fiber_result_error("could not destroy Workflow Update routine", routine_result)
+		}
+		routine.fiber = nil
 	}
 	fiber_result := fiber_raw.destroy(instance.fiber)
 	if fiber_result != .Success {
@@ -594,6 +748,7 @@ add_fiber_instance :: proc(
 	instance.signals = make([dynamic]Fiber_Signal)
 	instance.query_handlers = make([dynamic]Fiber_Query_Handler)
 	instance.update_handlers = make([dynamic]Fiber_Update_Handler)
+	instance.update_routines = make([dynamic]^Fiber_Update_Routine)
 	context.allocator = previous_allocator
 	if run_id_error != nil || clone_error != .None {
 		virtual.arena_destroy(&instance.arena)
@@ -792,9 +947,10 @@ set_update_handler_payload :: proc(
 	callback_data: rawptr,
 	validator: Update_Validate_Proc,
 	callback: Update_Invoke_Proc,
+	routine_callback: Update_Routine_Invoke_Proc = nil,
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || callback == nil {
+	   len(name) == 0 || callback_data == nil || (callback == nil) == (routine_callback == nil) {
 		if ctx != nil {
 			update_registration_failed(ctx.instance, "invalid Workflow Update handler")
 		}
@@ -818,9 +974,143 @@ set_update_handler_payload :: proc(
 			callback_data = callback_data,
 			validate = validator,
 			invoke = callback,
+			invoke_routine = routine_callback,
 		},
 	)
 	return true
+}
+
+// set_validated_update_routine_json registers an Update handler on its own
+// stackful routine. Unlike the synchronous form, the handler receives a
+// Fiber_Context and may await Activities, timers, or signals.
+set_validated_update_routine_json :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	validator: proc(state: State, input: $Input) -> Update_Validation,
+	callback: proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> $Output,
+) -> bool {
+	Validator :: #type proc(state: State, input: Input) -> Update_Validation
+	Callback :: #type proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> Output
+	Data :: struct {
+		instance:  ^Fiber_Instance,
+		state:     ^State,
+		validator: Validator,
+		callback:  Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || validator == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid validated Workflow Update routine")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(ctx.instance, "could not allocate typed Workflow Update routine")
+		return false
+	}
+	data.instance = ctx.instance
+	data.state = state
+	data.validator = validator
+	data.callback = callback
+	return set_update_handler_payload(
+		ctx,
+		name,
+		data,
+		proc(callback_data: rawptr, input: codec.Payload_View) -> Update_Validation {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return update_reject(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return owned.validator(owned.state^, value)
+		},
+		nil,
+		proc(
+			callback_data: rawptr,
+			routine_ctx: ^Fiber_Context,
+			input: codec.Payload_View,
+		) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			output := owned.callback(routine_ctx, owned.state, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow Update result as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
+}
+
+set_update_routine_json :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	callback: proc(ctx: ^Fiber_Context, state: ^State, input: $Input) -> $Output,
+) -> bool {
+	Callback :: #type proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> Output
+	Data :: struct {
+		instance: ^Fiber_Instance,
+		state:    ^State,
+		callback: Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid Workflow Update routine")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(ctx.instance, "could not allocate typed Workflow Update routine")
+		return false
+	}
+	data.instance = ctx.instance
+	data.state = state
+	data.callback = callback
+	return set_update_handler_payload(
+		ctx,
+		name,
+		data,
+		nil,
+		nil,
+		proc(
+			callback_data: rawptr,
+			routine_ctx: ^Fiber_Context,
+			input: codec.Payload_View,
+		) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			output := owned.callback(routine_ctx, owned.state, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow Update result as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
 }
 
 // set_update_handler_json registers a synchronous state-mutating Update. The
@@ -2202,6 +2492,158 @@ append_pending_update_response :: proc(
 	)
 }
 
+find_update_routine :: proc(
+	instance: ^Fiber_Instance,
+	protocol_instance_id: string,
+) -> (^Fiber_Update_Routine, bool) {
+	for routine in instance.update_routines {
+		if routine.protocol_instance_id == protocol_instance_id {
+			return routine, true
+		}
+	}
+	return nil, false
+}
+
+start_update_routine :: proc(
+	instance: ^Fiber_Instance,
+	handler: ^Fiber_Update_Handler,
+	protocol_instance_id: string,
+	input: codec.Payload_View,
+) -> (^Fiber_Update_Routine, Error) {
+	if instance == nil || handler == nil || handler.invoke_routine == nil ||
+	   len(protocol_instance_id) == 0 {
+		return nil, error_from_string("invalid Workflow Update routine")
+	}
+	_, duplicate := find_update_routine(instance, protocol_instance_id)
+	if duplicate {
+		return nil, error_from_string("Workflow Update routine already exists")
+	}
+	allocator := instance.odin_context.allocator
+	routine, allocation_error := new(Fiber_Update_Routine, allocator)
+	if allocation_error != nil {
+		return nil, error_from_string("could not allocate Workflow Update routine")
+	}
+	owned_protocol_id, id_error := strings.clone(protocol_instance_id, allocator)
+	owned_input, input_error := codec.payload_clone(input, allocator)
+	if id_error != nil || input_error != .None {
+		return nil, error_from_string("could not preserve Workflow Update routine input")
+	}
+	routine.instance = instance
+	routine.protocol_instance_id = owned_protocol_id
+	routine.input = owned_input
+	routine.callback_data = handler.callback_data
+	routine.invoke = handler.invoke_routine
+	routine.ctx.instance = instance
+	routine.phase = .Ready
+	create_result := fiber_raw.create(
+		&routine.fiber,
+		update_routine_entry,
+		routine,
+		FIBER_STACK_SIZE,
+	)
+	if create_result != .Success {
+		return nil, fiber_result_error("could not create Workflow Update routine", create_result)
+	}
+	resume_error := resume_update_routine(routine)
+	if resume_error.message != nil {
+		if routine.fiber != nil {
+			_ = fiber_raw.destroy(routine.fiber)
+			routine.fiber = nil
+		}
+		return nil, resume_error
+	}
+	append(&instance.update_routines, routine)
+	return routine, {}
+}
+
+append_finished_update_routine_response :: proc(
+	routine: ^Fiber_Update_Routine,
+	responses: ^[dynamic]Pending_Update_Response,
+) -> Error {
+	if routine == nil || routine.response_emitted || routine.fiber == nil ||
+	   fiber_raw.status(routine.fiber) != .Dead {
+		return {}
+	}
+	kind := Update_Response_Kind.Completed
+	if routine.result.status == .Failed || routine.phase == .Failed {
+		kind = .Rejected
+	}
+	append_pending_update_response(
+		responses,
+		routine.protocol_instance_id,
+		kind,
+		routine.result,
+	)
+	routine.result = {}
+	routine.response_emitted = true
+	destroy_result := fiber_raw.destroy(routine.fiber)
+	if destroy_result != .Success {
+		return fiber_result_error("could not destroy completed Workflow Update routine", destroy_result)
+	}
+	routine.fiber = nil
+	return {}
+}
+
+append_finished_update_routine_responses :: proc(
+	instance: ^Fiber_Instance,
+	responses: ^[dynamic]Pending_Update_Response,
+) -> Error {
+	for routine in instance.update_routines {
+		append_error := append_finished_update_routine_response(routine, responses)
+		if append_error.message != nil {
+			return append_error
+		}
+	}
+	return {}
+}
+
+update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
+	if routine == nil || routine.instance == nil || routine.fiber == nil ||
+	   fiber_raw.status(routine.fiber) != .Suspended {
+		return false
+	}
+	instance := routine.instance
+	cancellation_applies := instance.cancellation_requested && routine.detached_scope_depth == 0
+	switch routine.phase {
+	case .Waiting_Activity:
+		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
+		return found && (operation.state == .Resolved || operation.state == .Failed ||
+			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_Timer:
+		operation, found := find_timer_operation(instance, routine.waiting_timer_seq)
+		return found && (operation.state == .Resolved || operation.state == .Cancel_Requested ||
+			operation.state == .Canceled)
+	case .Waiting_Signal:
+		_, found := find_buffered_signal(instance, routine.waiting_signal_name)
+		return found || cancellation_applies
+	case .Waiting_Signal_Or_Timer:
+		_, signal_found := find_buffered_signal(instance, routine.waiting_signal_name)
+		timer, timer_found := find_timer_operation(instance, routine.waiting_timer_seq)
+		return signal_found || cancellation_applies ||
+			(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
+			timer.state == .Canceled))
+	case .Ready, .Canceled, .Completed, .Failed:
+	}
+	return false
+}
+
+resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
+	for routine in instance.update_routines {
+		if !update_routine_should_resume(routine) {
+			continue
+		}
+		routine.phase = .Ready
+		routine.waiting_activity_seq = 0
+		routine.waiting_timer_seq = 0
+		routine.waiting_signal_name = ""
+		resume_error := resume_update_routine(routine)
+		if resume_error.message != nil {
+			return resume_error
+		}
+	}
+	return {}
+}
+
 invoke_workflow_update :: proc(
 	instance: ^Fiber_Instance,
 	update: ^proto.Coresdk_Workflow_Activation_DoUpdate,
@@ -2278,6 +2720,43 @@ invoke_workflow_update :: proc(
 	}
 
 	append_pending_update_response(responses, protocol_instance_id, .Accepted)
+	if handler.invoke_routine != nil {
+		routine, routine_error := start_update_routine(
+			instance,
+			handler,
+			protocol_instance_id,
+			codec.payload_view(&input),
+		)
+		if routine_error.message != nil {
+			failure_message := fmt.aprintf("%s", string(routine_error.message))
+			append_pending_update_response(
+				responses,
+				protocol_instance_id,
+				.Rejected,
+				payload_fail(
+					failure_message,
+					"OdinWorkflowUpdateRoutineError",
+				),
+			)
+			error_free(&routine_error)
+			return
+		}
+		append_error := append_finished_update_routine_response(routine, responses)
+		if append_error.message != nil {
+			failure_message := fmt.aprintf("%s", string(append_error.message))
+			append_pending_update_response(
+				responses,
+				protocol_instance_id,
+				.Rejected,
+				payload_fail(
+					failure_message,
+					"OdinWorkflowUpdateRoutineError",
+				),
+			)
+			error_free(&append_error)
+		}
+		return
+	}
 	command_state := workflow_command_state(instance)
 	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
 	if workflow_command_state_changed(instance, command_state) {
@@ -2341,12 +2820,12 @@ append_update_response_command :: proc(
 	)
 }
 
-append_fiber_pending_commands :: proc(
+append_shared_operation_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 	task_queue: string,
-) -> Error {
+) {
 	for index in 0..<len(instance.activities) {
 		operation := &instance.activities[index]
 		if operation.state == .Scheduled {
@@ -2361,6 +2840,15 @@ append_fiber_pending_commands :: proc(
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
+}
+
+append_fiber_pending_commands :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+	task_queue: string,
+) -> Error {
+	append_shared_operation_commands(result, commands, instance, task_queue)
 	switch instance.phase {
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
@@ -2375,6 +2863,15 @@ append_fiber_pending_commands :: proc(
 	}
 	result.run_id = instance.run_id
 	return {}
+}
+
+has_active_update_routines :: proc(instance: ^Fiber_Instance) -> bool {
+	for routine in instance.update_routines {
+		if !routine.response_emitted {
+			return true
+		}
+	}
+	return false
 }
 
 commands_are_update_responses :: proc(
@@ -2512,7 +3009,13 @@ append_fiber_progress_command :: proc(
 	if instance.phase == .Canceled {
 		return append_fiber_cancellation_commands(result, commands, instance)
 	}
-	switch fiber_raw.status(instance.fiber) {
+	main_status := fiber_raw.status(instance.fiber)
+	if main_status == .Dead && has_active_update_routines(instance) {
+		append_shared_operation_commands(result, commands, instance, task_queue)
+		result.run_id = instance.run_id
+		return {}
+	}
+	switch main_status {
 	case .Suspended:
 		return append_fiber_pending_commands(result, commands, instance, task_queue)
 	case .Dead:
@@ -2780,6 +3283,24 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	}
 
 	if instance_found {
+		resume_updates_error := resume_ready_update_routines(instance)
+		if resume_updates_error.message != nil {
+			message := string(resume_updates_error.message)
+			process_error(&result, activation.run_id, message)
+			error_free(&resume_updates_error)
+			return
+		}
+		finished_updates_error := append_finished_update_routine_responses(
+			instance,
+			&pending_update_responses,
+		)
+		if finished_updates_error.message != nil {
+			message := string(finished_updates_error.message)
+			process_error(&result, activation.run_id, message)
+			error_free(&finished_updates_error)
+			return
+		}
+
 		should_resume := false
 		switch instance.phase {
 		case .Waiting_Activity:
