@@ -27,12 +27,12 @@ Typed_Greeting_Output :: struct {
 	heartbeat_timeout_milliseconds: i64,
 }
 
-main :: proc() {
+run :: proc() -> int {
 	client, connect_error := temporal_client.connect()
 	if connect_error.message != nil {
 		fmt.eprintf("Temporal client connection failed: %s\n", string(connect_error.message))
 		temporal_client.error_free(&connect_error)
-		os.exit(1)
+		return 1
 	}
 	defer temporal_client.close(&client)
 
@@ -61,7 +61,7 @@ main :: proc() {
 			string(start_error.message),
 		)
 		temporal_client.error_free(&start_error)
-		os.exit(1)
+		return 1
 	}
 	defer temporal_client.workflow_handle_free(&handle)
 
@@ -82,16 +82,24 @@ main :: proc() {
 			string(result_error.message),
 		)
 		temporal_client.error_free(&result_error)
-		os.exit(1)
+		return 1
 	}
 
 	fmt.printf(
 		"Odin client completed workflow_id=%s run_id=%s message=%q activity_id=%s task_queue=%s retry_attempts=%d\n",
 		result.workflow_id,
-		handle.result_run_id,
+		handle.run_id,
 		result.message,
 		result.activity_id,
 		result.task_queue,
 		result.retry_maximum_attempts,
 	)
+	return 0
+}
+
+main :: proc() {
+	exit_code := run()
+	if exit_code != 0 {
+		os.exit(exit_code)
+	}
 }

@@ -250,11 +250,11 @@ grep -q 'activation_failed=true error="Workflow type odin_missing_workflow not f
 grep -q 'activation_failed=false .*evicted=true' "$worker_log"
 grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file"
 kill -0 "$worker_pid"
-temporal workflow terminate \
-  --workflow-id "$unknown_workflow_id" \
-  --reason "unknown Workflow type test completed" \
-  --command-timeout 10s \
-  --output none
+TEMPORAL_CLIENT_ACTION=terminate \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$unknown_workflow_id" \
+  TEMPORAL_CLIENT_REASON="unknown Workflow type test completed" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
 unknown_workflow_id=""
 
 workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
@@ -284,12 +284,12 @@ if ! grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worke
   exit 1
 fi
 
-temporal workflow signal \
-  --workflow-id "$workflow_id" \
-  --name approval \
-  --input '"Approved"' \
-  --command-timeout 10s \
-  --output none
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=approval \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=Approved \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
 
 wait "$workflow_cli_pid"
 workflow_cli_pid=""
@@ -361,10 +361,11 @@ run_workflow_cancellation_case() {
     exit 1
   fi
 
-  temporal workflow cancel \
-    --workflow-id "$workflow_id" \
-    --command-timeout 10s \
-    --output none
+  TEMPORAL_CLIENT_ACTION=cancel \
+    TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+    TEMPORAL_CLIENT_REASON="Odin Client integration cancellation" \
+    TEMPORAL_ODIN_SKIP_BUILD=1 \
+    "$repo_root/scripts/run-client-control.sh"
 
   workflow_cli_status=0
   wait "$workflow_cli_pid" || workflow_cli_status=$?

@@ -7,7 +7,8 @@ Current status: Milestones 0–2 plus bounded explicit-state-machine and stackfu
 fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
-Odin Client over Core's generic WorkflowService RPC bridge. It also proves
+Odin Client over Core's generic WorkflowService RPC bridge. The Client also
+sends typed signals, requests cancellation, and terminates executions. It proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
@@ -72,7 +73,7 @@ git submodule update --init --recursive
 ./scripts/build-core.sh
 ```
 
-Build all three Odin examples in one pass with:
+Build all Odin examples in one pass with:
 
 ```bash
 ./scripts/build-examples.sh
@@ -135,6 +136,20 @@ The Client owns its Core runtime, connection, and namespace. A Workflow handle
 owns its ID/run-ID strings but borrows the Client, so handles must be freed
 before `client.close`. The Payload variants expose the codec-neutral boundary;
 the JSON variants currently send and receive exactly one Payload.
+
+Existing executions can be addressed without an RPC when creating the handle:
+
+```odin
+handle, err := temporal_client.get_workflow_handle(&client, "order-42")
+defer temporal_client.workflow_handle_free(&handle)
+
+err = temporal_client.signal_workflow_json(&handle, "approve", approval)
+err = temporal_client.cancel_workflow(&handle, "customer canceled")
+```
+
+An empty run ID targets the current execution. Signal and cancellation calls
+generate UUIDv4 request IDs unless the caller supplies one. Termination has
+plain, Payload, and typed JSON detail variants.
 
 The combined example now uses the reusable registration boundary:
 
@@ -249,8 +264,10 @@ The compatibility helpers retain their experimental 20-second
 Start-to-Close/one-attempt behavior.
 
 `register_payload_workflow` is the lower-level form. String Workflows remain a
-compatibility adapter over `json/plain`. Signals are still string-only in the
-experimental public API.
+compatibility adapter over `json/plain`. Workflow signal buffering preserves a
+generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
+typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
+the `json/plain` string compatibility adapter.
 
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
@@ -260,14 +277,14 @@ that close completes.
 
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
-also starts `examples/hello_workflow` and uses Temporal CLI to verify the Odin
-Workflow result after delivering an `approval` signal while the fiber is blocked
-on a durable timer, cancelling that timer, evicting the fiber, and requiring
-replay to reproduce the timer cancellation and following Activity command.
-Two more executions use `temporal workflow cancel` to verify pending-timer and
-pending-Activity cleanup through Core. The Activity case waits for an Odin
-heartbeat, observes Core's cancel task in the in-flight context, and replies
-with a cancellation completion. A separate fan-out case proves two Odin
+also starts `examples/hello_workflow`; the Odin Client delivers an `approval`
+signal while the fiber is blocked on a durable timer, cancelling that timer,
+evicting the fiber, and requiring replay to reproduce the timer cancellation
+and following Activity command. Two more executions use Odin Client cancellation
+to verify pending-timer and pending-Activity cleanup through Core. Temporal CLI
+still starts/waits on these older test executions and reads their history. The
+Activity case waits for an Odin heartbeat, observes Core's cancel task in the
+in-flight context, and replies with a cancellation completion. A separate fan-out case proves two Odin
 Activity callbacks overlap rather than merely being queued concurrently. The
 suite also starts an unregistered Workflow type, verifies a retryable
 `WorkflowTaskFailed` event and Core eviction, then proves that the same Odin
@@ -309,9 +326,10 @@ temporal/activity/        Activity context
 temporal/worker/          Activity/Workflow registry and concurrent Core polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/workflow/        explicit-state and stackful-fiber experiments
-temporal/client/          owned Client, Workflow handle, start/result APIs
+temporal/client/          owned Client and Workflow handle/control APIs
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
+examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests

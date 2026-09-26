@@ -15,9 +15,11 @@ above that boundary. Workflow Activity options are represented explicitly and
 preserved across fresh-stack replay. Activity context now carries heap-stable
 execution identity, timestamps/timeouts, effective Retry Policy, priority, and
 generic heartbeat details copied from Core before the poll decode arena dies.
-The first public Client slice owns Core connection lifecycle, starts a Workflow,
-long-polls its close event, follows new runs, and returns a generic or typed
-Payload result.
+The public Client owns Core connection lifecycle, starts or obtains a Workflow
+handle, long-polls its close event, follows new runs, returns a generic or typed
+Payload result, sends typed signals, requests cancellation, and terminates
+executions. The Workflow runtime now preserves signal Payloads generically and
+offers raw, typed JSON, and string await adapters.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -144,6 +146,14 @@ ID, and uses `HISTORY_EVENT_FILTER_TYPE_CLOSE_EVENT` with `wait_new_event =
 true`. Core owns gRPC transport and retries. The handle result loop maps
 completed, failed, canceled, terminated, timed-out, and Continue-As-New close
 events, following the next run by default as the current .NET SDK does.
+
+The same generic bridge now carries `SignalWorkflowExecution`,
+`RequestCancelWorkflowExecution`, and `TerminateWorkflowExecution`. Signals
+support zero or one generic/typed Payload and generate a UUIDv4 request ID for
+deduplication unless the caller supplies one. Cancellation does the same.
+Cancellation and termination forward a started handle's first execution run ID
+as a chain guard. `get_workflow_handle` performs no RPC and allows an empty run
+ID to address the current execution by Workflow ID.
 
 `client.Client` heap-owns a stable Core runtime and connection because
 `core.Client` retains a pointer to its runtime. It also owns its namespace.
@@ -696,7 +706,7 @@ produces a non-retryable `OdinWorkflowPayloadConversionError`, not a worker
 shutdown. A raw Payload test separately carries custom `encoding`,
 `messageType`, opaque bytes, and external-payload size details through Workflow
 input -> Activity command -> Activity resolution -> Workflow completion. Typed
-signal adapters remain future work.
+signals use the same Payload boundary.
 
 Activity scheduling is no longer hardcoded. `Activity_Options` maps directly
 onto the pinned Core `ScheduleActivity` command: Activity ID, task queue,
@@ -834,12 +844,16 @@ responsibilities: the TypeScript SDK has an explicit
 and Temporal's Go documentation confirms that
 [signals are retained until matching Workflow code receives them](https://github.com/temporalio/documentation/blob/main/docs/develop/go/workflows/message-passing.mdx#signal-channels).
 
-The Odin spike accepts exactly one `json/plain` string argument per signal. It
-copies name and payload into the Workflow instance arena and appends them to an
-arrival-ordered queue. `await_signal(ctx, name)` consumes the oldest unconsumed
-matching entry immediately, or changes the fiber phase to `Waiting_Signal` and
-yields. A signal only resumes the fiber when that exact phase/name is active;
-signals received while waiting on an Activity remain buffered.
+The Odin runtime currently accepts exactly one generic Payload per signal. It
+copies the name and complete Payload—including metadata and external-payload
+details—into the Workflow instance arena and appends them to an arrival-ordered
+queue. `await_signal_payload(ctx, name)` consumes the oldest unconsumed matching
+entry immediately, or changes the fiber phase to `Waiting_Signal` and yields.
+`await_signal_json` decodes a typed value at the authoring boundary;
+`await_signal` remains the `json/plain` string adapter. Generic, typed, and
+string signal-or-timeout variants share the same buffer and race logic. A signal
+only resumes the fiber when that exact phase/name is active; signals received
+while waiting on an Activity remain buffered.
 
 The live acceptance sequence was:
 
@@ -1134,10 +1148,11 @@ Workflows are enabled.
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
-8. **Client/server feature skew.** Workflow start/result is live-proven, but the
-   public Client still lacks signals, queries, updates, cancellation,
-   termination, headers, retry/options completeness, and failure-detail
-   conversion. The pinned standalone-Activity client API is
+8. **Client/server feature skew.** Workflow start/result, signals,
+   cancellation, and termination are live-proven, but the public Client still
+   lacks queries, updates, describe/history iteration, headers, search
+   attributes, memo, retry/options completeness, and failure-detail conversion.
+   The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
 
@@ -1167,14 +1182,14 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest vertical milestone should extend the now-proven Client with
-`SignalWorkflowExecution` and use it to replace Temporal CLI in the durable
-signal/timer integration case. This exercises a running handle, request-ID
-generation, and another Payload-bearing RPC without prematurely growing a
-broad client surface.
+The next smallest vertical milestone should expose structured Activity failure
+details to Workflow code. The runtime already preserves the complete failure
+protobuf across the activation arena boundary, but the catchable API exposes
+only status and message. Decode Application Failure type, retryability, details,
+and next-retry delay behind an owned/view boundary without changing command
+replay.
 
-After that, extend the same Payload adapter pattern to typed Activity failure
-details in Workflow code, then stress pool
+After that, introduce user cancellation scopes and cleanup, then stress pool
 shutdown/cancel/heartbeat/failure interleavings. Panic containment should be
 designed as subprocess isolation unless Odin gains supported recovery. A
 statechart oracle becomes worthwhile when retry/cancellation/shutdown
@@ -1183,8 +1198,9 @@ cancellation scopes remain a separate Workflow-runtime change.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Keep queries and updates deferred until cancellation semantics are
-grounded at the user-code boundary.
+dependency. Query delivery should follow once typed signal dispatch and
+cancellation semantics are grounded at the user-code boundary; Updates remain
+deferred until then.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

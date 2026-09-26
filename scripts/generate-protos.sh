@@ -49,7 +49,10 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.StartWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.StartWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryRequest \
-  temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse
+  temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse \
+  temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest
 
 if [[ "$mode" == "--check" ]]; then
   if ! cmp -s "$generated" "$destination"; then

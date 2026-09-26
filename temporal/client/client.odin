@@ -142,7 +142,7 @@ Start_Workflow_Options :: struct {
 Workflow_Handle :: struct {
 	client:                 ^Client,
 	id:                     string,
-	result_run_id:          string,
+	run_id:                 string,
 	first_execution_run_id: string,
 }
 
@@ -152,9 +152,45 @@ workflow_handle_free :: proc(handle: ^Workflow_Handle) {
 	}
 	heap := allocator_runtime.heap_allocator()
 	delete(handle.id, heap)
-	delete(handle.result_run_id, heap)
+	delete(handle.run_id, heap)
 	delete(handle.first_execution_run_id, heap)
 	handle^ = {}
+}
+
+get_workflow_handle :: proc(
+	client: ^Client,
+	id: string,
+	run_id := "",
+	first_execution_run_id := "",
+) -> (handle: Workflow_Handle, error: Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	if len(id) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow ID must not be empty")
+	}
+	heap := allocator_runtime.heap_allocator()
+	owned_id, id_error := strings.clone(id, heap)
+	if id_error != nil {
+		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
+	}
+	owned_run_id, run_id_error := strings.clone(run_id, heap)
+	if run_id_error != nil {
+		delete(owned_id, heap)
+		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
+	}
+	owned_first_run_id, first_run_error := strings.clone(first_execution_run_id, heap)
+	if first_run_error != nil {
+		delete(owned_run_id, heap)
+		delete(owned_id, heap)
+		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
+	}
+	return {
+		client = client,
+		id = owned_id,
+		run_id = owned_run_id,
+		first_execution_run_id = owned_first_run_id,
+	}, {}
 }
 
 duration_proto :: proc(value: time.Duration) -> proto.Google_Protobuf_Duration {
@@ -254,32 +290,11 @@ start_workflow_payload :: proc(
 		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed start response")
 	}
 
-	heap := allocator_runtime.heap_allocator()
-	owned_id, id_error := strings.clone(options.id, heap)
-	if id_error != nil {
-		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
-	}
-	owned_run_id, run_id_error := strings.clone(response.run_id, heap)
-	if run_id_error != nil {
-		delete(owned_id, heap)
-		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
-	}
 	first_execution_run_id := response.first_execution_run_id
 	if len(first_execution_run_id) == 0 {
 		first_execution_run_id = response.run_id
 	}
-	owned_first_run_id, first_run_error := strings.clone(first_execution_run_id, heap)
-	if first_run_error != nil {
-		delete(owned_run_id, heap)
-		delete(owned_id, heap)
-		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow handle")
-	}
-	return {
-		client = client,
-		id = owned_id,
-		result_run_id = owned_run_id,
-		first_execution_run_id = owned_first_run_id,
-	}, {}
+	return get_workflow_handle(client, options.id, response.run_id, first_execution_run_id)
 }
 
 start_workflow_json :: proc(
@@ -294,6 +309,204 @@ start_workflow_json :: proc(
 	}
 	defer codec.payload_free(&payload)
 	return start_workflow_payload(client, workflow_type, codec.payload_view(&payload), options)
+}
+
+workflow_handle_valid :: proc(handle: ^Workflow_Handle) -> bool {
+	return handle != nil && handle.client != nil && handle.client.connection != nil &&
+		handle.client.connection.handle != nil && len(handle.id) > 0
+}
+
+workflow_execution :: proc(handle: ^Workflow_Handle) -> proto.Temporal_Api_Common_V1_WorkflowExecution {
+	return {
+		workflow_id = handle.id,
+		run_id = handle.run_id,
+	}
+}
+
+resolve_request_id :: proc(explicit: string, buffer: []u8) -> string {
+	if len(explicit) > 0 {
+		return explicit
+	}
+	return uuid.to_string_buffer(uuid.generate_v4(), buffer)
+}
+
+rpc_empty_response :: proc(
+	handle: ^Workflow_Handle,
+	rpc: string,
+	request: []u8,
+) -> Error {
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		rpc,
+		request,
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		return error_from_core(&rpc_result.error)
+	}
+	return {}
+}
+
+signal_workflow :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	explicit_request_id := "",
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if len(signal_name) == 0 {
+		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	}
+	execution := workflow_execution(handle)
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
+		namespace = handle.client.namespace,
+		workflow_execution = &execution,
+		signal_name = signal_name,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
+}
+
+signal_workflow_payload :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	input: codec.Payload_View,
+	explicit_request_id := "",
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if len(signal_name) == 0 {
+		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	}
+	execution := workflow_execution(handle)
+	payload := proto.encode_payload(input)
+	defer delete(payload.metadata)
+	defer delete(payload.external_payloads)
+	inputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(inputs.payloads)
+	append(&inputs.payloads, payload)
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
+		namespace = handle.client.namespace,
+		workflow_execution = &execution,
+		signal_name = signal_name,
+		input = &inputs,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
+}
+
+signal_workflow_json :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	input: $T,
+	explicit_request_id := "",
+) -> Error {
+	payload, encode_error := codec.encode_json(input)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow signal input")
+	}
+	defer codec.payload_free(&payload)
+	return signal_workflow_payload(
+		handle,
+		signal_name,
+		codec.payload_view(&payload),
+		explicit_request_id,
+	)
+}
+
+cancel_workflow :: proc(
+	handle: ^Workflow_Handle,
+	reason := "",
+	explicit_request_id := "",
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	execution := workflow_execution(handle)
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{
+		namespace = handle.client.namespace,
+		workflow_execution = &execution,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
+		first_execution_run_id = handle.first_execution_run_id,
+		reason = reason,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(handle, "RequestCancelWorkflowExecution", request_bytes[:])
+}
+
+terminate_workflow :: proc(
+	handle: ^Workflow_Handle,
+	reason := "",
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	execution := workflow_execution(handle)
+	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
+		namespace = handle.client.namespace,
+		workflow_execution = &execution,
+		reason = reason,
+		identity = "temporal-sdk-odin@local",
+		first_execution_run_id = handle.first_execution_run_id,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(handle, "TerminateWorkflowExecution", request_bytes[:])
+}
+
+terminate_workflow_payload :: proc(
+	handle: ^Workflow_Handle,
+	reason: string,
+	details: codec.Payload_View,
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	execution := workflow_execution(handle)
+	payload := proto.encode_payload(details)
+	defer delete(payload.metadata)
+	defer delete(payload.external_payloads)
+	detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(detail_payloads.payloads)
+	append(&detail_payloads.payloads, payload)
+	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
+		namespace = handle.client.namespace,
+		workflow_execution = &execution,
+		reason = reason,
+		details = &detail_payloads,
+		identity = "temporal-sdk-odin@local",
+		first_execution_run_id = handle.first_execution_run_id,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(handle, "TerminateWorkflowExecution", request_bytes[:])
+}
+
+terminate_workflow_json :: proc(
+	handle: ^Workflow_Handle,
+	reason: string,
+	details: $T,
+) -> Error {
+	payload, encode_error := codec.encode_json(details)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow termination details")
+	}
+	defer codec.payload_free(&payload)
+	return terminate_workflow_payload(handle, reason, codec.payload_view(&payload))
 }
 
 Result_Page_Kind :: enum {
@@ -471,7 +684,7 @@ get_result_payload :: proc(
 	if handle == nil || handle.client == nil || handle.client.connection == nil || len(handle.id) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
-	current_run_id, allocation_error := strings.clone(handle.result_run_id)
+	current_run_id, allocation_error := strings.clone(handle.run_id)
 	if allocation_error != nil {
 		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow result run ID")
 	}

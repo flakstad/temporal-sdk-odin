@@ -150,6 +150,16 @@ Signal_Wait_Result :: struct {
 	value:  string,
 }
 
+Payload_Signal_Wait_Result :: struct {
+	status: Signal_Wait_Status,
+	value:  codec.Payload_View,
+}
+
+Json_Signal_Wait_Result :: struct(T: typeid) {
+	status: Signal_Wait_Status,
+	value:  T,
+}
+
 Fiber_Activity_Operation :: struct {
 	seq:           u32,
 	activity_id:   string,
@@ -170,7 +180,7 @@ Fiber_Timer_Operation :: struct {
 
 Fiber_Signal :: struct {
 	name:     string,
-	payload:  string,
+	payload:  codec.Payload,
 	consumed: bool,
 }
 
@@ -349,6 +359,9 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	for &operation in instance.activities {
 		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
+	}
+	for &signal in instance.signals {
+		codec.payload_free(&signal.payload)
 	}
 	virtual.arena_destroy(&instance.arena)
 	free(instance, instance.owner_allocator)
@@ -1003,50 +1016,87 @@ execute_activity_json_with_options :: proc(
 	return result.value
 }
 
-// await_signal consumes the oldest buffered signal with the requested name, or
-// suspends until Core delivers one. Signals with other names stay buffered.
-await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
+signal_payload_conversion_failed :: proc(instance: ^Fiber_Instance, message: string) {
+	if instance == nil {
+		return
+	}
+	instance.phase = .Failed
+	instance.failure_message = message
+	instance.failure_type = "OdinWorkflowPayloadConversionError"
+}
+
+// await_signal_payload consumes the oldest buffered signal with the requested
+// name, or suspends until Core delivers one. Signals with other names stay
+// buffered. The returned view is owned by the Workflow instance.
+await_signal_payload :: proc(ctx: ^Fiber_Context, name: string) -> codec.Payload_View {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
-		return ""
+		return {}
 	}
 	instance := ctx.instance
 	signal, found := find_buffered_signal(instance, name)
 	if found {
 		signal.consumed = true
-		return signal.payload
+		return codec.payload_view(&signal.payload)
 	}
 	waiting_name, allocation_error := strings.clone(name)
 	if allocation_error != nil {
 		instance.phase = .Failed
-		return ""
+		return {}
 	}
 	instance.waiting_signal_name = waiting_name
 	instance.phase = .Waiting_Signal
 	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
-		return ""
+		return {}
 	}
 	signal, found = find_buffered_signal(instance, name)
 	if !found {
 		instance.phase = .Failed
-		return ""
+		return {}
 	}
 	signal.consumed = true
-	return signal.payload
+	return codec.payload_view(&signal.payload)
+}
+
+// await_signal is the json/plain string compatibility adapter.
+await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
+	payload := await_signal_payload(ctx, name)
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
+		return ""
+	}
+	value, decode_error := codec.decode_string(payload.data, codec.encoding(payload))
+	if decode_error != .None {
+		signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain string")
+		return ""
+	}
+	return value
+}
+
+await_signal_json :: proc(ctx: ^Fiber_Context, name: string, $T: typeid) -> T {
+	payload := await_signal_payload(ctx, name)
+	value: T
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
+		return value
+	}
+	if codec.decode_json(payload, &value) != .None {
+		signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain")
+		return {}
+	}
+	return value
 }
 
 // await_signal_or_timeout races a named signal against a durable Temporal
 // timer. Core orders signal jobs before timer jobs in the same activation, so a
 // buffered matching signal wins that tie without cancelling an already-fired
 // timer.
-await_signal_or_timeout :: proc(
+await_signal_payload_or_timeout :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
 	duration: time.Duration,
-) -> Signal_Wait_Result {
+) -> Payload_Signal_Wait_Result {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 || duration <= 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
@@ -1057,7 +1107,7 @@ await_signal_or_timeout :: proc(
 	signal, signal_found := find_buffered_signal(instance, name)
 	if signal_found {
 		signal.consumed = true
-		return {status = .Received, value = signal.payload}
+		return {status = .Received, value = codec.payload_view(&signal.payload)}
 	}
 	waiting_name, allocation_error := strings.clone(name)
 	if allocation_error != nil {
@@ -1086,13 +1136,55 @@ await_signal_or_timeout :: proc(
 		if timer_found && timer.state == .Commanded {
 			timer.state = .Cancel_Requested
 		}
-		return {status = .Received, value = signal.payload}
+		return {status = .Received, value = codec.payload_view(&signal.payload)}
 	}
 	if timer_found && timer.state == .Resolved {
 		return {status = .Timed_Out}
 	}
 	instance.phase = .Failed
 	return {status = .Timed_Out}
+}
+
+await_signal_or_timeout :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	duration: time.Duration,
+) -> Signal_Wait_Result {
+	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
+	if payload_result.status == .Timed_Out {
+		return {status = .Timed_Out}
+	}
+	value, decode_error := codec.decode_string(
+		payload_result.value.data,
+		codec.encoding(payload_result.value),
+	)
+	if decode_error != .None {
+		if ctx != nil {
+			signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain string")
+		}
+		return {status = .Received}
+	}
+	return {status = .Received, value = value}
+}
+
+await_signal_json_or_timeout :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	duration: time.Duration,
+	$T: typeid,
+) -> Json_Signal_Wait_Result(T) {
+	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
+	if payload_result.status == .Timed_Out {
+		return {status = .Timed_Out}
+	}
+	value: T
+	if codec.decode_json(payload_result.value, &value) != .None {
+		if ctx != nil {
+			signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain")
+		}
+		return {status = .Received}
+	}
+	return {status = .Received, value = value}
 }
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
@@ -1597,13 +1689,12 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, "Workflow signal must have a name and one payload")
 				return
 			}
-			payload := proto.payload_view(&variant.value.input[0])
 			context.allocator = instance.odin_context.allocator
 			signal_name, name_error := strings.clone(variant.value.signal_name)
-			signal_payload, decode_error := codec.decode_string(payload.data, payload.encoding)
+			signal_payload, clone_error := proto.clone_payload(&variant.value.input[0])
 			context.allocator = previous_allocator
-			if name_error != nil || decode_error != .None {
-				process_error(&result, activation.run_id, "could not preserve Workflow signal as json/plain string")
+			if name_error != nil || clone_error != .None {
+				process_error(&result, activation.run_id, "could not preserve Workflow signal Payload")
 				return
 			}
 			append(

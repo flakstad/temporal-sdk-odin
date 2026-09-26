@@ -343,8 +343,33 @@ IDs by default. Set `follow_runs = false` to receive
 `Workflow_Continued_As_New` instead. RPC failures retain the gRPC status code
 and binary status-details protobuf.
 
-The integration test uses Temporal CLI directly—no Docker, PostgreSQL, or
-Elasticsearch:
+The same handle supports control operations:
+
+```odin
+existing, handle_error := temporal_client.get_workflow_handle(&client, "greeting-42")
+defer temporal_client.workflow_handle_free(&existing)
+
+signal_error := temporal_client.signal_workflow_json(&existing, "approval", approval)
+cancel_error := temporal_client.cancel_workflow(&existing, "no longer needed")
+terminate_error := temporal_client.terminate_workflow(&existing, "operator decision")
+```
+
+Handle creation only clones identifiers; it does not contact the Service. An
+empty run ID targets the current execution. Signal and cancellation requests
+generate UUIDv4 deduplication IDs by default. Signal and termination have
+codec-neutral Payload forms, plus typed JSON helpers. The live suite invokes
+all three operations through `examples/client_control`.
+
+Workflow-side signal buffering is codec-neutral. Use
+`workflow.await_signal_payload` for the borrowed Payload or
+`workflow.await_signal_json(ctx, name, T)` for a typed value. The
+`await_signal_payload_or_timeout`, `await_signal_json_or_timeout`, and string
+compatibility forms use the same deterministic signal/timer race. Payload
+conversion failures fail the Workflow with
+`OdinWorkflowPayloadConversionError` rather than stopping the worker.
+
+The integration test uses the Temporal CLI dev server directly—no Docker,
+PostgreSQL, or Elasticsearch:
 
 ```bash
 ./scripts/integration-test.sh
@@ -406,8 +431,8 @@ Before the registered Workflow scenario, the live suite starts
 `odin_missing_workflow` on the same queue. It requires both an
 `EVENT_TYPE_WORKFLOW_TASK_FAILED` event in server history and a following Core
 cache eviction, confirms that the worker process is still alive, terminates the
-intentionally stuck execution, and then runs the registered Workflow. Temporal
-[documents unknown Workflow Tasks](https://docs.temporal.io/task-queue) as
+intentionally stuck execution through the Odin Client, and then runs the
+registered Workflow. Temporal [documents unknown Workflow Tasks](https://docs.temporal.io/task-queue) as
 retryable Task failures rather than Workflow Execution failures, so the
 explicit termination is test cleanup, not SDK behavior.
 
@@ -435,16 +460,17 @@ after eviction and fresh-stack replay. The Client property generates another
 destroys the encoded response, and requires the owned result Payload to retain
 the generated value.
 
-Finally, the script starts `examples/hello_workflow` and invokes it directly
-with `temporal workflow execute` in the background. After the Workflow has
+Finally, the script starts `examples/hello_workflow` and invokes it with
+`temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
-`approval` signal, the script sends the signal through Temporal CLI. The signal
-wins, so the Odin runtime emits `CancelTimer` and schedules an Activity in the
+`approval` signal, `examples/client_control` sends a typed JSON signal through
+Core. The signal wins, so the Odin runtime emits `CancelTimer` and schedules an
+Activity in the
 same completion. The reusable worker's Activity poll thread completes that
 Activity while its Workflow poll thread handles Core-directed eviction and
 fresh-stack replay. The final completion eviction is required before the test
-succeeds. It then runs two cancellation cases through
-`temporal workflow cancel`: a Workflow blocked on a timer must emit
+succeeds. It then runs two cancellation cases through the Odin Client: a
+Workflow blocked on a timer must emit
 `CancelTimer` plus `CancelWorkflowExecution`, and a Workflow blocked on an
 Activity must emit `RequestCancelActivity` plus `CancelWorkflowExecution`.
 For the Activity case, polling remains enabled: the callback first heartbeats,

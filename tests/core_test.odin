@@ -223,9 +223,18 @@ fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: 
 	return result
 }
 
+Signal_Test_Value :: struct {
+	message:  string,
+	approved: bool,
+}
+
 fiber_wait_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
-	return workflow.await_signal(ctx, "approval")
+	approval := workflow.await_signal_json(ctx, "approval", Signal_Test_Value)
+	if !approval.approved {
+		return "Denied"
+	}
+	return approval.message
 }
 
 fiber_signal_timeout_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -745,6 +754,44 @@ client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
 	testing.expect(t, page_error.message == nil)
 	testing.expect(t, page.kind == .Continued_As_New)
 	testing.expect_value(t, page.next_run_id, "continued-run-id")
+}
+
+@(test)
+client_workflow_handle_owns_identifiers :: proc(t: ^testing.T) {
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{connection = &connection}
+	id, _ := strings.clone("owned-workflow-id")
+	run_id, _ := strings.clone("owned-run-id")
+	first_run_id, _ := strings.clone("owned-first-run-id")
+	handle, handle_error := temporal_client.get_workflow_handle(
+		&client,
+		id,
+		run_id,
+		first_run_id,
+	)
+	delete(id)
+	delete(run_id)
+	delete(first_run_id)
+	defer temporal_client.workflow_handle_free(&handle)
+	defer temporal_client.error_free(&handle_error)
+	testing.expect(t, handle_error.message == nil)
+	testing.expect_value(t, handle.id, "owned-workflow-id")
+	testing.expect_value(t, handle.run_id, "owned-run-id")
+	testing.expect_value(t, handle.first_execution_run_id, "owned-first-run-id")
+}
+
+@(test)
+client_control_operations_reject_invalid_handles :: proc(t: ^testing.T) {
+	handle := temporal_client.Workflow_Handle{}
+	signal_error := temporal_client.signal_workflow(&handle, "approval")
+	defer temporal_client.error_free(&signal_error)
+	testing.expect(t, signal_error.kind == .Invalid_Argument)
+	cancel_error := temporal_client.cancel_workflow(&handle)
+	defer temporal_client.error_free(&cancel_error)
+	testing.expect(t, cancel_error.kind == .Invalid_Argument)
+	terminate_error := temporal_client.terminate_workflow(&handle)
+	defer temporal_client.error_free(&terminate_error)
+	testing.expect(t, terminate_error.kind == .Invalid_Argument)
 }
 
 @(test)
@@ -3164,15 +3211,14 @@ workflow_fiber_resumes_direct_signal_await :: proc(t: ^testing.T) {
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
-	signal_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Approved"`)}
-	defer delete(signal_payload.metadata)
-	append(
-		&signal_payload.metadata,
-		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
-			key = "encoding",
-			value = transmute([]u8)string("json/plain"),
-		},
+	owned_signal_payload, signal_encode_error := codec.encode_json(
+		Signal_Test_Value{message = "Approved", approved = true},
 	)
+	testing.expect(t, signal_encode_error == .None)
+	defer codec.payload_free(&owned_signal_payload)
+	signal_payload := proto.encode_payload(codec.payload_view(&owned_signal_payload))
+	defer delete(signal_payload.metadata)
+	defer delete(signal_payload.external_payloads)
 	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "approval"}
 	defer delete(signal.input)
 	append(&signal.input, signal_payload)
@@ -3190,6 +3236,11 @@ workflow_fiber_resumes_direct_signal_await :: proc(t: ^testing.T) {
 	testing.expectf(t, processed.error.message == nil, "direct signal await failed: %s", string(processed.error.message))
 	testing.expect(t, processed.received_signal)
 	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	defer delete(inspection.completion_result)
+	testing.expect(t, inspection.decoded)
+	testing.expect(t, inspection.completed)
+	testing.expect_value(t, string(inspection.completion_result), `"Approved"`)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
