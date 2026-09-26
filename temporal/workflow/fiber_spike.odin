@@ -28,6 +28,14 @@ Query_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Update_Validate_Proc :: #type proc(
+	callback_data: rawptr,
+	input: codec.Payload_View,
+) -> Update_Validation
+Update_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	input: codec.Payload_View,
+) -> Payload_Result
 
 Payload_Result_Status :: enum {
 	Completed,
@@ -52,6 +60,27 @@ payload_fail :: proc(
 	return {
 		status = .Failed,
 		failure_message = message,
+		failure_type = failure_type,
+	}
+}
+
+Update_Validation :: struct {
+	accepted:     bool,
+	message:      string,
+	failure_type: string,
+}
+
+update_accept :: proc() -> Update_Validation {
+	return {accepted = true}
+}
+
+update_reject :: proc(
+	message: string,
+	failure_type := "OdinWorkflowUpdateRejected",
+) -> Update_Validation {
+	return {
+		accepted = false,
+		message = message,
 		failure_type = failure_type,
 	}
 }
@@ -218,9 +247,28 @@ Fiber_Query_Handler :: struct {
 	invoke:        Query_Invoke_Proc,
 }
 
+Fiber_Update_Handler :: struct {
+	name:          string,
+	callback_data: rawptr,
+	validate:      Update_Validate_Proc,
+	invoke:        Update_Invoke_Proc,
+}
+
 Pending_Query_Response :: struct {
 	query_id: string,
 	result:   Payload_Result,
+}
+
+Update_Response_Kind :: enum {
+	Accepted,
+	Rejected,
+	Completed,
+}
+
+Pending_Update_Response :: struct {
+	protocol_instance_id: string,
+	kind:                 Update_Response_Kind,
+	result:               Payload_Result,
 }
 
 Fiber_Activity_Operation :: struct {
@@ -261,6 +309,7 @@ Fiber_Instance :: struct {
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
 	query_handlers:   [dynamic]Fiber_Query_Handler,
+	update_handlers:  [dynamic]Fiber_Update_Handler,
 	waiting_activity_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
@@ -544,6 +593,7 @@ add_fiber_instance :: proc(
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
 	instance.query_handlers = make([dynamic]Fiber_Query_Handler)
+	instance.update_handlers = make([dynamic]Fiber_Update_Handler)
 	context.allocator = previous_allocator
 	if run_id_error != nil || clone_error != .None {
 		virtual.arena_destroy(&instance.arena)
@@ -704,6 +754,198 @@ set_query_handler_json :: proc(
 				return payload_fail(
 					"could not encode Workflow query result as json/plain",
 					"OdinWorkflowQueryPayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
+}
+
+find_update_handler :: proc(
+	instance: ^Fiber_Instance,
+	name: string,
+) -> (^Fiber_Update_Handler, bool) {
+	if instance == nil {
+		return nil, false
+	}
+	for index in 0..<len(instance.update_handlers) {
+		handler := &instance.update_handlers[index]
+		if handler.name == name {
+			return handler, true
+		}
+	}
+	return nil, false
+}
+
+update_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
+	if instance == nil {
+		return
+	}
+	instance.failure_message = message
+	instance.failure_type = "OdinWorkflowUpdateRegistrationError"
+	instance.phase = .Failed
+}
+
+set_update_handler_payload :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	validator: Update_Validate_Proc,
+	callback: Update_Invoke_Proc,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid Workflow Update handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_update_handler(instance, name)
+	if duplicate {
+		update_registration_failed(instance, "Workflow Update handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(instance, "could not preserve Workflow Update handler name")
+		return false
+	}
+	append(
+		&instance.update_handlers,
+		Fiber_Update_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			validate = validator,
+			invoke = callback,
+		},
+	)
+	return true
+}
+
+// set_update_handler_json registers a synchronous state-mutating Update. The
+// handler cannot suspend and receives no Fiber_Context in this first slice.
+set_update_handler_json :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	callback: proc(state: ^State, input: $Input) -> $Output,
+) -> bool {
+	Callback :: #type proc(state: ^State, input: Input) -> Output
+	Data :: struct {
+		instance: ^Fiber_Instance,
+		state:    ^State,
+		callback: Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid typed Workflow Update handler")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(ctx.instance, "could not allocate typed Workflow Update handler")
+		return false
+	}
+	data.instance = ctx.instance
+	data.state = state
+	data.callback = callback
+	return set_update_handler_payload(
+		ctx,
+		name,
+		data,
+		nil,
+		proc(callback_data: rawptr, input: codec.Payload_View) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			previous_allocator := context.allocator
+			context.allocator = owned.instance.odin_context.allocator
+			defer { context.allocator = previous_allocator }
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			output := owned.callback(owned.state, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow Update result as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
+}
+
+// set_validated_update_handler_json runs a read-only validator on non-replay
+// delivery, then invokes the synchronous state-mutating handler after acceptance.
+set_validated_update_handler_json :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	validator: proc(state: State, input: $Input) -> Update_Validation,
+	callback: proc(state: ^State, input: Input) -> $Output,
+) -> bool {
+	Validator :: #type proc(state: State, input: Input) -> Update_Validation
+	Callback :: #type proc(state: ^State, input: Input) -> Output
+	Data :: struct {
+		instance:  ^Fiber_Instance,
+		state:     ^State,
+		validator: Validator,
+		callback:  Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || validator == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid validated Workflow Update handler")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(ctx.instance, "could not allocate validated Workflow Update handler")
+		return false
+	}
+	data.instance = ctx.instance
+	data.state = state
+	data.validator = validator
+	data.callback = callback
+	return set_update_handler_payload(
+		ctx,
+		name,
+		data,
+		proc(callback_data: rawptr, input: codec.Payload_View) -> Update_Validation {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return update_reject(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return owned.validator(owned.state^, value)
+		},
+		proc(callback_data: rawptr, input: codec.Payload_View) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			previous_allocator := context.allocator
+			context.allocator = owned.instance.odin_context.allocator
+			defer { context.allocator = previous_allocator }
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			output := owned.callback(owned.state, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow Update result as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
 				)
 			}
 			return payload_complete(payload)
@@ -1819,6 +2061,50 @@ append_fiber_activity_cancellations :: proc(
 	}
 }
 
+Workflow_Command_State :: struct {
+	phase:             Fiber_Phase,
+	next_activity_seq: u32,
+	next_timer_seq:    u32,
+	activity_count:    int,
+	timer_count:       int,
+}
+
+workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_State {
+	return {
+		phase = instance.phase,
+		next_activity_seq = instance.next_activity_seq,
+		next_timer_seq = instance.next_timer_seq,
+		activity_count = len(instance.activities),
+		timer_count = len(instance.timers),
+	}
+}
+
+workflow_command_state_changed :: proc(
+	instance: ^Fiber_Instance,
+	before: Workflow_Command_State,
+) -> bool {
+	return instance.phase != before.phase ||
+		instance.next_activity_seq != before.next_activity_seq ||
+		instance.next_timer_seq != before.next_timer_seq ||
+		len(instance.activities) != before.activity_count ||
+		len(instance.timers) != before.timer_count
+}
+
+restore_workflow_command_state :: proc(
+	instance: ^Fiber_Instance,
+	before: Workflow_Command_State,
+) {
+	instance.phase = before.phase
+	instance.next_activity_seq = before.next_activity_seq
+	instance.next_timer_seq = before.next_timer_seq
+	for len(instance.activities) > before.activity_count {
+		ordered_remove(&instance.activities, len(instance.activities) - 1)
+	}
+	for len(instance.timers) > before.timer_count {
+		ordered_remove(&instance.timers, len(instance.timers) - 1)
+	}
+}
+
 invoke_workflow_query :: proc(
 	instance: ^Fiber_Instance,
 	query: ^proto.Coresdk_Workflow_Activation_QueryWorkflow,
@@ -1837,11 +2123,7 @@ invoke_workflow_query :: proc(
 		message := fmt.aprintf("Workflow query handler %s is not registered", query.query_type)
 		return payload_fail(message, "OdinWorkflowQueryNotFound")
 	}
-	phase := instance.phase
-	next_activity_seq := instance.next_activity_seq
-	next_timer_seq := instance.next_timer_seq
-	activity_count := len(instance.activities)
-	timer_count := len(instance.timers)
+	command_state := workflow_command_state(instance)
 	input, clone_error := proto.clone_payload(&query.arguments[0])
 	if clone_error != .None {
 		return payload_fail(
@@ -1851,19 +2133,9 @@ invoke_workflow_query :: proc(
 	}
 	defer codec.payload_free(&input)
 	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
-	if instance.phase != phase || instance.next_activity_seq != next_activity_seq ||
-	   instance.next_timer_seq != next_timer_seq || len(instance.activities) != activity_count ||
-	   len(instance.timers) != timer_count {
+	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&result.payload)
-		instance.phase = phase
-		instance.next_activity_seq = next_activity_seq
-		instance.next_timer_seq = next_timer_seq
-		for len(instance.activities) > activity_count {
-			ordered_remove(&instance.activities, len(instance.activities) - 1)
-		}
-		for len(instance.timers) > timer_count {
-			ordered_remove(&instance.timers, len(instance.timers) - 1)
-		}
+		restore_workflow_command_state(instance, command_state)
 		return payload_fail(
 			"Workflow query handler attempted to mutate runtime command state",
 			"OdinWorkflowQueryMutationError",
@@ -1914,6 +2186,161 @@ append_query_response_command :: proc(
 	)
 }
 
+append_pending_update_response :: proc(
+	responses: ^[dynamic]Pending_Update_Response,
+	protocol_instance_id: string,
+	kind: Update_Response_Kind,
+	result: Payload_Result = {},
+) {
+	append(
+		responses,
+		Pending_Update_Response{
+			protocol_instance_id = protocol_instance_id,
+			kind = kind,
+			result = result,
+		},
+	)
+}
+
+invoke_workflow_update :: proc(
+	instance: ^Fiber_Instance,
+	update: ^proto.Coresdk_Workflow_Activation_DoUpdate,
+	responses: ^[dynamic]Pending_Update_Response,
+) {
+	protocol_instance_id := update.protocol_instance_id
+	if len(update.name) == 0 || len(update.input) != 1 {
+		append_pending_update_response(
+			responses,
+			protocol_instance_id,
+			.Rejected,
+			payload_fail(
+				"Workflow Update requires a name and exactly one argument",
+				"OdinWorkflowUpdateArgumentError",
+			),
+		)
+		return
+	}
+	handler, found := find_update_handler(instance, update.name)
+	if !found {
+		message := fmt.aprintf("Workflow Update handler %s is not registered", update.name)
+		append_pending_update_response(
+			responses,
+			protocol_instance_id,
+			.Rejected,
+			payload_fail(message, "OdinWorkflowUpdateNotFound"),
+		)
+		return
+	}
+	input, clone_error := proto.clone_payload(&update.input[0])
+	if clone_error != .None {
+		append_pending_update_response(
+			responses,
+			protocol_instance_id,
+			.Rejected,
+			payload_fail(
+				"could not preserve Workflow Update input",
+				"OdinWorkflowUpdatePayloadConversionError",
+			),
+		)
+		return
+	}
+	defer codec.payload_free(&input)
+
+	if update.run_validator && handler.validate != nil {
+		command_state := workflow_command_state(instance)
+		validation := handler.validate(handler.callback_data, codec.payload_view(&input))
+		if workflow_command_state_changed(instance, command_state) {
+			restore_workflow_command_state(instance, command_state)
+			append_pending_update_response(
+				responses,
+				protocol_instance_id,
+				.Rejected,
+				payload_fail(
+					"Workflow Update validator attempted to mutate runtime command state",
+					"OdinWorkflowUpdateValidatorMutationError",
+				),
+			)
+			return
+		}
+		if !validation.accepted {
+			failure_type := validation.failure_type
+			if len(failure_type) == 0 {
+				failure_type = "OdinWorkflowUpdateRejected"
+			}
+			append_pending_update_response(
+				responses,
+				protocol_instance_id,
+				.Rejected,
+				payload_fail(validation.message, failure_type),
+			)
+			return
+		}
+	}
+
+	append_pending_update_response(responses, protocol_instance_id, .Accepted)
+	command_state := workflow_command_state(instance)
+	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
+	if workflow_command_state_changed(instance, command_state) {
+		codec.payload_free(&result.payload)
+		restore_workflow_command_state(instance, command_state)
+		result = payload_fail(
+			"synchronous Workflow Update handler attempted to mutate runtime command state",
+			"OdinWorkflowUpdateMutationError",
+		)
+	}
+	if result.status == .Completed {
+		append_pending_update_response(responses, protocol_instance_id, .Completed, result)
+	} else {
+		append_pending_update_response(responses, protocol_instance_id, .Rejected, result)
+	}
+}
+
+append_update_response_command :: proc(
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	response: ^Pending_Update_Response,
+) {
+	update_response := new(proto.Coresdk_Workflow_Commands_UpdateResponse)
+	update_response.protocol_instance_id = response.protocol_instance_id
+	switch response.kind {
+	case .Accepted:
+		accepted := new(proto.Google_Protobuf_Empty)
+		update_response.response = proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Accepted{
+			value = accepted,
+		}
+	case .Completed:
+		payload := new(proto.Temporal_Api_Common_V1_Payload)
+		payload^ = proto.encode_payload(codec.payload_view(&response.result.payload))
+		update_response.response = proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Completed{
+			value = payload,
+		}
+	case .Rejected:
+		failure_type := response.result.failure_type
+		if len(failure_type) == 0 {
+			failure_type = "OdinWorkflowUpdateRejected"
+		}
+		application_info := new(proto.Temporal_Api_Failure_V1_ApplicationFailureInfo)
+		application_info.type = failure_type
+		application_info.non_retryable = true
+		failure := new(proto.Temporal_Api_Failure_V1_Failure)
+		failure.message = response.result.failure_message
+		failure.source = "OdinSDK"
+		failure.failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = application_info,
+		}
+		update_response.response = proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Rejected{
+			value = failure,
+		}
+	}
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response{
+				value = update_response,
+			},
+		},
+	)
+}
+
 append_fiber_pending_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -1950,12 +2377,28 @@ append_fiber_pending_commands :: proc(
 	return {}
 }
 
+commands_are_update_responses :: proc(
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+) -> bool {
+	for command in commands^ {
+		is_update_response := false
+		#partial switch variant in command.variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
+			is_update_response = variant.value != nil
+		}
+		if !is_update_response {
+			return false
+		}
+	}
+	return true
+}
+
 append_fiber_completion_command :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if len(commands^) != 0 {
+	if !commands_are_update_responses(commands) {
 		return error_from_string("fiber spike emitted completion after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
@@ -1982,7 +2425,7 @@ append_fiber_failure_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if len(commands^) != 0 {
+	if !commands_are_update_responses(commands) {
 		return error_from_string("fiber spike emitted failure after another command")
 	}
 	failure := new(proto.Temporal_Api_Failure_V1_Failure)
@@ -2034,7 +2477,7 @@ append_fiber_cancellation_commands :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if len(commands^) != 0 {
+	if !commands_are_update_responses(commands) {
 		return error_from_string("fiber spike emitted cancellation after another command")
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
@@ -2116,10 +2559,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	pending_query_responses := make([dynamic]Pending_Query_Response)
+	pending_update_responses := make([dynamic]Pending_Update_Response)
 	context.allocator = previous_allocator
 	defer {
 		for &query_response in pending_query_responses {
 			codec.payload_free(&query_response.result.payload)
+		}
+		for &update_response in pending_update_responses {
+			codec.payload_free(&update_response.result.payload)
 		}
 	}
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
@@ -2238,6 +2685,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					result = query_result,
 				},
 			)
+			context.allocator = previous_allocator
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update:
+			handled = true
+			if variant.value == nil || !instance_found || len(variant.value.protocol_instance_id) == 0 {
+				process_error(&result, activation.run_id, "Workflow Update has no active fiber or protocol instance ID")
+				return
+			}
+			context.allocator = virtual.arena_allocator(&decode_arena)
+			invoke_workflow_update(instance, variant.value, &pending_update_responses)
 			context.allocator = previous_allocator
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow:
@@ -2359,6 +2816,17 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	for &update_response in pending_update_responses {
+		append_update_response_command(&commands, &update_response)
+		switch update_response.kind {
+		case .Accepted:
+			result.updates_accepted += 1
+		case .Rejected:
+			result.updates_rejected += 1
+		case .Completed:
+			result.updates_completed += 1
+		}
+	}
 	if instance_found {
 		progress_error := append_fiber_progress_command(&result, &commands, instance, runtime.task_queue)
 		if progress_error.message != nil {

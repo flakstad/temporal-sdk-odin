@@ -293,6 +293,15 @@ Query_Mutation_State :: struct {
 	ctx: ^workflow.Fiber_Context,
 }
 
+Update_Test_Input :: struct {
+	amount: int,
+}
+
+Update_Test_Output :: struct {
+	previous: int,
+	current:  int,
+}
+
 fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Query_Test_State{phase = "waiting", count = len(name)}
 	registered := workflow.set_query_handler_json(
@@ -322,6 +331,28 @@ fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 	)
 	if !mutation_registered {
 		return "query mutation handler registration failed"
+	}
+	update_registered := workflow.set_validated_update_handler_json(
+		ctx,
+		"increment",
+		&state,
+		proc(state: Query_Test_State, input: Update_Test_Input) -> workflow.Update_Validation {
+			if state.phase != "waiting" || input.amount <= 0 {
+				return workflow.update_reject(
+					"increment must be positive while waiting",
+					"InvalidIncrement",
+				)
+			}
+			return workflow.update_accept()
+		},
+		proc(state: ^Query_Test_State, input: Update_Test_Input) -> Update_Test_Output {
+			previous := state.count
+			state.count += input.amount
+			return {previous = previous, current = state.count}
+		},
+	)
+	if !update_registered {
+		return "Workflow Update handler registration failed"
 	}
 	approval := workflow.await_signal(ctx, "finish")
 	state.phase = "finished"
@@ -536,6 +567,97 @@ inspect_query_response :: proc(
 		}
 	}
 	return
+}
+
+Update_Response_Inspection :: struct {
+	accepted:        int,
+	rejected:        int,
+	completed:       int,
+	command_count:   int,
+	accepted_index:  int,
+	completed_index: int,
+	payload:          codec.Payload,
+	failure_message:  []u8,
+	failure_type:     []u8,
+}
+
+inspect_update_responses :: proc(
+	data: []u8,
+	protocol_instance_id: string,
+) -> (inspection: Update_Response_Inspection) {
+	inspection.accepted_index = -1
+	inspection.completed_index = -1
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		inspection.command_count = len(status.value.commands)
+		for command, index in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
+				if variant.value == nil || variant.value.protocol_instance_id != protocol_instance_id {
+					continue
+				}
+				#partial switch response in variant.value.response {
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Accepted:
+					inspection.accepted += 1
+					inspection.accepted_index = index
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Completed:
+					if response.value != nil {
+						inspection.completed += 1
+						inspection.completed_index = index
+						cloned, clone_error := proto.clone_payload(response.value)
+						if clone_error == .None {
+							inspection.payload = cloned
+						}
+					}
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Rejected:
+					if response.value != nil {
+						inspection.rejected += 1
+						inspection.failure_message = bytes.clone(
+							transmute([]u8)response.value.message,
+						)
+						#partial switch failure_info in response.value.failure_info {
+						case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+							if failure_info.value != nil {
+								inspection.failure_type = bytes.clone(
+									transmute([]u8)failure_info.value.type,
+								)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return
+}
+
+update_response_inspection_free :: proc(inspection: ^Update_Response_Inspection) {
+	if inspection == nil {
+		return
+	}
+	codec.payload_free(&inspection.payload)
+	delete(inspection.failure_message)
+	delete(inspection.failure_type)
+	inspection^ = {}
 }
 
 clone_scheduled_activity_payload :: proc(
@@ -3073,6 +3195,255 @@ workflow_fiber_preserves_structured_activity_failure_across_activations :: proc(
 		delete(message)
 	}
 	codec.payload_free(&completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_update_workflow",
+		"test-queue",
+		fiber_query_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(workflow_input.metadata)
+	append(
+		&workflow_input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_update_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-update-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	update_input, update_input_error := codec.encode_json(Update_Test_Input{amount = 3})
+	testing.expect(t, update_input_error == .None)
+	defer codec.payload_free(&update_input)
+	update_input_proto := proto.encode_payload(codec.payload_view(&update_input))
+	defer delete(update_input_proto.metadata)
+	defer delete(update_input_proto.external_payloads)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "increment-1",
+		protocol_instance_id = "update-protocol-1",
+		name = "increment",
+		run_validator = true,
+	}
+	defer delete(update.input)
+	append(&update.input, update_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect_value(t, processed.updates_rejected, 0)
+	testing.expect_value(t, processed.updates_completed, 1)
+	update_inspection := inspect_update_responses(processed.completion[:], "update-protocol-1")
+	testing.expect_value(t, update_inspection.command_count, 2)
+	testing.expect_value(t, update_inspection.accepted, 1)
+	testing.expect_value(t, update_inspection.completed, 1)
+	testing.expect_value(t, update_inspection.rejected, 0)
+	testing.expect_value(t, update_inspection.accepted_index, 0)
+	testing.expect_value(t, update_inspection.completed_index, 1)
+	update_output: Update_Test_Output
+	update_decode_error := codec.decode_json(
+		codec.payload_view(&update_inspection.payload),
+		&update_output,
+	)
+	testing.expect(t, update_decode_error == .None)
+	testing.expect_value(t, update_output.previous, 4)
+	testing.expect_value(t, update_output.current, 7)
+	update_response_inspection_free(&update_inspection)
+	update_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	query_input, query_input_error := codec.encode_json(Query_Test_Input{prefix = "After "})
+	testing.expect(t, query_input_error == .None)
+	defer codec.payload_free(&query_input)
+	query_input_proto := proto.encode_payload(codec.payload_view(&query_input))
+	defer delete(query_input_proto.metadata)
+	defer delete(query_input_proto.external_payloads)
+	query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "query-after-update",
+		query_type = "status",
+	}
+	defer delete(query.arguments)
+	append(&query.arguments, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	query_inspection := inspect_query_response(processed.completion[:], "query-after-update")
+	query_output: Query_Test_Output
+	query_decode_error := codec.decode_json(
+		codec.payload_view(&query_inspection.payload),
+		&query_output,
+	)
+	testing.expect(t, query_decode_error == .None)
+	testing.expect_value(t, query_output.message, "After waiting")
+	testing.expect_value(t, query_output.count, 7)
+	delete(query_output.message)
+	codec.payload_free(&query_inspection.payload)
+	delete(query_inspection.failure_message)
+	delete(query_inspection.failure_type)
+	query_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 3
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	update.run_validator = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(update_completion[:], processed.completion[:]))
+	delete(update_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(query_completion[:], processed.completion[:]))
+	delete(query_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	rejected_input, rejected_input_error := codec.encode_json(Update_Test_Input{amount = -1})
+	testing.expect(t, rejected_input_error == .None)
+	defer codec.payload_free(&rejected_input)
+	rejected_input_proto := proto.encode_payload(codec.payload_view(&rejected_input))
+	defer delete(rejected_input_proto.metadata)
+	defer delete(rejected_input_proto.external_payloads)
+	rejected_update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "increment-rejected",
+		protocol_instance_id = "update-protocol-rejected",
+		name = "increment",
+		run_validator = true,
+	}
+	defer delete(rejected_update.input)
+	append(&rejected_update.input, rejected_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &rejected_update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.updates_accepted, 0)
+	testing.expect_value(t, processed.updates_rejected, 1)
+	testing.expect_value(t, processed.updates_completed, 0)
+	rejected_inspection := inspect_update_responses(
+		processed.completion[:],
+		"update-protocol-rejected",
+	)
+	testing.expect_value(t, rejected_inspection.command_count, 1)
+	testing.expect_value(t, rejected_inspection.accepted, 0)
+	testing.expect_value(t, rejected_inspection.rejected, 1)
+	testing.expect_value(t, string(rejected_inspection.failure_type), "InvalidIncrement")
+	update_response_inspection_free(&rejected_inspection)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

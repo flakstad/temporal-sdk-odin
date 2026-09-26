@@ -402,6 +402,164 @@ query_responses_preserve_generated_payloads_and_failures :: proc(t: ^testing.T) 
 	pbt.require_pass(t, result)
 }
 
+update_response_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
+	protocol_instance_id := pbt.draw(t, pbt.string_ascii(1, 32))
+	mode := pbt.draw(t, pbt.int_range(0, 2))
+	expected := Generated_Payload_Value{
+		name = pbt.draw(t, pbt.string_ascii(0, 24)),
+		count = pbt.draw(t, pbt.int_range(-10_000, 10_000)),
+		enabled = pbt.draw(t, pbt.boolean()),
+	}
+	failure_type := pbt.draw(t, pbt.string_ascii(1, 24))
+	pbt.cover(t, mode == 0, 20.0, "accepted and completed")
+	pbt.cover(t, mode == 1, 20.0, "validator rejected")
+	pbt.cover(t, mode == 2, 20.0, "accepted then handler rejected")
+
+	payload: codec.Payload
+	has_payload := false
+	defer {
+		if has_payload {
+			codec.payload_free(&payload)
+		}
+	}
+	if mode == 0 {
+		encode_error: codec.Error
+		payload, encode_error = codec.encode_json(expected)
+		if encode_error != .None {
+			return pbt.error("could not encode generated Update result")
+		}
+		has_payload = true
+	}
+
+	command_arena: virtual.Arena
+	if virtual.arena_init_growing(&command_arena) != nil {
+		return pbt.error("could not initialize Update command arena")
+	}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&command_arena)
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	if mode != 1 {
+		accepted := workflow.Pending_Update_Response{
+			protocol_instance_id = protocol_instance_id,
+			kind = .Accepted,
+		}
+		workflow.append_update_response_command(&commands, &accepted)
+	}
+	if mode == 0 {
+		completed := workflow.Pending_Update_Response{
+			protocol_instance_id = protocol_instance_id,
+			kind = .Completed,
+			result = workflow.payload_complete(payload),
+		}
+		workflow.append_update_response_command(&commands, &completed)
+	} else {
+		rejected := workflow.Pending_Update_Response{
+			protocol_instance_id = protocol_instance_id,
+			kind = .Rejected,
+			result = workflow.payload_fail("generated Update rejection", failure_type),
+		}
+		workflow.append_update_response_command(&commands, &rejected)
+	}
+	context.allocator = previous_allocator
+	success := proto.Coresdk_Workflow_Completion_Success{commands = commands}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{
+		run_id = "generated-update-run",
+		status = proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful{
+			value = &success,
+		},
+	}
+	encoded := proto.encode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(&completion)
+	virtual.arena_destroy(&command_arena)
+	defer delete(encoded)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize Update decode arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded_ok := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		encoded[:],
+		&decoded,
+	)
+	context.allocator = previous_allocator
+	if !decoded_ok {
+		return pbt.fail("generated Update response did not decode")
+	}
+
+	accepted_count := 0
+	completed_count := 0
+	rejected_count := 0
+	valid := true
+	#partial switch status in decoded.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != (mode == 1 ? 1 : 2) {
+			valid = false
+			break
+		}
+		for command, index in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
+				if variant.value == nil || variant.value.protocol_instance_id != protocol_instance_id {
+					valid = false
+					continue
+				}
+				#partial switch response in variant.value.response {
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Accepted:
+					accepted_count += 1
+					valid = valid && index == 0 && mode != 1
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Completed:
+					completed_count += 1
+					if mode != 0 || index != 1 || response.value == nil {
+						valid = false
+						continue
+					}
+					owned, clone_error := proto.clone_payload(response.value)
+					if clone_error != .None {
+						valid = false
+						continue
+					}
+					actual: Generated_Payload_Value
+					decode_error := codec.decode_json(codec.payload_view(&owned), &actual)
+					valid = valid && decode_error == .None && actual.name == expected.name &&
+						actual.count == expected.count && actual.enabled == expected.enabled
+					delete(actual.name)
+					codec.payload_free(&owned)
+				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Rejected:
+					rejected_count += 1
+					valid = valid && mode != 0 && response.value != nil &&
+						response.value.message == "generated Update rejection"
+					if response.value != nil {
+						#partial switch failure_info in response.value.failure_info {
+						case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+							valid = valid && failure_info.value != nil &&
+								failure_info.value.type == failure_type && failure_info.value.non_retryable
+						}
+					}
+				}
+			}
+		}
+	}
+	valid = valid && accepted_count == (mode == 1 ? 0 : 1) &&
+		completed_count == (mode == 0 ? 1 : 0) && rejected_count == (mode == 0 ? 0 : 1)
+	if !valid {
+		return pbt.fail("generated Workflow Update responses changed across protobuf encoding")
+	}
+	return pbt.pass()
+}
+
+@(test)
+update_responses_preserve_protocol_order_and_results :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow Update responses preserve protocol order and results",
+		update_response_wire_property,
+		{num_tests = 500, seed = 0x5550_4441_5445_5253},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 activity_deadline_property :: proc(t: ^pbt.T) -> pbt.Result {
 	scheduled_seconds := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
 	started_offset := i64(pbt.draw(t, pbt.int_range(0, 2_000)))

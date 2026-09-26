@@ -53,6 +53,10 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.QueryWorkflowRequest \
   temporal.api.workflowservice.v1.QueryWorkflowResponse \
+  temporal.api.workflowservice.v1.UpdateWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.UpdateWorkflowExecutionResponse \
+  temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateRequest \
+  temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateResponse \
   temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest
 

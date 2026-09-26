@@ -938,6 +938,68 @@ query-only completion when Core sends such an activation, but it does not yet
 reject a malformed mixed legacy activation itself. Query headers and
 Client-side reject-condition selection are also not exposed yet.
 
+### Synchronous Workflow Updates
+
+Core delivers durable Updates as
+[`DoUpdate`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L343)
+jobs. The user-visible Update ID and Core's `protocol_instance_id` are distinct;
+every language response must echo the protocol instance ID. The completion
+contract is stricter than queries:
+
+- A validator rejection produces one `UpdateResponse.Rejected` in the same
+  activation.
+- An accepted Update always produces `Accepted` in that activation.
+- The handler later produces either `Completed` with a Payload or `Rejected`
+  with a Failure. A synchronous handler may place this terminal response
+  immediately after `Accepted` in the same completion.
+- On replay Core sets `run_validator=false`. Odin skips validation, reruns the
+  state mutation, and still emits the same `Accepted` plus terminal sequence.
+
+These rules come directly from
+[`UpdateResponse`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L346)
+and Core's Update state machine, which explicitly supports immediate
+accept-and-complete. Update responses are emitted before ordinary Workflow
+commands so an activation that also closes the Workflow cannot place its
+terminal command ahead of the Update protocol messages.
+
+The current Odin slice registers a synchronous handler against Workflow-owned
+state. A validator receives a top-level state copy and cannot receive a
+`Fiber_Context`; the mutating handler receives `^State`, but likewise has no
+normal Temporal scheduling surface. Phase, command sequence counters, and
+Activity/timer table sizes are guarded around both callbacks. Attempting to
+schedule through a smuggled context rejects the Update and restores runtime
+command state. As with queries, this is not deep memory-purity enforcement.
+
+Typed handler input is decoded in the Workflow instance arena—not the
+activation decode arena—because a state mutation may retain strings or slices
+from that input beyond the current activation. It remains valid until eviction.
+Validator input and rejected-result strings need only activation lifetime.
+Successful result Payloads are logically released after completion
+serialization through their recorded allocator. Because typed handlers allocate
+in the instance arena, their backing storage is reclaimed in bulk at eviction.
+Replay then constructs a new arena and reapplies accepted Updates to rebuild
+state.
+
+The public Client uses the C bridge's existing generic RPC symbol for
+`UpdateWorkflowExecution`, requests lifecycle stage `COMPLETED`, and falls back
+to `PollWorkflowExecutionUpdate` when the first server response has no outcome.
+Successful outcomes are cloned out of the protobuf decode arena. Failure
+outcomes become `.Workflow_Update_Failed`, with an owned message and encoded
+Temporal Failure bytes in `Error.details`. No new native ABI symbol is needed.
+
+The live CLI-devserver test first rejects an invalid name through the validator,
+then accepts a typed rename Update, receives the typed previous/current result,
+and queries the changed state. Core evicts the fiber and replays the accepted
+Update with validation disabled; the subsequent query and signal observe the
+same rebuilt state. Offline tests require byte-identical accepted/completed
+responses and state after fresh-stack replay. Property tests generate validator
+rejection, immediate completion, and accepted-then-handler-rejection sequences.
+
+The deliberate limitation is that an Update handler cannot suspend yet. A
+future handler routine must preserve accepted in-flight Updates by protocol ID,
+resume them across Activity/timer resolutions, emit the terminal response in a
+later activation, and handle cancellation/Workflow-close interactions.
+
 ### Durable signal/timer race
 
 The pinned Core schema already exposes `StartTimer`, `FireTimer`, and
@@ -1216,8 +1278,9 @@ Workflows are enabled.
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
    a durable timer/signal race, generic/typed Payload flow, read-only queries,
-   root cancellation, and detached Activity cleanup across fresh-stack replay.
-   It does not yet prove general nested cancellation scopes, updates, panic containment,
+   synchronous validated Updates, root cancellation, and detached Activity
+   cleanup across fresh-stack replay. It does not yet prove general nested
+   cancellation scopes, suspending Updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -1236,8 +1299,8 @@ Workflows are enabled.
    policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
-   cancellation, and termination are live-proven, but the public Client still
-   lacks updates, describe/history iteration, query reject conditions, headers,
+   synchronous Updates, cancellation, and termination are live-proven, but the
+   public Client still lacks Update handles, describe/history iteration, query reject conditions, headers,
    search attributes, memo, retry/options completeness, and failure-detail conversion.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
@@ -1248,7 +1311,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Add Update dispatch and test multiple live Workflow runs without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, synchronous Updates, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Give accepted Update handlers their own suspendable routines and test multiple live Workflow runs without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1266,17 +1329,17 @@ Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
 proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
-500 Client close-event/result round trips and 500 query response round trips,
+500 Client close-event/result round trips, 500 query response round trips, and
+500 Update protocol response sequences,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should add typed Workflow Update handlers.
-Core already delivers update jobs and expects language-side validation,
-acceptance/rejection, and completion commands. Unlike queries, Updates are
-durable and may suspend while running, so this slice should first prove one
-synchronous typed validator plus one synchronous handler before admitting
-awaiting handlers or widening the authoring API. The query work establishes the
-handler registry, codec-neutral result boundary, and non-resuming read-only
-dispatch needed as a comparison point.
+The next smallest feature milestone should make accepted Workflow Update
+handlers suspendable. It needs a per-instance routine table keyed by protocol
+instance ID, separate from the main Workflow fiber, and must prove an Update
+that accepts, awaits an Activity or timer, survives eviction/replay, and emits
+its terminal response in a later activation. Public Update handles can then
+separate start/wait from `execute_update_json`; the current Client already polls
+when an execute call does not receive an immediate outcome.
 
 Before widening cancellation further, model root cancellation, late
 resolutions, detached cleanup, eviction, and replay with an independent
@@ -1292,8 +1355,8 @@ statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. Awaiting Updates remain deferred until synchronous Update delivery,
-validation, and replay are grounded at the user-code boundary.
+dependency. Suspending Update handlers should be implemented only with explicit
+routine ownership and replay tests; the synchronous boundary is now grounded.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

@@ -10,7 +10,9 @@ Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
 sends typed signals, requests cancellation, and terminates executions. It proves
 typed read-only Workflow queries through the public Odin Client, including
-query failure responses, eviction, and fresh-stack replay. It also proves
+query failure responses, eviction, and fresh-stack replay. Synchronous typed
+Workflow Updates now validate, mutate Workflow-owned state, return a typed
+result, and replay without rerunning validators. It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
@@ -35,7 +37,7 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-scope trees, signal handlers, updates,
+nested/child cancellation-scope trees, signal handlers, suspending Update handlers,
 multiple Activity arguments, in-process panic containment, or a stable public
 API.
 Do not use it in production.
@@ -153,6 +155,13 @@ err = temporal_client.query_workflow_json(
     "order_status",
     Order_Status_Query{},
     &status,
+)
+updated: Rename_Result
+err = temporal_client.execute_update_json(
+    &handle,
+    "rename_order",
+    Rename_Input{name = "priority-order"},
+    &updated,
 )
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 ```
@@ -304,6 +313,37 @@ experimental boundary accepts exactly one input Payload and one result Payload.
 Unknown handlers and codec errors become failed query responses rather than
 failed Workflow Tasks.
 
+Synchronous typed Updates use a mutable state pointer plus an optional
+read-only validator:
+
+```odin
+rename_validator :: proc(state: Status_State, input: Rename_Input) -> workflow.Update_Validation {
+    if len(input.name) == 0 {
+        return workflow.update_reject("name is required", "InvalidName")
+    }
+    return workflow.update_accept()
+}
+
+rename :: proc(state: ^Status_State, input: Rename_Input) -> Rename_Result {
+    previous := state.order_id
+    state.order_id = input.name
+    return {previous = previous, current = state.order_id}
+}
+
+_ = workflow.set_validated_update_handler_json(
+    ctx,
+    "rename_order",
+    &state,
+    rename_validator,
+    rename,
+)
+```
+
+The runtime emits `Accepted` followed by `Completed` in the same activation.
+Validator rejection emits only `Rejected`; validators are skipped during
+replay exactly as directed by Core. Update handlers cannot suspend or schedule
+Temporal commands yet.
+
 Catchable Activity failures expose both the outer Activity metadata and the
 nested Application Failure:
 
@@ -351,8 +391,9 @@ that close completes.
 
 The script starts `temporal server start-dev --headless` only when a healthy
 service is not already running on `localhost:7233`; Docker is not involved. It
-also starts `examples/hello_workflow`; before the signal, the Odin Client
-performs a typed `greeting_status` query and receives live Workflow state
+also starts `examples/hello_workflow`; before the signal, the Odin Client first
+proves validator rejection, then performs a typed state-mutating Update. A
+typed `greeting_status` query receives the changed live Workflow state
 without waking the fiber. The Client then delivers an `approval` signal while
 the fiber is blocked on a durable timer, cancelling that timer, evicting the
 fiber, and requiring replay to reproduce the timer cancellation

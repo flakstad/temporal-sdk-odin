@@ -68,6 +68,9 @@ Run_Stats :: struct {
 	workflow_signals_received:            int,
 	workflow_queries_answered:            int,
 	workflow_queries_failed:              int,
+	workflow_updates_accepted:             int,
+	workflow_updates_rejected:             int,
+	workflow_updates_completed:            int,
 	workflow_cancellations_received:      int,
 	timers_canceled:                      int,
 	activity_cancellations_requested:     int,
@@ -1150,6 +1153,9 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 	stats.workflow_queries_failed += processed.queries_failed
 	if !processed.is_replaying {
 		stats.workflow_signals_received += processed.received_signal_count
+		stats.workflow_updates_accepted += processed.updates_accepted
+		stats.workflow_updates_rejected += processed.updates_rejected
+		stats.workflow_updates_completed += processed.updates_completed
 		if processed.received_cancellation {
 			stats.workflow_cancellations_received += 1
 		}

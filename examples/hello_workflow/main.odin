@@ -54,6 +54,15 @@ Greeting_Query_Output :: struct {
 	name:  string,
 }
 
+Greeting_Update_Input :: struct {
+	name: string,
+}
+
+Greeting_Update_Output :: struct {
+	previous_name: string,
+	current_name:  string,
+}
+
 greeting_status_query :: proc(
 	state: Greeting_Query_State,
 	input: Greeting_Query_Input,
@@ -63,6 +72,25 @@ greeting_status_query :: proc(
 		result.name = state.name
 	}
 	return result
+}
+
+validate_greeting_name :: proc(
+	_: Greeting_Query_State,
+	input: Greeting_Update_Input,
+) -> workflow.Update_Validation {
+	if len(input.name) == 0 || input.name == "reject" {
+		return workflow.update_reject("greeting name is invalid", "InvalidGreetingName")
+	}
+	return workflow.update_accept()
+}
+
+update_greeting_name :: proc(
+	state: ^Greeting_Query_State,
+	input: Greeting_Update_Input,
+) -> Greeting_Update_Output {
+	previous := state.name
+	state.name = input.name
+	return {previous_name = previous, current_name = state.name}
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
@@ -166,6 +194,15 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register greeting status query"
 	}
+	if !workflow.set_validated_update_handler_json(
+		ctx,
+		"set_greeting_name",
+		&query_state,
+		validate_greeting_name,
+		update_greeting_name,
+	) {
+		return "could not register greeting name Update"
+	}
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
@@ -245,7 +282,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -257,6 +294,9 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.received_signal,
 		processed.queries_answered,
 		processed.queries_failed,
+		processed.updates_accepted,
+		processed.updates_rejected,
+		processed.updates_completed,
 		processed.received_cancellation,
 		processed.canceled_workflow,
 		processed.started_timer,
@@ -380,7 +420,8 @@ main :: proc() {
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
-	expect_query := scenario == "query"
+	expect_update := scenario == "update"
+	expect_query := scenario == "query" || expect_update
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
@@ -429,13 +470,17 @@ main :: proc() {
 				failed = true
 			}
 		} else if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
-		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) {
+		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
+		   (expect_update && (run_stats.workflow_updates_accepted != 1 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 1)) {
 			fmt.eprintf(
-				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d timers_canceled=%d replay_activations=%d\n",
+				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d timers_canceled=%d replay_activations=%d\n",
 				run_stats.activity_tasks_completed,
 				run_stats.workflow_signals_received,
 				run_stats.workflow_queries_answered,
 				run_stats.workflow_queries_failed,
+				run_stats.workflow_updates_accepted,
+				run_stats.workflow_updates_rejected,
+				run_stats.workflow_updates_completed,
 				run_stats.timers_canceled,
 				run_stats.workflow_replay_activations,
 			)

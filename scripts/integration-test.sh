@@ -230,7 +230,7 @@ worker_pid=""
 cat "$worker_log"
 grep -q "structured Activity failure details reached Workflow code" "$worker_log"
 
-TEMPORAL_ODIN_SCENARIO=query \
+TEMPORAL_ODIN_SCENARIO=update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
@@ -316,6 +316,31 @@ if ! grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worke
   exit 1
 fi
 
+if TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
+  TEMPORAL_CLIENT_UPDATE_INPUT=reject \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file" 2>&1; then
+  echo "Workflow Update validator unexpectedly accepted invalid input" >&2
+  exit 1
+fi
+rejected_update_output="$(<"$workflow_control_output_file")"
+echo "$rejected_update_output"
+grep -q 'kind=Workflow_Update_Failed' <<<"$rejected_update_output"
+grep -q 'greeting name is invalid' <<<"$rejected_update_output"
+
+TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file"
+update_output="$(<"$workflow_control_output_file")"
+echo "$update_output"
+grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$update_output"
+grep -q 'previous="Odin" current="Temporal"' <<<"$update_output"
+
 TEMPORAL_CLIENT_ACTION=query \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
   TEMPORAL_CLIENT_QUERY_NAME=greeting_status \
@@ -324,7 +349,7 @@ TEMPORAL_CLIENT_ACTION=query \
 query_output="$(<"$workflow_control_output_file")"
 echo "$query_output"
 grep -q "Odin client query=greeting_status workflow_id=$workflow_id" <<<"$query_output"
-grep -q 'phase="waiting-for-approval" name="Odin"' <<<"$query_output"
+grep -q 'phase="waiting-for-approval" name="Temporal"' <<<"$query_output"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
@@ -346,6 +371,8 @@ cat "$worker_log"
 grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
 grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=1" "$worker_log"
 grep -Eq "replay=(true|false) .*queries=1 query_failures=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*updates_accepted=1 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 
 run_workflow_cancellation_case() {

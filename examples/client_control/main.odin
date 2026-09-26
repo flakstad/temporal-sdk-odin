@@ -28,6 +28,15 @@ Greeting_Query_Output :: struct {
 	name:  string,
 }
 
+Greeting_Update_Input :: struct {
+	name: string,
+}
+
+Greeting_Update_Output :: struct {
+	previous_name: string,
+	current_name:  string,
+}
+
 run :: proc() -> int {
 	action_buffer: [32]u8
 	id_buffer: [256]u8
@@ -90,6 +99,36 @@ run :: proc() -> int {
 			workflow_id,
 			output.phase,
 			output.name,
+		)
+		return 0
+	case "update":
+		update_name := env("TEMPORAL_CLIENT_UPDATE_NAME", name_buffer[:])
+		if len(update_name) == 0 {
+			update_name = "set_greeting_name"
+		}
+		new_name := env("TEMPORAL_CLIENT_UPDATE_INPUT", input_buffer[:])
+		if len(new_name) == 0 {
+			new_name = "Temporal"
+		}
+		output: Greeting_Update_Output
+		operation_error = temporal_client.execute_update_json(
+			&handle,
+			update_name,
+			Greeting_Update_Input{name = new_name},
+			&output,
+		)
+		if operation_error.message != nil {
+			print_error(action, &operation_error)
+			return 1
+		}
+		defer delete(output.previous_name)
+		defer delete(output.current_name)
+		fmt.printf(
+			"Odin client update=%s workflow_id=%s previous=%q current=%q\n",
+			update_name,
+			workflow_id,
+			output.previous_name,
+			output.current_name,
 		)
 		return 0
 	case "terminate":

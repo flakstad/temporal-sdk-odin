@@ -391,6 +391,35 @@ must be read-only, must not retain the input/state values, and cannot suspend.
 Unknown query names and codec failures become failed `RespondToQuery` commands
 without failing the Workflow Task.
 
+Synchronous Updates use the same Workflow handle:
+
+```odin
+result: Rename_Result
+update_error := temporal_client.execute_update_json(
+    &existing,
+    "rename_order",
+    Rename_Input{name = "priority-order"},
+    &result,
+)
+```
+
+`execute_update_payload` is the codec-neutral form. It creates UUIDv4 Update
+and request IDs unless an explicit Update ID is supplied, asks
+`UpdateWorkflowExecution` to wait for `COMPLETED`, and long-polls
+`PollWorkflowExecutionUpdate` if the Service returns before an outcome exists.
+The successful Payload is caller-owned. Update failure returns
+`.Workflow_Update_Failed`; `Error.message` owns the Temporal failure message and
+`Error.details` owns the encoded Failure protobuf.
+
+Workflow code uses `set_update_handler_json` or
+`set_validated_update_handler_json`. Validators receive state by value, run
+only when Core sets `run_validator`, and return `update_accept()` or
+`update_reject(message, type)`. Handlers receive `^State`, run again during
+replay, and may synchronously mutate it. They cannot suspend or schedule
+Temporal operations in this slice. Typed handler input is decoded in the
+Workflow arena so strings/slices retained in state survive the activation;
+validator and query inputs retain their shorter activation lifetime.
+
 Workflow-side signal buffering is codec-neutral. Use
 `workflow.await_signal_payload` for the borrowed Payload or
 `workflow.await_signal_json(ctx, name, T)` for a typed value. The
@@ -513,14 +542,19 @@ the generated value. The query property generates 500 success/failure
 responses, destroys the command arena after encoding, and verifies query IDs,
 typed success Payloads, and non-retryable Application Failure types after a
 fresh decode.
+The Update property adds 500 immediate protocol sequences across validator
+rejection, accepted completion, and accepted handler rejection. It checks the
+protocol instance ID, requires `Accepted` to precede the terminal response, and
+round-trips typed result Payloads plus Application Failure types.
 
 Finally, the script starts `examples/hello_workflow` and invokes it with
 `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
-`approval` signal, `examples/client_control` first sends a typed JSON query
-through Core. The worker returns phase `waiting-for-approval` and name `Odin`
-without resuming the fiber; the activation can be marked replaying while Core
-reconstructs query state. The Client then sends the typed signal. The signal
+`approval` signal, `examples/client_control` first proves a validator rejection,
+then executes a typed Update that changes the name from `Odin` to `Temporal`.
+A typed query returns phase `waiting-for-approval` and the changed name without
+resuming the fiber; Core evicts and replays the accepted Update with validation
+disabled while reconstructing query state. The Client then sends the typed signal. The signal
 wins, so the Odin runtime emits `CancelTimer` and schedules an
 Activity in the
 same completion. The reusable worker's Activity poll thread completes that
@@ -586,6 +620,15 @@ before sending the approval signal:
 ```bash
 TEMPORAL_CLIENT_ACTION=query \
 TEMPORAL_CLIENT_WORKFLOW_ID=odin-workflow-manual \
+./scripts/run-client-control.sh
+```
+
+Execute the example's validated synchronous Update with:
+
+```bash
+TEMPORAL_CLIENT_ACTION=update \
+TEMPORAL_CLIENT_WORKFLOW_ID=odin-workflow-manual \
+TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
 ./scripts/run-client-control.sh
 ```
 
