@@ -124,6 +124,44 @@ typed_payload_workflow_test :: proc(
 	)
 }
 
+activity_options_workflow_test :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	non_retryable_types := [?]string{"PermanentFailure", "InvalidInput"}
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = 250 * time.Millisecond,
+		backoff_coefficient = 1.5,
+		maximum_interval = 3 * time.Second,
+		maximum_attempts = 7,
+		non_retryable_error_types = non_retryable_types[:],
+	}
+	return workflow.execute_activity_json_with_options(
+		ctx,
+		"configured_activity",
+		input,
+		string,
+		{
+			activity_id = "business-activity-id",
+			task_queue = "configured-activity-queue",
+			schedule_to_close_timeout = 45 * time.Second,
+			schedule_to_start_timeout = 4 * time.Second,
+			start_to_close_timeout = 12 * time.Second,
+			heartbeat_timeout = 2 * time.Second,
+			retry_policy = &retry_policy,
+			cancellation_type = .Wait_Cancellation_Completed,
+			disable_eager_execution = true,
+		},
+	)
+}
+
+invalid_activity_options_workflow_test :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	return workflow.execute_activity_json_with_options(
+		ctx,
+		"invalid_activity",
+		input,
+		string,
+		{},
+	)
+}
+
 payload_passthrough_workflow_test :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: codec.Payload_View,
@@ -332,6 +370,104 @@ clone_scheduled_activity_payload :: proc(
 					found = clone_error == .None
 					return
 				}
+			}
+		}
+	}
+	return
+}
+
+Scheduled_Activity_Inspection :: struct {
+	found:                     bool,
+	activity_id:               string,
+	activity_type:             string,
+	task_queue:                string,
+	schedule_to_close_timeout: time.Duration,
+	schedule_to_start_timeout: time.Duration,
+	start_to_close_timeout:    time.Duration,
+	heartbeat_timeout:         time.Duration,
+	retry_policy_present:      bool,
+	retry_initial_interval:    time.Duration,
+	retry_backoff_coefficient: f64,
+	retry_maximum_interval:    time.Duration,
+	retry_maximum_attempts:    i32,
+	non_retryable_error_types: [dynamic]string,
+	cancellation_type: proto.Coresdk_Workflow_Commands_ActivityCancellationType,
+	disable_eager_execution: bool,
+}
+
+proto_duration_value :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {
+	if value == nil {
+		return 0
+	}
+	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+}
+
+scheduled_activity_inspection_free :: proc(inspection: ^Scheduled_Activity_Inspection) {
+	if inspection == nil {
+		return
+	}
+	delete(inspection.activity_id)
+	delete(inspection.activity_type)
+	delete(inspection.task_queue)
+	for error_type in inspection.non_retryable_error_types {
+		delete(error_type)
+	}
+	delete(inspection.non_retryable_error_types)
+	inspection^ = {}
+}
+
+inspect_scheduled_activity :: proc(
+	data: []u8,
+) -> (inspection: Scheduled_Activity_Inspection) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+				if variant.value == nil {
+					return
+				}
+				schedule := variant.value
+				inspection.found = true
+				inspection.activity_id, _ = strings.clone(schedule.activity_id)
+				inspection.activity_type, _ = strings.clone(schedule.activity_type)
+				inspection.task_queue, _ = strings.clone(schedule.task_queue)
+				inspection.schedule_to_close_timeout = proto_duration_value(schedule.schedule_to_close_timeout)
+				inspection.schedule_to_start_timeout = proto_duration_value(schedule.schedule_to_start_timeout)
+				inspection.start_to_close_timeout = proto_duration_value(schedule.start_to_close_timeout)
+				inspection.heartbeat_timeout = proto_duration_value(schedule.heartbeat_timeout)
+				inspection.cancellation_type = schedule.cancellation_type
+				inspection.disable_eager_execution = schedule.do_not_eagerly_execute
+				if schedule.retry_policy != nil {
+					policy := schedule.retry_policy
+					inspection.retry_policy_present = true
+					inspection.retry_initial_interval = proto_duration_value(policy.initial_interval)
+					inspection.retry_backoff_coefficient = policy.backoff_coefficient
+					inspection.retry_maximum_interval = proto_duration_value(policy.maximum_interval)
+					inspection.retry_maximum_attempts = policy.maximum_attempts
+					inspection.non_retryable_error_types = make([dynamic]string)
+					for error_type in policy.non_retryable_error_types {
+						cloned, _ := strings.clone(error_type)
+						append(&inspection.non_retryable_error_types, cloned)
+					}
+				}
+				return
 			}
 		}
 	}
@@ -1056,6 +1192,170 @@ payload_workflow_preserves_metadata_and_external_details :: proc(t: ^testing.T) 
 	codec.payload_free(&completion)
 	delete(completed.completion)
 	workflow.error_free(&completed.error)
+}
+
+@(test)
+activity_options_survive_command_encoding_and_fresh_stack_replay :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"activity_options_workflow",
+		"workflow-default-queue",
+		activity_options_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "activity_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "activity-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.scheduled_activity)
+	initial_bytes := bytes.clone(initial.completion[:])
+	inspection := inspect_scheduled_activity(initial.completion[:])
+	defer scheduled_activity_inspection_free(&inspection)
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, inspection.activity_id, "business-activity-id")
+	testing.expect_value(t, inspection.activity_type, "configured_activity")
+	testing.expect_value(t, inspection.task_queue, "configured-activity-queue")
+	testing.expect_value(t, inspection.schedule_to_close_timeout, 45 * time.Second)
+	testing.expect_value(t, inspection.schedule_to_start_timeout, 4 * time.Second)
+	testing.expect_value(t, inspection.start_to_close_timeout, 12 * time.Second)
+	testing.expect_value(t, inspection.heartbeat_timeout, 2 * time.Second)
+	testing.expect(t, inspection.retry_policy_present)
+	testing.expect_value(t, inspection.retry_initial_interval, 250 * time.Millisecond)
+	testing.expect_value(t, inspection.retry_backoff_coefficient, 1.5)
+	testing.expect_value(t, inspection.retry_maximum_interval, 3 * time.Second)
+	testing.expect_value(t, inspection.retry_maximum_attempts, i32(7))
+	testing.expect_value(t, len(inspection.non_retryable_error_types), 2)
+	if len(inspection.non_retryable_error_types) == 2 {
+		testing.expect_value(t, inspection.non_retryable_error_types[0], "PermanentFailure")
+		testing.expect_value(t, inspection.non_retryable_error_types[1], "InvalidInput")
+	}
+	testing.expect(
+		t,
+		inspection.cancellation_type == .WAIT_CANCELLATION_COMPLETED,
+	)
+	testing.expect(t, inspection.disable_eager_execution)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	testing.expect(t, evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, replayed.scheduled_activity)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
+invalid_activity_options_fail_the_workflow_deterministically :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"invalid_activity_options_workflow",
+		"test-queue",
+		invalid_activity_options_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "invalid_activity_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "invalid-activity-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.scheduled_activity)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.failure_type), "OdinActivityOptionsError")
+	testing.expect_value(
+		t,
+		string(inspection.message),
+		"Activity requires a positive Schedule-to-Close or Start-to-Close timeout",
+	)
+	testing.expect(t, inspection.non_retryable)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
 }
 
 @(test)

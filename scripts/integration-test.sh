@@ -10,6 +10,7 @@ server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
 unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
+typed_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-typed-history.XXXXXX")"
 
 cleanup() {
   if [[ -n "$unknown_workflow_id" ]]; then
@@ -31,7 +32,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file" "$unknown_history_file"
+  rm -f "$workflow_output_file" "$unknown_history_file" "$typed_history_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -181,6 +182,21 @@ echo "$workflow_output"
 grep -q '"status": "COMPLETED"' <<<"$workflow_output"
 grep -q '"message": "Hello, Odin!"' <<<"$workflow_output"
 grep -q '"name_length": 4' <<<"$workflow_output"
+grep -q '"activity_id": "typed-greeting-options"' <<<"$workflow_output"
+temporal workflow show \
+  --workflow-id "$typed_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q '"activityId": "typed-greeting-options"' "$typed_history_file"
+grep -q '"scheduleToCloseTimeout": "30s"' "$typed_history_file"
+grep -q '"scheduleToStartTimeout": "5s"' "$typed_history_file"
+grep -q '"startToCloseTimeout": "10s"' "$typed_history_file"
+grep -q '"heartbeatTimeout": "2s"' "$typed_history_file"
+grep -q '"initialInterval": "0.100s"' "$typed_history_file"
+grep -q '"backoffCoefficient": 2' "$typed_history_file"
+grep -q '"maximumInterval": "1s"' "$typed_history_file"
+grep -q '"maximumAttempts": 3' "$typed_history_file"
+grep -q '"InvalidGreeting"' "$typed_history_file"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

@@ -216,6 +216,46 @@ type to the compiler. JSON conversion failures become non-retryable
 `OdinWorkflowPayloadConversionError` Workflow failures. Signal payloads remain
 on the string compatibility API for now.
 
+Every Activity start/execute family has a `_with_options` form. The options map
+to Core's `ScheduleActivity` fields:
+
+```odin
+non_retryable_types := [?]string{"InvalidOrder"}
+retry := workflow.Retry_Policy{
+    initial_interval = 500 * time.Millisecond,
+    backoff_coefficient = 2,
+    maximum_interval = 10 * time.Second,
+    maximum_attempts = 5,
+    non_retryable_error_types = non_retryable_types[:],
+}
+future := workflow.start_activity_json_with_options(
+    ctx,
+    "charge",
+    order,
+    {
+        activity_id = "charge-order-42",
+        task_queue = "payments",
+        schedule_to_close_timeout = 2 * time.Minute,
+        schedule_to_start_timeout = 10 * time.Second,
+        start_to_close_timeout = 30 * time.Second,
+        heartbeat_timeout = 5 * time.Second,
+        retry_policy = &retry,
+        cancellation_type = .Wait_Cancellation_Completed,
+        disable_eager_execution = true,
+    },
+)
+```
+
+The options value, its Retry Policy pointer, and the non-retryable error-type
+slice are borrowed only until `start_activity_*_with_options` returns. The
+runtime clones all strings into the Workflow instance arena. A nil Retry Policy
+leaves the field absent so the Service can apply its default policy. Zero
+duration means unspecified; either Schedule-to-Close or Start-to-Close must be
+positive. Invalid options fail the Workflow with non-retryable
+`OdinActivityOptionsError`. The no-options compatibility calls still use the
+bounded spike defaults: 20-second Start-to-Close, maximum attempts 1, and eager
+execution disabled.
+
 The raw Payload test uses `binary/custom`, an extra `messageType` metadata
 entry, opaque bytes, and external-payload details. It verifies those fields are
 unchanged in both the scheduled Activity argument and final Workflow result;
@@ -286,7 +326,10 @@ A separate live case starts `odin_typed_workflow` with
 `{name: "Odin", salutation: "Hello"}`. Odin preserves that Payload into a
 typed Activity command, Core evicts the Workflow, fresh-stack replay reproduces
 the same command, and the resolved object becomes the Workflow completion.
-Temporal CLI receives `{message: "Hello, Odin!", name_length: 4}`.
+Temporal CLI receives `{message: "Hello, Odin!", name_length: 4,
+activity_id: "typed-greeting-options"}`. The test reads history back from the
+Service and verifies the configured Activity ID, four timeouts, retry timing,
+attempt limit, and non-retryable failure type.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
@@ -316,7 +359,10 @@ default/explicit retry delays, then round-trips every field through the Core
 completion protobuf. Both suites pass against the pin and `~/Projects/pbt`.
 The Workflow Payload property adds another 500 generated structs, creates and
 evicts a typed fiber for each, and requires byte-identical completion after
-fresh-stack replay.
+fresh-stack replay. The Activity-options property generates 500 valid timeout,
+retry, queue, ID, cancellation, and eager-execution combinations. It checks
+every encoded `ScheduleActivity` field and requires byte-identical commands
+after eviction and fresh-stack replay.
 
 Finally, the script starts `examples/hello_workflow` and invokes it directly
 with `temporal workflow execute` in the background. After the Workflow has

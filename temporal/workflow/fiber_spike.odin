@@ -2,6 +2,7 @@ package workflow
 
 import allocator_runtime "base:runtime"
 import "core:fmt"
+import "core:math"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
@@ -49,6 +50,47 @@ payload_fail :: proc(
 		failure_message = message,
 		failure_type = failure_type,
 	}
+}
+
+Activity_Cancellation_Type :: enum {
+	Try_Cancel,
+	Wait_Cancellation_Completed,
+	Abandon,
+}
+
+Retry_Policy :: struct {
+	initial_interval:          time.Duration,
+	backoff_coefficient:       f64,
+	maximum_interval:          time.Duration,
+	maximum_attempts:          i32,
+	non_retryable_error_types: []string,
+}
+
+// Activity_Options borrows its strings, slices, and retry_policy only for the
+// start/execute call. The Workflow runtime copies them into the run arena before
+// it can suspend. A zero duration means "not specified".
+Activity_Options :: struct {
+	activity_id:               string,
+	task_queue:                string,
+	schedule_to_close_timeout: time.Duration,
+	schedule_to_start_timeout: time.Duration,
+	start_to_close_timeout:    time.Duration,
+	heartbeat_timeout:         time.Duration,
+	retry_policy:              ^Retry_Policy,
+	cancellation_type:         Activity_Cancellation_Type,
+	disable_eager_execution:   bool,
+}
+
+Owned_Activity_Options :: struct {
+	task_queue:                string,
+	schedule_to_close_timeout: time.Duration,
+	schedule_to_start_timeout: time.Duration,
+	start_to_close_timeout:    time.Duration,
+	heartbeat_timeout:         time.Duration,
+	retry_policy:              Retry_Policy,
+	has_retry_policy:          bool,
+	cancellation_type:         Activity_Cancellation_Type,
+	disable_eager_execution:   bool,
 }
 
 Fiber_Phase :: enum {
@@ -112,6 +154,7 @@ Fiber_Activity_Operation :: struct {
 	seq:           u32,
 	activity_id:   string,
 	activity_type: string,
+	options:       Owned_Activity_Options,
 	input:         codec.Payload,
 	result:        codec.Payload,
 	failure_message: string,
@@ -489,10 +532,102 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	instance.phase = .Canceled
 }
 
+activity_options_error :: proc(activity_type: string, options: Activity_Options) -> string {
+	if len(activity_type) == 0 {
+		return "Activity type must not be empty"
+	}
+	if options.schedule_to_close_timeout <= 0 && options.start_to_close_timeout <= 0 {
+		return "Activity requires a positive Schedule-to-Close or Start-to-Close timeout"
+	}
+	if options.schedule_to_close_timeout < 0 ||
+	   options.schedule_to_start_timeout < 0 ||
+	   options.start_to_close_timeout < 0 ||
+	   options.heartbeat_timeout < 0 {
+		return "Activity timeouts must not be negative"
+	}
+	if options.schedule_to_close_timeout > 0 &&
+	   options.start_to_close_timeout > options.schedule_to_close_timeout {
+		return "Activity Start-to-Close timeout must not exceed Schedule-to-Close timeout"
+	}
+	if options.schedule_to_close_timeout > 0 &&
+	   options.schedule_to_start_timeout > options.schedule_to_close_timeout {
+		return "Activity Schedule-to-Start timeout must not exceed Schedule-to-Close timeout"
+	}
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		if policy.initial_interval < 0 || policy.maximum_interval < 0 {
+			return "Activity Retry Policy intervals must not be negative"
+		}
+		if math.is_nan(policy.backoff_coefficient) || math.is_inf(policy.backoff_coefficient) {
+			return "Activity Retry Policy backoff coefficient must be finite"
+		}
+		if policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1 {
+			return "Activity Retry Policy backoff coefficient must be zero or at least one"
+		}
+		if policy.maximum_interval > 0 &&
+		   policy.initial_interval > 0 &&
+		   policy.maximum_interval < policy.initial_interval {
+			return "Activity Retry Policy maximum interval must not be shorter than its initial interval"
+		}
+		if policy.maximum_attempts < 0 {
+			return "Activity Retry Policy maximum attempts must not be negative"
+		}
+	}
+	return ""
+}
+
+mark_activity_options_failure :: proc(ctx: ^Fiber_Context, message: string) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	ctx.instance.failure_message = message
+	ctx.instance.failure_type = "OdinActivityOptionsError"
+	ctx.instance.phase = .Failed
+}
+
+clone_activity_options :: proc(
+	instance: ^Fiber_Instance,
+	options: Activity_Options,
+) -> (owned: Owned_Activity_Options, ok: bool) {
+	allocator := instance.odin_context.allocator
+	if len(options.task_queue) > 0 {
+		queue, queue_error := strings.clone(options.task_queue, allocator)
+		if queue_error != nil {
+			return {}, false
+		}
+		owned.task_queue = queue
+	}
+	owned.schedule_to_close_timeout = options.schedule_to_close_timeout
+	owned.schedule_to_start_timeout = options.schedule_to_start_timeout
+	owned.start_to_close_timeout = options.start_to_close_timeout
+	owned.heartbeat_timeout = options.heartbeat_timeout
+	owned.cancellation_type = options.cancellation_type
+	owned.disable_eager_execution = options.disable_eager_execution
+	if options.retry_policy != nil {
+		owned.has_retry_policy = true
+		owned.retry_policy = options.retry_policy^
+		error_types := make(
+			[]string,
+			len(options.retry_policy.non_retryable_error_types),
+			allocator,
+		)
+		owned.retry_policy.non_retryable_error_types = error_types
+		for error_type, index in options.retry_policy.non_retryable_error_types {
+			cloned, clone_error := strings.clone(error_type, allocator)
+			if clone_error != nil {
+				return {}, false
+			}
+			owned.retry_policy.non_retryable_error_types[index] = cloned
+		}
+	}
+	return owned, true
+}
+
 start_activity_owned :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
 	input: codec.Payload,
+	options: Activity_Options,
 ) -> Activity_Future {
 	owned_input := input
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
@@ -503,11 +638,48 @@ start_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
+	validation_error := activity_options_error(activity_type, options)
+	if len(validation_error) > 0 {
+		codec.payload_free(&owned_input)
+		mark_activity_options_failure(ctx, validation_error)
+		return {}
+	}
+	owned_activity_type, type_error := strings.clone(
+		activity_type,
+		instance.odin_context.allocator,
+	)
+	if type_error != nil {
+		codec.payload_free(&owned_input)
+		mark_activity_options_failure(ctx, "could not preserve Activity type")
+		return {}
+	}
+	owned_options, options_ok := clone_activity_options(instance, options)
+	if !options_ok {
+		codec.payload_free(&owned_input)
+		mark_activity_options_failure(ctx, "could not preserve Activity options")
+		return {}
+	}
 	instance.next_activity_seq += 1
+	activity_id := options.activity_id
+	if len(activity_id) == 0 {
+		activity_id = fmt.aprintf("activity-%d", instance.next_activity_seq)
+	} else {
+		cloned_id, id_error := strings.clone(
+			activity_id,
+			instance.odin_context.allocator,
+		)
+		if id_error != nil {
+			codec.payload_free(&owned_input)
+			mark_activity_options_failure(ctx, "could not preserve Activity ID")
+			return {}
+		}
+		activity_id = cloned_id
+	}
 	operation := Fiber_Activity_Operation{
 		seq = instance.next_activity_seq,
-		activity_id = fmt.aprintf("activity-%d", instance.next_activity_seq),
-		activity_type = activity_type,
+		activity_id = activity_id,
+		activity_type = owned_activity_type,
+		options = owned_options,
 		input = owned_input,
 		state = .Scheduled,
 	}
@@ -523,6 +695,25 @@ start_activity_payload :: proc(
 	activity_type: string,
 	input: codec.Payload_View,
 ) -> Activity_Future {
+	retry_policy := Retry_Policy{maximum_attempts = 1}
+	return start_activity_payload_with_options(
+		ctx,
+		activity_type,
+		input,
+		{
+			start_to_close_timeout = 20 * time.Second,
+			retry_policy = &retry_policy,
+			disable_eager_execution = true,
+		},
+	)
+}
+
+start_activity_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+	options: Activity_Options,
+) -> Activity_Future {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
@@ -536,10 +727,29 @@ start_activity_payload :: proc(
 		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
 		return {}
 	}
-	return start_activity_owned(ctx, activity_type, owned_input)
+	return start_activity_owned(ctx, activity_type, owned_input, options)
 }
 
 start_activity_json :: proc(ctx: ^Fiber_Context, activity_type: string, input: $T) -> Activity_Future {
+	retry_policy := Retry_Policy{maximum_attempts = 1}
+	return start_activity_json_with_options(
+		ctx,
+		activity_type,
+		input,
+		{
+			start_to_close_timeout = 20 * time.Second,
+			retry_policy = &retry_policy,
+			disable_eager_execution = true,
+		},
+	)
+}
+
+start_activity_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $T,
+	options: Activity_Options,
+) -> Activity_Future {
 	if ctx == nil || ctx.instance == nil {
 		return {}
 	}
@@ -550,11 +760,19 @@ start_activity_json :: proc(ctx: ^Fiber_Context, activity_type: string, input: $
 		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
 		return {}
 	}
-	return start_activity_owned(ctx, activity_type, payload)
+	return start_activity_owned(ctx, activity_type, payload, options)
 }
 
 start_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Future {
 	return start_activity_json(ctx, activity_type, input)
+}
+
+start_activity_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Activity_Options,
+) -> Activity_Future {
+	return start_activity_json_with_options(ctx, activity_type, input, options)
 }
 
 payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
@@ -678,8 +896,30 @@ execute_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> s
 	return await_activity(ctx, start_activity(ctx, activity_type, input))
 }
 
+execute_activity_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Activity_Options,
+) -> string {
+	return await_activity(
+		ctx,
+		start_activity_with_options(ctx, activity_type, input, options),
+	)
+}
+
 execute_activity_result :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Result {
 	return await_activity_result(ctx, start_activity(ctx, activity_type, input))
+}
+
+execute_activity_result_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Activity_Options,
+) -> Activity_Result {
+	return await_activity_result(
+		ctx,
+		start_activity_with_options(ctx, activity_type, input, options),
+	)
 }
 
 execute_activity_payload :: proc(
@@ -690,6 +930,18 @@ execute_activity_payload :: proc(
 	return await_activity_payload(
 		ctx,
 		start_activity_payload(ctx, activity_type, input),
+	)
+}
+
+execute_activity_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+	options: Activity_Options,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_activity_payload_with_options(ctx, activity_type, input, options),
 	)
 }
 
@@ -706,6 +958,20 @@ execute_activity_json_result :: proc(
 	)
 }
 
+execute_activity_json_result_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+	options: Activity_Options,
+) -> Json_Activity_Result(Output) {
+	return await_activity_json_result(
+		ctx,
+		start_activity_json_with_options(ctx, activity_type, input, options),
+		Output,
+	)
+}
+
 execute_activity_json :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
@@ -713,6 +979,22 @@ execute_activity_json :: proc(
 	$Output: typeid,
 ) -> Output {
 	future := start_activity_json(ctx, activity_type, input)
+	result := await_activity_json_result(ctx, future, Output)
+	if result.status == .Failed {
+		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	return result.value
+}
+
+execute_activity_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+	options: Activity_Options,
+) -> Output {
+	future := start_activity_json_with_options(ctx, activity_type, input, options)
 	result := await_activity_json_result(ctx, future, Output)
 	if result.status == .Failed {
 		mark_activity_failure_unhandled(ctx, future)
@@ -837,6 +1119,48 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	}
 }
 
+duration_to_proto :: proc(duration: time.Duration) -> ^proto.Google_Protobuf_Duration {
+	if duration <= 0 {
+		return nil
+	}
+	nanoseconds := i64(duration)
+	value := new(proto.Google_Protobuf_Duration)
+	value.seconds = nanoseconds / i64(time.Second)
+	value.nanos = i32(nanoseconds % i64(time.Second))
+	return value
+}
+
+activity_cancellation_type_to_proto :: proc(
+	cancellation_type: Activity_Cancellation_Type,
+) -> proto.Coresdk_Workflow_Commands_ActivityCancellationType {
+	switch cancellation_type {
+	case .Try_Cancel:
+		return .TRY_CANCEL
+	case .Wait_Cancellation_Completed:
+		return .WAIT_CANCELLATION_COMPLETED
+	case .Abandon:
+		return .ABANDON
+	}
+	return .TRY_CANCEL
+}
+
+retry_policy_to_proto :: proc(
+	policy: ^Retry_Policy,
+) -> ^proto.Temporal_Api_Common_V1_RetryPolicy {
+	if policy == nil {
+		return nil
+	}
+	result := new(proto.Temporal_Api_Common_V1_RetryPolicy)
+	result.initial_interval = duration_to_proto(policy.initial_interval)
+	result.backoff_coefficient = policy.backoff_coefficient
+	result.maximum_interval = duration_to_proto(policy.maximum_interval)
+	result.maximum_attempts = policy.maximum_attempts
+	for error_type in policy.non_retryable_error_types {
+		append(&result.non_retryable_error_types, error_type)
+	}
+	return result
+}
+
 append_fiber_schedule_command :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -845,21 +1169,27 @@ append_fiber_schedule_command :: proc(
 ) {
 	payload := new(proto.Temporal_Api_Common_V1_Payload)
 	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
-	timeout := new(proto.Google_Protobuf_Duration)
-	timeout.seconds = 20
-	// The bounded spike has no Activity options yet. One attempt makes failure
-	// handling observable without waiting through Temporal's default retries.
-	retry_policy := new(proto.Temporal_Api_Common_V1_RetryPolicy)
-	retry_policy.maximum_attempts = 1
+	activity_task_queue := operation.options.task_queue
+	if len(activity_task_queue) == 0 {
+		activity_task_queue = task_queue
+	}
+	retry_policy: ^proto.Temporal_Api_Common_V1_RetryPolicy
+	if operation.options.has_retry_policy {
+		retry_policy = retry_policy_to_proto(&operation.options.retry_policy)
+	}
 	schedule := new(proto.Coresdk_Workflow_Commands_ScheduleActivity)
 	schedule^ = proto.Coresdk_Workflow_Commands_ScheduleActivity{
 		seq = operation.seq,
 		activity_id = operation.activity_id,
 		activity_type = operation.activity_type,
-		task_queue = task_queue,
-		start_to_close_timeout = timeout,
+		task_queue = activity_task_queue,
+		schedule_to_close_timeout = duration_to_proto(operation.options.schedule_to_close_timeout),
+		schedule_to_start_timeout = duration_to_proto(operation.options.schedule_to_start_timeout),
+		start_to_close_timeout = duration_to_proto(operation.options.start_to_close_timeout),
+		heartbeat_timeout = duration_to_proto(operation.options.heartbeat_timeout),
 		retry_policy = retry_policy,
-		do_not_eagerly_execute = true,
+		cancellation_type = activity_cancellation_type_to_proto(operation.options.cancellation_type),
+		do_not_eagerly_execute = operation.options.disable_eager_execution,
 	}
 	append(&schedule.arguments, payload^)
 	append(

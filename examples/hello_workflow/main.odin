@@ -21,6 +21,7 @@ Typed_Greeting_Input :: struct {
 Typed_Greeting_Output :: struct {
 	message:     string,
 	name_length: int,
+	activity_id: string,
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
@@ -50,12 +51,16 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	return greeting
 }
 
-typed_greeting :: proc(_: ^activity.Context, input: Typed_Greeting_Input) -> Typed_Greeting_Output {
+typed_greeting :: proc(ctx: ^activity.Context, input: Typed_Greeting_Input) -> Typed_Greeting_Output {
 	message, allocation_error := strings.concatenate({input.salutation, ", ", input.name, "!"})
 	if allocation_error != nil {
 		return {}
 	}
-	return {message = message, name_length = len(input.name)}
+	return {
+		message = message,
+		name_length = len(input.name),
+		activity_id = activity.activity_id(ctx),
+	}
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -74,11 +79,30 @@ typed_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Typed_Greeting_Input,
 ) -> Typed_Greeting_Output {
-	return workflow.execute_activity_json(
+	non_retryable_types := [?]string{"InvalidGreeting"}
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = 100 * time.Millisecond,
+		backoff_coefficient = 2,
+		maximum_interval = time.Second,
+		maximum_attempts = 3,
+		non_retryable_error_types = non_retryable_types[:],
+	}
+	return workflow.execute_activity_json_with_options(
 		ctx,
 		"typed_greeting",
 		input,
 		Typed_Greeting_Output,
+		{
+			activity_id = "typed-greeting-options",
+			task_queue = TASK_QUEUE,
+			schedule_to_close_timeout = 30 * time.Second,
+			schedule_to_start_timeout = 5 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+			heartbeat_timeout = 2 * time.Second,
+			retry_policy = &retry_policy,
+			cancellation_type = .Wait_Cancellation_Completed,
+			disable_eager_execution = true,
+		},
 	)
 }
 

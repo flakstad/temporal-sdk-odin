@@ -365,6 +365,255 @@ typed_workflow_payloads_replay_for_generated_structs :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Activity_Options_Input :: struct {
+	activity_id:              string,
+	task_queue:               string,
+	schedule_to_close_ms:     int,
+	schedule_to_start_ms:     int,
+	start_to_close_ms:        int,
+	heartbeat_ms:             int,
+	retry_initial_ms:         int,
+	retry_maximum_ms:         int,
+	retry_maximum_attempts:   int,
+	cancellation_type:        int,
+	disable_eager_execution:  bool,
+}
+
+generated_activity_options_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Activity_Options_Input,
+) -> string {
+	cancellation_type := workflow.Activity_Cancellation_Type.Try_Cancel
+	switch input.cancellation_type {
+	case 1:
+		cancellation_type = .Wait_Cancellation_Completed
+	case 2:
+		cancellation_type = .Abandon
+	}
+	non_retryable_types := [?]string{"GeneratedPermanentFailure"}
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = time.Duration(input.retry_initial_ms) * time.Millisecond,
+		backoff_coefficient = 1.5,
+		maximum_interval = time.Duration(input.retry_maximum_ms) * time.Millisecond,
+		maximum_attempts = i32(input.retry_maximum_attempts),
+		non_retryable_error_types = non_retryable_types[:],
+	}
+	return workflow.execute_activity_json_with_options(
+		ctx,
+		"generated_options_activity",
+		input.activity_id,
+		string,
+		{
+			activity_id = input.activity_id,
+			task_queue = input.task_queue,
+			schedule_to_close_timeout = time.Duration(input.schedule_to_close_ms) * time.Millisecond,
+			schedule_to_start_timeout = time.Duration(input.schedule_to_start_ms) * time.Millisecond,
+			start_to_close_timeout = time.Duration(input.start_to_close_ms) * time.Millisecond,
+			heartbeat_timeout = time.Duration(input.heartbeat_ms) * time.Millisecond,
+			retry_policy = &retry_policy,
+			cancellation_type = cancellation_type,
+			disable_eager_execution = input.disable_eager_execution,
+		},
+	)
+}
+
+pbt_proto_duration :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {
+	if value == nil {
+		return 0
+	}
+	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+}
+
+generated_activity_options_match :: proc(
+	data: []u8,
+	expected: ^Generated_Activity_Options_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+			if variant.value == nil || variant.value.retry_policy == nil {
+				return false
+			}
+			schedule := variant.value
+			policy := schedule.retry_policy
+			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.TRY_CANCEL
+			switch expected.cancellation_type {
+			case 1:
+				expected_cancellation = .WAIT_CANCELLATION_COMPLETED
+			case 2:
+				expected_cancellation = .ABANDON
+			}
+			return schedule.activity_id == expected.activity_id &&
+				schedule.activity_type == "generated_options_activity" &&
+				schedule.task_queue == expected.task_queue &&
+				pbt_proto_duration(schedule.schedule_to_close_timeout) == time.Duration(expected.schedule_to_close_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.schedule_to_start_timeout) == time.Duration(expected.schedule_to_start_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.start_to_close_timeout) == time.Duration(expected.start_to_close_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.heartbeat_timeout) == time.Duration(expected.heartbeat_ms) * time.Millisecond &&
+				pbt_proto_duration(policy.initial_interval) == time.Duration(expected.retry_initial_ms) * time.Millisecond &&
+				policy.backoff_coefficient == 1.5 &&
+				pbt_proto_duration(policy.maximum_interval) == time.Duration(expected.retry_maximum_ms) * time.Millisecond &&
+				policy.maximum_attempts == i32(expected.retry_maximum_attempts) &&
+				len(policy.non_retryable_error_types) == 1 &&
+				policy.non_retryable_error_types[0] == "GeneratedPermanentFailure" &&
+				schedule.cancellation_type == expected_cancellation &&
+				schedule.do_not_eagerly_execute == expected.disable_eager_execution
+		}
+	}
+	return false
+}
+
+activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	schedule_to_close_ms := pbt.draw(t, pbt.int_range(100, 120_000))
+	start_to_close_ms := pbt.draw(t, pbt.int_range(1, schedule_to_close_ms))
+	schedule_to_start_ms := pbt.draw(t, pbt.int_range(1, schedule_to_close_ms))
+	heartbeat_ms := pbt.draw(t, pbt.int_range(1, start_to_close_ms))
+	retry_initial_ms := pbt.draw(t, pbt.int_range(1, 10_000))
+	retry_maximum_ms := pbt.draw(t, pbt.int_range(retry_initial_ms, 120_000))
+	input_value := Generated_Activity_Options_Input{
+		activity_id = pbt.draw(t, pbt.string_ascii(1, 32)),
+		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
+		schedule_to_close_ms = schedule_to_close_ms,
+		schedule_to_start_ms = schedule_to_start_ms,
+		start_to_close_ms = start_to_close_ms,
+		heartbeat_ms = heartbeat_ms,
+		retry_initial_ms = retry_initial_ms,
+		retry_maximum_ms = retry_maximum_ms,
+		retry_maximum_attempts = pbt.draw(t, pbt.int_range(0, 20)),
+		cancellation_type = pbt.draw(t, pbt.int_range(0, 2)),
+		disable_eager_execution = pbt.draw(t, pbt.boolean()),
+	}
+	pbt.cover(t, input_value.cancellation_type == 0, 20.0, "try cancel")
+	pbt.cover(t, input_value.cancellation_type == 1, 20.0, "wait for cancellation")
+	pbt.cover(t, input_value.cancellation_type == 2, 20.0, "abandon")
+	pbt.cover(t, input_value.retry_maximum_attempts == 0, 2.0, "unlimited attempts")
+	pbt.cover(t, input_value.disable_eager_execution, 30.0, "eager disabled")
+
+	owned_queue, queue_error := strings.clone("pbt-workflow-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate Activity options Workflow queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_activity_options_workflow",
+		generated_activity_options_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register Activity options Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Activity options")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_activity_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.scheduled_activity {
+		return pbt.fail("generated Activity options did not schedule an Activity")
+	}
+	if !generated_activity_options_match(initial.completion[:], &input_value) {
+		return pbt.fail("generated Activity options changed across command encoding")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated Activity options Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated Activity options replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_options_replay_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity options survive generated command encoding and replay",
+		activity_options_replay_property,
+		{num_tests = 500, seed = 0x4143_545f_4f50_5453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

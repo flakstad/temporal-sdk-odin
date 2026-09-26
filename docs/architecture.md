@@ -8,9 +8,11 @@ failure, buffered Workflow signals, a durable signal/timer race, and
 runtime-owned Workflow cancellation, plus a reusable Activity/Workflow worker
 registry and poll loop, updated 2026-09-26. The Activity slice now also has a
 generic Temporal Payload boundary, typed JSON Activity registration, and
-structured Application Failures proven through a live retry. The Workflow fiber now
-preserves generic Payloads across initialization, Activity commands/results,
-completion, eviction, and replay, with typed JSON adapters above that boundary.
+structured Application Failures proven through a live retry. The Workflow fiber
+now preserves generic Payloads across initialization, Activity
+commands/results, completion, eviction, and replay, with typed JSON adapters
+above that boundary. Workflow Activity options are represented explicitly and
+preserved across fresh-stack replay.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -621,7 +623,8 @@ copied rather than reconstructed, so custom codecs can use the same runtime.
 The offline typed test forces eviction after scheduling the Activity and
 requires the fresh fiber to emit byte-identical command bytes. A live Temporal
 CLI case sends `{name, salutation}`, Core evicts and replays the Workflow, Odin
-runs a typed Activity, and the Service returns `{message, name_length}`. A
+runs a typed Activity, and the Service returns `{message, name_length,
+activity_id}`. A
 500-case PBT property repeats structured Workflow input/output plus
 eviction/replay with generated values. Incompatible typed input deterministically
 produces a non-retryable `OdinWorkflowPayloadConversionError`, not a worker
@@ -629,6 +632,27 @@ shutdown. A raw Payload test separately carries custom `encoding`,
 `messageType`, opaque bytes, and external-payload size details through Workflow
 input -> Activity command -> Activity resolution -> Workflow completion. Typed
 signal adapters remain future work.
+
+Activity scheduling is no longer hardcoded. `Activity_Options` maps directly
+onto the pinned Core `ScheduleActivity` command: Activity ID, task queue,
+Schedule-to-Close, Schedule-to-Start, Start-to-Close, heartbeat timeout, Retry
+Policy, cancellation type, and eager-execution control. Options are borrowed at
+the author-facing call and copied into the fiber instance arena before the
+Workflow can yield. This includes each non-retryable error type in a Retry
+Policy. Empty task queue and Activity ID select the Workflow queue and the
+deterministic sequence-derived ID respectively.
+
+The options API validates that at least one close timeout is positive, rejects
+negative durations/attempt counts and invalid retry coefficients, and rejects
+Start-to-Close or Schedule-to-Start values larger than an explicit
+Schedule-to-Close value. Invalid options become a non-retryable
+`OdinActivityOptionsError` Workflow failure rather than a malformed Core
+command. The original convenience functions remain compatibility wrappers with
+the spike's 20-second Start-to-Close timeout, one attempt, and disabled eager
+execution. Options-specific offline and 500-case PBT tests require exact
+command fields and byte-identical fresh-stack replay. The live test additionally
+reads Service history and checks the Activity ID, all four timeouts, retry
+intervals/coefficient/attempt limit, and non-retryable type.
 
 `execute_activity` and `sleep` each record a typed operation and yield from
 inside the nested Odin call. Activity and timer sequence counters are separate;
@@ -1064,19 +1088,18 @@ a comparison point; it is not yet enough to freeze the public API.
 
 Activity concurrency, task-token routing, cooperative cancel delivery,
 heartbeat transport, typed JSON Payloads, structured user failures with a real
-server-directed retry, and generic Workflow Payloads are now proven live. The
-PBT suites generate 500 Payload values, 500 Application Failure contracts, and
-500 typed Workflow replay cases against both the pinned library and
+server-directed retry, generic Workflow Payloads, and replay-safe Activity
+options are now proven live. The PBT suites generate 500 Payload values, 500
+Application Failure contracts, 500 typed Workflow replay cases, and 500
+Activity-option command/replay cases against both the pinned library and
 `~/Projects/pbt`.
 
-The next vertical milestone should replace the Workflow runtime's hardcoded
-20-second Activity timeout and single attempt with an Odin `Activity_Options`
-value. Start with activity ID/task queue, Start-to-Close and Schedule-to-Close
-timeouts, heartbeat timeout, cancellation type, and Retry Policy; preserve the
-options in the operation table so replay emits identical commands. In parallel,
-populate Activity context with Core's deadline, retry policy, heartbeat details,
-Workflow identity, and task queue. This turns the current proof into a usable
-Activity scheduling surface without changing the fiber architecture.
+The next vertical milestone should populate Activity context from Core's
+`ActivityTask.Start`: deadline, all execution timestamps/timeouts, effective
+Retry Policy, heartbeat details, Workflow identity, namespace, Activity type,
+and task queue. The worker must copy every borrowed protobuf field before its
+decode arena is destroyed, and heartbeat details should use the generic Payload
+boundary rather than assume JSON.
 
 After that, extend the same Payload adapter pattern to typed signals and typed
 Activity failure details in Workflow code, then stress pool

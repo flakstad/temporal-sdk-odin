@@ -23,7 +23,9 @@ non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
 attempt 1 to attempt 2. Workflow initialization, Activity arguments/results,
 and Workflow completion now preserve generic Payloads; typed JSON Workflows run
-end-to-end across eviction and fresh-stack replay. It does **not** provide user
+end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
+now accept IDs, task queues, all four server timeouts, Retry Policies,
+cancellation type, and eager-execution control. It does **not** provide user
 Workflow cancellation scopes/cleanup, signal handlers, queries/updates,
 multiple Activity arguments, in-process panic containment, or a stable public
 API.
@@ -159,6 +161,35 @@ greeting_workflow :: proc(
 _ = worker.register_json_workflow(&temporal_worker, "greeting", greeting_workflow)
 ```
 
+The options form remains explicit and allocator-safe across suspension:
+
+```odin
+retry := workflow.Retry_Policy{
+    initial_interval = time.Second,
+    backoff_coefficient = 2,
+    maximum_attempts = 3,
+}
+result := workflow.execute_activity_json_with_options(
+    ctx,
+    "typed_greeting",
+    input,
+    Greeting_Output,
+    {
+        activity_id = "greeting-for-order-42",
+        start_to_close_timeout = 10 * time.Second,
+        heartbeat_timeout = 2 * time.Second,
+        retry_policy = &retry,
+        cancellation_type = .Wait_Cancellation_Completed,
+    },
+)
+```
+
+`Activity_Options` borrows its strings, slices, and Retry Policy only for the
+call. The runtime copies them into Workflow-owned storage before it can
+suspend. At least one of Start-to-Close or Schedule-to-Close must be positive.
+The compatibility helpers retain their experimental 20-second
+Start-to-Close/one-attempt behavior.
+
 `register_payload_workflow` is the lower-level form. String Workflows remain a
 compatibility adapter over `json/plain`. Signals are still string-only in the
 experimental public API.
@@ -188,7 +219,9 @@ Activity, plus a retryable typed failure whose 10 ms `next_retry_delay` is
 honored before the same Activity succeeds with `activity.attempt(ctx) == 2`.
 It also starts a typed Odin Workflow with a structured object, schedules a typed
 Odin Activity, observes Core eviction and replay, and receives the structured
-Workflow result through Temporal CLI.
+Workflow result through Temporal CLI. That live path uses explicit Activity
+timeouts, retry/cancellation policy, task queue, and Activity ID; the Activity
+returns the server-delivered ID as part of the result.
 
 Unit, codec, generated-protobuf, and lifecycle tests:
 
