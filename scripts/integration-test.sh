@@ -356,6 +356,60 @@ cat "$worker_log"
 grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
 grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
 
+if ! temporal operator search-attribute list \
+  --command-timeout 10s \
+  --output json | grep -q 'OdinSdkKeyword'; then
+  temporal operator search-attribute create \
+    --name OdinSdkKeyword \
+    --type Keyword \
+    --command-timeout 10s \
+    --output none
+fi
+
+TEMPORAL_ODIN_SCENARIO=workflow-properties \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Workflow-properties Odin Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+properties_workflow_id="odin-sdk-workflow-properties-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$properties_workflow_id" \
+  --type odin_workflow_properties \
+  --task-queue odin-hello-workflow \
+  --input "\"$properties_workflow_id\"" \
+  --memo 'odin-start="before"' \
+  --search-attribute 'OdinSdkKeyword="before"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+properties_workflow_output="$(<"$workflow_output_file")"
+echo "$properties_workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$properties_workflow_output"
+grep -q 'Workflow properties updated' <<<"$properties_workflow_output"
+temporal workflow show \
+  --workflow-id "$properties_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED' "$typed_history_file"
+grep -q 'EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES' "$typed_history_file"
+grep -q 'odin-status' "$typed_history_file"
+grep -q 'OdinSdkKeyword' "$typed_history_file"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq 'replay=false .*memo_upserts=2 search_upserts=1 .*completed=true' "$worker_log"
+grep -q "Workflow info, memo, and Search Attributes completed through Core and Temporal Server" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

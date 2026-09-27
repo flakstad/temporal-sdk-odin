@@ -22,6 +22,10 @@ executions. The Workflow runtime now preserves signal Payloads generically and
 offers raw, typed JSON, and string await adapters.
 Catchable Activity results now expose the outer Activity failure metadata and a
 typed view of nested Application Failure fields and details.
+Workflow initialization metadata, memo, and Search Attributes are also mapped
+into run-owned state. Workflow code can read them through borrowed views and
+emit deterministic memo/Search Attribute upserts or removals; unit, generated
+property, replay, and live Service-history tests cover this boundary.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -241,7 +245,8 @@ The language runtime consumes all jobs for an activation and returns a
 [`WorkflowActivationCompletion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_completion/workflow_completion.proto).
 A success carries ordered `WorkflowCommand`s—start/cancel timer, schedule/cancel
 activity, complete/fail/cancel workflow, child/external operations, queries,
-updates, and more. A failure carries a Temporal `Failure`.
+updates, memo property modifications, Search Attribute upserts, and more. A
+failure carries a Temporal `Failure`.
 
 An eviction activation contains only `remove_from_cache`; language workflow
 code must not be invoked and an empty successful completion is expected. The
@@ -261,6 +266,7 @@ ordering, and discard them on eviction.
 | Sticky/non-sticky server mechanics and eviction requests | Dropping cached language state on eviction |
 | Activity task delivery and completion transport | Calling activities and converting arguments/results/failures |
 | Workflow time/random seeds/patch information delivery | Temporal-aware clock/random/patch APIs |
+| Initial Workflow metadata, memo, and Search Attribute delivery | Run-owned views, codecs, mutation API, and deterministic property command order |
 | Protocol-level heartbeat transport | Activity context and user-facing heartbeat/cancellation API |
 | Service metrics hooks and internal telemetry | Odin logging/tracing integration and public configuration |
 
@@ -292,7 +298,7 @@ now includes representations for:
 
 - Core `ActivityTask`, `ActivityTaskCompletion`, and `ActivityExecutionResult`;
 - Temporal `Payload`, `Failure`, `WorkflowExecution`, `RetryPolicy`, and
-  `Priority`;
+  `Priority`, plus `Memo` and `SearchAttributes` maps;
 - Google `Timestamp` and `Duration`;
 - all transitively used enums and `oneof`s.
 
@@ -709,6 +715,56 @@ shutdown. A raw Payload test separately carries custom `encoding`,
 `messageType`, opaque bytes, and external-payload size details through Workflow
 input -> Activity command -> Activity resolution -> Workflow completion. Typed
 signals use the same Payload boundary.
+
+### Workflow information, memo, and Search Attributes
+
+No C-bridge expansion was necessary for this slice. Core already sends the
+language-facing state in `InitializeWorkflow` and accepts mutations as ordinary
+completion commands:
+
+```text
+InitializeWorkflow
+  +-- identity, Workflow/run/type/attempt and run-chain metadata
+  +-- timeouts, start/expiration time, parent/root, Retry Policy, priority
+  +-- Memo<string, Payload>
+  `-- SearchAttributes<string, Payload>
+
+Odin Workflow code
+  +-- workflow.info / memo_* / search_attribute_*
+  +-- ModifyWorkflowProperties(upserted_memo)
+  `-- UpsertWorkflowSearchAttributes(search_attributes)
+```
+
+`workflow.Info` is copied into the per-run arena during initialization. Its
+strings and slices are borrowed by user code and remain valid until Core asks
+the Worker to evict that run. The root execution protobuf does not carry a
+namespace, so `Info.root.namespace` is empty; parent namespace is preserved
+from Core's `NamespacedWorkflowExecution`. Invalid protobuf durations or
+timestamps fail initialization instead of reaching user code.
+
+Memo and Search Attribute values remain generic `codec.Payload` objects. The
+runtime clones initial maps into the run arena, so they outlive the activation
+decode arena. Raw accessors return borrowed `Payload_View`s and JSON accessors
+are adapters above that boundary. Every successful mutation records an owned
+command value and immediately updates the local map, giving deterministic
+read-after-write behavior in the same Workflow task. Removal uses the upstream
+protobuf contract: the named entry is sent with a default/empty Payload.
+
+Temporal's Search Attribute type is encoded in Payload metadata under `type`.
+The Odin enum maps exactly to the upstream strings `Bool`, `Int`, `Double`,
+`Keyword`, `Text`, `Datetime`, and `KeywordList`. This is distinct from the
+user codec's `encoding` metadata. The current generic API does not statically
+prove that an Odin value matches the selected Search Attribute type; the
+Service schema and application tests remain the enforcement boundary. Custom
+field names must be registered with the Service before use.
+
+Commands retain call order and are emitted before a terminal Workflow command.
+Fresh-stack replay reconstructs the initial maps and executes the same calls,
+therefore producing byte-identical completion bytes. A 500-case property varies
+keys, values, Keyword/Text selection, upsert/removal sequences, local
+read-after-write, eviction, and replay. The CLI-devserver test observes both
+`EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED` and
+`EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` in real Service history.
 
 Activity scheduling is no longer hardcoded. `Activity_Options` maps directly
 onto the pinned Core `ScheduleActivity` command: Activity ID, task queue,

@@ -178,6 +178,69 @@ Retry_Policy :: struct {
 	non_retryable_error_types: []string,
 }
 
+Workflow_Execution_Info :: struct {
+	namespace:   string,
+	workflow_id: string,
+	run_id:      string,
+}
+
+Workflow_Priority :: struct {
+	priority_key:    i32,
+	fairness_key:    string,
+	fairness_weight: f32,
+}
+
+Continue_Initiator :: enum {
+	Unspecified,
+	Workflow,
+	Retry,
+	Cron_Schedule,
+}
+
+// Info borrows all strings and slices from the current Workflow run. It is
+// valid until the run is evicted from the Worker cache.
+Info :: struct {
+	namespace:   string,
+	task_queue:  string,
+	workflow_id: string,
+	run_id:      string,
+	workflow_type: string,
+	identity:      string,
+	attempt:       i32,
+	first_execution_run_id:    string,
+	original_execution_run_id: string,
+	continued_from_run_id:     string,
+	continued_initiator:       Continue_Initiator,
+	cron_schedule:             string,
+	execution_timeout:     time.Duration,
+	has_execution_timeout: bool,
+	run_timeout:           time.Duration,
+	has_run_timeout:       bool,
+	task_timeout:          time.Duration,
+	has_task_timeout:      bool,
+	start_time:            time.Time,
+	has_start_time:        bool,
+	execution_expiration_time:     time.Time,
+	has_execution_expiration_time: bool,
+	parent:     Workflow_Execution_Info,
+	has_parent: bool,
+	root:       Workflow_Execution_Info,
+	has_root:   bool,
+	retry_policy:     Retry_Policy,
+	has_retry_policy: bool,
+	priority: Workflow_Priority,
+}
+
+Search_Attribute_Type :: enum {
+	Bool,
+	Int,
+	Double,
+	Keyword,
+	Text,
+	Datetime,
+	Keyword_List,
+}
+
 // Activity_Options borrows its strings, slices, and retry_policy only for the
 // start/execute call. The Workflow runtime copies them into the run arena before
 // it can suspend. A zero duration means "not specified".
@@ -580,6 +643,23 @@ Fiber_Activity_Operation :: struct {
 	detached_from_root_cancellation: bool,
 }
 
+Fiber_Named_Payload :: struct {
+	key:     string,
+	payload: codec.Payload,
+}
+
+Fiber_Property_Command_Kind :: enum {
+	Memo,
+	Search_Attribute,
+}
+
+Fiber_Property_Command :: struct {
+	kind:    Fiber_Property_Command_Kind,
+	key:     string,
+	payload: codec.Payload,
+	emitted: bool,
+}
+
 Fiber_Timer_Operation :: struct {
 	seq:      u32,
 	duration: time.Duration,
@@ -708,9 +788,15 @@ Fiber_Update_Routine :: struct {
 }
 
 Fiber_Instance :: struct {
+	namespace:       string,
 	run_id:          string,
+	workflow_id:     string,
 	workflow_type:   string,
 	task_queue:      string,
+	info:            Info,
+	memo:            [dynamic]Fiber_Named_Payload,
+	search_attributes: [dynamic]Fiber_Named_Payload,
+	property_commands: [dynamic]Fiber_Property_Command,
 	input:           codec.Payload,
 	output:          codec.Payload,
 	callback_data:   rawptr,
@@ -766,6 +852,7 @@ Fiber_Instance :: struct {
 }
 
 Fiber_Runtime :: struct {
+	namespace:              string,
 	workflow_type:          string,
 	task_queue:             string,
 	callback_data:          rawptr,
@@ -786,19 +873,29 @@ fiber_runtime_init_invoker :: proc(
 	callback_data: rawptr,
 	invoke: Workflow_Invoke_Proc,
 	callback_destroy: Workflow_Callback_Destroy_Proc,
+	namespace := "default",
 ) -> Error {
-	if runtime == nil || len(workflow_type) == 0 || len(task_queue) == 0 || callback_data == nil || invoke == nil || callback_destroy == nil {
-		return error_from_string("workflow type, task queue, and workflow procedure are required")
+	if runtime == nil || len(namespace) == 0 || len(workflow_type) == 0 ||
+	   len(task_queue) == 0 || callback_data == nil || invoke == nil ||
+	   callback_destroy == nil {
+		return error_from_string("namespace, workflow type, task queue, and workflow procedure are required")
+	}
+	owned_namespace, namespace_error := strings.clone(namespace)
+	if namespace_error != nil {
+		return error_from_string("could not allocate workflow namespace")
 	}
 	owned_type, type_error := strings.clone(workflow_type)
 	if type_error != nil {
+		delete(owned_namespace)
 		return error_from_string("could not allocate workflow type")
 	}
 	owned_queue, queue_error := strings.clone(task_queue)
 	if queue_error != nil {
+		delete(owned_namespace)
 		delete(owned_type)
 		return error_from_string("could not allocate workflow task queue")
 	}
+	runtime.namespace = owned_namespace
 	runtime.workflow_type = owned_type
 	runtime.task_queue = owned_queue
 	runtime.callback_data = callback_data
@@ -812,6 +909,7 @@ fiber_runtime_init :: proc(
 	runtime: ^Fiber_Runtime,
 	workflow_type, task_queue: string,
 	workflow: Fiber_Proc,
+	namespace := "default",
 ) -> Error {
 	if workflow == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
@@ -849,6 +947,7 @@ fiber_runtime_init :: proc(
 		proc(data: rawptr) {
 			free(cast(^Fiber_Proc)data, allocator_runtime.heap_allocator())
 		},
+		namespace,
 	)
 	if init_error.message != nil {
 		free(owned_callback, allocator)
@@ -860,6 +959,7 @@ fiber_runtime_init_payload :: proc(
 	runtime: ^Fiber_Runtime,
 	workflow_type, task_queue: string,
 	workflow: Payload_Proc,
+	namespace := "default",
 ) -> Error {
 	if workflow == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
@@ -882,6 +982,7 @@ fiber_runtime_init_payload :: proc(
 		proc(data: rawptr) {
 			free(cast(^Payload_Proc)data, allocator_runtime.heap_allocator())
 		},
+		namespace,
 	)
 	if init_error.message != nil {
 		free(owned_callback, allocator)
@@ -1207,6 +1308,7 @@ fiber_runtime_close :: proc(runtime: ^Fiber_Runtime) {
 		_ = fiber_instance_destroy(instance)
 	}
 	delete(runtime.instances)
+	delete(runtime.namespace)
 	delete(runtime.workflow_type)
 	delete(runtime.task_queue)
 	if runtime.callback_data != nil && runtime.callback_destroy != nil {
@@ -1274,12 +1376,99 @@ fiber_entry :: proc "c" (user_data: rawptr) {
 	instance.phase = .Completed
 }
 
+workflow_continue_initiator_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_ContinueAsNewInitiator,
+) -> Continue_Initiator {
+	switch value {
+	case .CONTINUE_AS_NEW_INITIATOR_WORKFLOW:
+		return .Workflow
+	case .CONTINUE_AS_NEW_INITIATOR_RETRY:
+		return .Retry
+	case .CONTINUE_AS_NEW_INITIATOR_CRON_SCHEDULE:
+		return .Cron_Schedule
+	case .CONTINUE_AS_NEW_INITIATOR_UNSPECIFIED:
+		return .Unspecified
+	}
+	return .Unspecified
+}
+
+workflow_info_duration :: proc(
+	value: ^proto.Google_Protobuf_Duration,
+) -> (duration: time.Duration, present, ok: bool) {
+	if value == nil {
+		return 0, false, true
+	}
+	if value.seconds < 0 || value.nanos < 0 || value.nanos >= 1_000_000_000 ||
+	   value.seconds > 9_223_372_036 ||
+	   (value.seconds == 9_223_372_036 && value.nanos > 854_775_807) {
+		return 0, true, false
+	}
+	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos)), true, true
+}
+
+workflow_info_time :: proc(
+	value: ^proto.Google_Protobuf_Timestamp,
+) -> (result: time.Time, present, ok: bool) {
+	if value == nil {
+		return {}, false, true
+	}
+	if value.nanos < 0 || value.nanos >= 1_000_000_000 {
+		return {}, true, false
+	}
+	return time.unix(value.seconds, i64(value.nanos)), true, true
+}
+
+clone_named_proto_payloads :: proc(
+	entries: []proto.Temporal_Api_Common_V1_Memo_FieldsEntry,
+	result: ^[dynamic]Fiber_Named_Payload,
+) -> bool {
+	for entry in entries {
+		if len(entry.key) == 0 || entry.value == nil {
+			return false
+		}
+		key, key_error := strings.clone(entry.key)
+		payload, payload_error := proto.clone_payload(entry.value)
+		if key_error != nil || payload_error != .None {
+			return false
+		}
+		append(result, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return true
+}
+
+clone_named_search_payloads :: proc(
+	entries: []proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry,
+	result: ^[dynamic]Fiber_Named_Payload,
+) -> bool {
+	for entry in entries {
+		if len(entry.key) == 0 || entry.value == nil {
+			return false
+		}
+		key, key_error := strings.clone(entry.key)
+		payload, payload_error := proto.clone_payload(entry.value)
+		if key_error != nil || payload_error != .None {
+			return false
+		}
+		append(result, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return true
+}
+
+clone_workflow_info_string :: proc(value: string, result: ^string) -> bool {
+	cloned, clone_error := strings.clone(value)
+	if clone_error != nil {
+		return false
+	}
+	result^ = cloned
+	return true
+}
+
 add_fiber_instance :: proc(
 	runtime: ^Fiber_Runtime,
 	run_id: string,
-	input_payload: ^proto.Temporal_Api_Common_V1_Payload,
+	initialize: ^proto.Coresdk_Workflow_Activation_InitializeWorkflow,
 ) -> (^Fiber_Instance, Error) {
-	if input_payload == nil {
+	if initialize == nil || len(initialize.arguments) != 1 {
 		return nil, error_from_string("workflow initialization has no input")
 	}
 
@@ -1295,14 +1484,21 @@ add_fiber_instance :: proc(
 	instance.odin_context.allocator = virtual.arena_allocator(&instance.arena)
 	previous_allocator := context.allocator
 	context.allocator = instance.odin_context.allocator
+	owned_namespace, namespace_error := strings.clone(runtime.namespace)
+	instance.namespace = owned_namespace
 	owned_run_id, run_id_error := strings.clone(run_id)
 	instance.run_id = owned_run_id
+	owned_workflow_id, workflow_id_error := strings.clone(initialize.workflow_id)
+	instance.workflow_id = owned_workflow_id
 	owned_workflow_type, workflow_type_error := strings.clone(runtime.workflow_type)
 	instance.workflow_type = owned_workflow_type
 	owned_task_queue, task_queue_error := strings.clone(runtime.task_queue)
 	instance.task_queue = owned_task_queue
-	owned_input, clone_error := proto.clone_payload(input_payload)
+	owned_input, clone_error := proto.clone_payload(&initialize.arguments[0])
 	instance.input = owned_input
+	instance.memo = make([dynamic]Fiber_Named_Payload)
+	instance.search_attributes = make([dynamic]Fiber_Named_Payload)
+	instance.property_commands = make([dynamic]Fiber_Property_Command)
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.external_signals = make([dynamic]Fiber_External_Signal_Operation)
@@ -1316,12 +1512,122 @@ add_fiber_instance :: proc(
 	instance.query_handlers = make([dynamic]Fiber_Query_Handler)
 	instance.update_handlers = make([dynamic]Fiber_Update_Handler)
 	instance.update_routines = make([dynamic]^Fiber_Update_Routine)
+
+	info := &instance.info
+	info.namespace = instance.namespace
+	info.task_queue = instance.task_queue
+	info.workflow_id = instance.workflow_id
+	info.run_id = instance.run_id
+	info.workflow_type = instance.workflow_type
+	metadata_strings_ok := clone_workflow_info_string(initialize.identity, &info.identity)
+	metadata_strings_ok = clone_workflow_info_string(
+		initialize.first_execution_run_id,
+		&info.first_execution_run_id,
+	) && metadata_strings_ok
+	metadata_strings_ok = clone_workflow_info_string(
+		initialize.original_execution_run_id,
+		&info.original_execution_run_id,
+	) && metadata_strings_ok
+	metadata_strings_ok = clone_workflow_info_string(
+		initialize.continued_from_execution_run_id,
+		&info.continued_from_run_id,
+	) && metadata_strings_ok
+	metadata_strings_ok = clone_workflow_info_string(
+		initialize.cron_schedule,
+		&info.cron_schedule,
+	) && metadata_strings_ok
+	info.attempt = initialize.attempt
+	info.continued_initiator = workflow_continue_initiator_from_proto(initialize.continued_initiator)
+	execution_timeout, has_execution_timeout, execution_timeout_ok := workflow_info_duration(
+		initialize.workflow_execution_timeout,
+	)
+	info.execution_timeout = execution_timeout
+	info.has_execution_timeout = has_execution_timeout
+	run_timeout, has_run_timeout, run_timeout_ok := workflow_info_duration(
+		initialize.workflow_run_timeout,
+	)
+	info.run_timeout = run_timeout
+	info.has_run_timeout = has_run_timeout
+	task_timeout, has_task_timeout, task_timeout_ok := workflow_info_duration(
+		initialize.workflow_task_timeout,
+	)
+	info.task_timeout = task_timeout
+	info.has_task_timeout = has_task_timeout
+	start_time, has_start_time, start_time_ok := workflow_info_time(initialize.start_time)
+	info.start_time = start_time
+	info.has_start_time = has_start_time
+	expiration_time, has_expiration_time, expiration_ok := workflow_info_time(
+		initialize.workflow_execution_expiration_time,
+	)
+	info.execution_expiration_time = expiration_time
+	info.has_execution_expiration_time = has_expiration_time
+	if initialize.parent_workflow_info != nil {
+		info.has_parent = true
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.parent_workflow_info.namespace,
+			&info.parent.namespace,
+		) && metadata_strings_ok
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.parent_workflow_info.workflow_id,
+			&info.parent.workflow_id,
+		) && metadata_strings_ok
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.parent_workflow_info.run_id,
+			&info.parent.run_id,
+		) && metadata_strings_ok
+	}
+	if initialize.root_workflow != nil {
+		info.has_root = true
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.root_workflow.workflow_id,
+			&info.root.workflow_id,
+		) && metadata_strings_ok
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.root_workflow.run_id,
+			&info.root.run_id,
+		) && metadata_strings_ok
+	}
+	retry_durations_ok := true
+	if initialize.retry_policy != nil {
+		info.has_retry_policy = true
+		policy := initialize.retry_policy
+		retry_initial, _, retry_initial_ok := workflow_info_duration(policy.initial_interval)
+		info.retry_policy.initial_interval = retry_initial
+		info.retry_policy.backoff_coefficient = policy.backoff_coefficient
+		retry_maximum, _, retry_maximum_ok := workflow_info_duration(policy.maximum_interval)
+		info.retry_policy.maximum_interval = retry_maximum
+		retry_durations_ok = retry_initial_ok && retry_maximum_ok
+		info.retry_policy.maximum_attempts = policy.maximum_attempts
+		info.retry_policy.non_retryable_error_types = make([]string, len(policy.non_retryable_error_types))
+		for error_type, index in policy.non_retryable_error_types {
+			metadata_strings_ok = clone_workflow_info_string(
+				error_type,
+				&info.retry_policy.non_retryable_error_types[index],
+			) && metadata_strings_ok
+		}
+	}
+	if initialize.priority != nil {
+		info.priority.priority_key = initialize.priority.priority_key
+		metadata_strings_ok = clone_workflow_info_string(
+			initialize.priority.fairness_key,
+			&info.priority.fairness_key,
+		) && metadata_strings_ok
+		info.priority.fairness_weight = initialize.priority.fairness_weight
+	}
+	memo_ok := initialize.memo == nil || clone_named_proto_payloads(initialize.memo.fields[:], &instance.memo)
+	search_ok := initialize.search_attributes == nil || clone_named_search_payloads(
+		initialize.search_attributes.indexed_fields[:],
+		&instance.search_attributes,
+	)
 	context.allocator = previous_allocator
-	if run_id_error != nil || workflow_type_error != nil || task_queue_error != nil ||
-	   clone_error != .None {
+	if namespace_error != nil || run_id_error != nil || workflow_id_error != nil ||
+	   workflow_type_error != nil || task_queue_error != nil || clone_error != .None ||
+	   !metadata_strings_ok || !retry_durations_ok ||
+	   !execution_timeout_ok || !run_timeout_ok || !task_timeout_ok || !start_time_ok ||
+	   !expiration_ok || !memo_ok || !search_ok {
 		virtual.arena_destroy(&instance.arena)
 		free(instance, instance.owner_allocator)
-		return nil, error_from_string("could not preserve Workflow input Payload")
+		return nil, error_from_string("could not preserve Workflow initialization")
 	}
 
 	instance.callback_data = runtime.callback_data
@@ -2153,6 +2459,247 @@ history_length :: proc(ctx: ^Fiber_Context) -> u32 {
 		return 0
 	}
 	return ctx.instance.activation_history_length
+}
+
+info :: proc(ctx: ^Fiber_Context) -> (value: Info, present: bool) {
+	if ctx == nil || ctx.instance == nil {
+		return {}, false
+	}
+	return ctx.instance.info, true
+}
+
+find_named_payload :: proc(
+	entries: ^[dynamic]Fiber_Named_Payload,
+	key: string,
+) -> (^Fiber_Named_Payload, int, bool) {
+	if entries == nil {
+		return nil, -1, false
+	}
+	for index in 0..<len(entries^) {
+		if entries^[index].key == key {
+			return &entries^[index], index, true
+		}
+	}
+	return nil, -1, false
+}
+
+memo_payload :: proc(ctx: ^Fiber_Context, key: string) -> (codec.Payload_View, bool) {
+	if ctx == nil || ctx.instance == nil {
+		return {}, false
+	}
+	entry, _, found := find_named_payload(&ctx.instance.memo, key)
+	if !found {
+		return {}, false
+	}
+	return codec.payload_view(&entry.payload), true
+}
+
+memo_json :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := memo_payload(ctx, key)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+search_attribute_payload :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+) -> (codec.Payload_View, bool) {
+	if ctx == nil || ctx.instance == nil {
+		return {}, false
+	}
+	entry, _, found := find_named_payload(&ctx.instance.search_attributes, key)
+	if !found {
+		return {}, false
+	}
+	return codec.payload_view(&entry.payload), true
+}
+
+search_attribute_json :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := search_attribute_payload(ctx, key)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+property_mutation_failure :: proc(instance: ^Fiber_Instance, message: string) {
+	if instance == nil {
+		return
+	}
+	instance.failure_message = message
+	instance.failure_type = "OdinWorkflowPropertyError"
+	instance.phase = .Failed
+}
+
+upsert_property_owned :: proc(
+	ctx: ^Fiber_Context,
+	kind: Fiber_Property_Command_Kind,
+	key: string,
+	payload: codec.Payload,
+	remove: bool,
+) -> bool {
+	owned_payload := payload
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(key) == 0 {
+		codec.payload_free(&owned_payload)
+		if ctx != nil && ctx.instance != nil {
+			property_mutation_failure(ctx.instance, "Workflow property mutation requires a ready context and non-empty key")
+		}
+		return false
+	}
+	instance := ctx.instance
+	allocator := instance.odin_context.allocator
+	command_key, command_key_error := strings.clone(key, allocator)
+	if command_key_error != nil {
+		codec.payload_free(&owned_payload)
+		property_mutation_failure(instance, "could not preserve Workflow property key")
+		return false
+	}
+	entries := &instance.memo
+	if kind == .Search_Attribute {
+		entries = &instance.search_attributes
+	}
+	entry, index, found := find_named_payload(entries, key)
+	if remove {
+		if found {
+			codec.payload_free(&entry.payload)
+			ordered_remove(entries, index)
+		}
+	} else {
+		local_payload, clone_error := codec.payload_clone(
+			codec.payload_view(&owned_payload),
+			allocator,
+		)
+		if clone_error != .None {
+			codec.payload_free(&owned_payload)
+			property_mutation_failure(instance, "could not preserve Workflow property value")
+			return false
+		}
+		if found {
+			codec.payload_free(&entry.payload)
+			entry.payload = local_payload
+		} else {
+			local_key, local_key_error := strings.clone(key, allocator)
+			if local_key_error != nil {
+				codec.payload_free(&owned_payload)
+				codec.payload_free(&local_payload)
+				property_mutation_failure(instance, "could not preserve Workflow property key")
+				return false
+			}
+			append(entries, Fiber_Named_Payload{key = local_key, payload = local_payload})
+		}
+	}
+	append(
+		&instance.property_commands,
+		Fiber_Property_Command{
+			kind = kind,
+			key = command_key,
+			payload = owned_payload,
+		},
+	)
+	return true
+}
+
+upsert_memo_payload :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	value: codec.Payload_View,
+) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	payload, clone_error := codec.payload_clone(value, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		property_mutation_failure(ctx.instance, "could not preserve Workflow memo value")
+		return false
+	}
+	return upsert_property_owned(ctx, .Memo, key, payload, false)
+}
+
+upsert_memo_json :: proc(ctx: ^Fiber_Context, key: string, value: $T) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	payload, encode_error := codec.encode_json(value, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		property_mutation_failure(ctx.instance, "could not encode Workflow memo value")
+		return false
+	}
+	return upsert_property_owned(ctx, .Memo, key, payload, false)
+}
+
+remove_memo :: proc(ctx: ^Fiber_Context, key: string) -> bool {
+	return upsert_property_owned(ctx, .Memo, key, {}, true)
+}
+
+search_attribute_type_name :: proc(value: Search_Attribute_Type) -> string {
+	switch value {
+	case .Bool:         return "Bool"
+	case .Int:          return "Int"
+	case .Double:       return "Double"
+	case .Keyword:      return "Keyword"
+	case .Text:         return "Text"
+	case .Datetime:     return "Datetime"
+	case .Keyword_List: return "KeywordList"
+	}
+	return ""
+}
+
+upsert_search_attribute_payload :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: codec.Payload_View,
+) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	payload, clone_error := codec.payload_clone(value, ctx.instance.odin_context.allocator)
+	if clone_error != .None || codec.payload_add_metadata(
+		&payload,
+		"type",
+		transmute([]u8)search_attribute_type_name(attribute_type),
+	) != .None {
+		codec.payload_free(&payload)
+		property_mutation_failure(ctx.instance, "could not preserve Workflow Search Attribute")
+		return false
+	}
+	return upsert_property_owned(ctx, .Search_Attribute, key, payload, false)
+}
+
+upsert_search_attribute_json :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: $T,
+) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	payload, encode_error := codec.encode_json(value, ctx.instance.odin_context.allocator)
+	if encode_error != .None || codec.payload_add_metadata(
+		&payload,
+		"type",
+		transmute([]u8)search_attribute_type_name(attribute_type),
+	) != .None {
+		codec.payload_free(&payload)
+		property_mutation_failure(ctx.instance, "could not encode Workflow Search Attribute")
+		return false
+	}
+	return upsert_property_owned(ctx, .Search_Attribute, key, payload, false)
+}
+
+remove_search_attribute :: proc(ctx: ^Fiber_Context, key: string) -> bool {
+	return upsert_property_owned(ctx, .Search_Attribute, key, {}, true)
 }
 
 // now returns Temporal's activation timestamp. It never reads the host clock.
@@ -5127,6 +5674,9 @@ Workflow_Command_State :: struct {
 	external_signal_count: int,
 	external_cancel_count: int,
 	patch_count:          int,
+	property_command_count: int,
+	memo_count:              int,
+	search_attribute_count:  int,
 	random_state:         u64,
 }
 
@@ -5144,6 +5694,9 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 		external_signal_count = len(instance.external_signals),
 		external_cancel_count = len(instance.external_cancels),
 		patch_count = len(instance.patches),
+		property_command_count = len(instance.property_commands),
+		memo_count = len(instance.memo),
+		search_attribute_count = len(instance.search_attributes),
 		random_state = instance.random_state,
 	}
 }
@@ -5164,6 +5717,9 @@ workflow_command_state_changed :: proc(
 		len(instance.external_signals) != before.external_signal_count ||
 		len(instance.external_cancels) != before.external_cancel_count ||
 		len(instance.patches) != before.patch_count ||
+		len(instance.property_commands) != before.property_command_count ||
+		len(instance.memo) != before.memo_count ||
+		len(instance.search_attributes) != before.search_attribute_count ||
 		instance.random_state != before.random_state
 }
 
@@ -5195,6 +5751,15 @@ restore_workflow_command_state :: proc(
 	}
 	for len(instance.patches) > before.patch_count {
 		ordered_remove(&instance.patches, len(instance.patches) - 1)
+	}
+	for len(instance.property_commands) > before.property_command_count {
+		ordered_remove(&instance.property_commands, len(instance.property_commands) - 1)
+	}
+	for len(instance.memo) > before.memo_count {
+		ordered_remove(&instance.memo, len(instance.memo) - 1)
+	}
+	for len(instance.search_attributes) > before.search_attribute_count {
+		ordered_remove(&instance.search_attributes, len(instance.search_attributes) - 1)
 	}
 }
 
@@ -5890,6 +6455,64 @@ append_shared_operation_commands :: proc(
 	append_fiber_external_signal_cancellations(result, commands, instance)
 }
 
+append_fiber_property_commands :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) {
+	for index in 0..<len(instance.property_commands) {
+		property := &instance.property_commands[index]
+		if property.emitted {
+			continue
+		}
+		payload := new(proto.Temporal_Api_Common_V1_Payload)
+		payload^ = proto.encode_payload(codec.payload_view(&property.payload))
+		switch property.kind {
+		case .Memo:
+			memo := new(proto.Temporal_Api_Common_V1_Memo)
+			append(
+				&memo.fields,
+				proto.Temporal_Api_Common_V1_Memo_FieldsEntry{
+					key = property.key,
+					value = payload,
+				},
+			)
+			modify := new(proto.Coresdk_Workflow_Commands_ModifyWorkflowProperties)
+			modify.upserted_memo = memo
+			append(
+				commands,
+				proto.Coresdk_Workflow_Commands_WorkflowCommand{
+					variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Modify_Workflow_Properties{
+						value = modify,
+					},
+				},
+			)
+			result.memo_upserts += 1
+		case .Search_Attribute:
+			attributes := new(proto.Temporal_Api_Common_V1_SearchAttributes)
+			append(
+				&attributes.indexed_fields,
+				proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+					key = property.key,
+					value = payload,
+				},
+			)
+			upsert := new(proto.Coresdk_Workflow_Commands_UpsertWorkflowSearchAttributes)
+			upsert.search_attributes = attributes
+			append(
+				commands,
+				proto.Coresdk_Workflow_Commands_WorkflowCommand{
+					variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Upsert_Workflow_Search_Attributes{
+						value = upsert,
+					},
+				},
+			)
+			result.search_attribute_upserts += 1
+		}
+		property.emitted = true
+	}
+}
+
 append_fiber_patch_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -6011,6 +6634,10 @@ commands_are_nonterminal_prefix :: proc(
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
 			allowed = variant.value != nil
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Set_Patch_Marker:
+			allowed = variant.value != nil
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Modify_Workflow_Properties:
+			allowed = variant.value != nil
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Upsert_Workflow_Search_Attributes:
 			allowed = variant.value != nil
 		}
 		if !allowed {
@@ -6192,6 +6819,7 @@ append_fiber_progress_command :: proc(
 		return {}
 	}
 	append_fiber_patch_commands(result, commands, instance)
+	append_fiber_property_commands(result, commands, instance)
 	if instance.terminal_failure_requested {
 		instance.failure_message = instance.terminal_failure_message
 		instance.failure_type = instance.terminal_failure_type
@@ -6360,7 +6988,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			add_error: Error
-			instance, add_error = add_fiber_instance(runtime, activation.run_id, &variant.value.arguments[0])
+			instance, add_error = add_fiber_instance(runtime, activation.run_id, variant.value)
 			if add_error.message != nil {
 				result.error = add_error
 				result.completion = encode_activation_failure(activation.run_id, string(add_error.message))

@@ -16,6 +16,7 @@ LOCAL_ACTIVITY_WORKFLOW_TYPE :: "odin_local_activity_workflow"
 LOCAL_ACTIVITY_RETRY_WORKFLOW_TYPE :: "odin_local_activity_retry_workflow"
 FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
+WORKFLOW_PROPERTIES_TYPE :: "odin_workflow_properties"
 PATCH_ID :: "odin-sdk-live-patch-v1"
 
 Typed_Greeting_Input :: struct {
@@ -447,13 +448,64 @@ patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	return result
 }
 
+workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: string) -> string {
+	metadata, metadata_found := workflow.info(ctx)
+	if !metadata_found || metadata.namespace != "default" ||
+	   metadata.task_queue != TASK_QUEUE || metadata.workflow_id != expected_workflow_id ||
+	   metadata.workflow_type != WORKFLOW_PROPERTIES_TYPE || metadata.attempt != 1 ||
+	   len(metadata.run_id) == 0 {
+		return "Workflow info mismatch"
+	}
+	initial_memo: string
+	memo_found, memo_error := workflow.memo_json(ctx, "odin-start", &initial_memo)
+	initial_search: string
+	search_found, search_error := workflow.search_attribute_json(
+		ctx,
+		"OdinSdkKeyword",
+		&initial_search,
+	)
+	if !memo_found || memo_error != .None || initial_memo != "before" ||
+	   !search_found || search_error != .None || initial_search != "before" {
+		return "Initial Workflow properties mismatch"
+	}
+	if !workflow.upsert_memo_json(ctx, "odin-status", "after") ||
+	   !workflow.remove_memo(ctx, "odin-start") ||
+	   !workflow.upsert_search_attribute_json(
+		ctx,
+		"OdinSdkKeyword",
+		.Keyword,
+		"after",
+	) {
+		return "Workflow property mutation failed"
+	}
+	updated_memo: string
+	updated_memo_found, updated_memo_error := workflow.memo_json(
+		ctx,
+		"odin-status",
+		&updated_memo,
+	)
+	_, removed_memo_found := workflow.memo_payload(ctx, "odin-start")
+	updated_search: string
+	updated_search_found, updated_search_error := workflow.search_attribute_json(
+		ctx,
+		"OdinSdkKeyword",
+		&updated_search,
+	)
+	if !updated_memo_found || updated_memo_error != .None || updated_memo != "after" ||
+	   removed_memo_found || !updated_search_found || updated_search_error != .None ||
+	   updated_search != "after" {
+		return "Local Workflow property view mismatch"
+	}
+	return "Workflow properties updated"
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	error_message := ""
 	if processed.error.message != nil {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d memo_upserts=%d search_upserts=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -477,6 +529,8 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.warned_unfinished_update_handlers,
 		processed.patch_markers_emitted,
 		processed.deprecated_patch_markers_emitted,
+		processed.memo_upserts,
+		processed.search_attribute_upserts,
 		processed.received_cancellation,
 		processed.canceled_workflow,
 		processed.started_timer,
@@ -646,6 +700,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	properties_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		WORKFLOW_PROPERTIES_TYPE,
+		workflow_properties,
+	)
+	if properties_workflow_register_error.message != nil {
+		fmt.eprintf(
+			"Workflow properties registration failed: %s\n",
+			string(properties_workflow_register_error.message),
+		)
+		worker.error_free(&properties_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
 	env_buffer: [64]u8
@@ -663,13 +733,14 @@ main :: proc() {
 	expect_local_activity_retry := scenario == "local-activity-retry"
 	expect_failure_details := scenario == "failure-details"
 	expect_patch := scenario == "patch"
+	expect_properties := scenario == "workflow-properties"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
 			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -704,10 +775,10 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch {
+		} else if expect_patch || expect_properties {
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 ||
 			   run_stats.timers_canceled != 0 {
-				fmt.eprintln("Workflow patch path produced unexpected worker stats")
+				fmt.eprintln("Command-only Workflow path produced unexpected worker stats")
 				failed = true
 			}
 		} else if expect_local_activity_retry {
@@ -798,6 +869,8 @@ main :: proc() {
 		fmt.println("structured Activity failure details reached Workflow code")
 	} else if expect_patch {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
+	} else if expect_properties {
+		fmt.println("Workflow info, memo, and Search Attributes completed through Core and Temporal Server")
 	} else if expect_abandon_update {
 		fmt.println("Workflow close abandoned the unfinished Update handler with a warning")
 	} else if expect_cancel_update {

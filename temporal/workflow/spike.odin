@@ -102,6 +102,8 @@ Process_Result :: struct {
 	continued_as_new:      bool,
 	patch_markers_emitted: int,
 	deprecated_patch_markers_emitted: int,
+	search_attribute_upserts: int,
+	memo_upserts:             int,
 	completed:          bool,
 	evicted:            bool,
 	is_replaying:       bool,

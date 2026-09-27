@@ -1943,6 +1943,176 @@ workflow_cancellation_during_local_activity_backoff_cancels_timer :: proc(t: ^te
 }
 
 @(test)
+workflow_info_memo_and_search_attributes_replay_identically :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"workflow_properties_test_workflow",
+		"properties-queue",
+		workflow_properties_test_workflow,
+		namespace = "test-namespace",
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("properties")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	old_memo, old_memo_error := codec.encode_json("before")
+	testing.expect(t, old_memo_error == .None)
+	defer codec.payload_free(&old_memo)
+	proto_old_memo := proto.encode_payload(codec.payload_view(&old_memo))
+	defer delete(proto_old_memo.metadata)
+	defer delete(proto_old_memo.external_payloads)
+	old_search, old_search_error := codec.encode_json("old")
+	testing.expect(t, old_search_error == .None)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&old_search,
+			"type",
+			transmute([]u8)string("Keyword"),
+		) == .None,
+	)
+	defer codec.payload_free(&old_search)
+	proto_old_search := proto.encode_payload(codec.payload_view(&old_search))
+	defer delete(proto_old_search.metadata)
+	defer delete(proto_old_search.external_payloads)
+	memo := proto.Temporal_Api_Common_V1_Memo{}
+	defer delete(memo.fields)
+	append(&memo.fields, proto.Temporal_Api_Common_V1_Memo_FieldsEntry{
+		key = "old-memo",
+		value = &proto_old_memo,
+	})
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	defer delete(search_attributes.indexed_fields)
+	append(
+		&search_attributes.indexed_fields,
+		proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+			key = "OldKeywordField",
+			value = &proto_old_search,
+		},
+	)
+	execution_timeout := proto.Google_Protobuf_Duration{seconds = 86_400}
+	run_timeout := proto.Google_Protobuf_Duration{seconds = 7_200}
+	task_timeout := proto.Google_Protobuf_Duration{seconds = 15}
+	retry_initial := proto.Google_Protobuf_Duration{seconds = 1}
+	retry_maximum := proto.Google_Protobuf_Duration{seconds = 60}
+	retry_policy := proto.Temporal_Api_Common_V1_RetryPolicy{
+		initial_interval = &retry_initial,
+		backoff_coefficient = 2,
+		maximum_interval = &retry_maximum,
+		maximum_attempts = 5,
+	}
+	defer delete(retry_policy.non_retryable_error_types)
+	append(&retry_policy.non_retryable_error_types, "Permanent")
+	start_time := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_000_000,
+		nanos = 123_000_000,
+	}
+	expiration_time := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_086_400,
+		nanos = 456_000_000,
+	}
+	parent := proto.Coresdk_Common_NamespacedWorkflowExecution{
+		namespace = "parent-namespace",
+		workflow_id = "parent-workflow",
+		run_id = "parent-run",
+	}
+	root := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "root-workflow",
+		run_id = "root-run",
+	}
+	priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 7,
+		fairness_key = "tenant-a",
+		fairness_weight = 1.5,
+	}
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "workflow_properties_test_workflow",
+		workflow_id = "properties-workflow-id",
+		identity = "properties-client",
+		parent_workflow_info = &parent,
+		workflow_execution_timeout = &execution_timeout,
+		workflow_run_timeout = &run_timeout,
+		workflow_task_timeout = &task_timeout,
+		continued_from_execution_run_id = "previous-run",
+		continued_initiator = .CONTINUE_AS_NEW_INITIATOR_RETRY,
+		first_execution_run_id = "first-run",
+		retry_policy = &retry_policy,
+		attempt = 3,
+		cron_schedule = "0 * * * *",
+		workflow_execution_expiration_time = &expiration_time,
+		memo = &memo,
+		search_attributes = &search_attributes,
+		start_time = &start_time,
+		root_workflow = &root,
+		priority = &priority,
+		original_execution_run_id = "original-run",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "properties-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+	})
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Workflow properties failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, processed.memo_upserts, 2)
+	testing.expect_value(t, processed.search_attribute_upserts, 2)
+	completion_bytes := bytes.clone(processed.completion[:])
+	inspection := inspect_workflow_properties(processed.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect_value(t, inspection.command_count, 5)
+	testing.expect_value(t, inspection.memo_upsert_count, 1)
+	testing.expect_value(t, inspection.memo_remove_count, 1)
+	testing.expect_value(t, inspection.search_upsert_count, 1)
+	testing.expect_value(t, inspection.search_remove_count, 1)
+	testing.expect_value(t, string(inspection.new_memo_data), `"after"`)
+	testing.expect_value(t, string(inspection.new_search_data), `"blue"`)
+	testing.expect_value(t, string(inspection.new_search_type_metadata), "Keyword")
+	testing.expect(t, inspection.completed)
+	testing.expect_value(t, string(inspection.completion_result), `"Workflow properties updated"`)
+	workflow_properties_inspection_free(&inspection)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{value = &eviction},
+	})
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	testing.expect(t, evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	activation.is_replaying = true
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+	})
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "Workflow properties replay failed: %s", string(replayed.error.message))
+	testing.expect(t, bytes.equal(completion_bytes, replayed.completion[:]))
+	delete(completion_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2890,6 +3060,82 @@ local_activity_retry_test_workflow :: proc(
 	)
 }
 
+workflow_properties_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	_ = input
+	info, present := workflow.info(ctx)
+	if !present || info.namespace != "test-namespace" ||
+	   info.task_queue != "properties-queue" || info.workflow_id != "properties-workflow-id" ||
+	   info.run_id != "properties-run" || info.workflow_type != "workflow_properties_test_workflow" ||
+	   info.identity != "properties-client" || info.attempt != 3 ||
+	   info.first_execution_run_id != "first-run" ||
+	   info.original_execution_run_id != "original-run" ||
+	   info.continued_from_run_id != "previous-run" ||
+	   info.continued_initiator != .Retry || info.cron_schedule != "0 * * * *" ||
+	   !info.has_execution_timeout || info.execution_timeout != 24 * time.Hour ||
+	   !info.has_run_timeout || info.run_timeout != 2 * time.Hour ||
+	   !info.has_task_timeout || info.task_timeout != 15 * time.Second ||
+	   !info.has_start_time || time.to_unix_nanoseconds(info.start_time) != 1_700_000_000_123_000_000 ||
+	   !info.has_execution_expiration_time ||
+	   time.to_unix_nanoseconds(info.execution_expiration_time) != 1_700_086_400_456_000_000 ||
+	   !info.has_parent || info.parent.namespace != "parent-namespace" ||
+	   info.parent.workflow_id != "parent-workflow" || info.parent.run_id != "parent-run" ||
+	   !info.has_root || info.root.workflow_id != "root-workflow" || info.root.run_id != "root-run" ||
+	   !info.has_retry_policy || info.retry_policy.initial_interval != time.Second ||
+	   info.retry_policy.backoff_coefficient != 2 ||
+	   info.retry_policy.maximum_interval != time.Minute ||
+	   info.retry_policy.maximum_attempts != 5 ||
+	   len(info.retry_policy.non_retryable_error_types) != 1 ||
+	   info.retry_policy.non_retryable_error_types[0] != "Permanent" ||
+	   info.priority.priority_key != 7 || info.priority.fairness_key != "tenant-a" ||
+	   info.priority.fairness_weight != 1.5 {
+		return "Workflow info mismatch"
+	}
+	initial_memo: string
+	memo_found, memo_error := workflow.memo_json(ctx, "old-memo", &initial_memo)
+	if !memo_found || memo_error != .None || initial_memo != "before" {
+		return "initial memo mismatch"
+	}
+	initial_search: string
+	search_found, search_error := workflow.search_attribute_json(
+		ctx,
+		"OldKeywordField",
+		&initial_search,
+	)
+	if !search_found || search_error != .None || initial_search != "old" {
+		return "initial Search Attribute mismatch"
+	}
+	if !workflow.upsert_memo_json(ctx, "new-memo", "after") ||
+	   !workflow.remove_memo(ctx, "old-memo") ||
+	   !workflow.upsert_search_attribute_json(
+		   ctx,
+		   "CustomKeywordField",
+		   workflow.Search_Attribute_Type.Keyword,
+		   "blue",
+	   ) ||
+	   !workflow.remove_search_attribute(ctx, "OldKeywordField") {
+		return "Workflow property mutation failed"
+	}
+	updated_memo: string
+	updated_memo_found, updated_memo_error := workflow.memo_json(ctx, "new-memo", &updated_memo)
+	_, removed_memo_found := workflow.memo_payload(ctx, "old-memo")
+	updated_search: string
+	updated_search_found, updated_search_error := workflow.search_attribute_json(
+		ctx,
+		"CustomKeywordField",
+		&updated_search,
+	)
+	_, removed_search_found := workflow.search_attribute_payload(ctx, "OldKeywordField")
+	if !updated_memo_found || updated_memo_error != .None || updated_memo != "after" ||
+	   removed_memo_found || !updated_search_found || updated_search_error != .None ||
+	   updated_search != "blue" || removed_search_found {
+		return "Workflow property local view mismatch"
+	}
+	return "Workflow properties updated"
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -3536,6 +3782,98 @@ Scheduled_Local_Activity_Inspection :: struct {
 	cancellation_type:           proto.Coresdk_Workflow_Commands_ActivityCancellationType,
 	include_arguments_in_marker: bool,
 	input:                       codec.Payload,
+}
+
+Workflow_Properties_Inspection :: struct {
+	decoded:                  bool,
+	command_count:            int,
+	memo_upsert_count:        int,
+	memo_remove_count:        int,
+	search_upsert_count:      int,
+	search_remove_count:      int,
+	new_memo_data:            []u8,
+	new_search_data:          []u8,
+	new_search_type_metadata: []u8,
+	completed:                bool,
+	completion_result:        []u8,
+}
+
+workflow_properties_inspection_free :: proc(inspection: ^Workflow_Properties_Inspection) {
+	if inspection == nil {
+		return
+	}
+	delete(inspection.new_memo_data)
+	delete(inspection.new_search_data)
+	delete(inspection.new_search_type_metadata)
+	delete(inspection.completion_result)
+	inspection^ = {}
+}
+
+inspect_workflow_properties :: proc(data: []u8) -> (inspection: Workflow_Properties_Inspection) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	inspection.decoded = proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	if !inspection.decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		inspection.command_count = len(status.value.commands)
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Modify_Workflow_Properties:
+				if variant.value == nil || variant.value.upserted_memo == nil ||
+				   len(variant.value.upserted_memo.fields) != 1 {
+					continue
+				}
+				entry := &variant.value.upserted_memo.fields[0]
+				if entry.key == "new-memo" && entry.value != nil {
+					inspection.memo_upsert_count += 1
+					inspection.new_memo_data = bytes.clone(entry.value.data)
+				} else if entry.key == "old-memo" && entry.value != nil &&
+				          len(entry.value.data) == 0 && len(entry.value.metadata) == 0 {
+					inspection.memo_remove_count += 1
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Upsert_Workflow_Search_Attributes:
+				if variant.value == nil || variant.value.search_attributes == nil ||
+				   len(variant.value.search_attributes.indexed_fields) != 1 {
+					continue
+				}
+				entry := &variant.value.search_attributes.indexed_fields[0]
+				if entry.key == "CustomKeywordField" && entry.value != nil {
+					inspection.search_upsert_count += 1
+					inspection.new_search_data = bytes.clone(entry.value.data)
+					for metadata in entry.value.metadata {
+						if metadata.key == "type" {
+							inspection.new_search_type_metadata = bytes.clone(metadata.value)
+						}
+					}
+				} else if entry.key == "OldKeywordField" && entry.value != nil &&
+				          len(entry.value.data) == 0 && len(entry.value.metadata) == 0 {
+					inspection.search_remove_count += 1
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+				if variant.value != nil && variant.value.result != nil {
+					inspection.completed = true
+					inspection.completion_result = bytes.clone(variant.value.result.data)
+				}
+			}
+		}
+	}
+	return
 }
 
 proto_duration_value :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {

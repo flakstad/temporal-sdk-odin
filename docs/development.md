@@ -603,6 +603,13 @@ after eviction and fresh-stack replay. A separate 500-case Local Activity
 options property covers
 all three cancellation modes, timeouts, retry fields, local retry threshold,
 marker-input inclusion, `ScheduleLocalActivity` encoding, and exact replay. The
+Workflow-properties property generates 500 memo/Search Attribute keys and
+values, Keyword/Text types, and independent removals. Each case verifies local
+read-after-write, command counts, eviction, and byte-identical fresh-stack
+replay. The focused unit test additionally checks every exposed `workflow.Info`
+field and decodes the exact `ModifyWorkflowProperties` and
+`UpsertWorkflowSearchAttributes` payloads and type metadata.
+The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
 and Parent Close Policy combinations, plus generated signal names and JSON
@@ -760,7 +767,11 @@ server-backed paths automatically:
   input/timeouts, is evicted, starts a second run under the same Workflow ID,
   and returns the second run's result to Temporal CLI; and
 - a Workflow that takes its new `patched` branch, emits `SetPatchMarker`, and
-  leaves a server-side `core_patch` marker visible through `temporal workflow show`.
+  leaves a server-side `core_patch` marker visible through `temporal workflow show`;
+- a Workflow that reads its Core-supplied identity, starting memo, and starting
+  Search Attribute, then upserts/removes memo fields and upserts a typed Search
+  Attribute. The test observes `EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED` and
+  `EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` in Service history.
 
 The unit suite additionally evicts the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
@@ -778,6 +789,31 @@ non-returning terminal path, default type/queue reuse, options encoding, invalid
 option failure, second-run initialization, and exact replay. Patch unit tests
 cover fresh history, replay with and without a preemptive notification, Core's
 actual initialize-then-notify job order, memoization, and deprecated markers.
+
+Run only the Workflow-properties live path by registering its custom Search
+Attribute once, starting the worker, and executing the command-only Workflow:
+
+```bash
+temporal operator search-attribute create \
+  --name OdinSdkKeyword \
+  --type Keyword
+
+TEMPORAL_ODIN_SCENARIO=workflow-properties \
+./scripts/run-hello-workflow.sh
+
+temporal workflow execute \
+  --workflow-id odin-properties-manual \
+  --type odin_workflow_properties \
+  --task-queue odin-hello-workflow \
+  --input '"odin-properties-manual"' \
+  --memo 'odin-start="before"' \
+  --search-attribute 'OdinSdkKeyword="before"'
+```
+
+The registration command is only needed for a new dev server. The Workflow
+returns `Workflow properties updated`; its history contains two memo-property
+events (one upsert and one empty-Payload removal) and one Search Attribute
+upsert event.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

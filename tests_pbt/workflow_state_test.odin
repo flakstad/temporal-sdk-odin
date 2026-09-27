@@ -946,6 +946,202 @@ typed_workflow_payloads_replay_for_generated_structs :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Workflow_Properties_Input :: struct {
+	memo_key:       string,
+	memo_value:     string,
+	search_key:     string,
+	search_value:   string,
+	search_is_text: bool,
+	remove_memo:    bool,
+	remove_search:  bool,
+}
+
+generated_workflow_properties :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Workflow_Properties_Input,
+) -> bool {
+	metadata, metadata_found := workflow.info(ctx)
+	if !metadata_found || metadata.namespace != "generated-namespace" ||
+	   metadata.task_queue != "generated-properties-queue" ||
+	   metadata.workflow_id != "generated-properties-id" ||
+	   metadata.run_id != "generated-properties-run" ||
+	   metadata.workflow_type != "generated_workflow_properties" {
+		return false
+	}
+	if !workflow.upsert_memo_json(ctx, input.memo_key, input.memo_value) {
+		return false
+	}
+	attribute_type := workflow.Search_Attribute_Type.Keyword
+	if input.search_is_text {
+		attribute_type = .Text
+	}
+	if !workflow.upsert_search_attribute_json(
+		ctx,
+		input.search_key,
+		attribute_type,
+		input.search_value,
+	) {
+		return false
+	}
+	if input.remove_memo && !workflow.remove_memo(ctx, input.memo_key) {
+		return false
+	}
+	if input.remove_search && !workflow.remove_search_attribute(ctx, input.search_key) {
+		return false
+	}
+	memo_value: string
+	memo_found, memo_error := workflow.memo_json(ctx, input.memo_key, &memo_value)
+	search_value: string
+	search_found, search_error := workflow.search_attribute_json(ctx, input.search_key, &search_value)
+	return memo_error == .None && search_error == .None &&
+	       memo_found == !input.remove_memo && search_found == !input.remove_search &&
+	       (input.remove_memo || memo_value == input.memo_value) &&
+	       (input.remove_search || search_value == input.search_value)
+}
+
+workflow_properties_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	input_value := Generated_Workflow_Properties_Input{
+		memo_key = pbt.draw(t, pbt.string_ascii(1, 24)),
+		memo_value = pbt.draw(t, pbt.string_ascii(0, 48)),
+		search_key = pbt.draw(t, pbt.string_ascii(1, 24)),
+		search_value = pbt.draw(t, pbt.string_ascii(0, 48)),
+		search_is_text = pbt.draw(t, pbt.boolean()),
+		remove_memo = pbt.draw(t, pbt.boolean()),
+		remove_search = pbt.draw(t, pbt.boolean()),
+	}
+	pbt.cover(t, input_value.search_is_text, 30.0, "Text Search Attribute")
+	pbt.cover(t, !input_value.search_is_text, 30.0, "Keyword Search Attribute")
+	pbt.cover(t, input_value.remove_memo, 30.0, "memo removal")
+	pbt.cover(t, input_value.remove_search, 30.0, "Search Attribute removal")
+	pbt.cover(
+		t,
+		input_value.remove_memo && input_value.remove_search,
+		15.0,
+		"both properties removed",
+	)
+
+	owned_queue, queue_error := strings.clone("generated-properties-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate generated Workflow properties queue")
+	}
+	owned_namespace, namespace_error := strings.clone("generated-namespace")
+	if namespace_error != nil {
+		delete(owned_queue)
+		return pbt.error("could not allocate generated Workflow properties namespace")
+	}
+	sdk_worker := worker.Worker{
+		namespace = owned_namespace,
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_workflow_properties",
+		generated_workflow_properties,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register generated Workflow properties runtime")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Workflow properties")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_workflow_properties",
+		workflow_id = "generated-properties-id",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-properties-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	expected_memo_commands := 1
+	if input_value.remove_memo {
+		expected_memo_commands += 1
+	}
+	expected_search_commands := 1
+	if input_value.remove_search {
+		expected_search_commands += 1
+	}
+	if initial.error.message != nil || !initial.completed ||
+	   initial.memo_upserts != expected_memo_commands ||
+	   initial.search_attribute_upserts != expected_search_commands {
+		return pbt.fail("generated Workflow property commands were incomplete")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated Workflow properties run")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated Workflow property replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_properties_replay_for_generated_mutations :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow properties replay for generated mutations",
+		workflow_properties_replay_property,
+		{num_tests = 500, seed = 0x5052_4f50_4552_5459},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Generated_Activity_Options_Input :: struct {
 	activity_id:              string,
 	task_queue:               string,

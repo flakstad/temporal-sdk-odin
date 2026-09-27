@@ -60,6 +60,16 @@ then emits a fresh Local Activity command carrying Core's attempt and original
 schedule time while preserving the Odin Future. Both transitions replay to
 byte-identical commands, and the CLI-devserver suite exercises a real failed
 first attempt followed by timer-backed success.
+Workflow initialization metadata is now exposed through borrowed
+`workflow.Info`, including execution identity, attempt/run-chain fields,
+timeouts, start/expiration time, parent/root identity, Retry Policy, priority,
+cron schedule, and continuation cause. Initial and locally updated memo/Search
+Attribute Payloads are readable through codec-neutral and typed JSON helpers.
+Mutations emit Core's `ModifyWorkflowProperties` and
+`UpsertWorkflowSearchAttributes` commands, update the local Workflow view
+immediately, support explicit removal, and replay byte-for-byte. The live
+CLI-devserver case verifies both history event types without adding another C
+symbol: these features are entirely activation/completion protobuf behavior.
 Workers must also set `Run_Options.enable_local_activities`; the opt-in keeps
 the still-unhardened mixed remote-cancellation/local shutdown path out of
 workers that do not use Local Activities.
@@ -411,8 +421,9 @@ if state.events_processed >= 10_000 {
 ```
 
 Empty Workflow type and task queue options reuse the current registration.
-The current slice also supports Retry Policy and first-task backoff. Memo,
-headers, search attributes, and versioning overrides are not exposed yet.
+The current slice also supports Retry Policy and first-task backoff.
+Continue-As-New-specific memo, header, Search Attribute, and versioning
+overrides are not exposed yet.
 The primitive may only be called from the main Workflow context; misuse fails
 the Workflow with an SDK Application Failure rather than returning past the
 terminal command.
@@ -451,6 +462,33 @@ pre-scanned `UpdateRandomSeed`; its SplitMix64 sequence is replay compatibility
 state and is not cryptographically secure. `uuid_v4` consumes that stream and
 returns a lowercase RFC 4122 variant/version string. Named isolated random
 streams are not implemented yet.
+
+Workflow identity and mutable properties use the same activation-owned state:
+
+```odin
+metadata, ok := workflow.info(ctx)
+customer: string
+found, decode_error := workflow.memo_json(ctx, "customer", &customer)
+
+_ = workflow.upsert_memo_json(ctx, "status", "charged")
+_ = workflow.remove_memo(ctx, "legacy-status")
+_ = workflow.upsert_search_attribute_json(
+    ctx,
+    "OrderStatus",
+    .Keyword,
+    "charged",
+)
+_ = workflow.remove_search_attribute(ctx, "LegacyOrderStatus")
+```
+
+`Info`, `memo_payload`, and `search_attribute_payload` return borrowed values
+valid until the run is evicted. Mutation functions clone their inputs into the
+run arena and provide deterministic read-after-write behavior. The raw Payload
+forms keep codecs isolated; JSON is only a convenience adapter. Search
+Attribute types map to Temporal's exact `Bool`, `Int`, `Double`, `Keyword`,
+`Text`, `Datetime`, and `KeywordList` Payload metadata. The caller must register
+custom Search Attribute names with the Temporal Service and keep the declared
+type consistent with the encoded value.
 
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:

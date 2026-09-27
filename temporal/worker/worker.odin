@@ -335,6 +335,13 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 	)
 }
 
+workflow_runtime_namespace :: proc(worker: ^Worker) -> string {
+	if worker != nil && len(worker.namespace) > 0 {
+		return worker.namespace
+	}
+	return "default"
+}
+
 register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
 	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return error_from_string("worker is not initialized")
@@ -355,7 +362,13 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 		return error_from_string("could not allocate workflow name")
 	}
 	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init(&runtime, name, worker.task_queue, callback)
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		name,
+		worker.task_queue,
+		callback,
+		namespace = workflow_runtime_namespace(worker),
+	)
 	if init_error.message != nil {
 		delete(owned_name)
 		result := error_from_string(string(init_error.message))
@@ -393,7 +406,13 @@ register_payload_workflow :: proc(
 		return error_from_string("could not allocate workflow name")
 	}
 	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init_payload(&runtime, name, worker.task_queue, callback)
+	init_error := workflow.fiber_runtime_init_payload(
+		&runtime,
+		name,
+		worker.task_queue,
+		callback,
+		namespace = workflow_runtime_namespace(worker),
+	)
 	if init_error.message != nil {
 		delete(owned_name)
 		result := error_from_string(string(init_error.message))
@@ -467,6 +486,7 @@ register_json_workflow :: proc(
 		proc(data: rawptr) {
 			free(cast(^Callback)data, allocator_runtime.heap_allocator())
 		},
+		namespace = workflow_runtime_namespace(worker),
 	)
 	if init_error.message != nil {
 		delete(owned_name)
