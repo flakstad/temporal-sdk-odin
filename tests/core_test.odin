@@ -276,6 +276,22 @@ fiber_cancellation_cleanup_test_workflow :: proc(
 	return ""
 }
 
+fiber_preemptive_detached_activity_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	scope := workflow.detached_cancellation_scope(ctx)
+	if !scope.active {
+		return "could not open preemptive detached scope"
+	}
+	defer workflow.cancellation_scope_end(&scope)
+	result := workflow.execute_activity_result(ctx, "hello", name)
+	if result.status != .Succeeded {
+		return "detached Activity did not finish"
+	}
+	return result.value
+}
+
 Query_Test_State :: struct {
 	phase: string,
 	count: int,
@@ -405,6 +421,57 @@ fiber_silent_abandon_registration_test_workflow :: proc(
 		return "silent Workflow Update routine registration failed"
 	}
 	return workflow.await_signal(ctx, "finish")
+}
+
+fiber_detached_update_cancellation_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	state := Update_Routine_State{name = name}
+	registered := workflow.set_update_routine_json(
+		ctx,
+		"detached_rename",
+		&state,
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			state: ^Update_Routine_State,
+			input: Update_Routine_Input,
+		) -> Update_Routine_Output {
+			scope := workflow.detached_cancellation_scope(routine_ctx)
+			if !scope.active {
+				return {}
+			}
+			defer workflow.cancellation_scope_end(&scope)
+			previous := state.name
+			activity_result := workflow.execute_activity_result(
+				routine_ctx,
+				"decorate_name",
+				input.name,
+			)
+			if activity_result.status != .Succeeded {
+				return {previous = previous, current = "detached Activity failed"}
+			}
+			state.name = activity_result.value
+			return {
+				previous = previous,
+				current = state.name,
+				activity_result = activity_result.value,
+			}
+		},
+	)
+	if !registered {
+		return "detached Workflow Update routine registration failed"
+	}
+	result := workflow.await_signal(ctx, "finish")
+	if workflow.is_cancellation_requested(ctx) {
+		scope := workflow.detached_cancellation_scope(ctx)
+		if !scope.active {
+			return "could not detach handler drain"
+		}
+		defer workflow.cancellation_scope_end(&scope)
+		workflow.await_all_handlers_finished(ctx)
+	}
+	return result
 }
 
 fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -3829,6 +3896,253 @@ workflow_update_routine_registration_preserves_unfinished_policy :: proc(t: ^tes
 }
 
 @(test)
+workflow_detached_update_finishes_before_cancellation_and_replays :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_detached_update_cancellation_workflow",
+		"test-queue",
+		fiber_detached_update_cancellation_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_detached_update_cancellation_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-detached-update-cancellation-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	update_input, update_input_error := codec.encode_json(Update_Routine_Input{name = "Temporal"})
+	testing.expect(t, update_input_error == .None)
+	defer codec.payload_free(&update_input)
+	update_input_proto := proto.encode_payload(codec.payload_view(&update_input))
+	defer delete(update_input_proto.metadata)
+	defer delete(update_input_proto.external_payloads)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "detached-update",
+		protocol_instance_id = "detached-update-protocol",
+		name = "detached_rename",
+	}
+	defer delete(update.input)
+	append(&update.input, update_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Update start failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	update_start_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	cancel := proto.Coresdk_Workflow_Activation_CancelWorkflow{
+		reason = "finish detached Update before cancellation",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Update cancellation failed: %s", string(processed.error.message))
+	testing.expect(t, processed.received_cancellation)
+	testing.expect(t, processed.waiting_handlers)
+	testing.expect(t, !processed.requested_activity_cancellation)
+	testing.expect(t, !processed.canceled_workflow)
+	testing.expect(t, !processed.completed)
+	cancel_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, cancel_inspection.decoded)
+	testing.expect_value(t, cancel_inspection.command_count, 0)
+	delete(cancel_inspection.failure_message)
+	delete(cancel_inspection.completion_result)
+	cancel_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	activity_output, activity_output_error := codec.encode_json("Hello Temporal")
+	testing.expect(t, activity_output_error == .None)
+	defer codec.payload_free(&activity_output)
+	activity_output_proto := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(activity_output_proto.metadata)
+	defer delete(activity_output_proto.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &activity_output_proto}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Update resolution failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_completed, 1)
+	testing.expect(t, processed.canceled_workflow)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, processed.unfinished_update_handlers, 0)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded)
+	testing.expect_value(t, terminal_inspection.command_count, 2)
+	testing.expect(t, terminal_inspection.canceled_workflow)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
+	update_finished := inspect_update_responses(processed.completion[:], "detached-update-protocol")
+	testing.expect_value(t, update_finished.completed, 1)
+	testing.expect_value(t, update_finished.completed_index, 0)
+	update_output: Update_Routine_Output
+	decode_error := codec.decode_json(codec.payload_view(&update_finished.payload), &update_output)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, update_output.previous, "Odin")
+	testing.expect_value(t, update_output.current, "Hello Temporal")
+	testing.expect_value(t, update_output.activity_result, "Hello Temporal")
+	delete(update_output.previous)
+	delete(update_output.current)
+	delete(update_output.activity_result)
+	update_response_inspection_free(&update_finished)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(update_start_completion[:], processed.completion[:]))
+	delete(update_start_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(cancel_completion[:], processed.completion[:]))
+	delete(cancel_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Update replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
 workflow_update_routines_complete_out_of_order_and_replay :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -6105,6 +6419,195 @@ workflow_fiber_runs_detached_cleanup_before_acknowledging_cancellation :: proc(t
 	testing.expect(t, terminal_inspection.canceled_workflow)
 	delete(terminal_inspection.failure_message)
 	delete(terminal_inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_preemptive_detached_activity_survives_cancellation_and_replays :: proc(
+	t: ^testing.T,
+) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_preemptive_detached_activity_workflow",
+		"test-queue",
+		fiber_preemptive_detached_activity_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_preemptive_detached_activity_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-preemptive-detached-activity-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.waiting_activity_seq, u32(1))
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	cancel := proto.Coresdk_Workflow_Activation_CancelWorkflow{
+		reason = "detached Activity must finish",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached cancellation failed: %s", string(processed.error.message))
+	testing.expect(t, processed.received_cancellation)
+	testing.expect(t, !processed.requested_activity_cancellation)
+	testing.expect(t, !processed.canceled_workflow)
+	testing.expect(t, !processed.completed)
+	testing.expect_value(t, processed.waiting_activity_seq, u32(1))
+	cancel_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, cancel_inspection.decoded)
+	testing.expect_value(t, cancel_inspection.command_count, 0)
+	delete(cancel_inspection.failure_message)
+	delete(cancel_inspection.completion_result)
+	cancel_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	activity_output, output_error := codec.encode_json("Hello Odin")
+	testing.expect(t, output_error == .None)
+	defer codec.payload_free(&activity_output)
+	activity_output_proto := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(activity_output_proto.metadata)
+	defer delete(activity_output_proto.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &activity_output_proto}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Activity resolution failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.resolved_activity_seq, u32(1))
+	testing.expect(t, processed.canceled_workflow)
+	testing.expect(t, processed.completed)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded)
+	testing.expect_value(t, terminal_inspection.command_count, 1)
+	testing.expect(t, terminal_inspection.canceled_workflow)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached cancellation replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(cancel_completion[:], processed.completion[:]))
+	delete(cancel_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "detached Activity replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

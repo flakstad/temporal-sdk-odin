@@ -99,7 +99,7 @@ warnings promoted to errors. It then runs a separate property suite from
 forces eviction, reconstructs a fresh fiber, and requires the decisive
 `WorkflowActivationCompletion` bytes to match replay exactly. PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
-close/await/cancel/late-event traces and checks them against an independent
+close/await/cancel/drain/late-event traces and checks them against an independent
 statechart lifecycle model. Its own package tests currently contain an upstream
 unused-variable warning, so dependency warnings are not promoted to errors in
 that second compilation; SDK-owned tests remain strict.
@@ -437,9 +437,9 @@ Each accepted routine has its own stack, wait state, and protocol ID, but shares
 the Workflow instance's deterministic operation tables and sequence numbers.
 The first completion contains `Accepted` and any commands scheduled before the
 routine yields. A later activation resumes it and carries `Completed` or the
-post-acceptance `Rejected` failure. Update cancellation and unfinished-handler
-policy remain experimental. A main Workflow that returns now emits its terminal
-command even when an accepted routine is unfinished. The registration default
+post-acceptance `Rejected` failure. Root Workflow cancellation and
+unfinished-handler policy remain experimental. A main Workflow that returns now
+emits its terminal command even when an accepted routine is unfinished. The registration default
 is `Handler_Unfinished_Policy.Warn_And_Abandon`; `.Abandon` suppresses the
 warning. Workflow code that requires handler results calls
 `await_all_handlers_finished` before returning.
@@ -527,6 +527,17 @@ for the cleanup Activity. Core evicts and replays both command batches. Only
 after cleanup resolves does Odin emit `CancelWorkflowExecution`; Temporal CLI
 must report the final execution as `CANCELED`.
 
+The `cancel-update` case opens a detached scope inside an Update handler before
+it schedules its Activity. Operations capture that detached/root relationship
+at creation time. The main Workflow receives root cancellation, cancels its own
+timer/signal wait, then opens its own detached scope around
+`await_all_handlers_finished`. The cancellation activation emits neither
+`RequestCancelActivity` nor a terminal command. When the Activity resolves, the
+runtime emits the Update's `Completed` response before
+`CancelWorkflowExecution`; the Update caller receives its typed result and the
+Workflow then reaches `CANCELED`. The unit test evicts the instance and requires
+all four activation completions to be byte-identical on fresh-stack replay.
+
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
 if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
@@ -577,10 +588,12 @@ round-trips typed result Payloads plus Application Failure types. A second 500
 case property varies which of two accepted Updates finishes first and verifies
 that each result stays attached to its own protocol instance ID.
 The Update lifecycle property compiles a small pinned statechart and generates
-1,000 traces through handler start/finish, main return, explicit await,
-Workflow cancellation, and late resolution. It requires at most one Workflow
-terminal command, no state changes after close, no premature close during an
-explicit await, and identical observations when replaying the same trace. Use
+1,000 traces through seven event kinds: handler start/finish, main return,
+explicit await, immediate Workflow cancellation, cancellation with handler
+draining, and late resolution. It requires at most one Workflow terminal
+command, no state changes after close, no premature close during an explicit
+await or cancellation drain, and identical observations when replaying the
+same trace. Use
 `STATECHARTS_ROOT=~/Projects/statecharts ./scripts/test.sh` to exercise a local
 statecharts checkout without changing the pin; both root overrides can be set
 together.
@@ -610,6 +623,9 @@ the test cancels the Workflow, Core emits an Activity cancel task, and the Odin
 callback returns a valid canceled completion. Core then delivers the terminal
 Activity resolution in one final activation before eviction; Odin acknowledges
 it with an empty successful completion and does not repeat the terminal command.
+The suite also cancels a Workflow with a detached, Activity-awaiting Update in
+flight. It requires no Activity-cancel command, waits for the Update client to
+receive its result, and only then accepts the Workflow's canceled close status.
 
 ## Manual run
 

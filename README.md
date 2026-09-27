@@ -26,8 +26,12 @@ buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
 `CancelTimer` alongside an Activity command, and reproduces both commands after
 eviction. Workflow cancellation now resumes suspended Odin code with a canceled
-result, exposes the owned reason, and permits deterministic Activity/timer
-cleanup in an explicit detached scope before `CancelWorkflowExecution`. A
+result, exposes the owned reason, and permits deterministic Activity/timer work
+in an explicit detached scope before `CancelWorkflowExecution`. Detached
+operations may be started before cancellation, or afterward for cleanup. A
+canceling main Workflow can also drain a detached Update handler; the live
+suite proves that its Update result reaches the caller before the Workflow is
+acknowledged as canceled. A
 reusable worker now registers both Activity and Workflow procedures, routes run IDs to the
 correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
@@ -45,8 +49,8 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-scope trees, signal handlers, complete handler
-cancellation semantics, multiple Activity arguments, in-process panic
+nested/child cancellation-token trees, signal handlers, client cancellation of
+an accepted Update, multiple Activity arguments, in-process panic
 containment, or a stable public API.
 Do not use it in production.
 
@@ -396,8 +400,9 @@ These values are borrowed from the Workflow instance and remain valid for that
 run. Unhandled failures still propagate the preserved Temporal Failure protobuf.
 
 Cancellation is cooperative in Workflow code. Result-returning waits report
-`.Canceled`; cleanup that must outlive root cancellation runs in an explicit
-detached scope:
+`.Canceled`. An Activity or timer created inside a detached scope does not
+inherit root Workflow cancellation; the scope may be opened proactively, or
+after delivery for cleanup:
 
 ```odin
 result := workflow.execute_activity_result(ctx, "charge", order_id)
@@ -412,6 +417,10 @@ if result.status == .Canceled {
 
 Returning from the Workflow while root cancellation is pending acknowledges it
 with `CancelWorkflowExecution`; the return value is not completed successfully.
+Detached scope state is local to the currently running main or Update fiber.
+To let a detached handler finish, the main Workflow must itself use a detached
+scope around `workflow.await_all_handlers_finished(ctx)` after observing
+cancellation.
 
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the
@@ -432,7 +441,10 @@ and following Activity command. Two executions use Odin Client cancellation
 to verify direct pending-timer and pending-Activity cleanup through Core. A
 third resumes Workflow code, requests cancellation of its in-flight Activity,
 schedules a detached cleanup Activity, survives eviction/replay, and only then
-acknowledges Workflow cancellation. Temporal CLI
+acknowledges Workflow cancellation. A fourth starts an Activity-awaiting Update
+inside a detached scope, cancels the Workflow, and proves the Update completes
+before the main fiber emits `CancelWorkflowExecution`, without requesting
+Activity cancellation. Temporal CLI
 still starts/waits on these older test executions and reads their history. The
 Activity case waits for an Odin heartbeat, observes Core's cancel task in the
 in-flight context, and replies with a cancellation completion. A separate fan-out case proves two Odin

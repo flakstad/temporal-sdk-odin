@@ -106,6 +106,25 @@ hold_greeting_name :: proc(
 	return {previous_name = previous, current_name = state.name}
 }
 
+update_greeting_name_detached :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Greeting_Query_State,
+	input: Greeting_Update_Input,
+) -> Greeting_Update_Output {
+	scope := workflow.detached_cancellation_scope(ctx)
+	if !scope.active {
+		return {}
+	}
+	defer workflow.cancellation_scope_end(&scope)
+	previous := state.name
+	activity_result := workflow.execute_activity_result(ctx, "hello", input.name)
+	if activity_result.status != .Succeeded {
+		return {previous_name = previous, current_name = "detached Activity failed"}
+	}
+	state.name = input.name
+	return {previous_name = previous, current_name = state.name}
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	// The integration scenario deliberately resolves the second concurrent
 	// Workflow Update first. Sleeping in an Activity is safe: the ordering is
@@ -230,9 +249,26 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register held greeting name Update"
 	}
+	if !workflow.set_update_routine_json(
+		ctx,
+		"set_greeting_name_detached",
+		&query_state,
+		update_greeting_name_detached,
+	) {
+		return "could not register detached greeting name Update"
+	}
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
+	}
+	if approval.status == .Canceled && name == "cancel-update" {
+		scope := workflow.detached_cancellation_scope(ctx)
+		if !scope.active {
+			return "could not detach Update drain"
+		}
+		defer workflow.cancellation_scope_end(&scope)
+		workflow.await_all_handlers_finished(ctx)
+		return "Update handlers drained"
 	}
 	query_state.phase = "running-activity"
 	return workflow.execute_activity(ctx, "hello", approval.value)
@@ -452,6 +488,7 @@ main :: proc() {
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
 	expect_update := scenario == "update"
 	expect_abandon_update := scenario == "abandon-update"
+	expect_cancel_update := scenario == "cancel-update"
 	expect_query := scenario == "query" || expect_update
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
@@ -509,6 +546,17 @@ main :: proc() {
 				fmt.eprintln("Workflow Update abandonment stats did not match")
 				failed = true
 			}
+		} else if expect_cancel_update {
+			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 ||
+			   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
+			   run_stats.activity_cancellations_requested != 0 ||
+			   run_stats.workflow_updates_accepted != 1 ||
+			   run_stats.workflow_updates_completed != 1 ||
+			   run_stats.workflow_update_handlers_abandoned != 0 ||
+			   run_stats.workflow_update_handler_warnings != 0 {
+				fmt.eprintln("Detached Workflow Update cancellation stats did not match")
+				failed = true
+			}
 		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
@@ -552,6 +600,8 @@ main :: proc() {
 		fmt.println("structured Activity failure details reached Workflow code")
 	} else if expect_abandon_update {
 		fmt.println("Workflow close abandoned the unfinished Update handler with a warning")
+	} else if expect_cancel_update {
+		fmt.println("detached Workflow Update completed before cancellation acknowledgement")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

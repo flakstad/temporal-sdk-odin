@@ -504,6 +504,93 @@ grep -Eq "replay=false .*unfinished_updates=1 update_warnings=1 .*completed=true
 grep -q "Temporal warning: Workflow .* closed with 1 unfinished Update handler(s); handlers were abandoned" "$worker_log"
 grep -q "Workflow close abandoned the unfinished Update handler with a warning" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=cancel-update \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Detached-Update Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+cancel_update_workflow_id="odin-sdk-cancel-update-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$cancel_update_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"cancel-update"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Detached-Update Workflow did not reach its main await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cancel_update_workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name_detached \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal-slow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$slow_update_output_file" 2>&1 &
+slow_update_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
+    echo "Detached Workflow Update did not suspend on its Activity" >&2
+    cat "$worker_log" >&2
+    cat "$slow_update_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=cancel \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cancel_update_workflow_id" \
+  TEMPORAL_CLIENT_REASON="drain detached Update" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+wait "$slow_update_pid"
+slow_update_pid=""
+detached_update_output="$(<"$slow_update_output_file")"
+echo "$detached_update_output"
+grep -q "Odin client update=set_greeting_name_detached workflow_id=$cancel_update_workflow_id" <<<"$detached_update_output"
+grep -q 'previous="cancel-update" current="Temporal-slow"' <<<"$detached_update_output"
+
+cancel_update_cli_status=0
+wait "$workflow_cli_pid" || cancel_update_cli_status=$?
+workflow_cli_pid=""
+workflow_output="$(<"$workflow_output_file")"
+echo "$workflow_output"
+[[ "$cancel_update_cli_status" -eq 0 || "$cancel_update_cli_status" -eq 1 ]]
+grep -q '"status": "CANCELED"' <<<"$workflow_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*cancel=true canceled_workflow=false .*canceled_timer=true canceled_activity=false .*waiting_handlers=true completed=false" "$worker_log"
+grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*canceled_workflow=true .*completed=true" "$worker_log"
+grep -q "detached Workflow Update completed before cancellation acknowledgement" "$worker_log"
+
 run_workflow_cancellation_case() {
   local scenario="$1"
   local input="$2"

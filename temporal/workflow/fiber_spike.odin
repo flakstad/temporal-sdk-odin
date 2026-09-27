@@ -305,12 +305,14 @@ Fiber_Activity_Operation :: struct {
 	failure_detail_payloads: [dynamic]codec.Payload,
 	failure_detail_views:    []codec.Payload_View,
 	state:         Fiber_Operation_State,
+	detached_from_root_cancellation: bool,
 }
 
 Fiber_Timer_Operation :: struct {
 	seq:      u32,
 	duration: time.Duration,
 	state:    Fiber_Operation_State,
+	detached_from_root_cancellation: bool,
 }
 
 Fiber_Signal :: struct {
@@ -1270,6 +1272,9 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	instance.cancellation_requested = true
 	for index in 0..<len(instance.activities) {
 		operation := &instance.activities[index]
+		if operation.detached_from_root_cancellation {
+			continue
+		}
 		switch operation.state {
 		case .Scheduled:
 			operation.state = .Canceled
@@ -1280,6 +1285,9 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	}
 	for index in 0..<len(instance.timers) {
 		operation := &instance.timers[index]
+		if operation.detached_from_root_cancellation {
+			continue
+		}
 		switch operation.state {
 		case .Scheduled:
 			operation.state = .Canceled
@@ -1301,12 +1309,12 @@ cancellation_reason :: proc(ctx: ^Fiber_Context) -> string {
 	return ctx.instance.cancellation_reason
 }
 
-// detached_cancellation_scope allows Temporal-safe cleanup after root Workflow
-// cancellation. The scope is intentionally valid only after cancellation has
-// been delivered; operations outside it observe cancellation immediately.
+// detached_cancellation_scope prevents operations created inside the scope from
+// inheriting root Workflow cancellation. It may be opened before cancellation
+// for work that must finish independently, or afterward for deterministic
+// cleanup. The scope is local to the currently executing main/handler fiber.
 detached_cancellation_scope :: proc(ctx: ^Fiber_Context) -> Cancellation_Scope {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   !ctx.instance.cancellation_requested {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
 		return {}
 	}
 	ctx.instance.detached_scope_depth += 1
@@ -1490,6 +1498,7 @@ start_activity_owned :: proc(
 		options = owned_options,
 		input = owned_input,
 		state = .Scheduled,
+		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
 	append(&instance.activities, operation)
 	return Activity_Future{seq = operation.seq}
@@ -2094,6 +2103,7 @@ await_signal_payload_or_timeout :: proc(
 		seq = instance.next_timer_seq,
 		duration = duration,
 		state = .Scheduled,
+		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
 	append(&instance.timers, operation)
 	instance.waiting_signal_name = waiting_name
@@ -2183,6 +2193,7 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 		seq = instance.next_timer_seq,
 		duration = duration,
 		state = .Scheduled,
+		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
 	append(&instance.timers, operation)
 	instance.waiting_timer_seq = operation.seq

@@ -8,6 +8,7 @@ Update_Lifecycle_State :: enum {
 	Running,
 	Handling,
 	Waiting_Handlers,
+	Cancel_Draining,
 	Completed,
 	Canceled,
 }
@@ -18,6 +19,7 @@ Update_Lifecycle_Event :: enum {
 	Main_Returned,
 	Await_Handlers,
 	Cancel_Workflow,
+	Cancel_And_Drain,
 	Late_Resolution,
 }
 
@@ -59,6 +61,7 @@ update_lifecycle_states := [?]sc.State_Def(Update_Lifecycle_State){
 	{id = .Running},
 	{id = .Handling},
 	{id = .Waiting_Handlers},
+	{id = .Cancel_Draining},
 	{id = .Completed},
 	{id = .Canceled},
 }
@@ -74,6 +77,7 @@ update_lifecycle_transitions := [?]sc.Transition_Def(
 	sc.on(Update_Lifecycle_State.Handling, Update_Lifecycle_Event.Main_Returned, Update_Lifecycle_State.Completed, action = record_abandoned_close),
 	sc.on(Update_Lifecycle_State.Handling, Update_Lifecycle_Event.Await_Handlers, Update_Lifecycle_State.Waiting_Handlers),
 	sc.on(Update_Lifecycle_State.Handling, Update_Lifecycle_Event.Cancel_Workflow, Update_Lifecycle_State.Canceled, action = record_abandoned_close),
+	sc.on(Update_Lifecycle_State.Handling, Update_Lifecycle_Event.Cancel_And_Drain, Update_Lifecycle_State.Cancel_Draining),
 	sc.on(
 		Update_Lifecycle_State.Waiting_Handlers,
 		Update_Lifecycle_Event.Handler_Finished,
@@ -81,6 +85,12 @@ update_lifecycle_transitions := [?]sc.Transition_Def(
 		action = record_update_response_and_close,
 	),
 	sc.on(Update_Lifecycle_State.Waiting_Handlers, Update_Lifecycle_Event.Cancel_Workflow, Update_Lifecycle_State.Canceled, action = record_abandoned_close),
+	sc.on(
+		Update_Lifecycle_State.Cancel_Draining,
+		Update_Lifecycle_Event.Handler_Finished,
+		Update_Lifecycle_State.Canceled,
+		action = record_update_response_and_close,
+	),
 }
 
 Update_Lifecycle_Run :: struct {
@@ -143,16 +153,17 @@ run_update_lifecycle :: proc(events: []int) -> (run: Update_Lifecycle_Run, ok: b
 }
 
 update_lifecycle_property :: proc(t: ^pbt.T) -> pbt.Result {
-	events := pbt.draw(t, pbt.array(pbt.int_range(0, 5), 0, 32))
+	events := pbt.draw(t, pbt.array(pbt.int_range(0, 6), 0, 32))
 	event_labels := [?]string{
 		"start update",
 		"handler finished",
 		"main returned",
 		"await handlers",
 		"cancel Workflow",
+		"cancel and drain handlers",
 		"late resolution",
 	}
-	for event_index in 0 ..< 6 {
+	for event_index in 0 ..< 7 {
 		covered := false
 		for event in events {
 			if event == event_index {
@@ -170,7 +181,8 @@ update_lifecycle_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if first != second {
 		return pbt.fail("Update lifecycle statechart was not deterministic")
 	}
-	if first.state == .Waiting_Handlers && first.observation.terminal_commands != 0 {
+	if (first.state == .Waiting_Handlers || first.state == .Cancel_Draining) &&
+	   first.observation.terminal_commands != 0 {
 		return pbt.fail("explicit handler await emitted a terminal command too early")
 	}
 	if (first.state == .Completed || first.state == .Canceled) &&

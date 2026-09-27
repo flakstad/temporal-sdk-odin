@@ -1051,7 +1051,8 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are complete cancellation semantics,
+The remaining Update-runtime risks are general cancellation-token semantics,
+detached timer/signal coverage, client cancellation of an accepted Update,
 shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
@@ -1101,6 +1102,14 @@ operations react. This matches the [.NET cancellation contract](https://github.c
 and the TypeScript runtime's
 [root cancellation-scope handling](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
 
+The pinned Rust Workflow crate confirms the intended split. It owns a root
+[`WorkflowCancellationToken`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/cancellation.rs),
+cancels it from `notify_cancel`, and lets operation options override the root
+with another token. A newly created token is detached; a child token inherits
+its parent. This policy lives above the Core C bridge: Core delivers
+`CancelWorkflow` and consumes cancellation commands, while the language runtime
+must associate user operations and handler routines with cancellation scopes.
+
 The Odin runtime now models the Workflow's root cancellation state explicitly:
 
 1. Preserve the cancellation reason in the Workflow-owned arena and mark the
@@ -1112,14 +1121,23 @@ The Odin runtime now models the Workflow's root cancellation state explicitly:
    root cancellation remains pending acknowledges cancellation rather than
    completing successfully.
 4. New operations in the canceled root scope resolve locally as canceled.
-5. `detached_cancellation_scope` temporarily unlinks cleanup operations from
-   root cancellation. It may only be opened after cancellation delivery and
-   must be paired with `cancellation_scope_end` (normally through `defer`).
+5. `detached_cancellation_scope` temporarily unlinks newly created operations
+   from root cancellation. It may be opened proactively or after cancellation
+   delivery and must be paired with `cancellation_scope_end` (normally through
+   `defer`). Every Activity/timer captures the relationship when scheduled, so
+   later root cancellation skips detached operations even after the lexical
+   scope has closed.
 6. The runtime emits `CancelWorkflowExecution` only after user code returns,
    so detached Activities/timers may finish first.
+7. Scope depth is part of the currently selected execution state. Swapping
+   between main and Update fibers keeps their scopes independent even though
+   their deterministic operation tables are shared.
 
 This is a useful cleanup scope, not yet a general cancellation tree: there are
-no child scopes, user-created cancellation sources, or propagated deadlines.
+no public token values, arbitrary child relationships, user-triggered sources,
+or propagated deadlines. There is also no separate protocol for canceling an
+already accepted Update; root Workflow cancellation and the handler's operation
+scope determine whether that routine can finish before close.
 Activity cancellation remains cooperative at the Activity implementation
 boundary; the Workflow request does not forcibly stop arbitrary Odin code.
 
@@ -1151,6 +1169,16 @@ The live detached-cleanup path adds a non-terminal cancellation activation:
 | 15 | `ResolveActivity(seq=2)` -> `CancelWorkflowExecution` |
 | 15 | final cache eviction |
 
+The live detached-Update path proves handler draining across cancellation:
+
+| History phase | Odin command/job |
+| ---: | --- |
+| initialize | main starts a timer/signal race |
+| Update | handler accepts and schedules detached `Activity(seq=1)` |
+| cancel | main timer is canceled; detached Activity is not; no terminal command |
+| Activity resolution | `UpdateResponse.Completed`, then `CancelWorkflowExecution` |
+| close | Update caller has its result; Workflow status becomes `CANCELED` |
+
 The late resolution is a Core-language-runtime handshake, not a second user
 event. The Workflow instance must remain alive until eviction, accept the
 terminal resolution idempotently, and never repeat `CancelWorkflowExecution`.
@@ -1159,7 +1187,11 @@ initial command is emitted, same-activation races, the late Activity
 resolution, and byte-identical replay of both timer and Activity cancellation
 sequences. A separate test proves cancellation delivery into user code,
 detached Activity cleanup, delayed acknowledgement, and byte-identical
-fresh-stack replay. The live CLI-devserver case proves the same command ordering
+fresh-stack replay. Additional tests open the detached scope before cancellation
+and prove both a main-fiber Activity and an Update-handler Activity survive root
+cancellation. The Update case drains the handler, emits its protocol response
+before the terminal command, and reproduces four activation completions
+byte-for-byte after eviction. The live CLI-devserver case proves the same command ordering
 through Core and the Service and finishes with Temporal status `CANCELED`.
 
 ### Generated lifecycle testing
@@ -1174,10 +1206,11 @@ constraints ensure every class appears in a successful run.
 The pinned, test-only
 [flakstad/statecharts](https://github.com/flakstad/statecharts) library now
 provides an independent Update lifecycle oracle. PBT generates 1,000 traces
-across handler start/finish, main return, explicit handler await, cancellation,
-and late resolution. The model asserts one-shot terminal emission, no changes
-after close, explicit-wait blocking, and deterministic re-execution of the same
-trace. `PBT_ROOT=~/Projects/pbt` and
+across handler start/finish, main return, explicit handler await, immediate
+cancellation, cancellation with a detached handler drain, and late resolution.
+The model asserts one-shot terminal emission, no changes after close,
+await/drain blocking, a combined response-and-close transition, and
+deterministic re-execution of the same trace. `PBT_ROOT=~/Projects/pbt` and
 `STATECHARTS_ROOT=~/Projects/statecharts` allow deeper testing against the
 sibling checkouts without weakening the reproducible submodule pins.
 
@@ -1337,9 +1370,10 @@ Workflows are enabled.
    apply-all-before-resume, catchable Activity failures, buffered signals, and
    a durable timer/signal race, generic/typed Payload flow, read-only queries,
    synchronous and Activity-awaiting validated Updates, default/suppressed
-   unfinished-handler warnings, explicit handler draining, root cancellation, and detached Activity
-   cleanup across fresh-stack replay. It does not yet prove general nested
-   cancellation scopes, complete Update cancellation policy, panic containment,
+   unfinished-handler warnings, explicit handler draining, root cancellation,
+   preemptively detached operations, and detached Update/Activity cleanup across
+   fresh-stack replay. It does not yet prove general nested cancellation-token
+   trees, client cancellation of accepted Updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -1370,7 +1404,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, explicit handler draining/default abandonment, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Complete handler cancellation semantics and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, explicit handler draining/default abandonment, detached main/Update cancellation work, registered dispatch, eviction, and replay on macOS arm64 | Add asynchronous Signal handlers and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1393,12 +1427,20 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should complete Update cancellation and
-handler-shutdown behavior. It should exercise cancellation while handlers await
-Activities, timers, and signals; detached handler cleanup; and late Core
-resolutions after Workflow close. Concurrent out-of-order completion, public
-Client Update handles, explicit handler draining, default abandonment warnings,
-and the independent statechart oracle are now implemented and tested.
+The next smallest feature milestone should add asynchronous Signal handlers by
+generalizing the now-proven handler scheduler. Signals do not need the Update
+accept/complete protocol, but they do need independent suspension, deterministic
+registration/order, `await_all_handlers_finished`, unfinished-handler policy,
+root cancellation, and replay. This is a smaller step than child Workflows or a
+general cancellation-token tree and exercises whether Update-specific runtime
+state has been separated cleanly from common handler state.
+
+Update cancellation through root Workflow cancellation is now proven while a
+handler awaits an Activity: the detached operation survives, explicit draining
+prevents early close, the Update response precedes cancellation acknowledgement,
+and late resolution/replay are deterministic. Remaining cancellation work is a
+public token/tree abstraction, timer/signal coverage for detached handlers, and
+any future client-facing policy for canceling an accepted Update.
 
 Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
 containment should be designed as subprocess isolation unless Odin gains
@@ -1408,7 +1450,8 @@ statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
 dependency. The Update routine table now has explicit ownership, replay tests,
-and a defined Workflow-close policy, but cancellation remains experimental.
+a defined Workflow-close policy, and a live cancellation/drain path, but the
+public cancellation model remains experimental.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and
