@@ -716,7 +716,9 @@ identity, priority, deployment name, timing, counters, and invalid Client use.
 The Schedule property generates another 500 valid interval/phase, overlap,
 paused/limited-action, and immediate-trigger combinations, decodes each
 `CreateScheduleRequest`, and checks the exact Workflow action and policy wire
-contract. Focused ownership tests destroy encoded Describe/List/Count responses
+contract. A second 500-case Schedule property generates structured calendar
+ranges and full replacements, preserving every range and optimistic conflict
+token through `UpdateScheduleRequest`. Focused ownership tests destroy encoded Describe/List/Count responses
 before reading action inputs, recent executions, memo, pagination tokens, and
 grouped count Payloads.
 The query property generates 500 success/failure
@@ -924,10 +926,18 @@ TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
 ./scripts/run-schedule-lifecycle.sh
 ```
 
-The client creates a paused 24-hour interval Schedule, describes and lists it,
-unpauses and pauses it through `PatchSchedule`, triggers it manually, waits for
-the scheduled Odin Workflow result, and deletes the Schedule. This exercises
-Create/Describe/List/Patch/Delete through SDK Core and the CLI dev server.
+The client creates a paused 24-hour interval Schedule, describes it, replaces it
+with a 12-hour Schedule using the Describe conflict token, proves that a
+deliberately different update using a stale token is not applied, queries the
+next two days of matching times, lists
+it, unpauses and pauses it through `PatchSchedule`, triggers it manually, waits
+for the scheduled Odin Workflow result, and deletes the Schedule. This exercises
+Create/Describe/Update/List/ListScheduleMatchingTimes/Patch/Delete through SDK
+Core and the CLI dev server. Backfill is wire/property-tested separately because
+adding several executions would make this one-shot worker example ambiguous.
+CLI Server 1.29.1's legacy scheduler acknowledges the stale update RPC before it
+checks and ignores the conflict asynchronously, so the example reports both
+`stale_conflict_guarded=true` and `stale_rpc_rejected=false`.
 `CountSchedules` is also called; CLI Server 1.29.1 returns gRPC status 12
 (`UNIMPLEMENTED`), so the example reports `count_supported=false` and continues.
 The generated request/response and ownership tests still cover Count, and a

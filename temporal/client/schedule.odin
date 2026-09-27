@@ -26,13 +26,47 @@ Schedule_Interval :: struct {
 	phase: time.Duration,
 }
 
+Schedule_Range :: struct {
+	start: i32,
+	end:   i32,
+	step:  i32,
+}
+
+// Empty calendar fields use Temporal's high-level defaults: second/minute/hour
+// are zero, day_of_month/month/day_of_week match their full domains, and an
+// empty year matches every year.
+Schedule_Calendar :: struct {
+	second:       []Schedule_Range,
+	minute:       []Schedule_Range,
+	hour:         []Schedule_Range,
+	day_of_month: []Schedule_Range,
+	month:        []Schedule_Range,
+	year:         []Schedule_Range,
+	day_of_week:  []Schedule_Range,
+	comment:      string,
+}
+
+Schedule_Calendar_Snapshot :: struct {
+	second:       [dynamic]Schedule_Range,
+	minute:       [dynamic]Schedule_Range,
+	hour:         [dynamic]Schedule_Range,
+	day_of_month: [dynamic]Schedule_Range,
+	month:        [dynamic]Schedule_Range,
+	year:         [dynamic]Schedule_Range,
+	day_of_week:  [dynamic]Schedule_Range,
+	comment:      string,
+}
+
 Schedule_Spec :: struct {
-	cron_expressions: []string,
-	intervals:        []Schedule_Interval,
-	start_time:       Optional_Time,
-	end_time:         Optional_Time,
-	jitter:           time.Duration,
-	timezone_name:    string,
+	structured_calendars: []Schedule_Calendar,
+	cron_expressions:     []string,
+	intervals:            []Schedule_Interval,
+	excluded_calendars:   []Schedule_Calendar,
+	start_time:           Optional_Time,
+	end_time:             Optional_Time,
+	jitter:               time.Duration,
+	timezone_name:        string,
+	timezone_data:        []u8,
 }
 
 Schedule_Action_Options :: struct {
@@ -90,12 +124,15 @@ Schedule_Action_Result :: struct {
 
 Schedule_Description :: struct {
 	schedule_id:                string,
+	structured_calendars:       [dynamic]Schedule_Calendar_Snapshot,
 	cron_expressions:           [dynamic]string,
 	intervals:                  [dynamic]Schedule_Interval,
+	excluded_calendars:         [dynamic]Schedule_Calendar_Snapshot,
 	start_time:                 Optional_Time,
 	end_time:                   Optional_Time,
 	jitter:                     Optional_Duration,
 	timezone_name:              string,
+	timezone_data:              []u8,
 	action:                     Schedule_Action_Snapshot,
 	overlap_policy:             Schedule_Overlap_Policy,
 	catchup_window:             Optional_Duration,
@@ -162,6 +199,20 @@ Schedule_Count :: struct {
 	allocator: mem.Allocator,
 }
 
+Schedule_Backfill :: struct {
+	// The pinned API documents (start, end], while newer scheduler workflow
+	// versions make the start inclusive. Use a start strictly before the first
+	// desired matching time when behavior must be portable across servers.
+	start_time:     time.Time,
+	end_time:       time.Time,
+	overlap_policy: Schedule_Overlap_Policy,
+}
+
+Schedule_Matching_Times :: struct {
+	times:     [dynamic]time.Time,
+	allocator: mem.Allocator,
+}
+
 schedule_handle_free :: proc(handle: ^Schedule_Handle) {
 	if handle == nil {
 		return
@@ -209,6 +260,89 @@ schedule_overlap_to_proto :: proc(
 	return proto.Temporal_Api_Enums_V1_ScheduleOverlapPolicy(value)
 }
 
+schedule_range_error :: proc(ranges: []Schedule_Range, minimum, maximum: i32) -> string {
+	for value in ranges {
+		if value.start < minimum || value.start > maximum {
+			return "Schedule calendar range start is outside the field domain"
+		}
+		if value.end != 0 && (value.end < minimum || value.end > maximum) {
+			return "Schedule calendar range end is outside the field domain"
+		}
+		if value.step < 0 {
+			return "Schedule calendar range step must not be negative"
+		}
+	}
+	return ""
+}
+
+schedule_calendar_error :: proc(calendar: Schedule_Calendar) -> string {
+	checks := []struct { ranges: []Schedule_Range, minimum, maximum: i32 }{
+		{calendar.second, 0, 59},
+		{calendar.minute, 0, 59},
+		{calendar.hour, 0, 23},
+		{calendar.day_of_month, 1, 31},
+		{calendar.month, 1, 12},
+		{calendar.year, 0, 9999},
+		{calendar.day_of_week, 0, 6},
+	}
+	for check in checks {
+		if message := schedule_range_error(check.ranges, check.minimum, check.maximum); len(message) > 0 {
+			return message
+		}
+	}
+	return ""
+}
+
+schedule_append_ranges :: proc(
+	destination: ^[dynamic]proto.Temporal_Api_Schedule_V1_Range,
+	source: []Schedule_Range,
+	default_start, default_end: i32,
+) {
+	if len(source) == 0 {
+		append(destination, proto.Temporal_Api_Schedule_V1_Range{
+			start = default_start,
+			end = default_end,
+		})
+		return
+	}
+	for value in source {
+		append(destination, proto.Temporal_Api_Schedule_V1_Range{
+			start = value.start,
+			end = value.end,
+			step = value.step,
+		})
+	}
+}
+
+schedule_calendar_proto :: proc(value: Schedule_Calendar) -> proto.Temporal_Api_Schedule_V1_StructuredCalendarSpec {
+	result := proto.Temporal_Api_Schedule_V1_StructuredCalendarSpec{comment = value.comment}
+	schedule_append_ranges(&result.second, value.second, 0, 0)
+	schedule_append_ranges(&result.minute, value.minute, 0, 0)
+	schedule_append_ranges(&result.hour, value.hour, 0, 0)
+	schedule_append_ranges(&result.day_of_month, value.day_of_month, 1, 31)
+	schedule_append_ranges(&result.month, value.month, 1, 12)
+	for year in value.year {
+		append(&result.year, proto.Temporal_Api_Schedule_V1_Range{
+			start = year.start,
+			end = year.end,
+			step = year.step,
+		})
+	}
+	schedule_append_ranges(&result.day_of_week, value.day_of_week, 0, 6)
+	return result
+}
+
+schedule_calendar_proto_free :: proc(value: ^proto.Temporal_Api_Schedule_V1_StructuredCalendarSpec) {
+	delete(value.second)
+	delete(value.minute)
+	delete(value.hour)
+	delete(value.day_of_month)
+	delete(value.month)
+	delete(value.year)
+	delete(value.day_of_week)
+	value^ = {}
+}
+
 schedule_create_options_error :: proc(
 	schedule_id: string,
 	workflow_type: string,
@@ -226,8 +360,15 @@ schedule_create_options_error :: proc(
 	if len(options.action.task_queue) == 0 {
 		return "scheduled Workflow task queue must not be empty"
 	}
-	if len(options.spec.cron_expressions) == 0 && len(options.spec.intervals) == 0 {
-		return "Schedule must contain at least one cron expression or interval"
+	if len(options.spec.structured_calendars) == 0 && len(options.spec.cron_expressions) == 0 &&
+	   len(options.spec.intervals) == 0 {
+		return "Schedule must contain at least one calendar, cron expression, or interval"
+	}
+	for calendar in options.spec.structured_calendars {
+		if message := schedule_calendar_error(calendar); len(message) > 0 { return message }
+	}
+	for calendar in options.spec.excluded_calendars {
+		if message := schedule_calendar_error(calendar); len(message) > 0 { return message }
 	}
 	for interval in options.spec.intervals {
 		if interval.every <= 0 {
@@ -368,9 +509,18 @@ encode_create_schedule_request :: proc(
 
 	spec := proto.Temporal_Api_Schedule_V1_ScheduleSpec{
 		timezone_name = options.spec.timezone_name,
+		timezone_data = options.spec.timezone_data,
 	}
+	defer delete(spec.structured_calendar)
 	defer delete(spec.cron_string)
 	defer delete(spec.interval)
+	defer delete(spec.exclude_structured_calendar)
+	for calendar in options.spec.structured_calendars {
+		append(&spec.structured_calendar, schedule_calendar_proto(calendar))
+	}
+	defer for &calendar in spec.structured_calendar {
+		schedule_calendar_proto_free(&calendar)
+	}
 	for expression in options.spec.cron_expressions {
 		append(&spec.cron_string, expression)
 	}
@@ -386,6 +536,12 @@ encode_create_schedule_request :: proc(
 			value.phase = &interval_durations[index * 2 + 1]
 		}
 		append(&spec.interval, value)
+	}
+	for calendar in options.spec.excluded_calendars {
+		append(&spec.exclude_structured_calendar, schedule_calendar_proto(calendar))
+	}
+	defer for &calendar in spec.exclude_structured_calendar {
+		schedule_calendar_proto_free(&calendar)
 	}
 	start_time := proto.Google_Protobuf_Timestamp{}
 	end_time := proto.Google_Protobuf_Timestamp{}
@@ -591,6 +747,127 @@ create_schedule_json :: proc(
 	)
 }
 
+// UpdateSchedule is a full replacement of spec, action, policies, and state.
+// Pass the conflict token from describe_schedule to guard against lost updates,
+// or an empty token for an unconditional replacement. The legacy Temporal
+// scheduler can acknowledge the RPC and asynchronously ignore a conflicting
+// update, so RPC success alone is not proof that a guarded update was applied.
+// Top-level memo/search
+// attributes are preserved when options.metadata is nil and replaced (or
+// cleared by initialized empty metadata) when it is non-nil.
+encode_update_schedule_request :: proc(
+	namespace: string,
+	schedule_id: string,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Schedule_Create_Options,
+	conflict_token: []u8,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if options.trigger_immediately {
+		return nil, error_from_string(.Invalid_Argument, "Schedule update cannot trigger an initial action")
+	}
+	create_bytes, create_error := encode_create_schedule_request(
+		namespace,
+		schedule_id,
+		workflow_type,
+		input,
+		options,
+	)
+	if create_error.message != nil { return nil, create_error }
+	defer delete(create_bytes)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return nil, error_from_string(.Malformed_Response, "could not initialize Schedule update arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	create_request := proto.Temporal_Api_Workflowservice_V1_CreateScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_CreateScheduleRequest(
+		create_bytes[:],
+		&create_request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || create_request.schedule == nil {
+		return nil, error_from_string(.Malformed_Response, "could not construct Schedule update")
+	}
+
+	empty_memo := proto.Temporal_Api_Common_V1_Memo{}
+	empty_search := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateScheduleRequest{
+		namespace = namespace,
+		schedule_id = schedule_id,
+		schedule = create_request.schedule,
+		conflict_token = conflict_token,
+		identity = "temporal-sdk-odin@local",
+		request_id = create_request.request_id,
+	}
+	if options.metadata != nil {
+		request.memo = create_request.memo
+		if request.memo == nil { request.memo = &empty_memo }
+		request.search_attributes = create_request.search_attributes
+		if request.search_attributes == nil { request.search_attributes = &empty_search }
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_UpdateScheduleRequest(&request), {}
+}
+
+update_schedule_payload :: proc(
+	handle: ^Schedule_Handle,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Schedule_Create_Options,
+	conflict_token: []u8 = nil,
+) -> Error {
+	if !schedule_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
+	}
+	request_bytes, request_error := encode_update_schedule_request(
+		handle.client.namespace,
+		handle.id,
+		workflow_type,
+		input,
+		options,
+		conflict_token,
+	)
+	if request_error.message != nil { return request_error }
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"UpdateSchedule",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil { return error_from_core(&rpc_result.error) }
+	response := proto.Temporal_Api_Workflowservice_V1_UpdateScheduleResponse{}
+	if !proto.decode_Temporal_Api_Workflowservice_V1_UpdateScheduleResponse(rpc_result.protobuf, &response) {
+		return error_from_string(.Malformed_Response, "Temporal returned a malformed Update Schedule response")
+	}
+	return {}
+}
+
+update_schedule_json :: proc(
+	handle: ^Schedule_Handle,
+	workflow_type: string,
+	input: $T,
+	options: Schedule_Create_Options,
+	conflict_token: []u8 = nil,
+) -> Error {
+	payload, encode_error := codec.encode_json(input)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode scheduled Workflow input")
+	}
+	defer codec.payload_free(&payload)
+	return update_schedule_payload(
+		handle,
+		workflow_type,
+		codec.payload_view(&payload),
+		options,
+		conflict_token,
+	)
+}
+
 schedule_named_payloads_free :: proc(values: ^[dynamic]Named_Payload, allocator: mem.Allocator) {
 	if values == nil {
 		return
@@ -639,6 +916,55 @@ schedule_action_result_clone :: proc(
 	return result, true
 }
 
+schedule_calendar_snapshot_free :: proc(
+	value: ^Schedule_Calendar_Snapshot,
+	allocator: mem.Allocator,
+) {
+	if value == nil { return }
+	delete(value.second)
+	delete(value.minute)
+	delete(value.hour)
+	delete(value.day_of_month)
+	delete(value.month)
+	delete(value.year)
+	delete(value.day_of_week)
+	delete(value.comment, allocator)
+	value^ = {}
+}
+
+schedule_clone_ranges :: proc(
+	destination: ^[dynamic]Schedule_Range,
+	source: []proto.Temporal_Api_Schedule_V1_Range,
+) {
+	for value in source {
+		append(destination, Schedule_Range{start = value.start, end = value.end, step = value.step})
+	}
+}
+
+schedule_calendar_snapshot :: proc(
+	source: ^proto.Temporal_Api_Schedule_V1_StructuredCalendarSpec,
+	allocator: mem.Allocator,
+) -> (result: Schedule_Calendar_Snapshot, ok: bool) {
+	if source == nil { return {}, false }
+	result.second = make([dynamic]Schedule_Range, allocator)
+	result.minute = make([dynamic]Schedule_Range, allocator)
+	result.hour = make([dynamic]Schedule_Range, allocator)
+	result.day_of_month = make([dynamic]Schedule_Range, allocator)
+	result.month = make([dynamic]Schedule_Range, allocator)
+	result.year = make([dynamic]Schedule_Range, allocator)
+	result.day_of_week = make([dynamic]Schedule_Range, allocator)
+	schedule_clone_ranges(&result.second, source.second[:])
+	schedule_clone_ranges(&result.minute, source.minute[:])
+	schedule_clone_ranges(&result.hour, source.hour[:])
+	schedule_clone_ranges(&result.day_of_month, source.day_of_month[:])
+	schedule_clone_ranges(&result.month, source.month[:])
+	schedule_clone_ranges(&result.year, source.year[:])
+	schedule_clone_ranges(&result.day_of_week, source.day_of_week[:])
+	result.comment, ok = description_clone_string(source.comment, allocator)
+	if !ok { schedule_calendar_snapshot_free(&result, allocator) }
+	return result, ok
+}
+
 schedule_description_free :: proc(description: ^Schedule_Description) {
 	if description == nil {
 		return
@@ -649,12 +975,21 @@ schedule_description_free :: proc(description: ^Schedule_Description) {
 		return
 	}
 	delete(description.schedule_id, allocator)
+	for &calendar in description.structured_calendars {
+		schedule_calendar_snapshot_free(&calendar, allocator)
+	}
+	delete(description.structured_calendars)
 	for expression in description.cron_expressions {
 		delete(expression, allocator)
 	}
 	delete(description.cron_expressions)
 	delete(description.intervals)
+	for &calendar in description.excluded_calendars {
+		schedule_calendar_snapshot_free(&calendar, allocator)
+	}
+	delete(description.excluded_calendars)
 	delete(description.timezone_name, allocator)
+	delete(description.timezone_data, allocator)
 	delete(description.action.workflow_id, allocator)
 	delete(description.action.workflow_type, allocator)
 	delete(description.action.task_queue, allocator)
@@ -732,8 +1067,10 @@ decode_schedule_description :: proc(
 	}
 
 	description.allocator = allocator
+	description.structured_calendars = make([dynamic]Schedule_Calendar_Snapshot, allocator)
 	description.cron_expressions = make([dynamic]string, allocator)
 	description.intervals = make([dynamic]Schedule_Interval, allocator)
+	description.excluded_calendars = make([dynamic]Schedule_Calendar_Snapshot, allocator)
 	description.action.inputs = make([dynamic]codec.Payload, allocator)
 	description.running_workflows = make([dynamic]Workflow_Execution_Identity, allocator)
 	description.recent_actions = make([dynamic]Schedule_Action_Result, allocator)
@@ -741,6 +1078,7 @@ decode_schedule_description :: proc(
 	description.memo = make([dynamic]Named_Payload, allocator)
 	description.search_attributes = make([dynamic]Named_Payload, allocator)
 	description.conflict_token = bytes.clone(response.conflict_token, allocator)
+	description.timezone_data = bytes.clone(response.schedule.spec.timezone_data, allocator)
 	failed := false
 	defer if failed { schedule_description_free(&description) }
 	clone_targets := []struct {
@@ -761,6 +1099,14 @@ decode_schedule_description :: proc(
 	}
 
 	spec := response.schedule.spec
+	for &calendar in spec.structured_calendar {
+		owned, ok := schedule_calendar_snapshot(&calendar, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate Schedule calendar")
+		}
+		append(&description.structured_calendars, owned)
+	}
 	for expression in spec.cron_string {
 		owned, ok := description_clone_string(expression, allocator)
 		if !ok {
@@ -778,6 +1124,14 @@ decode_schedule_description :: proc(
 			every = description_duration(interval.interval).value,
 			phase = description_duration(interval.phase).value,
 		})
+	}
+	for &calendar in spec.exclude_structured_calendar {
+		owned, ok := schedule_calendar_snapshot(&calendar, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate excluded Schedule calendar")
+		}
+		append(&description.excluded_calendars, owned)
 	}
 	description.start_time = description_time(spec.start_time)
 	description.end_time = description_time(spec.end_time)
@@ -1138,6 +1492,144 @@ count_schedules :: proc(client: ^Client, query := "") -> (Schedule_Count, Error)
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_schedule_count(rpc_result.protobuf)
+}
+
+encode_backfill_schedule_request :: proc(
+	namespace, schedule_id: string,
+	backfills: []Schedule_Backfill,
+	request_id := "",
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(schedule_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Schedule backfill requires namespace and Schedule ID")
+	}
+	if len(backfills) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Schedule backfill must contain at least one range")
+	}
+	for backfill in backfills {
+		if time.to_unix_nanoseconds(backfill.start_time) >= time.to_unix_nanoseconds(backfill.end_time) {
+			return nil, error_from_string(.Invalid_Argument, "Schedule backfill start must be before end")
+		}
+		policy := i32(backfill.overlap_policy)
+		if policy < i32(Schedule_Overlap_Policy.Unspecified) || policy > i32(Schedule_Overlap_Policy.Allow_All) {
+			return nil, error_from_string(.Invalid_Argument, "Schedule backfill overlap policy is invalid")
+		}
+	}
+	timestamps := make([]proto.Google_Protobuf_Timestamp, len(backfills) * 2)
+	defer delete(timestamps)
+	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{}
+	defer delete(patch.backfill_request)
+	for backfill, index in backfills {
+		timestamps[index * 2] = schedule_timestamp_proto(backfill.start_time)
+		timestamps[index * 2 + 1] = schedule_timestamp_proto(backfill.end_time)
+		append(&patch.backfill_request, proto.Temporal_Api_Schedule_V1_BackfillRequest{
+			start_time = &timestamps[index * 2],
+			end_time = &timestamps[index * 2 + 1],
+			overlap_policy = schedule_overlap_to_proto(backfill.overlap_policy),
+		})
+	}
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	resolved_request_id := request_id
+	if len(resolved_request_id) == 0 {
+		resolved_request_id = uuid.to_string_buffer(uuid.generate_v4(), request_id_buffer[:])
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_PatchScheduleRequest{
+		namespace = namespace,
+		schedule_id = schedule_id,
+		patch = &patch,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolved_request_id,
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(&request), {}
+}
+
+backfill_schedule :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfill) -> Error {
+	if !schedule_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
+	}
+	request_bytes, request_error := encode_backfill_schedule_request(
+		handle.client.namespace,
+		handle.id,
+		backfills,
+	)
+	if request_error.message != nil { return request_error }
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"PatchSchedule",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil { return error_from_core(&rpc_result.error) }
+	return {}
+}
+
+schedule_matching_times_free :: proc(result: ^Schedule_Matching_Times) {
+	if result == nil { return }
+	delete(result.times)
+	result^ = {}
+}
+
+decode_schedule_matching_times :: proc(
+	data: []u8,
+	allocator := context.allocator,
+) -> (result: Schedule_Matching_Times, error: Error) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize Schedule matching-times arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesResponse(data, &response)
+	context.allocator = previous_allocator
+	if !decoded {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned malformed Schedule matching times")
+	}
+	result.allocator = allocator
+	result.times = make([dynamic]time.Time, allocator)
+	for &value in response.start_time {
+		converted := description_time(&value)
+		if !converted.present {
+			schedule_matching_times_free(&result)
+			return {}, error_from_string(.Malformed_Response, "Temporal returned an invalid Schedule matching time")
+		}
+		append(&result.times, converted.value)
+	}
+	return result, {}
+}
+
+list_schedule_matching_times :: proc(
+	handle: ^Schedule_Handle,
+	start_time, end_time: time.Time,
+	allocator := context.allocator,
+) -> (Schedule_Matching_Times, Error) {
+	if !schedule_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
+	}
+	if time.to_unix_nanoseconds(start_time) >= time.to_unix_nanoseconds(end_time) {
+		return {}, error_from_string(.Invalid_Argument, "Schedule matching-time start must be before end")
+	}
+	start_proto := schedule_timestamp_proto(start_time)
+	end_proto := schedule_timestamp_proto(end_time)
+	request := proto.Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesRequest{
+		namespace = handle.client.namespace,
+		schedule_id = handle.id,
+		start_time = &start_proto,
+		end_time = &end_proto,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesRequest(&request)
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"ListScheduleMatchingTimes",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil { return {}, error_from_core(&rpc_result.error) }
+	return decode_schedule_matching_times(rpc_result.protobuf, allocator)
 }
 
 schedule_patch :: proc(

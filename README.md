@@ -24,9 +24,15 @@ load-balancing, compression, identity, and payload-warning controls. API-key
 connections enable TLS automatically, and metadata/API keys can be replaced on
 a live connection. It proves
 Schedule lifecycle operations through the same Core RPC boundary: create a
-cron/interval Schedule with a typed Workflow action, describe/list/count it,
-pause/unpause, trigger it immediately, and delete it. The CLI-devserver suite
-waits for the triggered Odin Workflow result. `CountSchedules` is generated
+cron/interval/structured-calendar Schedule with exclusions and optional TZif
+data, replace it with an optimistic conflict token, describe/list/count it,
+query matching times, backfill, pause/unpause, trigger it immediately, and
+delete it. The CLI-devserver suite proves replacement, conflict-token rotation
+and guarding, matching-time queries, and waits for the triggered Odin Workflow
+result. On CLI Server 1.29.1 a stale guarded update is ignored by the legacy
+scheduler even though the RPC itself succeeds; callers that require observed
+application must Describe and verify the resulting definition.
+`CountSchedules` is generated
 and unit-tested but CLI Server 1.29.1 returns `UNIMPLEMENTED`; newer-server
 acceptance remains outstanding. It also proves
 typed read-only Workflow queries through the public Odin Client, including
@@ -322,6 +328,19 @@ defer temporal_client.schedule_handle_free(&schedule)
 
 description, err = temporal_client.describe_schedule(&schedule)
 defer temporal_client.schedule_description_free(&description)
+err = temporal_client.update_schedule_json(
+    &schedule,
+    "reconcile_orders",
+    Reconcile_Input{region = "no"},
+    replacement_options,
+    description.conflict_token, // guarded; empty means unconditional
+)
+matching, err := temporal_client.list_schedule_matching_times(
+    &schedule,
+    time.now(),
+    time.time_add(time.now(), 7 * 24 * time.Hour),
+)
+defer temporal_client.schedule_matching_times_free(&matching)
 err = temporal_client.pause_schedule(&schedule)
 err = temporal_client.trigger_schedule(&schedule)
 err = temporal_client.delete_schedule(&schedule)
@@ -370,7 +389,7 @@ delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
 policy combinations are rejected before the RPC.
 
 `Workflow_Description`, `History_Page`, `Workflow_List_Page`, and
-`Workflow_Count`, plus Schedule descriptions/list/counts, are allocator-owned snapshots; they do not borrow Core
+`Workflow_Count`, plus Schedule descriptions/list/counts/matching-times, are allocator-owned snapshots; they do not borrow Core
 response buffers or protobuf decode arenas. Call their matching `_free`
 procedures. List/count query strings are passed directly to Temporal Visibility;
 the SDK does not yet add a query DSL. List and history `next_page_token` values are opaque and

@@ -206,25 +206,41 @@ symbols:
 
 Schedules use the same generic client bridge and add no C ABI. The implemented
 surface encodes `CreateSchedule`, `DescribeSchedule`, `ListSchedules`,
-`CountSchedules`, `PatchSchedule`, and `DeleteSchedule`. Create currently
-accepts cron strings and interval specs, one Payload-backed Workflow action,
+`CountSchedules`, `UpdateSchedule`, `ListScheduleMatchingTimes`,
+`PatchSchedule`, and `DeleteSchedule`. Create and full replacement accept cron
+strings, interval specs, structured/excluded calendars, timezone names and TZif
+data, one Payload-backed Workflow action,
 Workflow headers/memo/Search Attributes, Schedule memo/Search Attributes,
-timeouts/retry/priority, overlap/catchup policies, initial state, and an optional
-immediate trigger. `Schedule_Handle` owns its ID and create conflict token while
+timeouts/retry/priority, overlap/catchup policies, and state. Create additionally
+supports an optional immediate trigger. `Schedule_Handle` owns its ID and create conflict token while
 borrowing the Client. Describe owns the normalized interval/cron projection,
 action inputs, state/policies, running/recent/future execution information,
 memo/Search Attributes, and the current conflict token. Patch powers
-pause/unpause and manual trigger; delete leaves handle lifetime explicit.
+pause/unpause, manual trigger, and one or more backfill ranges; delete leaves
+handle lifetime explicit. Matching-time results are allocator-owned. Full
+update replaces all four Schedule fields. Its conflict token is explicit:
+callers pass a token from Describe for optimistic concurrency, or an empty token
+for an unconditional update. It is intentionally not read implicitly from the
+handle because any intervening patch can make that token stale. Nil top-level
+metadata preserves memo/Search Attributes; initialized empty metadata clears
+them. Calendar input supplies useful high-level defaults for omitted fields,
+while Describe exposes the Service-normalized structured form.
 
-The pinned API also contains structured/excluded calendars, timezone-data,
-backfill, matching-time queries, and full `UpdateSchedule`. Those are deliberately
-not flattened into the first public shape: full update must preserve the
-Describe conflict token and fields that the Service normalizes. They are the
-next Schedule-completeness slice. `CountSchedules` is present in the pinned
+The pinned CLI Server 1.29.1 rotates the token and guards the mutation, but its
+legacy scheduler implements update as an asynchronous signal: a mismatched token
+is logged and the update is ignored after `UpdateSchedule` has already returned
+success. This matches the upstream legacy scheduler's `processUpdate` /
+`checkConflict` path and explains why current .NET and Rust clients do not expose
+a reliable conflict-specific result. Odin therefore treats RPC success as
+transport acceptance, not proof of application; callers needing that guarantee
+must Describe and verify. The live test sends a deliberately different stale
+definition after an intervening patch and proves it was not applied.
+
+`CountSchedules` is present in the pinned
 Core descriptors, but CLI Server 1.29.1 reports gRPC `UNIMPLEMENTED`; its wire
 and owned-response tests pass, while live acceptance requires a newer server.
 
-The ownership rule is the same for all four calls: Core's callback response buffer
+The ownership rule is the same for all of these calls: Core's callback response buffer
 is copied by `temporal/core`, generated decoding borrows a short-lived virtual
 arena, and the language-facing result records its own allocator. Its matching
 free procedure releases nested strings, Payload metadata/data, repeated lists,
@@ -1599,7 +1615,8 @@ Workflows are enabled.
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
    Visibility list/count are live-proven, but the public Client still lacks
    query reject conditions, static summary/details, eager start,
-   full Schedule update/backfill/calendar coverage, and complete failure-detail conversion.
+   complete failure-detail conversion and a supported-server matrix for newer
+   Schedule methods.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
@@ -1657,10 +1674,13 @@ end-to-end. Client start-policy completeness (ID reuse/conflict, Retry Policy,
 priority, delay, and cron) is now implemented and live-proven, including
 `Use_Existing`. Typed Describe, paginated history, Visibility list/count, and
 Schedule create/describe/list/pause/unpause/trigger/delete are now implemented
-and live-proven without new C symbols. The next smallest client-facing slice is
-Schedule replace-update with optimistic conflict tokens, followed by structured
-calendar/backfill/matching-time support; richer recursive failure inspection can
-proceed independently.
+and live-proven without new C symbols. Full replace-update with optimistic
+conflict tokens and matching-time queries are also live-proven; structured and
+excluded calendars, TZif data, and backfill have exact wire/property coverage.
+The next smallest client-facing slice is richer recursive failure inspection
+and query reject-condition/static summary support; backfill should gain a
+dedicated multi-execution live case without overloading the one-shot Schedule
+example.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

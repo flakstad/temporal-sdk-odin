@@ -1,5 +1,6 @@
 package workflow_pbt_test
 
+import "core:bytes"
 import "core:mem/virtual"
 import "core:testing"
 import "core:time"
@@ -94,6 +95,73 @@ schedule_create_requests_preserve_generated_contract :: proc(t: ^testing.T) {
 		"Schedule create requests preserve generated interval and policy contract",
 		schedule_create_request_property,
 		{num_tests = 500, seed = 0x5343_4845_4455_4c45},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+schedule_update_calendar_property :: proc(t: ^pbt.T) -> pbt.Result {
+	hour_start := i32(pbt.draw(t, pbt.int_range(0, 23)))
+	hour_end := i32(pbt.draw(t, pbt.int_range(int(hour_start), 23)))
+	minute_start := i32(pbt.draw(t, pbt.int_range(0, 59)))
+	minute_end := i32(pbt.draw(t, pbt.int_range(int(minute_start), 59)))
+	step := i32(pbt.draw(t, pbt.int_range(0, 12)))
+	pbt.cover(t, step == 0, 5, "default calendar step")
+	pbt.cover(t, hour_start == hour_end, 5, "single-hour range")
+	hours := [?]temporal_client.Schedule_Range{{start = hour_start, end = hour_end, step = step}}
+	minutes := [?]temporal_client.Schedule_Range{{start = minute_start, end = minute_end}}
+	calendars := [?]temporal_client.Schedule_Calendar{{hour = hours[:], minute = minutes[:]}}
+	input := codec.payload_create(transmute([]u8)string(`"property-calendar"`))
+	defer codec.payload_free(&input)
+	conflict_token := transmute([]u8)string("property-conflict")
+	encoded, encode_error := temporal_client.encode_update_schedule_request(
+		"property-namespace",
+		"property-calendar-schedule",
+		"property_workflow",
+		codec.payload_view(&input),
+		{
+			spec = {structured_calendars = calendars[:]},
+			action = {workflow_id = "property-workflow", task_queue = "property-queue"},
+			request_id = "property-update-request",
+		},
+		conflict_token,
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	if encode_error.message != nil {
+		return pbt.fail("valid generated Schedule calendar update was rejected")
+	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize Schedule update property arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateScheduleRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	if !decoded || request.schedule == nil || request.schedule.spec == nil ||
+	   len(request.schedule.spec.structured_calendar) != 1 || request.memo != nil ||
+	   request.search_attributes != nil {
+		return pbt.fail("generated Schedule calendar update did not decode")
+	}
+	calendar := request.schedule.spec.structured_calendar[0]
+	if len(calendar.hour) != 1 || len(calendar.minute) != 1 ||
+	   calendar.hour[0].start != hour_start || calendar.hour[0].end != hour_end ||
+	   calendar.hour[0].step != step || calendar.minute[0].start != minute_start ||
+	   calendar.minute[0].end != minute_end || !bytes.equal(request.conflict_token, conflict_token) {
+		return pbt.fail("generated Schedule calendar fields changed during update round trip")
+	}
+	return pbt.pass()
+}
+
+@(test)
+schedule_calendar_updates_preserve_generated_contract :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Schedule updates preserve generated structured calendars and conflict tokens",
+		schedule_update_calendar_property,
+		{num_tests = 500, seed = 0x5343_4845_4455_5042},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

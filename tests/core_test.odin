@@ -4659,6 +4659,168 @@ client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) 
 }
 
 @(test)
+client_schedule_create_encodes_structured_and_excluded_calendars :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"calendar"`))
+	defer codec.payload_free(&input)
+	hours := [?]temporal_client.Schedule_Range{{start = 9}}
+	excluded_days := [?]temporal_client.Schedule_Range{{start = 0}, {start = 6}}
+	calendars := [?]temporal_client.Schedule_Calendar{{
+		hour = hours[:],
+		comment = "daily at nine",
+	}}
+	excluded := [?]temporal_client.Schedule_Calendar{{
+		day_of_week = excluded_days[:],
+		comment = "weekends",
+	}}
+	timezone_data := transmute([]u8)string("TZif-test")
+	encoded, encode_error := temporal_client.encode_create_schedule_request(
+		"default",
+		"calendar-schedule",
+		"calendar_workflow",
+		codec.payload_view(&input),
+		{
+			spec = {
+				structured_calendars = calendars[:],
+				excluded_calendars = excluded[:],
+				timezone_name = "Europe/Oslo",
+				timezone_data = timezone_data,
+			},
+			action = {workflow_id = "calendar-workflow", task_queue = "calendar-queue"},
+			request_id = "calendar-request",
+		},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "calendar Schedule encode failed: %s", string(encode_error.message))
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_CreateScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_CreateScheduleRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect(t, request.schedule != nil && request.schedule.spec != nil)
+	if request.schedule != nil && request.schedule.spec != nil {
+		spec := request.schedule.spec
+		testing.expect_value(t, len(spec.structured_calendar), 1)
+		testing.expect_value(t, len(spec.exclude_structured_calendar), 1)
+		testing.expect(t, bytes.equal(spec.timezone_data, timezone_data))
+		if len(spec.structured_calendar) == 1 {
+			calendar := spec.structured_calendar[0]
+			testing.expect_value(t, calendar.hour[0].start, i32(9))
+			testing.expect_value(t, calendar.minute[0].start, i32(0))
+			testing.expect_value(t, calendar.day_of_month[0].end, i32(31))
+			testing.expect_value(t, calendar.month[0].end, i32(12))
+			testing.expect_value(t, calendar.day_of_week[0].end, i32(6))
+			testing.expect_value(t, len(calendar.year), 0)
+		}
+	}
+}
+
+@(test)
+client_schedule_update_is_full_replace_with_conflict_token :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"updated"`))
+	defer codec.payload_free(&input)
+	empty_metadata := temporal_client.Start_Metadata{}
+	metadata_error := temporal_client.start_metadata_init(&empty_metadata)
+	testing.expect(t, metadata_error.message == nil)
+	temporal_client.error_free(&metadata_error)
+	defer temporal_client.start_metadata_free(&empty_metadata)
+	intervals := [?]temporal_client.Schedule_Interval{{every = 12 * time.Hour}}
+	conflict_token := transmute([]u8)string("optimistic-token")
+	encoded, encode_error := temporal_client.encode_update_schedule_request(
+		"default",
+		"updated-schedule",
+		"updated_workflow",
+		codec.payload_view(&input),
+		{
+			spec = {intervals = intervals[:]},
+			action = {workflow_id = "updated-id", task_queue = "updated-queue"},
+			paused = true,
+			notes = "replacement",
+			metadata = &empty_metadata,
+			request_id = "update-request",
+		},
+		conflict_token,
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "Schedule update encode failed: %s", string(encode_error.message))
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateScheduleRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.schedule_id, "updated-schedule")
+	testing.expect_value(t, request.request_id, "update-request")
+	testing.expect(t, bytes.equal(request.conflict_token, conflict_token))
+	testing.expect(t, request.schedule != nil && request.schedule.spec != nil)
+	testing.expect(t, request.schedule.state.paused)
+	testing.expect_value(t, request.schedule.state.notes, "replacement")
+	testing.expect_value(t, request.schedule.spec.interval[0].interval.seconds, i64(43200))
+	testing.expect(t, request.memo != nil && len(request.memo.fields) == 0)
+	testing.expect(t, request.search_attributes != nil && len(request.search_attributes.indexed_fields) == 0)
+}
+
+@(test)
+client_schedule_backfill_encodes_all_ranges :: proc(t: ^testing.T) {
+	start := time.unix(1_800_000_000, 0)
+	backfills := [?]temporal_client.Schedule_Backfill{
+		{start_time = start, end_time = time.time_add(start, time.Hour), overlap_policy = .Buffer_All},
+		{start_time = time.time_add(start, 2 * time.Hour), end_time = time.time_add(start, 3 * time.Hour), overlap_policy = .Allow_All},
+	}
+	encoded, encode_error := temporal_client.encode_backfill_schedule_request(
+		"default",
+		"backfill-schedule",
+		backfills[:],
+		"backfill-request",
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "Schedule backfill encode failed: %s", string(encode_error.message))
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_PatchScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect(t, request.patch != nil)
+	if request.patch != nil {
+		testing.expect_value(t, len(request.patch.backfill_request), 2)
+		testing.expect(
+			t,
+			request.patch.backfill_request[0].overlap_policy == .SCHEDULE_OVERLAP_POLICY_BUFFER_ALL,
+		)
+		testing.expect_value(t, request.patch.backfill_request[1].start_time.seconds, i64(1_800_007_200))
+	}
+}
+
+@(test)
+client_schedule_matching_times_are_owned :: proc(t: ^testing.T) {
+	response := proto.Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesResponse{}
+	defer delete(response.start_time)
+	append(&response.start_time, proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000})
+	append(&response.start_time, proto.Google_Protobuf_Timestamp{seconds = 1_800_003_600})
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesResponse(&response)
+	result, decode_error := temporal_client.decode_schedule_matching_times(encoded[:])
+	delete(encoded)
+	defer temporal_client.schedule_matching_times_free(&result)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "Schedule matching-times decode failed: %s", string(decode_error.message))
+	testing.expect_value(t, len(result.times), 2)
+	testing.expect_value(t, time.to_unix_seconds(result.times[1]), i64(1_800_003_600))
+}
+
+@(test)
 client_schedule_description_is_owned :: proc(t: ^testing.T) {
 	interval_duration := proto.Google_Protobuf_Duration{seconds = 3600}
 	phase_duration := proto.Google_Protobuf_Duration{seconds = 300}
@@ -4666,9 +4828,17 @@ client_schedule_description_is_owned :: proc(t: ^testing.T) {
 		interval = &interval_duration,
 		phase = &phase_duration,
 	}
-	spec := proto.Temporal_Api_Schedule_V1_ScheduleSpec{timezone_name = "UTC"}
+	calendar := proto.Temporal_Api_Schedule_V1_StructuredCalendarSpec{comment = "owned calendar"}
+	defer delete(calendar.hour)
+	append(&calendar.hour, proto.Temporal_Api_Schedule_V1_Range{start = 8, end = 10, step = 2})
+	spec := proto.Temporal_Api_Schedule_V1_ScheduleSpec{
+		timezone_name = "UTC",
+		timezone_data = transmute([]u8)string("owned-tzif"),
+	}
 	defer delete(spec.interval)
+	defer delete(spec.structured_calendar)
 	append(&spec.interval, interval)
+	append(&spec.structured_calendar, calendar)
 	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "scheduled_workflow"}
 	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "scheduled-queue"}
 	input_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
@@ -4728,6 +4898,9 @@ client_schedule_description_is_owned :: proc(t: ^testing.T) {
 	testing.expect_value(t, description.schedule_id, "schedule-owned")
 	testing.expect_value(t, len(description.intervals), 1)
 	testing.expect_value(t, description.intervals[0].every, time.Hour)
+	testing.expect_value(t, len(description.structured_calendars), 1)
+	testing.expect_value(t, description.structured_calendars[0].hour[0].end, i32(10))
+	testing.expect(t, bytes.equal(description.timezone_data, transmute([]u8)string("owned-tzif")))
 	testing.expect_value(t, description.action.workflow_type, "scheduled_workflow")
 	testing.expect_value(t, len(description.action.inputs), 1)
 	testing.expect(t, description.paused)
@@ -4821,6 +4994,34 @@ client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
 		testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
 		temporal_client.error_free(&encode_error)
 	}
+	invalid_hours := [?]temporal_client.Schedule_Range{{start = 24}}
+	invalid_calendars := [?]temporal_client.Schedule_Calendar{{hour = invalid_hours[:]}}
+	encoded, encode_error := temporal_client.encode_create_schedule_request(
+		"default",
+		"invalid-calendar",
+		"workflow",
+		codec.payload_view(&input),
+		{
+			spec = {structured_calendars = invalid_calendars[:]},
+			action = {workflow_id = "workflow-id", task_queue = "queue"},
+		},
+	)
+	delete(encoded)
+	testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&encode_error)
+	invalid_backfills := [?]temporal_client.Schedule_Backfill{{
+		start_time = time.unix(200, 0),
+		end_time = time.unix(100, 0),
+	}}
+	encoded, encode_error = temporal_client.encode_backfill_schedule_request(
+		"default",
+		"invalid-backfill",
+		invalid_backfills[:],
+		"invalid-backfill-request",
+	)
+	delete(encoded)
+	testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&encode_error)
 }
 
 @(test)

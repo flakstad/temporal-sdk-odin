@@ -60,8 +60,12 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.CreateScheduleResponse \
   temporal.api.workflowservice.v1.DescribeScheduleRequest \
   temporal.api.workflowservice.v1.DescribeScheduleResponse \
+  temporal.api.workflowservice.v1.UpdateScheduleRequest \
+  temporal.api.workflowservice.v1.UpdateScheduleResponse \
   temporal.api.workflowservice.v1.PatchScheduleRequest \
   temporal.api.workflowservice.v1.PatchScheduleResponse \
+  temporal.api.workflowservice.v1.ListScheduleMatchingTimesRequest \
+  temporal.api.workflowservice.v1.ListScheduleMatchingTimesResponse \
   temporal.api.workflowservice.v1.DeleteScheduleRequest \
   temporal.api.workflowservice.v1.DeleteScheduleResponse \
   temporal.api.workflowservice.v1.ListSchedulesRequest \

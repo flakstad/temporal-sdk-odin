@@ -1,5 +1,6 @@
 package main
 
+import "core:bytes"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -68,7 +69,103 @@ run :: proc() -> int {
 		temporal_client.schedule_description_free(&description)
 		return 1
 	}
+	conflict_token := bytes.clone(description.conflict_token)
+	defer delete(conflict_token)
+	if len(conflict_token) == 0 {
+		fmt.eprintln("Describe Schedule returned an empty conflict token")
+		temporal_client.schedule_description_free(&description)
+		return 1
+	}
 	temporal_client.schedule_description_free(&description)
+
+	updated_intervals := [?]temporal_client.Schedule_Interval{{every = 12 * time.Hour}}
+	update_options := temporal_client.Schedule_Create_Options{
+		spec = {intervals = updated_intervals[:]},
+		action = {
+			workflow_id = workflow_id,
+			task_queue = "odin-hello-workflow",
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = time.Minute,
+			workflow_task_timeout = 10 * time.Second,
+		},
+		overlap_policy = .Skip,
+		catchup_window = time.Minute,
+		paused = true,
+		notes = "replaced by Odin with optimistic concurrency",
+	}
+	update_error := temporal_client.update_schedule_json(
+		&handle,
+		"odin_patch_workflow",
+		"Scheduled",
+		update_options,
+		conflict_token,
+	)
+	if update_error.message != nil {
+		return fail_error("Update Schedule failed", &update_error)
+	}
+	description, describe_error = temporal_client.describe_schedule(&handle)
+	if describe_error.message != nil {
+		return fail_error("Describe updated Schedule failed", &describe_error)
+	}
+	if len(description.intervals) != 1 || description.intervals[0].every != 12 * time.Hour ||
+	   description.notes != "replaced by Odin with optimistic concurrency" {
+		fmt.eprintln("Update Schedule did not replace the Schedule definition")
+		temporal_client.schedule_description_free(&description)
+		return 1
+	}
+	updated_conflict_token := bytes.clone(description.conflict_token)
+	defer delete(updated_conflict_token)
+	conflict_token_rotated := !bytes.equal(conflict_token, updated_conflict_token)
+	temporal_client.schedule_description_free(&description)
+
+	intervening_patch_error := temporal_client.unpause_schedule(
+		&handle,
+		"intervening mutation for optimistic concurrency test",
+	)
+	if intervening_patch_error.message != nil {
+		return fail_error("Intervening Schedule patch failed", &intervening_patch_error)
+	}
+	stale_intervals := [?]temporal_client.Schedule_Interval{{every = 6 * time.Hour}}
+	stale_options := update_options
+	stale_options.spec = {intervals = stale_intervals[:]}
+	stale_options.notes = "stale update must not apply"
+	stale_error := temporal_client.update_schedule_json(
+		&handle,
+		"odin_patch_workflow",
+		"Scheduled",
+		stale_options,
+		conflict_token,
+	)
+	stale_rpc_rejected := stale_error.message != nil
+	temporal_client.error_free(&stale_error)
+	description, describe_error = temporal_client.describe_schedule(&handle)
+	if describe_error.message != nil {
+		return fail_error("Describe Schedule after stale update failed", &describe_error)
+	}
+	stale_update_ignored := description.notes != "stale update must not apply" &&
+	                       (len(description.intervals) != 1 ||
+	                        description.intervals[0].every != 6 * time.Hour)
+	temporal_client.schedule_description_free(&description)
+	stale_conflict_guarded := stale_rpc_rejected || stale_update_ignored
+	if !stale_conflict_guarded {
+		fmt.eprintln("Temporal applied an update with a stale Schedule conflict token")
+		return 1
+	}
+	matching_start := time.now()
+	matching, matching_error := temporal_client.list_schedule_matching_times(
+		&handle,
+		matching_start,
+		time.time_add(matching_start, 2 * 24 * time.Hour),
+	)
+	if matching_error.message != nil {
+		return fail_error("List Schedule Matching Times failed", &matching_error)
+	}
+	matching_count := len(matching.times)
+	temporal_client.schedule_matching_times_free(&matching)
+	if matching_count < 3 {
+		fmt.eprintf("expected at least three matching Schedule times, got %d\n", matching_count)
+		return 1
+	}
 
 	list_page, list_error := temporal_client.list_schedules(&client, {maximum_page_size = 100})
 	if list_error.message != nil {
@@ -187,8 +284,12 @@ run :: proc() -> int {
 	}
 	deleted = true
 	fmt.printf(
-		"Odin Schedule lifecycle completed schedule_id=%s listed=%v count_supported=%v count=%d paused_unpaused=true workflow_id=%s result=%q deleted=true\n",
+		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d paused_unpaused=true workflow_id=%s result=%q deleted=true\n",
 		schedule_id,
+		conflict_token_rotated,
+		stale_conflict_guarded,
+		stale_rpc_rejected,
+		matching_count,
 		listed,
 		count_supported,
 		schedule_count,
