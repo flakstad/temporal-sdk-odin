@@ -56,6 +56,18 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.ListWorkflowExecutionsResponse \
   temporal.api.workflowservice.v1.CountWorkflowExecutionsRequest \
   temporal.api.workflowservice.v1.CountWorkflowExecutionsResponse \
+  temporal.api.workflowservice.v1.CreateScheduleRequest \
+  temporal.api.workflowservice.v1.CreateScheduleResponse \
+  temporal.api.workflowservice.v1.DescribeScheduleRequest \
+  temporal.api.workflowservice.v1.DescribeScheduleResponse \
+  temporal.api.workflowservice.v1.PatchScheduleRequest \
+  temporal.api.workflowservice.v1.PatchScheduleResponse \
+  temporal.api.workflowservice.v1.DeleteScheduleRequest \
+  temporal.api.workflowservice.v1.DeleteScheduleResponse \
+  temporal.api.workflowservice.v1.ListSchedulesRequest \
+  temporal.api.workflowservice.v1.ListSchedulesResponse \
+  temporal.api.workflowservice.v1.CountSchedulesRequest \
+  temporal.api.workflowservice.v1.CountSchedulesResponse \
   temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.QueryWorkflowRequest \
   temporal.api.workflowservice.v1.QueryWorkflowResponse \

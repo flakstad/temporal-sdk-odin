@@ -19,6 +19,7 @@ build_example() {
 build_example core_connect temporal-odin-core-connect
 build_example client_start temporal-odin-client-start
 build_example client_control temporal-odin-client-control
+build_example schedule_lifecycle temporal-odin-schedule-lifecycle
 build_example hello_activity temporal-odin-hello-activity
 build_example hello_workflow temporal-odin-hello-workflow
 build_example child_workflow temporal-odin-child-workflow

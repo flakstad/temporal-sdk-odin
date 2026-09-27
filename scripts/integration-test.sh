@@ -356,6 +356,39 @@ cat "$worker_log"
 grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
 grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=patch \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Schedule-trigger Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+schedule_id="odin-sdk-schedule-$$-$(date +%s)"
+TEMPORAL_SCHEDULE_ID="$schedule_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-schedule-lifecycle.sh" >"$workflow_output_file"
+schedule_output="$(<"$workflow_output_file")"
+echo "$schedule_output"
+grep -q "Odin Schedule lifecycle completed schedule_id=$schedule_id" <<<"$schedule_output"
+grep -q 'listed=true' <<<"$schedule_output"
+grep -q 'paused_unpaused=true' <<<"$schedule_output"
+grep -q 'Patched Scheduled' <<<"$schedule_output"
+grep -q 'deleted=true' <<<"$schedule_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
+grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
+
 if ! temporal operator search-attribute list \
   --command-timeout 10s \
   --output json | grep -q 'OdinSdkKeyword'; then

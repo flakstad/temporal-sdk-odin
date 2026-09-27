@@ -4558,6 +4558,272 @@ client_start_options_validate_cross_field_constraints :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) {
+	action_metadata := temporal_client.Start_Metadata{}
+	testing.expect(t, temporal_client.start_metadata_init(&action_metadata).message == nil)
+	defer temporal_client.start_metadata_free(&action_metadata)
+	action_header_error := temporal_client.start_metadata_add_header_json(
+		&action_metadata,
+		"schedule-header",
+		"header-value",
+	)
+	testing.expect(t, action_header_error.message == nil)
+	temporal_client.error_free(&action_header_error)
+	schedule_metadata := temporal_client.Start_Metadata{}
+	testing.expect(t, temporal_client.start_metadata_init(&schedule_metadata).message == nil)
+	defer temporal_client.start_metadata_free(&schedule_metadata)
+	memo_error := temporal_client.start_metadata_add_memo_json(
+		&schedule_metadata,
+		"schedule-note",
+		"owned",
+	)
+	testing.expect(t, memo_error.message == nil)
+	temporal_client.error_free(&memo_error)
+	input, input_error := codec.encode_json("Scheduled Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	intervals := [?]temporal_client.Schedule_Interval{{every = time.Hour, phase = 5 * time.Minute}}
+	priority := temporal_client.Priority{priority_key = 3, fairness_key = "schedule-tenant", fairness_weight = 2}
+	request_bytes, request_error := temporal_client.encode_create_schedule_request(
+		"default",
+		"daily-orders",
+		"order_workflow",
+		codec.payload_view(&input),
+		{
+			spec = {intervals = intervals[:], timezone_name = "UTC", jitter = time.Minute},
+			action = {
+				workflow_id = "scheduled-order",
+				task_queue = "orders",
+				workflow_execution_timeout = 24 * time.Hour,
+				workflow_run_timeout = time.Hour,
+				workflow_task_timeout = 10 * time.Second,
+				priority = &priority,
+				metadata = &action_metadata,
+			},
+			overlap_policy = .Buffer_One,
+			catchup_window = time.Minute,
+			pause_on_failure = true,
+			paused = true,
+			notes = "created paused",
+			limited_actions = true,
+			remaining_actions = 4,
+			trigger_immediately = true,
+			trigger_overlap_policy = .Allow_All,
+			metadata = &schedule_metadata,
+			request_id = "schedule-request",
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Schedule request failed: %s", string(request_error.message))
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_CreateScheduleRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_CreateScheduleRequest(request_bytes[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.schedule_id, "daily-orders")
+	testing.expect_value(t, request.request_id, "schedule-request")
+	testing.expect(t, request.schedule != nil && request.schedule.spec != nil)
+	testing.expect_value(t, len(request.schedule.spec.interval), 1)
+	testing.expect_value(t, request.schedule.spec.interval[0].interval.seconds, i64(3600))
+	testing.expect_value(t, request.schedule.spec.interval[0].phase.seconds, i64(300))
+	testing.expect_value(t, request.schedule.spec.jitter.seconds, i64(60))
+	testing.expect(t, request.schedule.state.paused)
+	testing.expect_value(t, request.schedule.state.remaining_actions, i64(4))
+	testing.expect(
+		t,
+		request.schedule.policies.overlap_policy == .SCHEDULE_OVERLAP_POLICY_BUFFER_ONE,
+	)
+	testing.expect(t, request.initial_patch != nil && request.initial_patch.trigger_immediately != nil)
+	workflow: ^proto.Temporal_Api_Workflow_V1_NewWorkflowExecutionInfo
+	#partial switch variant in request.schedule.action.action {
+	case proto.Temporal_Api_Schedule_V1_ScheduleAction_Action_Start_Workflow:
+		workflow = variant.value
+	}
+	testing.expect(t, workflow != nil)
+	if workflow != nil {
+		testing.expect_value(t, workflow.workflow_id, "scheduled-order")
+		testing.expect_value(t, workflow.workflow_type.name, "order_workflow")
+		testing.expect_value(t, workflow.task_queue.name, "orders")
+		testing.expect_value(t, workflow.workflow_execution_timeout.seconds, i64(86400))
+		testing.expect_value(t, workflow.priority.fairness_key, "schedule-tenant")
+		testing.expect_value(t, len(workflow.input.payloads), 1)
+		testing.expect_value(t, len(workflow.header.fields), 1)
+	}
+	testing.expect(t, request.memo != nil)
+	testing.expect_value(t, len(request.memo.fields), 1)
+}
+
+@(test)
+client_schedule_description_is_owned :: proc(t: ^testing.T) {
+	interval_duration := proto.Google_Protobuf_Duration{seconds = 3600}
+	phase_duration := proto.Google_Protobuf_Duration{seconds = 300}
+	interval := proto.Temporal_Api_Schedule_V1_IntervalSpec{
+		interval = &interval_duration,
+		phase = &phase_duration,
+	}
+	spec := proto.Temporal_Api_Schedule_V1_ScheduleSpec{timezone_name = "UTC"}
+	defer delete(spec.interval)
+	append(&spec.interval, interval)
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "scheduled_workflow"}
+	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "scheduled-queue"}
+	input_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	inputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(inputs.payloads)
+	append(&inputs.payloads, input_payload)
+	workflow := proto.Temporal_Api_Workflow_V1_NewWorkflowExecutionInfo{
+		workflow_id = "scheduled-id",
+		workflow_type = &workflow_type,
+		task_queue = &task_queue,
+		input = &inputs,
+	}
+	action := proto.Temporal_Api_Schedule_V1_ScheduleAction{
+		action = proto.Temporal_Api_Schedule_V1_ScheduleAction_Action_Start_Workflow{value = &workflow},
+	}
+	policies := proto.Temporal_Api_Schedule_V1_SchedulePolicies{
+		overlap_policy = .SCHEDULE_OVERLAP_POLICY_SKIP,
+		pause_on_failure = true,
+	}
+	state := proto.Temporal_Api_Schedule_V1_ScheduleState{notes = "paused for test", paused = true}
+	schedule := proto.Temporal_Api_Schedule_V1_Schedule{
+		spec = &spec,
+		action = &action,
+		policies = &policies,
+		state = &state,
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "scheduled-id-2026",
+		run_id = "scheduled-run",
+	}
+	action_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000}
+	action_result := proto.Temporal_Api_Schedule_V1_ScheduleActionResult{
+		schedule_time = &action_time,
+		actual_time = &action_time,
+		start_workflow_result = &execution,
+		start_workflow_status = .WORKFLOW_EXECUTION_STATUS_COMPLETED,
+	}
+	info := proto.Temporal_Api_Schedule_V1_ScheduleInfo{action_count = 1, state_size_bytes = 2048}
+	defer delete(info.recent_actions)
+	defer delete(info.future_action_times)
+	append(&info.recent_actions, action_result)
+	append(&info.future_action_times, action_time)
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeScheduleResponse{
+		schedule = &schedule,
+		info = &info,
+		conflict_token = transmute([]u8)string("schedule-conflict"),
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeScheduleResponse(&response)
+	description, description_error := temporal_client.decode_schedule_description(
+		"schedule-owned",
+		encoded[:],
+	)
+	delete(encoded)
+	defer temporal_client.schedule_description_free(&description)
+	defer temporal_client.error_free(&description_error)
+	testing.expectf(t, description_error.message == nil, "Schedule decode failed: %s", string(description_error.message))
+	testing.expect_value(t, description.schedule_id, "schedule-owned")
+	testing.expect_value(t, len(description.intervals), 1)
+	testing.expect_value(t, description.intervals[0].every, time.Hour)
+	testing.expect_value(t, description.action.workflow_type, "scheduled_workflow")
+	testing.expect_value(t, len(description.action.inputs), 1)
+	testing.expect(t, description.paused)
+	testing.expect_value(t, description.action_count, i64(1))
+	testing.expect_value(t, len(description.recent_actions), 1)
+	testing.expect_value(t, description.recent_actions[0].run_id, "scheduled-run")
+	testing.expect(t, bytes.equal(description.conflict_token, transmute([]u8)string("schedule-conflict")))
+}
+
+@(test)
+client_schedule_list_and_count_are_owned :: proc(t: ^testing.T) {
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "listed_workflow"}
+	action_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_100}
+	info := proto.Temporal_Api_Schedule_V1_ScheduleListInfo{
+		workflow_type = &workflow_type,
+		notes = "listed note",
+		paused = true,
+		state_size_bytes = 4096,
+	}
+	defer delete(info.future_action_times)
+	append(&info.future_action_times, action_time)
+	memo_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"listed memo"`)}
+	memo := proto.Temporal_Api_Common_V1_Memo{}
+	defer delete(memo.fields)
+	append(&memo.fields, proto.Temporal_Api_Common_V1_Memo_FieldsEntry{
+		key = "note",
+		value = &memo_payload,
+	})
+	response := proto.Temporal_Api_Workflowservice_V1_ListSchedulesResponse{
+		next_page_token = transmute([]u8)string("schedule-next"),
+	}
+	defer delete(response.schedules)
+	append(&response.schedules, proto.Temporal_Api_Schedule_V1_ScheduleListEntry{
+		schedule_id = "listed-schedule",
+		memo = &memo,
+		info = &info,
+	})
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListSchedulesResponse(&response)
+	page, page_error := temporal_client.decode_schedule_list_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.schedule_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expectf(t, page_error.message == nil, "Schedule list decode failed: %s", string(page_error.message))
+	testing.expect_value(t, len(page.schedules), 1)
+	testing.expect_value(t, page.schedules[0].schedule_id, "listed-schedule")
+	testing.expect_value(t, page.schedules[0].workflow_type, "listed_workflow")
+	testing.expect(t, page.schedules[0].paused)
+	testing.expect_value(t, len(page.schedules[0].memo), 1)
+	testing.expect(t, bytes.equal(page.next_page_token, transmute([]u8)string("schedule-next")))
+
+	group_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"group"`)}
+	group := proto.Temporal_Api_Workflowservice_V1_CountSchedulesResponse_AggregationGroup{count = 4}
+	defer delete(group.group_values)
+	append(&group.group_values, group_payload)
+	count_response := proto.Temporal_Api_Workflowservice_V1_CountSchedulesResponse{count = 7}
+	defer delete(count_response.groups)
+	append(&count_response.groups, group)
+	count_encoded := proto.encode_Temporal_Api_Workflowservice_V1_CountSchedulesResponse(&count_response)
+	count, count_error := temporal_client.decode_schedule_count(count_encoded[:])
+	delete(count_encoded)
+	defer temporal_client.schedule_count_free(&count)
+	defer temporal_client.error_free(&count_error)
+	testing.expectf(t, count_error.message == nil, "Schedule count decode failed: %s", string(count_error.message))
+	testing.expect_value(t, count.count, i64(7))
+	testing.expect_value(t, len(count.groups), 1)
+	testing.expect_value(t, count.groups[0].count, i64(4))
+	testing.expect(t, bytes.equal(count.groups[0].values[0].data, transmute([]u8)string(`"group"`)))
+}
+
+@(test)
+client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"input"`))
+	defer codec.payload_free(&input)
+	invalid_intervals := [?]temporal_client.Schedule_Interval{
+		{every = 0},
+		{every = time.Hour, phase = time.Hour},
+	}
+	for interval in invalid_intervals {
+		intervals := [?]temporal_client.Schedule_Interval{interval}
+		encoded, encode_error := temporal_client.encode_create_schedule_request(
+			"default",
+			"invalid-schedule",
+			"workflow",
+			codec.payload_view(&input),
+			{
+				spec = {intervals = intervals[:]},
+				action = {workflow_id = "workflow-id", task_queue = "queue"},
+			},
+		)
+		delete(encoded)
+		testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+		temporal_client.error_free(&encode_error)
+	}
+}
+
+@(test)
 client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
 	failure := proto.Temporal_Api_Failure_V1_Failure{message = "order workflow failed"}
 	failed := proto.Temporal_Api_History_V1_WorkflowExecutionFailedEventAttributes{

@@ -175,7 +175,7 @@ true`. Core owns gRPC transport and retries. The handle result loop maps
 completed, failed, canceled, terminated, timed-out, and Continue-As-New close
 events, following the next run by default as the current .NET SDK does.
 
-The same generic RPC boundary now implements two read APIs without adding C
+The same generic RPC boundary now implements four read APIs without adding C
 symbols:
 
 - `DescribeWorkflowExecution` decodes the API response in a temporary arena,
@@ -203,6 +203,26 @@ symbols:
   `GROUP BY` fields and remain codec-neutral owned Payloads; interpreting them
   as strings, integers, dates, or other Search Attribute types belongs above
   this transport-level API.
+
+Schedules use the same generic client bridge and add no C ABI. The implemented
+surface encodes `CreateSchedule`, `DescribeSchedule`, `ListSchedules`,
+`CountSchedules`, `PatchSchedule`, and `DeleteSchedule`. Create currently
+accepts cron strings and interval specs, one Payload-backed Workflow action,
+Workflow headers/memo/Search Attributes, Schedule memo/Search Attributes,
+timeouts/retry/priority, overlap/catchup policies, initial state, and an optional
+immediate trigger. `Schedule_Handle` owns its ID and create conflict token while
+borrowing the Client. Describe owns the normalized interval/cron projection,
+action inputs, state/policies, running/recent/future execution information,
+memo/Search Attributes, and the current conflict token. Patch powers
+pause/unpause and manual trigger; delete leaves handle lifetime explicit.
+
+The pinned API also contains structured/excluded calendars, timezone-data,
+backfill, matching-time queries, and full `UpdateSchedule`. Those are deliberately
+not flattened into the first public shape: full update must preserve the
+Describe conflict token and fields that the Service normalizes. They are the
+next Schedule-completeness slice. `CountSchedules` is present in the pinned
+Core descriptors, but CLI Server 1.29.1 reports gRPC `UNIMPLEMENTED`; its wire
+and owned-response tests pass, while live acceptance requires a newer server.
 
 The ownership rule is the same for all four calls: Core's callback response buffer
 is copied by `temporal/core`, generated decoding borrows a short-lived virtual
@@ -1578,8 +1598,10 @@ Workflows are enabled.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
    Visibility list/count are live-proven, but the public Client still lacks
-   query reject conditions, static summary/details, eager start, Schedule APIs,
-   and complete failure-detail conversion. Start headers,
+   query reject conditions, static summary/details, eager start,
+   full Schedule update/backfill/calendar coverage, and complete failure-detail conversion.
+   `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
+   despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
    metadata builder. ID reuse/conflict, Retry Policy, cron, start delay, and
    Priority are implemented and wire/live tested.
@@ -1633,11 +1655,12 @@ live-proven. Workflow information, headers, memo, and Search Attribute commands
 are implemented, and the Odin Client supplies all three initial Payload maps
 end-to-end. Client start-policy completeness (ID reuse/conflict, Retry Policy,
 priority, delay, and cron) is now implemented and live-proven, including
-`Use_Existing`. Typed Describe, paginated history, and Visibility list/count are
-now implemented and live-proven without new C symbols. The next smallest
-client-facing vertical slice is Schedule create/describe/list/pause/trigger/delete,
-starting with an owned action builder and one CLI-devserver create/trigger proof;
-richer recursive failure inspection can proceed independently.
+`Use_Existing`. Typed Describe, paginated history, Visibility list/count, and
+Schedule create/describe/list/pause/unpause/trigger/delete are now implemented
+and live-proven without new C symbols. The next smallest client-facing slice is
+Schedule replace-update with optimistic conflict tokens, followed by structured
+calendar/backfill/matching-time support; richer recursive failure inspection can
+proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

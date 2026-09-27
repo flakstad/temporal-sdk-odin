@@ -23,6 +23,12 @@ API-key, ASCII/binary RPC metadata, retry, keepalive, HTTP CONNECT proxy, DNS
 load-balancing, compression, identity, and payload-warning controls. API-key
 connections enable TLS automatically, and metadata/API keys can be replaced on
 a live connection. It proves
+Schedule lifecycle operations through the same Core RPC boundary: create a
+cron/interval Schedule with a typed Workflow action, describe/list/count it,
+pause/unpause, trigger it immediately, and delete it. The CLI-devserver suite
+waits for the triggered Odin Workflow result. `CountSchedules` is generated
+and unit-tested but CLI Server 1.29.1 returns `UNIMPLEMENTED`; newer-server
+acceptance remains outstanding. It also proves
 typed read-only Workflow queries through the public Odin Client, including
 query failure responses, eviction, and fresh-stack replay. Typed Workflow
 Updates now validate, run on independent stackful routines, await Activities,
@@ -220,6 +226,16 @@ close event, and decodes the result Payload without Temporal CLI:
 ./scripts/run-client-start.sh
 ```
 
+With `examples/hello_workflow` running in the `patch` scenario, exercise the
+complete Schedule lifecycle without Temporal CLI acting as the client:
+
+```bash
+TEMPORAL_ODIN_SCENARIO=patch ./scripts/run-hello-workflow.sh
+
+TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
+./scripts/run-schedule-lifecycle.sh
+```
+
 The public Client API remains explicit:
 
 ```odin
@@ -286,6 +302,29 @@ counts, err := temporal_client.count_workflows(
     `ExecutionStatus = "Running" GROUP BY WorkflowType`,
 )
 defer temporal_client.workflow_count_free(&counts)
+
+intervals := [?]temporal_client.Schedule_Interval{{every = 24 * time.Hour}}
+schedule, err := temporal_client.create_schedule_json(
+    &client,
+    "daily-order-reconciliation",
+    "reconcile_orders",
+    Reconcile_Input{region = "no"},
+    {
+        spec = {intervals = intervals[:]},
+        action = {
+            workflow_id = "daily-reconciliation",
+            task_queue = "orders",
+        },
+        overlap_policy = .Skip,
+    },
+)
+defer temporal_client.schedule_handle_free(&schedule)
+
+description, err = temporal_client.describe_schedule(&schedule)
+defer temporal_client.schedule_description_free(&description)
+err = temporal_client.pause_schedule(&schedule)
+err = temporal_client.trigger_schedule(&schedule)
+err = temporal_client.delete_schedule(&schedule)
 ```
 
 Temporal Cloud API-key authentication uses the same Core connection:
@@ -331,7 +370,7 @@ delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
 policy combinations are rejected before the RPC.
 
 `Workflow_Description`, `History_Page`, `Workflow_List_Page`, and
-`Workflow_Count` are allocator-owned snapshots; they do not borrow Core
+`Workflow_Count`, plus Schedule descriptions/list/counts, are allocator-owned snapshots; they do not borrow Core
 response buffers or protobuf decode arenas. Call their matching `_free`
 procedures. List/count query strings are passed directly to Temporal Visibility;
 the SDK does not yet add a query DSL. List and history `next_page_token` values are opaque and
@@ -812,6 +851,7 @@ temporal/client/          owned Client and Workflow handle/control APIs
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
+examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 examples/child_workflow/  child and external Workflow operation proofs

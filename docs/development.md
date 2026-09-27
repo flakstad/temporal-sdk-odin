@@ -713,6 +713,12 @@ plus zero to eight grouped count results with arbitrary ASCII Payload bytes.
 It destroys each encoded response before inspecting the owned Odin value;
 focused tests additionally cover memo/Search Attribute Payloads, parent/root
 identity, priority, deployment name, timing, counters, and invalid Client use.
+The Schedule property generates another 500 valid interval/phase, overlap,
+paused/limited-action, and immediate-trigger combinations, decodes each
+`CreateScheduleRequest`, and checks the exact Workflow action and policy wire
+contract. Focused ownership tests destroy encoded Describe/List/Count responses
+before reading action inputs, recent executions, memo, pagination tokens, and
+grouped count Payloads.
 The query property generates 500 success/failure
 responses, destroys the command arena after encoding, and verifies query IDs,
 typed success Payloads, and non-retryable Application Failure types after a
@@ -906,6 +912,26 @@ non-zero count. This is the live ownership, Visibility, and pagination
 acceptance path for the typed read APIs. Counts are approximate by Temporal's
 contract; the integration assertion therefore only requires the unique test
 execution to be visible, not an exact global total.
+
+### Schedule lifecycle live path
+
+Run the Schedule client against the patch Workflow worker:
+
+```bash
+TEMPORAL_ODIN_SCENARIO=patch ./scripts/run-hello-workflow.sh
+
+TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
+./scripts/run-schedule-lifecycle.sh
+```
+
+The client creates a paused 24-hour interval Schedule, describes and lists it,
+unpauses and pauses it through `PatchSchedule`, triggers it manually, waits for
+the scheduled Odin Workflow result, and deletes the Schedule. This exercises
+Create/Describe/List/Patch/Delete through SDK Core and the CLI dev server.
+`CountSchedules` is also called; CLI Server 1.29.1 returns gRPC status 12
+(`UNIMPLEMENTED`), so the example reports `count_supported=false` and continues.
+The generated request/response and ownership tests still cover Count, and a
+newer-server acceptance run is required before claiming its live support.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:
