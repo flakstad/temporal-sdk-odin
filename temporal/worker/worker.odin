@@ -66,6 +66,10 @@ Run_Stats :: struct {
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,
 	workflow_signals_received:            int,
+	workflow_signal_handlers_started:      int,
+	workflow_signal_handlers_completed:    int,
+	workflow_signal_handlers_abandoned:    int,
+	workflow_signal_handler_warnings:      int,
 	workflow_queries_answered:            int,
 	workflow_queries_failed:              int,
 	workflow_updates_accepted:             int,
@@ -1155,6 +1159,10 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 	stats.workflow_queries_failed += processed.queries_failed
 	if !processed.is_replaying {
 		stats.workflow_signals_received += processed.received_signal_count
+		stats.workflow_signal_handlers_started += processed.signal_handlers_started
+		stats.workflow_signal_handlers_completed += processed.signal_handlers_completed
+		stats.workflow_signal_handlers_abandoned += processed.unfinished_signal_handlers
+		stats.workflow_signal_handler_warnings += processed.warned_unfinished_signal_handlers
 		stats.workflow_updates_accepted += processed.updates_accepted
 		stats.workflow_updates_rejected += processed.updates_rejected
 		stats.workflow_updates_completed += processed.updates_completed
@@ -1212,6 +1220,13 @@ run_workflow_loop :: proc(
 				"Temporal warning: Workflow %s closed with %d unfinished Update handler(s); handlers were abandoned\n",
 				processed.run_id,
 				processed.warned_unfinished_update_handlers,
+			)
+		}
+		if !processed.is_replaying && processed.warned_unfinished_signal_handlers > 0 {
+			fmt.eprintf(
+				"Temporal warning: Workflow %s closed with %d unfinished Signal handler(s); handlers were abandoned\n",
+				processed.run_id,
+				processed.warned_unfinished_signal_handlers,
 			)
 		}
 		if processed.error.message != nil {

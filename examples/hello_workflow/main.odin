@@ -125,6 +125,17 @@ update_greeting_name_detached :: proc(
 	return {previous_name = previous, current_name = state.name}
 }
 
+set_greeting_name_from_signal :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Greeting_Query_State,
+	name: string,
+) {
+	activity_result := workflow.execute_activity_result(ctx, "hello", name)
+	if activity_result.status == .Succeeded {
+		state.name = name
+	}
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	// The integration scenario deliberately resolves the second concurrent
 	// Workflow Update first. Sleeping in an Activity is safe: the ordering is
@@ -257,6 +268,14 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register detached greeting name Update"
 	}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"set_greeting_name_async",
+		&query_state,
+		set_greeting_name_from_signal,
+	) {
+		return "could not register asynchronous greeting Signal"
+	}
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
@@ -345,7 +364,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -355,6 +374,10 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.resolved_activity_seq,
 		processed.resolved_activity_failed,
 		processed.received_signal,
+		processed.signal_handlers_started,
+		processed.signal_handlers_completed,
+		processed.unfinished_signal_handlers,
+		processed.warned_unfinished_signal_handlers,
 		processed.queries_answered,
 		processed.queries_failed,
 		processed.updates_accepted,
@@ -489,14 +512,15 @@ main :: proc() {
 	expect_update := scenario == "update"
 	expect_abandon_update := scenario == "abandon-update"
 	expect_cancel_update := scenario == "cancel-update"
-	expect_query := scenario == "query" || expect_update
+	expect_signal_handler := scenario == "signal-handler"
+	expect_query := scenario == "query" || expect_update || expect_signal_handler
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : 1),
+			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : (expect_signal_handler ? 2 : 1)),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer,
 			on_workflow_activation = observe_activation,
@@ -557,6 +581,16 @@ main :: proc() {
 				fmt.eprintln("Detached Workflow Update cancellation stats did not match")
 				failed = true
 			}
+		} else if expect_signal_handler {
+			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 2 ||
+			   run_stats.workflow_signal_handlers_started != 1 ||
+			   run_stats.workflow_signal_handlers_completed != 1 ||
+			   run_stats.workflow_signal_handlers_abandoned != 0 ||
+			   run_stats.workflow_signal_handler_warnings != 0 ||
+			   run_stats.workflow_queries_answered != 1 || run_stats.timers_canceled != 1 {
+				fmt.eprintln("Asynchronous Workflow Signal handler stats did not match")
+				failed = true
+			}
 		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
@@ -602,6 +636,8 @@ main :: proc() {
 		fmt.println("Workflow close abandoned the unfinished Update handler with a warning")
 	} else if expect_cancel_update {
 		fmt.println("detached Workflow Update completed before cancellation acknowledgement")
+	} else if expect_signal_handler {
+		fmt.println("asynchronous Workflow Signal handler awaited an Activity and replayed")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

@@ -416,6 +416,95 @@ grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updat
 grep -Eq "replay=true .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=signal-handler \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal-handler Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+signal_handler_workflow_id="odin-sdk-signal-handler-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$signal_handler_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"signal-handler"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Signal-handler Workflow did not reach its main await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=set_greeting_name_async \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=Temporal-slow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+for _ in {1..60}; do
+  if grep -Eq "replay=false .*resolved=1 .*signal_handlers_started=0 signal_handlers_completed=1 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Asynchronous Signal handler did not finish its Activity" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=query \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \
+  TEMPORAL_CLIENT_QUERY_NAME=greeting_status \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file"
+signal_query_output="$(<"$workflow_control_output_file")"
+echo "$signal_query_output"
+grep -q "Odin client query=greeting_status workflow_id=$signal_handler_workflow_id" <<<"$signal_query_output"
+grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$signal_query_output"
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=approval \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=Approved \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+workflow_output="$(<"$workflow_output_file")"
+echo "$workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$workflow_output"
+grep -q '"result": "Hello Approved"' <<<"$workflow_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*scheduled=1 last_activity=1 .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*resolved=1 .*signal_handlers_started=0 signal_handlers_completed=1 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
+grep -q "asynchronous Workflow Signal handler awaited an Activity and replayed" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=abandon-update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

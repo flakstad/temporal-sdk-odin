@@ -20,6 +20,10 @@ waiting for the result. Concurrent handler close semantics now match the
 established language SDKs: unfinished Update routines are abandoned with a
 warning by default, registration can suppress that warning, and
 `workflow.await_all_handlers_finished` explicitly keeps the main Workflow open.
+Typed Signals may now be registered as immediate handlers or independent
+stackful routines. An asynchronous Signal handler can await an Activity, mutate
+Workflow-owned state, participate in handler draining, and replay on a fresh
+stack; the CLI-devserver suite proves the state through a public Client Query.
 It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
@@ -49,9 +53,9 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-token trees, signal handlers, client cancellation of
-an accepted Update, multiple Activity arguments, in-process panic
-containment, or a stable public API.
+nested/child cancellation-token trees, child Workflows, local Activities,
+client cancellation of an accepted Update, multiple Activity arguments,
+in-process panic containment, or a stable public API.
 Do not use it in production.
 
 ```text
@@ -421,6 +425,26 @@ Detached scope state is local to the currently running main or Update fiber.
 To let a detached handler finish, the main Workflow must itself use a detached
 scope around `workflow.await_all_handlers_finished(ctx)` after observing
 cancellation.
+
+Signals can remain explicitly awaited, or dispatch to registered handlers.
+Immediate handlers mutate state without a `Fiber_Context`; routine handlers
+receive one and may suspend:
+
+```odin
+workflow.set_signal_routine_json(
+    ctx,
+    "rename",
+    &state,
+    proc(ctx: ^workflow.Fiber_Context, state: ^State, name: string) {
+        _ = workflow.execute_activity(ctx, "audit_rename", name)
+        state.name = name
+    },
+)
+```
+
+Registered names are dispatched to handlers; unregistered names retain the
+existing deterministic buffer semantics used by `workflow.await_signal*`.
+`await_all_handlers_finished` covers both Signal and Update routines.
 
 `worker.create` owns only language-side configuration and registries. The first
 `worker.run` constructs one Core worker whose enabled task streams match the

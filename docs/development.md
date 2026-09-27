@@ -448,7 +448,16 @@ whose wait condition resolved resumes. The unit and live suites start two
 Updates, resolve Activity sequence 2 before sequence 1, and require replay to
 preserve both protocol IDs and the out-of-order completion sequence.
 
-Workflow-side signal buffering is codec-neutral. Use
+Workflow-side signal dispatch is codec-neutral. Registered names use
+`set_signal_handler_json` for immediate state mutation or
+`set_signal_routine_json` for an independent stack that may await Activities,
+timers, or other unhandled signals. Each routine owns its execution state and
+shares deterministic operation tables with main and Update routines. It counts
+toward `all_handlers_finished`; closing first records the same default
+warn-and-abandon policy used by Updates. Handler input is decoded in the
+Workflow arena because user state may retain it after the activation.
+
+Unregistered names keep the existing buffer behavior. Use
 `workflow.await_signal_payload` for the borrowed Payload or
 `workflow.await_signal_json(ctx, name, T)` for a typed value. The
 `await_signal_payload_or_timeout`, `await_signal_json_or_timeout`, and string
@@ -538,6 +547,14 @@ runtime emits the Update's `Completed` response before
 Workflow then reaches `CANCELED`. The unit test evicts the instance and requires
 all four activation completions to be byte-identical on fresh-stack replay.
 
+The `signal-handler` live case sends `set_greeting_name_async` through the
+public Odin Client. The registered Signal routine schedules an Odin Activity
+and suspends without waking main. After resolution it mutates Workflow state; a
+typed Query observes the new name. A later unregistered `approval` signal takes
+the buffered-await path, cancels main's timer, and completes the Workflow. Core
+evicts between stages, and replay reconstructs both the handler stack and its
+Activity command/resolution.
+
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
 if both Odin callbacks overlap. `integration-test.sh` builds all examples once,
@@ -626,6 +643,9 @@ it with an empty successful completion and does not repeat the terminal command.
 The suite also cancels a Workflow with a detached, Activity-awaiting Update in
 flight. It requires no Activity-cancel command, waits for the Update client to
 receive its result, and only then accepts the Workflow's canceled close status.
+In a separate execution it dispatches a typed Signal to an Activity-awaiting
+handler, queries the handler's state mutation, and then completes main through
+the ordinary buffered Signal API.
 
 ## Manual run
 

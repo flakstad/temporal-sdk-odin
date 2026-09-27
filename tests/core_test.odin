@@ -333,6 +333,57 @@ Update_Routine_State :: struct {
 	name: string,
 }
 
+Signal_Routine_Input :: struct {
+	name: string,
+}
+
+Signal_Routine_State :: struct {
+	name: string,
+}
+
+fiber_signal_handler_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	state := Signal_Routine_State{name = name}
+	registered := workflow.set_signal_handler_json(
+		ctx,
+		"rename_immediately",
+		&state,
+		proc(state: ^Signal_Routine_State, input: string) {
+			state.name = input
+		},
+	)
+	if !registered {
+		return "Workflow Signal handler registration failed"
+	}
+	_ = workflow.await_signal(ctx, "finish")
+	return state.name
+}
+
+fiber_signal_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	state := Signal_Routine_State{name = name}
+	registered := workflow.set_signal_routine_json(
+		ctx,
+		"rename_with_activity",
+		&state,
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			state: ^Signal_Routine_State,
+			input: Signal_Routine_Input,
+		) {
+			state.name = workflow.execute_activity(routine_ctx, "decorate_name", input.name)
+		},
+	)
+	if !registered {
+		return "Workflow Signal routine registration failed"
+	}
+	finish := workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	result, allocation_error := strings.concatenate({state.name, " / ", finish})
+	if allocation_error != nil {
+		return ""
+	}
+	return result
+}
+
 fiber_update_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Update_Routine_State{name = name}
 	registered := workflow.set_validated_update_routine_json(
@@ -3844,6 +3895,22 @@ workflow_unfinished_update_policy_can_suppress_warning :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_unfinished_signal_policy_can_suppress_warning :: proc(t: ^testing.T) {
+	warn_routine := workflow.Fiber_Signal_Routine{}
+	abandon_routine := workflow.Fiber_Signal_Routine{
+		unfinished_policy = .Abandon,
+	}
+	finished_routine := workflow.Fiber_Signal_Routine{completion_observed = true}
+	instance := workflow.Fiber_Instance{}
+	defer delete(instance.signal_routines)
+	append(&instance.signal_routines, &warn_routine, &abandon_routine, &finished_routine)
+	result := workflow.Process_Result{}
+	workflow.observe_unfinished_signal_routines(&result, &instance)
+	testing.expect_value(t, result.unfinished_signal_handlers, 2)
+	testing.expect_value(t, result.warned_unfinished_signal_handlers, 1)
+}
+
+@(test)
 workflow_update_routine_registration_preserves_unfinished_policy :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -3893,6 +3960,336 @@ workflow_update_routine_registration_preserves_unfinished_policy :: proc(t: ^tes
 			)
 		}
 	}
+}
+
+@(test)
+workflow_synchronous_signal_handler_mutates_state_before_main_resumes :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_signal_handler_workflow",
+		"test-queue",
+		fiber_signal_handler_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_signal_handler_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-signal-handler-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	rename_input, rename_input_error := codec.encode_json("Temporal")
+	testing.expect(t, rename_input_error == .None)
+	defer codec.payload_free(&rename_input)
+	rename_input_proto := proto.encode_payload(codec.payload_view(&rename_input))
+	defer delete(rename_input_proto.metadata)
+	defer delete(rename_input_proto.external_payloads)
+	rename_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "rename_immediately",
+	}
+	defer delete(rename_signal.input)
+	append(&rename_signal.input, rename_input_proto)
+
+	finish_input, finish_input_error := codec.encode_json("done")
+	testing.expect(t, finish_input_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &rename_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "synchronous Signal handler failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.received_signal_count, 2)
+	testing.expect_value(t, processed.signal_handlers_started, 1)
+	testing.expect_value(t, processed.signal_handlers_completed, 1)
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect_value(t, inspection.command_count, 1)
+	testing.expect(t, inspection.completed)
+	testing.expect_value(t, string(inspection.completion_result), `"Temporal"`)
+	delete(inspection.failure_message)
+	delete(inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_signal_routine_workflow",
+		"test-queue",
+		fiber_signal_routine_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_signal_routine_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-signal-routine-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	handler_input, handler_input_error := codec.encode_json(Signal_Routine_Input{name = "Temporal"})
+	testing.expect(t, handler_input_error == .None)
+	defer codec.payload_free(&handler_input)
+	handler_input_proto := proto.encode_payload(codec.payload_view(&handler_input))
+	defer delete(handler_input_proto.metadata)
+	defer delete(handler_input_proto.external_payloads)
+	handler_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "rename_with_activity",
+	}
+	defer delete(handler_signal.input)
+	append(&handler_signal.input, handler_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &handler_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Signal routine start failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.received_signal_count, 1)
+	testing.expect_value(t, processed.signal_handlers_started, 1)
+	testing.expect_value(t, processed.signal_handlers_completed, 0)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect_value(t, processed.activity_seq, u32(1))
+	handler_start_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	finish_input, finish_input_error := codec.encode_json("done")
+	testing.expect(t, finish_input_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Signal handler drain start failed: %s", string(processed.error.message))
+	testing.expect(t, processed.waiting_handlers)
+	testing.expect(t, !processed.completed)
+	finish_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	activity_output, activity_output_error := codec.encode_json("Hello Temporal")
+	testing.expect(t, activity_output_error == .None)
+	defer codec.payload_free(&activity_output)
+	activity_output_proto := proto.encode_payload(codec.payload_view(&activity_output))
+	defer delete(activity_output_proto.metadata)
+	defer delete(activity_output_proto.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &activity_output_proto}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Signal routine resolution failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.signal_handlers_completed, 1)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, processed.unfinished_signal_handlers, 0)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded)
+	testing.expect_value(t, terminal_inspection.command_count, 1)
+	testing.expect(t, terminal_inspection.completed)
+	testing.expect_value(t, string(terminal_inspection.completion_result), `"Hello Temporal / done"`)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &handler_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(handler_start_completion[:], processed.completion[:]))
+	delete(handler_start_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(finish_completion[:], processed.completion[:]))
+	delete(finish_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Signal routine replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
 }
 
 @(test)

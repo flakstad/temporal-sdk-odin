@@ -1057,6 +1057,49 @@ shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
 
+### Workflow Signal handlers
+
+The pinned Rust runtime represents every asynchronous Signal invocation as a
+[`RoutineKind::Signal`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/types.rs#L70-L82).
+`start_signal_routine` decodes the input, starts a separately polled handler,
+and tracks it in the same active-handler count used by
+`all_handlers_finished`. Unlike an Update, a Signal has no accepted/completed
+protocol response; successful completion is language-runtime state only, while
+a handler failure fails the Workflow Task.
+
+Odin now follows that boundary:
+
+- `set_signal_handler_json` runs an immediate handler without exposing a
+  `Fiber_Context`, so it can mutate Workflow-owned state but cannot suspend or
+  intentionally schedule commands.
+- `set_signal_routine_json` creates one minicoro stack per invocation. Its
+  execution state is swapped through the same Temporal-aware primitives used by
+  main and Update routines, while Activity/timer sequence tables remain shared.
+- Registered names dispatch to handlers. Unregistered names continue into the
+  existing codec-neutral buffer for `await_signal_payload/json`.
+- Ready Signal routines run before Update routines and main. This preserves the
+  upstream handler-before-main rule and gives deterministic registration order
+  as the tie-breaker among ready Signal routines.
+- Signal and Update routines both participate in `all_handlers_finished` and
+  `await_all_handlers_finished`. Closing main abandons either kind; the default
+  emits a worker warning and `.Abandon` suppresses it.
+- Inputs are cloned into the Workflow arena before the handler starts. Routine
+  stacks and routing records live until completion or instance eviction.
+
+The offline test starts an Activity-awaiting Signal handler, delivers main's
+finish signal while that handler is suspended, and proves main remains in
+`Waiting_Handlers`. Activity resolution completes the handler and then main in
+the same activation. All four completion byte sequences match after eviction
+and fresh-stack replay. A second test invokes an immediate handler and main's
+buffered signal in one activation, proving handler state mutation is visible
+before main resumes. The live CLI-devserver test additionally queries the
+mutated state after Core eviction/replay.
+
+Remaining Signal risks are handler-failure retry/eviction stress, dynamic
+registration after a matching signal was already buffered, header exposure,
+concurrent shared-state policy, and timer/cancellation coverage for Signal
+routines.
+
 ### Durable signal/timer race
 
 The pinned Core schema already exposes `StartTimer`, `FireTimer`, and
@@ -1371,9 +1414,10 @@ Workflows are enabled.
    a durable timer/signal race, generic/typed Payload flow, read-only queries,
    synchronous and Activity-awaiting validated Updates, default/suppressed
    unfinished-handler warnings, explicit handler draining, root cancellation,
-   preemptively detached operations, and detached Update/Activity cleanup across
-   fresh-stack replay. It does not yet prove general nested cancellation-token
-   trees, client cancellation of accepted Updates, panic containment,
+   synchronous/asynchronous Signal handlers, preemptively detached operations,
+   and detached Update/Activity cleanup across fresh-stack replay. It does not
+   yet prove general nested cancellation-token trees, client cancellation of
+   accepted Updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -1404,7 +1448,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, explicit handler draining/default abandonment, detached main/Update cancellation work, registered dispatch, eviction, and replay on macOS arm64 | Add asynchronous Signal handlers and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, registered dispatch, eviction, and replay on macOS arm64 | Add Child Workflow start/result/cancel and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1427,13 +1471,20 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should add asynchronous Signal handlers by
-generalizing the now-proven handler scheduler. Signals do not need the Update
-accept/complete protocol, but they do need independent suspension, deterministic
-registration/order, `await_all_handlers_finished`, unfinished-handler policy,
-root cancellation, and replay. This is a smaller step than child Workflows or a
-general cancellation-token tree and exercises whether Update-specific runtime
-state has been separated cleanly from common handler state.
+The next smallest feature milestone should add Child Workflow start/result and
+cancellation. Core already exposes the start command plus separate start and
+completion resolutions, so the slice can reuse the proven future tables,
+sequence matching, failure preservation, fiber suspension, eviction, and replay
+without adding a new native ABI symbol. The first vertical path should start one
+child on the same task queue, await its typed result, propagate one child
+failure, and cancel one pending child through the public Workflow API.
+
+Asynchronous Signal handlers are now implemented by generalizing the handler
+scheduler. Immediate and stackful registrations, independent suspension,
+deterministic handler-before-main ordering, shared handler draining,
+warn/abandon close policy, public Client delivery, Query-observed state mutation,
+Core eviction, and fresh-stack replay are tested. Dynamic registration and
+handler-failure retry stress remain before this API can be called stable.
 
 Update cancellation through root Workflow cancellation is now proven while a
 handler awaits an Activity: the detached operation survives, explicit draining
