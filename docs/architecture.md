@@ -159,8 +159,16 @@ Payloads through the builder's recorded allocator; duplicate names replace the
 previous owned value. `Start_Workflow_Options` borrows the builder only while
 the blocking RPC request is encoded. Search Attribute typing shares the codec
 layer's canonical Temporal metadata mapping with the Workflow runtime. A wire
-unit test and 500 generated Payload-map cases decode the resulting
-`StartWorkflowExecutionRequest` and verify every key, byte, and type label.
+unit test and 500 generated start-request cases decode the resulting
+`StartWorkflowExecutionRequest` and verify every key, byte, type label, policy,
+duration, retry field, and priority field.
+The same request boundary maps Odin-native ID reuse/conflict enums, a borrowed
+Retry Policy, cron schedule, start delay, and borrowed Priority onto the
+corresponding Temporal API fields. Zero-valued optional policy fields retain
+the Service defaults; a nil Retry Policy still means that the Workflow does not
+retry. Odin rejects invalid duration, backoff, priority, cron/delay, and legacy
+terminate-if-running/conflict combinations before calling Core. This remains
+protobuf work above the generic Client RPC and adds no C symbol.
 
 The same generic bridge now carries `SignalWorkflowExecution`,
 `RequestCancelWorkflowExecution`, and `TerminateWorkflowExecution`. Signals
@@ -1506,9 +1514,10 @@ Workflows are enabled.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, and termination are live-proven, but the
    public Client still lacks describe/history iteration, query reject conditions,
-   retry/start-policy completeness, and failure-detail conversion. Start headers,
+   static summary/details, eager start, and failure-detail conversion. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
-   metadata builder.
+   metadata builder. ID reuse/conflict, Retry Policy, cron, start delay, and
+   Priority are implemented and wire/live tested.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -1537,7 +1546,7 @@ proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
-500 Client close-event/result round trips, 500 Client start-metadata request
+500 Client close-event/result round trips, 500 Client start request
 round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
@@ -1557,9 +1566,11 @@ implemented and live-proven. The first Local Activity
 command/dispatch/resolution path and timer-backed `DoBackoff` retries are now
 live-proven. Workflow information, headers, memo, and Search Attribute commands
 are implemented, and the Odin Client supplies all three initial Payload maps
-end-to-end. The next smallest client slice is start-policy completeness (ID
-reuse/conflict, Retry Policy, priority, delay, and cron) plus typed Describe;
-richer recursive failure inspection can proceed independently.
+end-to-end. Client start-policy completeness (ID reuse/conflict, Retry Policy,
+priority, delay, and cron) is now implemented and live-proven, including
+`Use_Existing`. The next smallest client slice is typed Describe Workflow plus
+paginated history iteration; richer recursive failure inspection can proceed
+independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

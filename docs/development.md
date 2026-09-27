@@ -369,11 +369,27 @@ _ = temporal_client.start_metadata_add_search_attribute_json(
     "pending",
 )
 
+retry_policy := temporal_client.Retry_Policy{
+    initial_interval = time.Second,
+    backoff_coefficient = 2,
+    maximum_attempts = 5,
+}
+priority := temporal_client.Priority{priority_key = 2}
+
 handle, start_error := temporal_client.start_workflow_json(
     &client,
     "greeting_workflow",
     input,
-    {id = "greeting-42", task_queue = "greetings", metadata = &metadata},
+    {
+        id = "greeting-42",
+        task_queue = "greetings",
+        id_reuse_policy = .Allow_Duplicate,
+        id_conflict_policy = .Fail,
+        retry_policy = &retry_policy,
+        start_delay = 500 * time.Millisecond,
+        priority = &priority,
+        metadata = &metadata,
+    },
 )
 ```
 
@@ -384,8 +400,24 @@ storage, and adding the same key again frees and replaces the previous value.
 Attribute helpers replace/add Temporal's canonical `type` Payload metadata;
 the custom field itself must already be registered in the namespace.
 
+Workflow start policies are plain borrowed option values. Nil `retry_policy`
+and `priority` pointers omit those messages. Within an explicit policy, zero
+durations, coefficient, priority key, and fairness weight preserve Service
+defaults. Zero maximum attempts means unlimited attempts up to Workflow
+timeouts. `Unspecified` ID policies preserve the Service defaults:
+`Allow_Duplicate` for a closed execution and `Fail` for a running execution.
+The SDK retains deprecated `Terminate_If_Running` for compatibility, but new
+code should combine `.Allow_Duplicate` with `.Terminate_Existing`.
+
+Validation happens before request encoding: durations must be non-negative,
+Run timeout cannot exceed an explicit Execution timeout, start delay cannot
+accompany cron, a nonzero backoff coefficient must be finite and at least one,
+maximum retry interval cannot be shorter than a nonzero initial interval,
+fairness keys are at most 64 bytes, and priority values cannot be
+negative/non-finite.
+
 Start uses a UUIDv4 request ID when the caller omits one. Zero duration means
-unspecified; negative execution/run/task timeouts are rejected before RPC.
+unspecified; invalid options are rejected before RPC.
 Result retrieval issues a blocking close-event long poll with no local timeout,
 maps every terminal Workflow event, and follows retry/cron/Continue-As-New run
 IDs by default. Set `follow_runs = false` to receive
@@ -641,7 +673,8 @@ replay. The focused unit test additionally checks every exposed `workflow.Info`
 field and decodes the exact `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` payloads and type metadata.
 Another 500-case property generates Client start headers, memo, Search
-Attributes, raw Payload bytes, keys, and all seven Temporal type labels. It
+Attributes, raw Payload bytes, keys, all seven Temporal type labels, ID
+policies, Retry Policies, delays, and priorities. It
 frees each source Payload before request encoding, then decodes the complete
 `StartWorkflowExecutionRequest` to prove builder ownership and wire fidelity.
 The

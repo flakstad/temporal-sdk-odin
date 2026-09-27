@@ -4,6 +4,7 @@ package client
 import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:encoding/uuid"
+import "core:math"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
@@ -182,7 +183,53 @@ Start_Workflow_Options :: struct {
 	workflow_execution_timeout: time.Duration,
 	workflow_run_timeout:       time.Duration,
 	workflow_task_timeout:      time.Duration,
+	id_reuse_policy:            Workflow_Id_Reuse_Policy,
+	id_conflict_policy:         Workflow_Id_Conflict_Policy,
+	retry_policy:               ^Retry_Policy,
+	cron_schedule:              string,
+	start_delay:                time.Duration,
+	priority:                   ^Priority,
 	metadata:                   ^Start_Metadata,
+}
+
+// Workflow_Id_Reuse_Policy controls reuse after a previous execution with the
+// same ID has closed. Unspecified uses the Service default (Allow_Duplicate).
+Workflow_Id_Reuse_Policy :: enum {
+	Unspecified,
+	Allow_Duplicate,
+	Allow_Duplicate_Failed_Only,
+	Reject_Duplicate,
+	// Deprecated by Temporal. Prefer Allow_Duplicate together with the
+	// Terminate_Existing conflict policy.
+	Terminate_If_Running,
+}
+
+// Workflow_Id_Conflict_Policy controls a start that conflicts with a currently
+// running execution. Unspecified uses the Service default (Fail).
+Workflow_Id_Conflict_Policy :: enum {
+	Unspecified,
+	Fail,
+	Use_Existing,
+	Terminate_Existing,
+}
+
+// Retry_Policy is borrowed by Start_Workflow_Options during synchronous request
+// encoding. Zero intervals/coefficient use Temporal Service defaults; zero
+// maximum_attempts means unlimited attempts up to Workflow timeouts.
+Retry_Policy :: struct {
+	initial_interval:          time.Duration,
+	backoff_coefficient:       f64,
+	maximum_interval:          time.Duration,
+	maximum_attempts:          i32,
+	non_retryable_error_types: []string,
+}
+
+// Priority is borrowed during synchronous request encoding. Zero values select
+// Service defaults. Lower positive priority keys are dispatched first.
+Priority :: struct {
+	priority_key:    i32,
+	fairness_key:    string,
+	fairness_weight: f32,
 }
 
 Search_Attribute_Type :: codec.Search_Attribute_Type
@@ -495,6 +542,96 @@ duration_proto :: proc(value: time.Duration) -> proto.Google_Protobuf_Duration {
 	}
 }
 
+workflow_id_reuse_policy_to_proto :: proc(
+	policy: Workflow_Id_Reuse_Policy,
+) -> proto.Temporal_Api_Enums_V1_WorkflowIdReusePolicy {
+	switch policy {
+	case .Unspecified:
+		return .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED
+	case .Allow_Duplicate:
+		return .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE
+	case .Allow_Duplicate_Failed_Only:
+		return .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
+	case .Reject_Duplicate:
+		return .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+	case .Terminate_If_Running:
+		return .WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING
+	}
+	return .WORKFLOW_ID_REUSE_POLICY_UNSPECIFIED
+}
+
+workflow_id_conflict_policy_to_proto :: proc(
+	policy: Workflow_Id_Conflict_Policy,
+) -> proto.Temporal_Api_Enums_V1_WorkflowIdConflictPolicy {
+	switch policy {
+	case .Unspecified:
+		return .WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED
+	case .Fail:
+		return .WORKFLOW_ID_CONFLICT_POLICY_FAIL
+	case .Use_Existing:
+		return .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING
+	case .Terminate_Existing:
+		return .WORKFLOW_ID_CONFLICT_POLICY_TERMINATE_EXISTING
+	}
+	return .WORKFLOW_ID_CONFLICT_POLICY_UNSPECIFIED
+}
+
+start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string {
+	if len(options.id) == 0 {
+		return "Workflow ID must not be empty"
+	}
+	if len(options.task_queue) == 0 {
+		return "Workflow task queue must not be empty"
+	}
+	if options.workflow_execution_timeout < 0 || options.workflow_run_timeout < 0 ||
+	   options.workflow_task_timeout < 0 || options.start_delay < 0 {
+		return "Workflow timeouts and start delay must not be negative"
+	}
+	if options.workflow_execution_timeout > 0 &&
+	   options.workflow_run_timeout > options.workflow_execution_timeout {
+		return "Workflow Run timeout must not exceed Execution timeout"
+	}
+	if options.start_delay > 0 && len(options.cron_schedule) > 0 {
+		return "Workflow start delay cannot be combined with a cron schedule"
+	}
+	if options.id_reuse_policy == .Terminate_If_Running &&
+	   options.id_conflict_policy != .Unspecified {
+		return "Terminate_If_Running ID reuse cannot be combined with an ID conflict policy"
+	}
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		if policy.initial_interval < 0 || policy.maximum_interval < 0 ||
+		   policy.maximum_attempts < 0 {
+			return "Workflow Retry Policy values must not be negative"
+		}
+		if math.is_nan(policy.backoff_coefficient) || math.is_inf(policy.backoff_coefficient) ||
+		   (policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1) {
+			return "Workflow Retry Policy backoff coefficient must be zero or at least one"
+		}
+		if policy.maximum_interval > 0 && policy.initial_interval > 0 &&
+		   policy.maximum_interval < policy.initial_interval {
+			return "Workflow Retry Policy maximum interval must not be shorter than its initial interval"
+		}
+	}
+	if options.priority != nil {
+		priority := options.priority
+		if priority.priority_key < 0 {
+			return "Workflow priority key must not be negative"
+		}
+		if len(priority.fairness_key) > 64 {
+			return "Workflow priority fairness key must not exceed 64 bytes"
+		}
+		if math.is_nan(priority.fairness_weight) || math.is_inf(priority.fairness_weight) ||
+		   priority.fairness_weight < 0 {
+			return "Workflow priority fairness weight must be finite and non-negative"
+		}
+	}
+	if options.metadata != nil && options.metadata.allocator.procedure == nil {
+		return "Workflow start metadata is not initialized"
+	}
+	return ""
+}
+
 free_start_proto_payloads :: proc(payloads: []proto.Temporal_Api_Common_V1_Payload) {
 	for &payload in payloads {
 		delete(payload.metadata)
@@ -518,18 +655,8 @@ encode_start_workflow_request :: proc(
 	if len(workflow_type) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Workflow type must not be empty")
 	}
-	if len(options.id) == 0 {
-		return nil, error_from_string(.Invalid_Argument, "Workflow ID must not be empty")
-	}
-	if len(options.task_queue) == 0 {
-		return nil, error_from_string(.Invalid_Argument, "Workflow task queue must not be empty")
-	}
-	if options.workflow_execution_timeout < 0 || options.workflow_run_timeout < 0 ||
-	   options.workflow_task_timeout < 0 {
-		return nil, error_from_string(.Invalid_Argument, "Workflow timeouts must not be negative")
-	}
-	if options.metadata != nil && options.metadata.allocator.procedure == nil {
-		return nil, error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	if options_message := start_workflow_options_error(options); len(options_message) > 0 {
+		return nil, error_from_string(.Invalid_Argument, options_message)
 	}
 
 	request_id := options.request_id
@@ -554,6 +681,9 @@ encode_start_workflow_request :: proc(
 		input = &inputs,
 		identity = "temporal-sdk-odin@local",
 		request_id = request_id,
+		workflow_id_reuse_policy = workflow_id_reuse_policy_to_proto(options.id_reuse_policy),
+		workflow_id_conflict_policy = workflow_id_conflict_policy_to_proto(options.id_conflict_policy),
+		cron_schedule = options.cron_schedule,
 	}
 	execution_timeout := duration_proto(options.workflow_execution_timeout)
 	run_timeout := duration_proto(options.workflow_run_timeout)
@@ -566,6 +696,42 @@ encode_start_workflow_request :: proc(
 	}
 	if options.workflow_task_timeout > 0 {
 		request.workflow_task_timeout = &task_timeout
+	}
+	start_delay := duration_proto(options.start_delay)
+	if options.start_delay > 0 {
+		request.workflow_start_delay = &start_delay
+	}
+
+	retry_policy := proto.Temporal_Api_Common_V1_RetryPolicy{}
+	retry_initial_interval := proto.Google_Protobuf_Duration{}
+	retry_maximum_interval := proto.Google_Protobuf_Duration{}
+	defer delete(retry_policy.non_retryable_error_types)
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		retry_policy.backoff_coefficient = policy.backoff_coefficient
+		retry_policy.maximum_attempts = policy.maximum_attempts
+		if policy.initial_interval > 0 {
+			retry_initial_interval = duration_proto(policy.initial_interval)
+			retry_policy.initial_interval = &retry_initial_interval
+		}
+		if policy.maximum_interval > 0 {
+			retry_maximum_interval = duration_proto(policy.maximum_interval)
+			retry_policy.maximum_interval = &retry_maximum_interval
+		}
+		for error_type in policy.non_retryable_error_types {
+			append(&retry_policy.non_retryable_error_types, error_type)
+		}
+		request.retry_policy = &retry_policy
+	}
+
+	priority := proto.Temporal_Api_Common_V1_Priority{}
+	if options.priority != nil {
+		priority = {
+			priority_key = options.priority.priority_key,
+			fairness_key = options.priority.fairness_key,
+			fairness_weight = options.priority.fairness_weight,
+		}
+		request.priority = &priority
 	}
 
 	header := proto.Temporal_Api_Common_V1_Header{}

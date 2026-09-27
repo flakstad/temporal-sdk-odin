@@ -390,6 +390,7 @@ TEMPORAL_CLIENT_SCENARIO=workflow-properties \
 properties_workflow_output="$(<"$workflow_output_file")"
 echo "$properties_workflow_output"
 grep -q "Odin client completed workflow-properties workflow_id=$properties_workflow_id" <<<"$properties_workflow_output"
+grep -q 'use_existing=true' <<<"$properties_workflow_output"
 grep -q 'Workflow properties updated' <<<"$properties_workflow_output"
 temporal workflow show \
   --workflow-id "$properties_workflow_id" \
@@ -400,6 +401,7 @@ grep -q 'EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES' "$typed_history_file"
 grep -q 'odin-status' "$typed_history_file"
 grep -q 'OdinSdkKeyword' "$typed_history_file"
 grep -q 'odin-header' "$typed_history_file"
+grep -q 'firstWorkflowTaskBackoff' "$typed_history_file"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

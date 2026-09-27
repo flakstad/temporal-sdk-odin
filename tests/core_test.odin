@@ -4342,6 +4342,19 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	input, input_error := codec.encode_json("start-input")
 	testing.expect(t, input_error == .None)
 	defer codec.payload_free(&input)
+	non_retryable_types := [?]string{"PermanentFailure", "InvalidOrder"}
+	retry_policy := temporal_client.Retry_Policy{
+		initial_interval = 2 * time.Second,
+		backoff_coefficient = 2.5,
+		maximum_interval = 30 * time.Second,
+		maximum_attempts = 7,
+		non_retryable_error_types = non_retryable_types[:],
+	}
+	priority := temporal_client.Priority{
+		priority_key = 2,
+		fairness_key = "customer-42",
+		fairness_weight = 1.5,
+	}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
 		"orders-namespace",
 		"order_workflow",
@@ -4353,6 +4366,11 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 			workflow_execution_timeout = 24 * time.Hour,
 			workflow_run_timeout = time.Hour,
 			workflow_task_timeout = 10 * time.Second,
+			id_reuse_policy = .Reject_Duplicate,
+			id_conflict_policy = .Use_Existing,
+			retry_policy = &retry_policy,
+			start_delay = 3 * time.Second,
+			priority = &priority,
 			metadata = &metadata,
 		},
 	)
@@ -4380,6 +4398,36 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.workflow_execution_timeout.seconds, i64(86_400))
 	testing.expect_value(t, request.workflow_run_timeout.seconds, i64(3_600))
 	testing.expect_value(t, request.workflow_task_timeout.seconds, i64(10))
+	testing.expect(
+		t,
+		request.workflow_id_reuse_policy == .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+	)
+	testing.expect(
+		t,
+		request.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	)
+	testing.expect(t, request.retry_policy != nil)
+	if request.retry_policy != nil {
+		testing.expect_value(t, request.retry_policy.initial_interval.seconds, i64(2))
+		testing.expect_value(t, request.retry_policy.backoff_coefficient, 2.5)
+		testing.expect_value(t, request.retry_policy.maximum_interval.seconds, i64(30))
+		testing.expect_value(t, request.retry_policy.maximum_attempts, i32(7))
+		testing.expect_value(t, len(request.retry_policy.non_retryable_error_types), 2)
+		if len(request.retry_policy.non_retryable_error_types) == 2 {
+			testing.expect_value(t, request.retry_policy.non_retryable_error_types[0], "PermanentFailure")
+			testing.expect_value(t, request.retry_policy.non_retryable_error_types[1], "InvalidOrder")
+		}
+	}
+	testing.expect(t, request.workflow_start_delay != nil)
+	if request.workflow_start_delay != nil {
+		testing.expect_value(t, request.workflow_start_delay.seconds, i64(3))
+	}
+	testing.expect(t, request.priority != nil)
+	if request.priority != nil {
+		testing.expect_value(t, request.priority.priority_key, i32(2))
+		testing.expect_value(t, request.priority.fairness_key, "customer-42")
+		testing.expect_value(t, request.priority.fairness_weight, f32(1.5))
+	}
 	testing.expect(t, request.header != nil)
 	testing.expect_value(t, len(request.header.fields), 1)
 	testing.expect_value(t, request.header.fields[0].key, "odin-header")
@@ -4431,6 +4479,82 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	defer delete(invalid_bytes)
 	defer temporal_client.error_free(&invalid_error)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+}
+
+@(test)
+client_start_options_validate_cross_field_constraints :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string("input"))
+	defer codec.payload_free(&input)
+	bad_retry_interval := temporal_client.Retry_Policy{initial_interval = -time.Second}
+	bad_retry_backoff := temporal_client.Retry_Policy{backoff_coefficient = 0.5}
+	bad_retry_maximum := temporal_client.Retry_Policy{
+		initial_interval = 10 * time.Second,
+		maximum_interval = time.Second,
+	}
+	bad_priority_key := temporal_client.Priority{priority_key = -1}
+	bad_priority_fairness := temporal_client.Priority{fairness_key = "12345678901234567890123456789012345678901234567890123456789012345"}
+	invalid_options := [?]temporal_client.Start_Workflow_Options{
+		{id = "id", task_queue = "queue", start_delay = -time.Second},
+		{id = "id", task_queue = "queue", start_delay = time.Second, cron_schedule = "0 * * * *"},
+		{
+			id = "id",
+			task_queue = "queue",
+			id_reuse_policy = .Terminate_If_Running,
+			id_conflict_policy = .Fail,
+		},
+		{id = "id", task_queue = "queue", retry_policy = &bad_retry_interval},
+		{id = "id", task_queue = "queue", retry_policy = &bad_retry_backoff},
+		{id = "id", task_queue = "queue", retry_policy = &bad_retry_maximum},
+		{id = "id", task_queue = "queue", priority = &bad_priority_key},
+		{id = "id", task_queue = "queue", priority = &bad_priority_fairness},
+		{
+			id = "id",
+			task_queue = "queue",
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = 2 * time.Minute,
+		},
+	}
+	for options in invalid_options {
+		encoded, encode_error := temporal_client.encode_start_workflow_request(
+			"default",
+			"workflow",
+			codec.payload_view(&input),
+			options,
+		)
+		delete(encoded)
+		testing.expect(t, encode_error.kind == .Invalid_Argument)
+		testing.expect(t, encode_error.message != nil)
+		temporal_client.error_free(&encode_error)
+	}
+
+	cron_bytes, cron_error := temporal_client.encode_start_workflow_request(
+		"default",
+		"workflow",
+		codec.payload_view(&input),
+		{
+			id = "cron-id",
+			task_queue = "queue",
+			request_id = "cron-request-id",
+			cron_schedule = "0 * * * *",
+		},
+	)
+	defer delete(cron_bytes)
+	defer temporal_client.error_free(&cron_error)
+	testing.expect(t, cron_error.message == nil)
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		cron_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.cron_schedule, "0 * * * *")
+	testing.expect(t, request.workflow_start_delay == nil)
 }
 
 @(test)

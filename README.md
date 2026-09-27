@@ -66,7 +66,10 @@ timeouts, start/expiration time, parent/root identity, Retry Policy, priority,
 cron schedule, and continuation cause. Initial headers plus initial and locally
 updated memo/Search Attribute Payloads are readable through codec-neutral and
 typed JSON helpers. The Odin Client supplies all three initial Payload maps
-through an explicitly owned start-metadata builder.
+through an explicitly owned start-metadata builder. Workflow starts also expose
+ID reuse/conflict policies, Retry Policy, cron schedule, start delay, and task
+priority. The live suite proves delayed start plus `Use_Existing` by requiring
+two starts against the CLI dev server to return the same run ID.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -221,11 +224,28 @@ err = temporal_client.start_metadata_add_search_attribute_json(
     "pending",
 )
 
+retry := temporal_client.Retry_Policy{
+    initial_interval = time.Second,
+    backoff_coefficient = 2,
+    maximum_interval = time.Minute,
+    maximum_attempts = 5,
+}
+priority := temporal_client.Priority{priority_key = 2}
+
 handle, err := temporal_client.start_workflow_json(
     &client,
     "order_workflow",
     order,
-    {id = "order-42", task_queue = "orders", metadata = &metadata},
+    {
+        id = "order-42",
+        task_queue = "orders",
+        id_reuse_policy = .Allow_Duplicate,
+        id_conflict_policy = .Fail,
+        retry_policy = &retry,
+        start_delay = 500 * time.Millisecond,
+        priority = &priority,
+        metadata = &metadata,
+    },
 )
 defer temporal_client.workflow_handle_free(&handle)
 
@@ -243,7 +263,10 @@ Payloads. Its `_payload` methods are codec-neutral; the JSON methods are
 convenience adapters. Options borrow the builder only until the synchronous
 start call returns, so it may be freed immediately afterward. Reusing a key
 replaces its value, and custom Search Attribute names must already exist in the
-Temporal namespace.
+Temporal namespace. Retry Policy and Priority are borrowed only during request
+encoding. Zero values inside them preserve Temporal Service defaults. Start
+delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
+policy combinations are rejected before the RPC.
 
 Existing executions can be addressed without an RPC when creating the handle:
 

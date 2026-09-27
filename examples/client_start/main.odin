@@ -131,6 +131,19 @@ run :: proc() -> int {
 			return 1
 		}
 		temporal_client.error_free(&search_error)
+		non_retryable_types := [?]string{"DoNotRetry"}
+		retry_policy := temporal_client.Retry_Policy{
+			initial_interval = 2 * time.Second,
+			backoff_coefficient = 2,
+			maximum_interval = 10 * time.Second,
+			maximum_attempts = 4,
+			non_retryable_error_types = non_retryable_types[:],
+		}
+		priority := temporal_client.Priority{
+			priority_key = 2,
+			fairness_key = "tenant-odin",
+			fairness_weight = 3,
+		}
 		handle, start_error := temporal_client.start_workflow_json(
 			&client,
 			"odin_workflow_properties",
@@ -141,6 +154,11 @@ run :: proc() -> int {
 				workflow_execution_timeout = time.Minute,
 				workflow_run_timeout = time.Minute,
 				workflow_task_timeout = 10 * time.Second,
+				id_reuse_policy = .Allow_Duplicate,
+				id_conflict_policy = .Fail,
+				retry_policy = &retry_policy,
+				start_delay = time.Second,
+				priority = &priority,
 				metadata = &metadata,
 			},
 		)
@@ -154,6 +172,42 @@ run :: proc() -> int {
 			return 1
 		}
 		defer temporal_client.workflow_handle_free(&handle)
+		existing, existing_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_workflow_properties",
+			workflow_id,
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+				id_reuse_policy = .Allow_Duplicate,
+				id_conflict_policy = .Use_Existing,
+				retry_policy = &retry_policy,
+				start_delay = time.Second,
+				priority = &priority,
+				metadata = &metadata,
+			},
+		)
+		if existing_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties use-existing start failed (status=%d): %s\n",
+				existing_error.status_code,
+				string(existing_error.message),
+			)
+			temporal_client.error_free(&existing_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&existing)
+		if existing.run_id != handle.run_id {
+			fmt.eprintf(
+				"Workflow-properties use-existing returned run %s instead of %s\n",
+				existing.run_id,
+				handle.run_id,
+			)
+			return 1
+		}
 		result: string
 		result_error := temporal_client.get_result_json(&handle, &result)
 		defer delete(result)
@@ -168,8 +222,9 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"Odin client completed workflow-properties workflow_id=%s result=%q\n",
+			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true result=%q\n",
 			workflow_id,
+			handle.run_id,
 			result,
 		)
 		return 0

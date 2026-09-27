@@ -453,7 +453,15 @@ workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: 
 	if !metadata_found || metadata.namespace != "default" ||
 	   metadata.task_queue != TASK_QUEUE || metadata.workflow_id != expected_workflow_id ||
 	   metadata.workflow_type != WORKFLOW_PROPERTIES_TYPE || metadata.attempt != 1 ||
-	   len(metadata.run_id) == 0 {
+	   len(metadata.run_id) == 0 || metadata.cron_schedule != "" ||
+	   metadata.retry_policy.initial_interval != 2 * time.Second ||
+	   metadata.retry_policy.backoff_coefficient != 2 ||
+	   metadata.retry_policy.maximum_interval != 10 * time.Second ||
+	   metadata.retry_policy.maximum_attempts != 4 ||
+	   len(metadata.retry_policy.non_retryable_error_types) != 1 ||
+	   metadata.retry_policy.non_retryable_error_types[0] != "DoNotRetry" ||
+	   metadata.priority.priority_key != 2 || metadata.priority.fairness_key != "tenant-odin" ||
+	   metadata.priority.fairness_weight != 3 {
 		return "Workflow info mismatch"
 	}
 	initial_header: string

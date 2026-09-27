@@ -179,6 +179,27 @@ generated_search_attribute_type :: proc(value: int) -> codec.Search_Attribute_Ty
 	return .Keyword
 }
 
+generated_id_reuse_policy :: proc(value: int) -> temporal_client.Workflow_Id_Reuse_Policy {
+	switch value {
+	case 0: return .Unspecified
+	case 1: return .Allow_Duplicate
+	case 2: return .Allow_Duplicate_Failed_Only
+	case 3: return .Reject_Duplicate
+	case 4: return .Terminate_If_Running
+	}
+	return .Unspecified
+}
+
+generated_id_conflict_policy :: proc(value: int) -> temporal_client.Workflow_Id_Conflict_Policy {
+	switch value {
+	case 0: return .Unspecified
+	case 1: return .Fail
+	case 2: return .Use_Existing
+	case 3: return .Terminate_Existing
+	}
+	return .Unspecified
+}
+
 client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	header_key := pbt.draw(t, pbt.string_ascii(1, 24))
 	memo_key := pbt.draw(t, pbt.string_ascii(1, 24))
@@ -188,9 +209,28 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	search_value := pbt.draw(t, pbt.string_ascii(0, 48))
 	type_case := pbt.draw(t, pbt.int_range(0, 6))
 	attribute_type := generated_search_attribute_type(type_case)
+	reuse_case := pbt.draw(t, pbt.int_range(0, 4))
+	conflict_case := pbt.draw(t, pbt.int_range(0, 3))
+	if reuse_case == 4 {
+		conflict_case = 0
+	}
+	id_reuse_policy := generated_id_reuse_policy(reuse_case)
+	id_conflict_policy := generated_id_conflict_policy(conflict_case)
+	start_delay_ms := pbt.draw(t, pbt.int_range(1, 10_000))
+	retry_initial_ms := pbt.draw(t, pbt.int_range(1, 10_000))
+	retry_maximum_ms := retry_initial_ms + pbt.draw(t, pbt.int_range(0, 100_000))
+	retry_coefficient := f64(pbt.draw(t, pbt.int_range(1, 10)))
+	retry_attempts := i32(pbt.draw(t, pbt.int_range(0, 20)))
+	retry_error_type := pbt.draw(t, pbt.string_ascii(1, 24))
+	priority_key := i32(pbt.draw(t, pbt.int_range(0, 5)))
+	fairness_key := pbt.draw(t, pbt.string_ascii(0, 64))
+	fairness_weight := f32(pbt.draw(t, pbt.int_range(0, 100_000))) / 100.0
 	pbt.cover(t, type_case == 0, 5.0, "Bool Search Attribute metadata")
 	pbt.cover(t, type_case == 6, 5.0, "KeywordList Search Attribute metadata")
 	pbt.cover(t, len(search_value) == 0, 2.0, "empty Search Attribute Payload")
+	pbt.cover(t, reuse_case == 4, 5.0, "deprecated terminate-if-running reuse policy")
+	pbt.cover(t, conflict_case == 3, 5.0, "terminate-existing conflict policy")
+	pbt.cover(t, len(fairness_key) == 64, 1.0, "maximum-length fairness key")
 
 	metadata := temporal_client.Start_Metadata{}
 	init_error := temporal_client.start_metadata_init(&metadata)
@@ -240,6 +280,19 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 
 	input := codec.payload_create(transmute([]u8)string("input"))
 	defer codec.payload_free(&input)
+	retry_error_types := [?]string{retry_error_type}
+	retry_policy := temporal_client.Retry_Policy{
+		initial_interval = time.Duration(retry_initial_ms) * time.Millisecond,
+		backoff_coefficient = retry_coefficient,
+		maximum_interval = time.Duration(retry_maximum_ms) * time.Millisecond,
+		maximum_attempts = retry_attempts,
+		non_retryable_error_types = retry_error_types[:],
+	}
+	priority := temporal_client.Priority{
+		priority_key = priority_key,
+		fairness_key = fairness_key,
+		fairness_weight = fairness_weight,
+	}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
 		"generated-namespace",
 		"generated-workflow",
@@ -248,6 +301,11 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 			id = "generated-workflow-id",
 			task_queue = "generated-queue",
 			request_id = "generated-request-id",
+			id_reuse_policy = id_reuse_policy,
+			id_conflict_policy = id_conflict_policy,
+			retry_policy = &retry_policy,
+			start_delay = time.Duration(start_delay_ms) * time.Millisecond,
+			priority = &priority,
 			metadata = &metadata,
 		},
 	)
@@ -272,8 +330,26 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	context.allocator = previous_allocator
 	if !decoded || request.header == nil || request.memo == nil ||
 	   request.search_attributes == nil || len(request.header.fields) != 1 ||
-	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 {
+	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 ||
+	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil {
 		return pbt.fail("generated Client start metadata did not decode")
+	}
+	if i32(request.workflow_id_reuse_policy) != i32(reuse_case) ||
+	   i32(request.workflow_id_conflict_policy) != i32(conflict_case) ||
+	   pbt_proto_duration(request.workflow_start_delay) !=
+	   time.Duration(start_delay_ms) * time.Millisecond ||
+	   pbt_proto_duration(request.retry_policy.initial_interval) !=
+	   time.Duration(retry_initial_ms) * time.Millisecond ||
+	   request.retry_policy.backoff_coefficient != retry_coefficient ||
+	   pbt_proto_duration(request.retry_policy.maximum_interval) !=
+	   time.Duration(retry_maximum_ms) * time.Millisecond ||
+	   request.retry_policy.maximum_attempts != retry_attempts ||
+	   len(request.retry_policy.non_retryable_error_types) != 1 ||
+	   request.retry_policy.non_retryable_error_types[0] != retry_error_type ||
+	   request.priority.priority_key != priority_key ||
+	   request.priority.fairness_key != fairness_key ||
+	   request.priority.fairness_weight != fairness_weight {
+		return pbt.fail("generated Client start options changed across protobuf encoding")
 	}
 	header_field := request.header.fields[0]
 	memo_field := request.memo.fields[0]
