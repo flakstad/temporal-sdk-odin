@@ -202,6 +202,7 @@ Fiber_Phase :: enum {
 	Waiting_Child_Workflow_Start,
 	Waiting_Child_Workflow,
 	Waiting_External_Signal,
+	Waiting_External_Cancel,
 	Waiting_Timer,
 	Waiting_Signal,
 	Waiting_Signal_Or_Timer,
@@ -228,23 +229,51 @@ Child_Workflow_Future :: struct {
 	seq: u32,
 }
 
-Child_Workflow_Signal_Status :: enum {
+Workflow_Signal_Status :: enum {
 	Succeeded,
 	Failed,
 	Canceled,
 }
 
-Child_Workflow_Signal_Failure_Cause :: enum {
+Workflow_Signal_Failure_Cause :: enum {
 	Unspecified,
 	Workflow_Not_Found,
 	Namespace_Not_Found,
 	Signal_Count_Limit_Exceeded,
 }
 
-Child_Workflow_Signal_Result :: struct {
-	status:          Child_Workflow_Signal_Status,
+Workflow_Signal_Result :: struct {
+	status:          Workflow_Signal_Status,
 	failure_message: string,
-	cause:           Child_Workflow_Signal_Failure_Cause,
+	cause:           Workflow_Signal_Failure_Cause,
+}
+
+Child_Workflow_Signal_Status :: Workflow_Signal_Status
+Child_Workflow_Signal_Failure_Cause :: Workflow_Signal_Failure_Cause
+Child_Workflow_Signal_Result :: Workflow_Signal_Result
+External_Workflow_Signal_Result :: Workflow_Signal_Result
+
+External_Workflow_Execution :: struct {
+	namespace:   string,
+	workflow_id: string,
+	run_id:      string,
+}
+
+External_Workflow_Cancel_Status :: enum {
+	Succeeded,
+	Failed,
+}
+
+External_Workflow_Cancel_Failure_Cause :: enum {
+	Unspecified,
+	Workflow_Not_Found,
+	Namespace_Not_Found,
+}
+
+External_Workflow_Cancel_Result :: struct {
+	status:          External_Workflow_Cancel_Status,
+	failure_message: string,
+	cause:           External_Workflow_Cancel_Failure_Cause,
 }
 
 Child_Workflow_Start_Status :: enum {
@@ -515,14 +544,28 @@ Fiber_Child_Workflow_Operation :: struct {
 Fiber_External_Signal_Operation :: struct {
 	seq:                u32,
 	child_workflow_seq: u32,
+	namespace:           string,
 	child_workflow_id:  string,
+	run_id:              string,
 	signal_name:        string,
 	input:              codec.Payload,
 	failure_message:    string,
 	failure_proto:      []u8,
-	cause:              Child_Workflow_Signal_Failure_Cause,
+	cause:              Workflow_Signal_Failure_Cause,
 	state:              Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
+}
+
+Fiber_External_Cancel_Operation :: struct {
+	seq:             u32,
+	namespace:       string,
+	workflow_id:     string,
+	run_id:          string,
+	reason:          string,
+	failure_message: string,
+	failure_proto:   []u8,
+	cause:           External_Workflow_Cancel_Failure_Cause,
+	state:           Fiber_Operation_State,
 }
 
 Fiber_Signal :: struct {
@@ -542,6 +585,7 @@ Fiber_Signal_Routine :: struct {
 	waiting_activity_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
+	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -566,6 +610,7 @@ Fiber_Update_Routine :: struct {
 	waiting_activity_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
+	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -589,6 +634,7 @@ Fiber_Instance :: struct {
 	activities:       [dynamic]Fiber_Activity_Operation,
 	child_workflows:  [dynamic]Fiber_Child_Workflow_Operation,
 	external_signals: [dynamic]Fiber_External_Signal_Operation,
+	external_cancels: [dynamic]Fiber_External_Cancel_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
 	signal_handlers:  [dynamic]Fiber_Signal_Handler,
@@ -599,6 +645,7 @@ Fiber_Instance :: struct {
 	waiting_activity_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
+	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	cancellation_reason:  string,
@@ -612,6 +659,7 @@ Fiber_Instance :: struct {
 	next_activity_seq: u32,
 	next_child_workflow_seq: u32,
 	next_external_signal_seq: u32,
+	next_external_cancel_seq: u32,
 	next_timer_seq:    u32,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
@@ -758,6 +806,7 @@ Fiber_Execution_State :: struct {
 	waiting_activity_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
+	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -774,6 +823,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 		waiting_activity_seq = instance.waiting_activity_seq,
 		waiting_child_workflow_seq = instance.waiting_child_workflow_seq,
 		waiting_external_signal_seq = instance.waiting_external_signal_seq,
+		waiting_external_cancel_seq = instance.waiting_external_cancel_seq,
 		waiting_timer_seq = instance.waiting_timer_seq,
 		waiting_signal_name = instance.waiting_signal_name,
 		detached_scope_depth = instance.detached_scope_depth,
@@ -790,6 +840,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 	instance.waiting_activity_seq = state.waiting_activity_seq
 	instance.waiting_child_workflow_seq = state.waiting_child_workflow_seq
 	instance.waiting_external_signal_seq = state.waiting_external_signal_seq
+	instance.waiting_external_cancel_seq = state.waiting_external_cancel_seq
 	instance.waiting_timer_seq = state.waiting_timer_seq
 	instance.waiting_signal_name = state.waiting_signal_name
 	instance.detached_scope_depth = state.detached_scope_depth
@@ -806,6 +857,7 @@ signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execut
 		waiting_activity_seq = routine.waiting_activity_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
+		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
@@ -825,6 +877,7 @@ capture_signal_routine_execution :: proc(
 	routine.waiting_activity_seq = instance.waiting_activity_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
+	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
@@ -898,6 +951,7 @@ update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execut
 		waiting_activity_seq = routine.waiting_activity_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
+		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
@@ -917,6 +971,7 @@ capture_update_routine_execution :: proc(
 	routine.waiting_activity_seq = instance.waiting_activity_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
+	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
@@ -1147,6 +1202,7 @@ add_fiber_instance :: proc(
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.external_signals = make([dynamic]Fiber_External_Signal_Operation)
+	instance.external_cancels = make([dynamic]Fiber_External_Cancel_Operation)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
 	instance.signal_handlers = make([dynamic]Fiber_Signal_Handler)
@@ -1208,6 +1264,18 @@ find_external_signal_operation :: proc(
 	for index in 0..<len(instance.external_signals) {
 		if instance.external_signals[index].seq == seq {
 			return &instance.external_signals[index], true
+		}
+	}
+	return nil, false
+}
+
+find_external_cancel_operation :: proc(
+	instance: ^Fiber_Instance,
+	seq: u32,
+) -> (^Fiber_External_Cancel_Operation, bool) {
+	for index in 0..<len(instance.external_cancels) {
+		if instance.external_cancels[index].seq == seq {
+			return &instance.external_cancels[index], true
 		}
 	}
 	return nil, false
@@ -2384,6 +2452,18 @@ child_workflow_start_result_from_operation :: proc(
 	return {status = .Failed, failure_message = "Child Workflow start has not resolved"}
 }
 
+child_workflow_start_failure_cause_from_proto :: proc(
+	value: proto.Coresdk_Child_Workflow_StartChildWorkflowExecutionFailedCause,
+) -> Child_Workflow_Start_Failure_Cause {
+	switch value {
+	case .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS:
+		return .Workflow_Already_Exists
+	case .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED:
+		return .Unspecified
+	}
+	return .Unspecified
+}
+
 await_child_workflow_start :: proc(
 	ctx: ^Fiber_Context,
 	future: Child_Workflow_Future,
@@ -2594,9 +2674,9 @@ cancel_child_workflow :: proc(
 	return true
 }
 
-child_workflow_signal_failure_cause_from_proto :: proc(
+workflow_signal_failure_cause_from_proto :: proc(
 	value: proto.Temporal_Api_Enums_V1_SignalExternalWorkflowExecutionFailedCause,
-) -> Child_Workflow_Signal_Failure_Cause {
+) -> Workflow_Signal_Failure_Cause {
 	switch value {
 	case .SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND:
 		return .Workflow_Not_Found
@@ -2610,7 +2690,7 @@ child_workflow_signal_failure_cause_from_proto :: proc(
 	return .Unspecified
 }
 
-child_workflow_signal_result_from_operation :: proc(
+workflow_signal_result_from_operation :: proc(
 	operation: ^Fiber_External_Signal_Operation,
 ) -> Child_Workflow_Signal_Result {
 	switch operation.state {
@@ -2628,7 +2708,40 @@ child_workflow_signal_result_from_operation :: proc(
 		return {status = .Canceled, failure_message = operation.failure_message}
 	case .Scheduled, .Commanded:
 	}
-	return {status = .Failed, failure_message = "Child Workflow signal has not resolved"}
+	return {status = .Failed, failure_message = "Workflow signal has not resolved"}
+}
+
+schedule_external_signal_and_await :: proc(
+	ctx: ^Fiber_Context,
+	operation: Fiber_External_Signal_Operation,
+) -> Workflow_Signal_Result {
+	instance := ctx.instance
+	owned_operation := operation
+	instance.next_external_signal_seq += 1
+	owned_operation.seq = instance.next_external_signal_seq
+	owned_operation.state = .Scheduled
+	owned_operation.detached_from_root_cancellation = instance.detached_scope_depth > 0
+	append(&instance.external_signals, owned_operation)
+	instance.waiting_external_signal_seq = owned_operation.seq
+	instance.phase = .Waiting_External_Signal
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		mark_child_workflow_failure(
+			ctx,
+			"could not resume external Workflow signal await",
+			"OdinWorkflowSignalError",
+		)
+		return {status = .Failed, failure_message = "could not resume external Workflow signal await"}
+	}
+	operation_ptr, operation_found := find_external_signal_operation(instance, owned_operation.seq)
+	if !operation_found {
+		mark_child_workflow_failure(
+			ctx,
+			"external Workflow signal operation was not found",
+			"OdinWorkflowSignalError",
+		)
+		return {status = .Failed, failure_message = "external Workflow signal operation was not found"}
+	}
+	return workflow_signal_result_from_operation(operation_ptr)
 }
 
 signal_child_workflow_owned :: proc(
@@ -2667,37 +2780,13 @@ signal_child_workflow_owned :: proc(
 		codec.payload_free(&owned_input)
 		return {status = .Failed, failure_message = "could not preserve Child Workflow signal name"}
 	}
-	instance.next_external_signal_seq += 1
 	operation := Fiber_External_Signal_Operation{
-		seq = instance.next_external_signal_seq,
 		child_workflow_seq = future.seq,
 		child_workflow_id = child.workflow_id,
 		signal_name = owned_name,
 		input = owned_input,
-		state = .Scheduled,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
-	append(&instance.external_signals, operation)
-	instance.waiting_external_signal_seq = operation.seq
-	instance.phase = .Waiting_External_Signal
-	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
-		mark_child_workflow_failure(
-			ctx,
-			"could not resume Child Workflow signal await",
-			"OdinChildWorkflowSignalError",
-		)
-		return {status = .Failed, failure_message = "could not resume Child Workflow signal await"}
-	}
-	operation_ptr, operation_found := find_external_signal_operation(instance, operation.seq)
-	if !operation_found {
-		mark_child_workflow_failure(
-			ctx,
-			"Child Workflow signal operation was not found",
-			"OdinChildWorkflowSignalError",
-		)
-		return {status = .Failed, failure_message = "Child Workflow signal operation was not found"}
-	}
-	return child_workflow_signal_result_from_operation(operation_ptr)
+	return schedule_external_signal_and_await(ctx, operation)
 }
 
 signal_child_workflow_payload :: proc(
@@ -2730,6 +2819,164 @@ signal_child_workflow_json :: proc(
 		return {status = .Failed, failure_message = "could not encode Child Workflow signal as json/plain"}
 	}
 	return signal_child_workflow_owned(ctx, future, signal_name, payload)
+}
+
+signal_external_workflow_owned :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: codec.Payload,
+) -> External_Workflow_Signal_Result {
+	owned_input := input
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(execution.namespace) == 0 || len(execution.workflow_id) == 0 ||
+	   len(signal_name) == 0 {
+		codec.payload_free(&owned_input)
+		return {status = .Failed, failure_message = "invalid external Workflow signal"}
+	}
+	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		codec.payload_free(&owned_input)
+		return {status = .Canceled, failure_message = instance.cancellation_reason}
+	}
+	owned_namespace, namespace_error := strings.clone(
+		execution.namespace,
+		instance.odin_context.allocator,
+	)
+	owned_workflow_id, workflow_id_error := strings.clone(
+		execution.workflow_id,
+		instance.odin_context.allocator,
+	)
+	owned_run_id, run_id_error := strings.clone(execution.run_id, instance.odin_context.allocator)
+	owned_name, name_error := strings.clone(signal_name, instance.odin_context.allocator)
+	if namespace_error != nil || workflow_id_error != nil || run_id_error != nil ||
+	   name_error != nil {
+		codec.payload_free(&owned_input)
+		return {status = .Failed, failure_message = "could not preserve external Workflow signal"}
+	}
+	operation := Fiber_External_Signal_Operation{
+		namespace = owned_namespace,
+		child_workflow_id = owned_workflow_id,
+		run_id = owned_run_id,
+		signal_name = owned_name,
+		input = owned_input,
+	}
+	return schedule_external_signal_and_await(ctx, operation)
+}
+
+signal_external_workflow_payload :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: codec.Payload_View,
+) -> External_Workflow_Signal_Result {
+	if ctx == nil || ctx.instance == nil {
+		return {status = .Failed, failure_message = "invalid external Workflow signal context"}
+	}
+	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		return {status = .Failed, failure_message = "could not preserve external Workflow signal Payload"}
+	}
+	return signal_external_workflow_owned(ctx, execution, signal_name, owned_input)
+}
+
+signal_external_workflow_json :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: $T,
+) -> External_Workflow_Signal_Result {
+	if ctx == nil || ctx.instance == nil {
+		return {status = .Failed, failure_message = "invalid external Workflow signal context"}
+	}
+	payload, encode_error := codec.encode_json(input, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		return {status = .Failed, failure_message = "could not encode external Workflow signal as json/plain"}
+	}
+	return signal_external_workflow_owned(ctx, execution, signal_name, payload)
+}
+
+external_workflow_cancel_failure_cause_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_CancelExternalWorkflowExecutionFailedCause,
+) -> External_Workflow_Cancel_Failure_Cause {
+	switch value {
+	case .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND:
+		return .Workflow_Not_Found
+	case .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_NAMESPACE_NOT_FOUND:
+		return .Namespace_Not_Found
+	case .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_UNSPECIFIED:
+		return .Unspecified
+	}
+	return .Unspecified
+}
+
+request_cancel_external_workflow :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	reason := "external Workflow cancellation requested",
+) -> External_Workflow_Cancel_Result {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(execution.namespace) == 0 || len(execution.workflow_id) == 0 {
+		return {status = .Failed, failure_message = "invalid external Workflow cancellation request"}
+	}
+	instance := ctx.instance
+	owned_namespace, namespace_error := strings.clone(
+		execution.namespace,
+		instance.odin_context.allocator,
+	)
+	owned_workflow_id, workflow_id_error := strings.clone(
+		execution.workflow_id,
+		instance.odin_context.allocator,
+	)
+	owned_run_id, run_id_error := strings.clone(execution.run_id, instance.odin_context.allocator)
+	owned_reason, reason_error := strings.clone(reason, instance.odin_context.allocator)
+	if namespace_error != nil || workflow_id_error != nil || run_id_error != nil ||
+	   reason_error != nil {
+		return {status = .Failed, failure_message = "could not preserve external Workflow cancellation request"}
+	}
+	instance.next_external_cancel_seq += 1
+	operation := Fiber_External_Cancel_Operation{
+		seq = instance.next_external_cancel_seq,
+		namespace = owned_namespace,
+		workflow_id = owned_workflow_id,
+		run_id = owned_run_id,
+		reason = owned_reason,
+		state = .Scheduled,
+	}
+	append(&instance.external_cancels, operation)
+	instance.waiting_external_cancel_seq = operation.seq
+	instance.phase = .Waiting_External_Cancel
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		mark_child_workflow_failure(
+			ctx,
+			"could not resume external Workflow cancellation await",
+			"OdinExternalWorkflowCancellationError",
+		)
+		return {
+			status = .Failed,
+			failure_message = "could not resume external Workflow cancellation await",
+		}
+	}
+	resolved, found := find_external_cancel_operation(instance, operation.seq)
+	if !found {
+		mark_child_workflow_failure(
+			ctx,
+			"external Workflow cancellation operation was not found",
+			"OdinExternalWorkflowCancellationError",
+		)
+		return {
+			status = .Failed,
+			failure_message = "external Workflow cancellation operation was not found",
+		}
+	}
+	if resolved.state == .Resolved {
+		return {status = .Succeeded}
+	}
+	return {
+		status = .Failed,
+		failure_message = resolved.failure_message,
+		cause = resolved.cause,
+	}
 }
 
 activity_retry_state_from_proto :: proc(
@@ -3821,7 +4068,7 @@ append_fiber_cancel_child_workflow_command :: proc(
 	result.canceled_child_workflow_seq = operation.seq
 }
 
-append_fiber_signal_child_workflow_command :: proc(
+append_fiber_signal_external_workflow_command :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	operation: ^Fiber_External_Signal_Operation,
@@ -3831,8 +4078,20 @@ append_fiber_signal_child_workflow_command :: proc(
 	request := new(proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution)
 	request.seq = operation.seq
 	request.signal_name = operation.signal_name
-	request.target = proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id{
-		value = operation.child_workflow_id,
+	if operation.child_workflow_seq != 0 {
+		request.target = proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id{
+			value = operation.child_workflow_id,
+		}
+	} else {
+		execution := new(proto.Coresdk_Common_NamespacedWorkflowExecution)
+		execution^ = {
+			namespace = operation.namespace,
+			workflow_id = operation.child_workflow_id,
+			run_id = operation.run_id,
+		}
+		request.target = proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Workflow_Execution{
+			value = execution,
+		}
 	}
 	append(&request.args, payload^)
 	append(
@@ -3844,9 +4103,46 @@ append_fiber_signal_child_workflow_command :: proc(
 		},
 	)
 	operation.state = .Commanded
-	result.signaled_child_workflow = true
-	result.signaled_child_workflow_count += 1
-	result.child_workflow_signal_seq = operation.seq
+	if operation.child_workflow_seq != 0 {
+		result.signaled_child_workflow = true
+		result.signaled_child_workflow_count += 1
+		result.child_workflow_signal_seq = operation.seq
+	} else {
+		result.signaled_external_workflow = true
+		result.signaled_external_workflow_count += 1
+		result.external_workflow_signal_seq = operation.seq
+	}
+}
+
+append_fiber_request_cancel_external_workflow_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	operation: ^Fiber_External_Cancel_Operation,
+) {
+	execution := new(proto.Coresdk_Common_NamespacedWorkflowExecution)
+	execution^ = {
+		namespace = operation.namespace,
+		workflow_id = operation.workflow_id,
+		run_id = operation.run_id,
+	}
+	request := new(proto.Coresdk_Workflow_Commands_RequestCancelExternalWorkflowExecution)
+	request^ = {
+		seq = operation.seq,
+		workflow_execution = execution,
+		reason = operation.reason,
+	}
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_External_Workflow_Execution{
+				value = request,
+			},
+		},
+	)
+	operation.state = .Commanded
+	result.requested_external_workflow_cancellation = true
+	result.requested_external_workflow_cancellation_count += 1
+	result.external_workflow_cancellation_seq = operation.seq
 }
 
 append_fiber_cancel_external_signal_command :: proc(
@@ -3865,7 +4161,11 @@ append_fiber_cancel_external_signal_command :: proc(
 		},
 	)
 	operation.state = .Canceled
-	result.canceled_child_workflow_signal = true
+	if operation.child_workflow_seq != 0 {
+		result.canceled_child_workflow_signal = true
+	} else {
+		result.canceled_external_workflow_signal = true
+	}
 }
 
 append_fiber_external_signal_cancellations :: proc(
@@ -3900,10 +4200,12 @@ Workflow_Command_State :: struct {
 	next_timer_seq:    u32,
 	next_child_workflow_seq: u32,
 	next_external_signal_seq: u32,
+	next_external_cancel_seq: u32,
 	activity_count:    int,
 	timer_count:       int,
 	child_workflow_count: int,
 	external_signal_count: int,
+	external_cancel_count: int,
 }
 
 workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_State {
@@ -3913,10 +4215,12 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 		next_timer_seq = instance.next_timer_seq,
 		next_child_workflow_seq = instance.next_child_workflow_seq,
 		next_external_signal_seq = instance.next_external_signal_seq,
+		next_external_cancel_seq = instance.next_external_cancel_seq,
 		activity_count = len(instance.activities),
 		timer_count = len(instance.timers),
 		child_workflow_count = len(instance.child_workflows),
 		external_signal_count = len(instance.external_signals),
+		external_cancel_count = len(instance.external_cancels),
 	}
 }
 
@@ -3929,10 +4233,12 @@ workflow_command_state_changed :: proc(
 		instance.next_timer_seq != before.next_timer_seq ||
 		instance.next_child_workflow_seq != before.next_child_workflow_seq ||
 		instance.next_external_signal_seq != before.next_external_signal_seq ||
+		instance.next_external_cancel_seq != before.next_external_cancel_seq ||
 		len(instance.activities) != before.activity_count ||
 		len(instance.timers) != before.timer_count ||
 		len(instance.child_workflows) != before.child_workflow_count ||
-		len(instance.external_signals) != before.external_signal_count
+		len(instance.external_signals) != before.external_signal_count ||
+		len(instance.external_cancels) != before.external_cancel_count
 }
 
 restore_workflow_command_state :: proc(
@@ -3944,6 +4250,7 @@ restore_workflow_command_state :: proc(
 	instance.next_timer_seq = before.next_timer_seq
 	instance.next_child_workflow_seq = before.next_child_workflow_seq
 	instance.next_external_signal_seq = before.next_external_signal_seq
+	instance.next_external_cancel_seq = before.next_external_cancel_seq
 	for len(instance.activities) > before.activity_count {
 		ordered_remove(&instance.activities, len(instance.activities) - 1)
 	}
@@ -3955,6 +4262,9 @@ restore_workflow_command_state :: proc(
 	}
 	for len(instance.external_signals) > before.external_signal_count {
 		ordered_remove(&instance.external_signals, len(instance.external_signals) - 1)
+	}
+	for len(instance.external_cancels) > before.external_cancel_count {
+		ordered_remove(&instance.external_cancels, len(instance.external_cancels) - 1)
 	}
 }
 
@@ -4165,6 +4475,9 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		operation, found := find_external_signal_operation(instance, routine.waiting_external_signal_seq)
 		return found && (operation.state == .Resolved || operation.state == .Failed ||
 			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_External_Cancel:
+		operation, found := find_external_cancel_operation(instance, routine.waiting_external_cancel_seq)
+		return found && (operation.state == .Resolved || operation.state == .Failed)
 	case .Waiting_Timer:
 		operation, found := find_timer_operation(instance, routine.waiting_timer_seq)
 		return found && (operation.state == .Resolved || operation.state == .Cancel_Requested ||
@@ -4192,6 +4505,7 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		routine.waiting_activity_seq = 0
 		routine.waiting_child_workflow_seq = 0
 		routine.waiting_external_signal_seq = 0
+		routine.waiting_external_cancel_seq = 0
 		routine.waiting_timer_seq = 0
 		routine.waiting_signal_name = ""
 		resume_error := resume_signal_routine(routine)
@@ -4387,6 +4701,9 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		operation, found := find_external_signal_operation(instance, routine.waiting_external_signal_seq)
 		return found && (operation.state == .Resolved || operation.state == .Failed ||
 			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_External_Cancel:
+		operation, found := find_external_cancel_operation(instance, routine.waiting_external_cancel_seq)
+		return found && (operation.state == .Resolved || operation.state == .Failed)
 	case .Waiting_Timer:
 		operation, found := find_timer_operation(instance, routine.waiting_timer_seq)
 		return found && (operation.state == .Resolved || operation.state == .Cancel_Requested ||
@@ -4414,6 +4731,7 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		routine.waiting_activity_seq = 0
 		routine.waiting_child_workflow_seq = 0
 		routine.waiting_external_signal_seq = 0
+		routine.waiting_external_cancel_seq = 0
 		routine.waiting_timer_seq = 0
 		routine.waiting_signal_name = ""
 		resume_error := resume_update_routine(routine)
@@ -4627,7 +4945,13 @@ append_shared_operation_commands :: proc(
 	for index in 0..<len(instance.external_signals) {
 		operation := &instance.external_signals[index]
 		if operation.state == .Scheduled {
-			append_fiber_signal_child_workflow_command(result, commands, operation)
+			append_fiber_signal_external_workflow_command(result, commands, operation)
+		}
+	}
+	for index in 0..<len(instance.external_cancels) {
+		operation := &instance.external_cancels[index]
+		if operation.state == .Scheduled {
+			append_fiber_request_cancel_external_workflow_command(result, commands, operation)
 		}
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
@@ -4651,6 +4975,7 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Child_Workflow:
 		result.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	case .Waiting_External_Signal:
+	case .Waiting_External_Cancel:
 	case .Waiting_Timer:
 	case .Waiting_Signal:
 		result.waiting_signal = true
@@ -5071,9 +5396,9 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 				operation.start_state = .Failed
 				operation.failure_message = "Child Workflow failed to start"
-				if status.value.cause == .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS {
-					operation.start_failure_cause = .Workflow_Already_Exists
-				}
+				operation.start_failure_cause = child_workflow_start_failure_cause_from_proto(
+					status.value.cause,
+				)
 			case proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Cancelled:
 				resolution_handled = true
 				if status.value == nil || status.value.failure == nil {
@@ -5172,27 +5497,35 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Signal_External_Workflow:
 			handled = true
 			if variant.value == nil || !instance_found {
-				process_error(&result, activation.run_id, "Child Workflow signal resolution has no Workflow fiber")
+				process_error(&result, activation.run_id, "external Workflow signal resolution has no Workflow fiber")
 				return
 			}
 			operation, operation_found := find_external_signal_operation(instance, variant.value.seq)
 			if !operation_found {
-				process_error(&result, activation.run_id, "Child Workflow signal resolution does not match a pending operation")
+				process_error(&result, activation.run_id, "external Workflow signal resolution does not match a pending operation")
 				return
 			}
 			if operation.state == .Resolved || operation.state == .Failed {
-				result.resolved_child_workflow_signal_seq = operation.seq
+				if operation.child_workflow_seq != 0 {
+					result.resolved_child_workflow_signal_seq = operation.seq
+				} else {
+					result.resolved_external_workflow_signal_seq = operation.seq
+				}
 				continue
 			}
 			if operation.state != .Commanded && operation.state != .Cancel_Requested && operation.state != .Canceled {
-				process_error(&result, activation.run_id, "Child Workflow signal resolution does not match a commanded operation")
+				process_error(&result, activation.run_id, "external Workflow signal resolution does not match a commanded operation")
 				return
 			}
 			was_canceled := operation.state == .Cancel_Requested || operation.state == .Canceled
 			if variant.value.failure == nil {
 				if was_canceled {
 					operation.state = .Canceled
-					result.canceled_child_workflow_signal = true
+					if operation.child_workflow_seq != 0 {
+						result.canceled_child_workflow_signal = true
+					} else {
+						result.canceled_external_workflow_signal = true
+					}
 				} else {
 					operation.state = .Resolved
 				}
@@ -5202,12 +5535,12 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(variant.value.failure)
 				context.allocator = previous_allocator
 				if allocation_error != nil || len(failure_proto) == 0 {
-					process_error(&result, activation.run_id, "could not preserve Child Workflow signal failure")
+					process_error(&result, activation.run_id, "could not preserve external Workflow signal failure")
 					return
 				}
 				operation.failure_message = failure_message
 				operation.failure_proto = failure_proto[:]
-				operation.cause = child_workflow_signal_failure_cause_from_proto(variant.value.cause)
+				operation.cause = workflow_signal_failure_cause_from_proto(variant.value.cause)
 				canceled_failure := false
 				#partial switch failure_info in variant.value.failure.failure_info {
 				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
@@ -5215,13 +5548,57 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 				if was_canceled || canceled_failure {
 					operation.state = .Canceled
-					result.canceled_child_workflow_signal = true
+					if operation.child_workflow_seq != 0 {
+						result.canceled_child_workflow_signal = true
+					} else {
+						result.canceled_external_workflow_signal = true
+					}
 				} else {
 					operation.state = .Failed
-					result.resolved_child_workflow_signal_failed = true
+					if operation.child_workflow_seq != 0 {
+						result.resolved_child_workflow_signal_failed = true
+					} else {
+						result.resolved_external_workflow_signal_failed = true
+					}
 				}
 			}
-			result.resolved_child_workflow_signal_seq = operation.seq
+			if operation.child_workflow_seq != 0 {
+				result.resolved_child_workflow_signal_seq = operation.seq
+			} else {
+				result.resolved_external_workflow_signal_seq = operation.seq
+			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Request_Cancel_External_Workflow:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "external Workflow cancellation resolution has no Workflow fiber")
+				return
+			}
+			operation, operation_found := find_external_cancel_operation(instance, variant.value.seq)
+			if !operation_found || operation.state != .Commanded {
+				process_error(&result, activation.run_id, "external Workflow cancellation resolution does not match a pending operation")
+				return
+			}
+			if variant.value.failure == nil {
+				operation.state = .Resolved
+			} else {
+				context.allocator = instance.odin_context.allocator
+				failure_message, allocation_error := strings.clone(variant.value.failure.message)
+				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(variant.value.failure)
+				context.allocator = previous_allocator
+				if allocation_error != nil || len(failure_proto) == 0 {
+					process_error(&result, activation.run_id, "could not preserve external Workflow cancellation failure")
+					return
+				}
+				operation.failure_message = failure_message
+				operation.failure_proto = failure_proto[:]
+				operation.cause = external_workflow_cancel_failure_cause_from_proto(
+					variant.value.cause,
+				)
+				operation.state = .Failed
+				result.resolved_external_workflow_cancellation_failed = true
+			}
+			result.resolved_external_workflow_cancellation_seq = operation.seq
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow:
 			handled = true
@@ -5378,6 +5755,9 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			operation, found := find_external_signal_operation(instance, instance.waiting_external_signal_seq)
 			should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
 				operation.state == .Cancel_Requested || operation.state == .Canceled)
+		case .Waiting_External_Cancel:
+			operation, found := find_external_cancel_operation(instance, instance.waiting_external_cancel_seq)
+			should_resume = found && (operation.state == .Resolved || operation.state == .Failed)
 		case .Waiting_Timer:
 			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
 			should_resume = found && (operation.state == .Resolved ||
@@ -5400,6 +5780,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			instance.waiting_activity_seq = 0
 			instance.waiting_child_workflow_seq = 0
 			instance.waiting_external_signal_seq = 0
+			instance.waiting_external_cancel_seq = 0
 			instance.waiting_timer_seq = 0
 			instance.waiting_signal_name = ""
 			resume_result := fiber_raw.resume(instance.fiber)

@@ -97,7 +97,9 @@ warnings promoted to errors. It then runs a separate property suite from
 `tests_pbt` against the pinned PBT and statechart submodules. That suite generates
 500 signal/timer/cancellation activation batches across nine ordering classes,
 forces eviction, reconstructs a fresh fiber, and requires the decisive
-`WorkflowActivationCompletion` bytes to match replay exactly. PBT is a
+`WorkflowActivationCompletion` bytes to match replay exactly. Separate
+500-case properties cover Child and external Workflow commands and exact
+fresh-stack replay. PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
 statechart lifecycle model. Its own package tests currently contain an upstream
@@ -596,7 +598,12 @@ generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
 and Parent Close Policy combinations, plus generated signal names and JSON
 payloads. It checks every encoded `StartChildWorkflowExecution` and
 `SignalExternalWorkflowExecution` field and requires both commands to be
-byte-identical after eviction and fresh-stack replay. The Client property generates another
+byte-identical after eviction and fresh-stack replay. The external Workflow
+property generates 500 namespace/Workflow ID/optional Run ID identities,
+signal names, JSON payloads, and cancellation reasons. It checks exact
+`NamespacedWorkflowExecution` targets for signal and cancellation commands and
+requires both completions to be byte-identical after eviction and fresh-stack
+replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
 the generated value. The query property generates 500 success/failure
@@ -716,7 +723,7 @@ temporal workflow execute \
 ```
 
 The example stops after two durable Workflow Executions reach terminal state
-and Core evicts both cached fibers. `scripts/integration-test.sh` runs three
+and Core evicts both cached fibers. `scripts/integration-test.sh` runs these
 server-backed paths automatically:
 
 - successful typed child result delivery;
@@ -728,7 +735,13 @@ server-backed paths automatically:
 - signaling a child through its Workflow-local Future and waiting for Core's
   `ResolveSignalExternalWorkflow` acknowledgement;
 - explicit child cancellation through the Future while the parent remains live
-  and completes normally after observing the canceled child result.
+  and completes normally after observing the canceled child result;
+- a second start with the same running child ID, producing Core's
+  `WorkflowAlreadyExists` start resolution before the first child is canceled;
+- two independent Workflows where one sends an external signal, waits for
+  `ResolveSignalExternalWorkflow`, requests target cancellation, waits for
+  `ResolveRequestCancelExternalWorkflow`, and completes while the target closes
+  as canceled.
 
 The unit suite additionally evicts the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
@@ -739,7 +752,9 @@ Failure wrapper. The 500-case Child Workflow property varies start options,
 signal names, and signal Payloads, then requires exact fresh-stack replay of
 both commands. A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
-the parent closes as canceled.
+the parent closes as canceled. External-operation unit tests inspect namespace,
+Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
+and fresh-stack replay bytes.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

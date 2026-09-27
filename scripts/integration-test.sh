@@ -976,3 +976,109 @@ cat "$worker_log"
 grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
 grep -q 'resolved=1 .*completed=true' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin duplicate Child Workflow Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_duplicate_parent_id="odin-sdk-child-duplicate-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$child_duplicate_parent_id" \
+  --type odin_child_duplicate_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"cancel-duplicate"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+child_duplicate_output="$(<"$workflow_output_file")"
+echo "$child_duplicate_output"
+grep -q '"status": "COMPLETED"' <<<"$child_duplicate_output"
+grep -q 'Observed Child Workflow Already Exists start failure' <<<"$child_duplicate_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'started=1 start_resolved=0' "$worker_log"
+grep -q 'start_resolved=2' "$worker_log"
+grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin external Workflow operation Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+external_suffix="$$-$(date +%s)"
+external_target_id="odin-sdk-external-target-$external_suffix"
+external_caller_id="odin-sdk-external-caller-$external_suffix"
+temporal workflow execute \
+  --workflow-id "$external_target_id" \
+  --type odin_external_target_workflow \
+  --task-queue odin-child-workflow \
+  --input '"target"' \
+  --command-timeout 30s \
+  --output json >"$workflow_control_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq 'history=3 .*completed=false' "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "External target Workflow did not reach its signal await" >&2
+    cat "$worker_log" >&2
+    cat "$workflow_control_output_file" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+temporal workflow execute \
+  --workflow-id "$external_caller_id" \
+  --type odin_external_caller_workflow \
+  --task-queue odin-child-workflow \
+  --input "\"$external_target_id\"" \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+external_caller_output="$(<"$workflow_output_file")"
+echo "$external_caller_output"
+grep -q '"status": "COMPLETED"' <<<"$external_caller_output"
+grep -q 'External Workflow signaled and cancellation requested' <<<"$external_caller_output"
+
+external_target_cli_status=0
+wait "$workflow_cli_pid" || external_target_cli_status=$?
+workflow_cli_pid=""
+external_target_output="$(<"$workflow_control_output_file")"
+echo "$external_target_output"
+[[ "$external_target_cli_status" -eq 0 || "$external_target_cli_status" -eq 1 ]]
+grep -q '"status": "CANCELED"' <<<"$external_target_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'signaled=1' "$worker_log"
+grep -q 'signal_resolved=1' "$worker_log"
+grep -q 'external_cancel_requested=true' "$worker_log"
+grep -q 'external_cancel_resolved=1' "$worker_log"
+grep -q 'canceled_workflow=true' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"

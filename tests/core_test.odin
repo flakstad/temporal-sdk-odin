@@ -698,6 +698,309 @@ workflow_cancellation_cancels_in_flight_child_signal :: proc(t: ^testing.T) {
 }
 
 @(test)
+child_workflow_start_failure_is_catchable :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"child_start_failure_test_workflow",
+		"parent-task-queue",
+		child_start_failure_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "child_start_failure_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "child-start-failure-parent-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.started_child_workflow)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	start_failed := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStartFailure{
+		workflow_id = "duplicate-child-id",
+		workflow_type = "child_start_failure_workflow",
+		cause = .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS,
+	}
+	resolve_start := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Failed{
+			value = &start_failed,
+		},
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution_Start{
+				value = &resolve_start,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "Child start failure resolution failed: %s", string(completed.error.message))
+	testing.expect_value(t, completed.resolved_child_workflow_start_seq, u32(1))
+	testing.expect(t, completed.completed)
+	completion := inspect_workflow_completion(completed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(
+		t,
+		string(completion.completion_result),
+		`"Observed Child Workflow start failure"`,
+	)
+	delete(completion.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+external_workflow_signal_and_cancel_are_replay_safe :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"external_signal_cancel_test_workflow",
+		"caller-task-queue",
+		external_signal_cancel_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("target-workflow")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "external_signal_cancel_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "external-signal-cancel-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "external signal scheduling failed: %s", string(initial.error.message))
+	testing.expect(t, initial.signaled_external_workflow)
+	testing.expect(t, !initial.signaled_child_workflow)
+	initial_bytes := bytes.clone(initial.completion[:])
+	signal_command := inspect_workflow_completion(initial.completion[:])
+	testing.expect_value(t, signal_command.command_count, 1)
+	testing.expect_value(t, signal_command.child_workflow_signal_seq, u32(1))
+	testing.expect_value(t, string(signal_command.external_workflow_signal_namespace), "billing")
+	testing.expect_value(t, string(signal_command.external_workflow_signal_id), "target-workflow")
+	testing.expect_value(t, string(signal_command.external_workflow_signal_run_id), "target-run")
+	testing.expect_value(t, string(signal_command.child_workflow_signal_name), "approve")
+	testing.expect_value(t, string(signal_command.child_workflow_signal_input), `"approved-by-caller"`)
+	delete(signal_command.child_workflow_signal_name)
+	delete(signal_command.child_workflow_signal_input)
+	delete(signal_command.external_workflow_signal_namespace)
+	delete(signal_command.external_workflow_signal_id)
+	delete(signal_command.external_workflow_signal_run_id)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	resolve_signal := proto.Coresdk_Workflow_Activation_ResolveSignalExternalWorkflow{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Signal_External_Workflow{
+				value = &resolve_signal,
+			},
+		},
+	)
+	cancel_requested := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, cancel_requested.error.message == nil, "external cancellation scheduling failed: %s", string(cancel_requested.error.message))
+	testing.expect_value(t, cancel_requested.resolved_external_workflow_signal_seq, u32(1))
+	testing.expect_value(t, cancel_requested.resolved_child_workflow_signal_seq, u32(0))
+	testing.expect(t, cancel_requested.requested_external_workflow_cancellation)
+	cancel_command := inspect_workflow_completion(cancel_requested.completion[:])
+	testing.expect_value(t, cancel_command.command_count, 1)
+	testing.expect_value(t, cancel_command.external_workflow_cancel_seq, u32(1))
+	testing.expect_value(t, string(cancel_command.external_workflow_cancel_namespace), "billing")
+	testing.expect_value(t, string(cancel_command.external_workflow_cancel_id), "target-workflow")
+	testing.expect_value(t, string(cancel_command.external_workflow_cancel_run_id), "target-run")
+	testing.expect_value(t, string(cancel_command.external_workflow_cancel_reason), "caller requested cancellation")
+	delete(cancel_command.external_workflow_cancel_namespace)
+	delete(cancel_command.external_workflow_cancel_id)
+	delete(cancel_command.external_workflow_cancel_run_id)
+	delete(cancel_command.external_workflow_cancel_reason)
+	delete(cancel_requested.completion)
+	workflow.error_free(&cancel_requested.error)
+
+	resolve_cancel := proto.Coresdk_Workflow_Activation_ResolveRequestCancelExternalWorkflow{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 11
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Request_Cancel_External_Workflow{
+				value = &resolve_cancel,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "external cancellation resolution failed: %s", string(completed.error.message))
+	testing.expect_value(t, completed.resolved_external_workflow_cancellation_seq, u32(1))
+	testing.expect(t, completed.completed)
+	completion := inspect_workflow_completion(completed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(t, string(completion.completion_result), `"External Workflow signaled and canceled"`)
+	delete(completion.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+external_workflow_cancel_failure_cause_is_catchable :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"external_cancel_failure_test_workflow",
+		"caller-task-queue",
+		external_cancel_failure_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("missing-workflow")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "external_cancel_failure_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "external-cancel-failure-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.requested_external_workflow_cancellation)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "External Workflow cancellation failed",
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveRequestCancelExternalWorkflow{
+		seq = 1,
+		failure = &failure,
+		cause = .CANCEL_EXTERNAL_WORKFLOW_EXECUTION_FAILED_CAUSE_EXTERNAL_WORKFLOW_EXECUTION_NOT_FOUND,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Request_Cancel_External_Workflow{
+				value = &resolve,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "external cancellation failure resolution failed: %s", string(completed.error.message))
+	testing.expect(t, completed.resolved_external_workflow_cancellation_failed)
+	testing.expect(t, completed.completed)
+	completion := inspect_workflow_completion(completed.completion[:])
+	testing.expect_value(t, string(completion.completion_result), `"Observed external Workflow cancellation failure"`)
+	delete(completion.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -1454,6 +1757,76 @@ child_signal_failure_test_workflow :: proc(
 	return "Child Workflow signal failure mismatch"
 }
 
+child_start_failure_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	future := workflow.start_child_workflow_json(
+		ctx,
+		"child_start_failure_workflow",
+		input,
+		{
+			workflow_id = "duplicate-child-id",
+			workflow_execution_timeout = 10 * time.Minute,
+		},
+	)
+	start := workflow.await_child_workflow_start(ctx, future)
+	if start.status == .Failed && start.cause == .Workflow_Already_Exists &&
+	   start.workflow_id == "duplicate-child-id" &&
+	   start.workflow_type == "child_start_failure_workflow" {
+		return "Observed Child Workflow start failure"
+	}
+	return "Child Workflow start failure mismatch"
+}
+
+external_signal_cancel_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	workflow_id: string,
+) -> string {
+	execution := workflow.External_Workflow_Execution{
+		namespace = "billing",
+		workflow_id = workflow_id,
+		run_id = "target-run",
+	}
+	signal := workflow.signal_external_workflow_json(
+		ctx,
+		execution,
+		"approve",
+		"approved-by-caller",
+	)
+	if signal.status != .Succeeded {
+		return "External Workflow signal failed"
+	}
+	cancel := workflow.request_cancel_external_workflow(
+		ctx,
+		execution,
+		"caller requested cancellation",
+	)
+	if cancel.status != .Succeeded {
+		return "External Workflow cancellation failed"
+	}
+	return "External Workflow signaled and canceled"
+}
+
+external_cancel_failure_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	workflow_id: string,
+) -> string {
+	result := workflow.request_cancel_external_workflow(
+		ctx,
+		{
+			namespace = "default",
+			workflow_id = workflow_id,
+		},
+		"cancel missing Workflow",
+	)
+	if result.status == .Failed && result.cause == .Workflow_Not_Found &&
+	   result.failure_message == "External Workflow cancellation failed" {
+		return "Observed external Workflow cancellation failure"
+	}
+	return "External Workflow cancellation failure mismatch"
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -1668,6 +2041,14 @@ Workflow_Completion_Inspection :: struct {
 	child_workflow_signal_id: []u8,
 	child_workflow_signal_name: []u8,
 	child_workflow_signal_input: []u8,
+	external_workflow_signal_namespace: []u8,
+	external_workflow_signal_id: []u8,
+	external_workflow_signal_run_id: []u8,
+	external_workflow_cancel_seq: u32,
+	external_workflow_cancel_namespace: []u8,
+	external_workflow_cancel_id: []u8,
+	external_workflow_cancel_run_id: []u8,
+	external_workflow_cancel_reason: []u8,
 	canceled_external_signal_seq: u32,
 	canceled_timer_seq:     u32,
 	canceled_activity_seq:  u32,
@@ -1731,6 +2112,18 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 						inspection.child_workflow_signal_id = bytes.clone(
 							transmute([]u8)target.value,
 						)
+					case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Workflow_Execution:
+						if target.value != nil {
+							inspection.external_workflow_signal_namespace = bytes.clone(
+								transmute([]u8)target.value.namespace,
+							)
+							inspection.external_workflow_signal_id = bytes.clone(
+								transmute([]u8)target.value.workflow_id,
+							)
+							inspection.external_workflow_signal_run_id = bytes.clone(
+								transmute([]u8)target.value.run_id,
+							)
+						}
 					}
 					if len(variant.value.args) == 1 {
 						inspection.child_workflow_signal_input = bytes.clone(variant.value.args[0].data)
@@ -1739,6 +2132,24 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Signal_Workflow:
 				if variant.value != nil {
 					inspection.canceled_external_signal_seq = variant.value.seq
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_External_Workflow_Execution:
+				if variant.value != nil {
+					inspection.external_workflow_cancel_seq = variant.value.seq
+					inspection.external_workflow_cancel_reason = bytes.clone(
+						transmute([]u8)variant.value.reason,
+					)
+					if variant.value.workflow_execution != nil {
+						inspection.external_workflow_cancel_namespace = bytes.clone(
+							transmute([]u8)variant.value.workflow_execution.namespace,
+						)
+						inspection.external_workflow_cancel_id = bytes.clone(
+							transmute([]u8)variant.value.workflow_execution.workflow_id,
+						)
+						inspection.external_workflow_cancel_run_id = bytes.clone(
+							transmute([]u8)variant.value.workflow_execution.run_id,
+						)
+					}
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Timer:
 				if variant.value != nil {

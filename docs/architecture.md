@@ -6,7 +6,7 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
-Activity/Workflow worker registry and poll loop, updated 2026-09-26. The Activity slice now also has a
+Activity/Workflow worker registry and poll loop, updated 2026-09-27. The Activity slice now also has a
 generic Temporal Payload boundary, typed JSON Activity registration, and
 structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
@@ -1415,7 +1415,8 @@ Workflows are enabled.
    synchronous and Activity-awaiting validated Updates, default/suppressed
    unfinished-handler warnings, explicit handler draining, root cancellation,
    synchronous/asynchronous Signal handlers, preemptively detached operations,
-   and detached Update/Activity cleanup across fresh-stack replay. It does not
+   detached Update/Activity cleanup, Child Workflows, and external Workflow
+   signal/cancel operations across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
    accepted Updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
@@ -1448,7 +1449,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, registered dispatch, eviction, and replay on macOS arm64 | Add external-Workflow operations and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, registered dispatch, eviction, and replay on macOS arm64 | Add Continue-As-New and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1468,14 +1469,17 @@ Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
-500 Child Workflow option/signal/replay cases, and 1,000 statechart-backed Update lifecycle traces,
+500 Child Workflow option/signal/replay cases, 500 external Workflow
+signal/cancel/replay cases, and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for
-await, signal, and explicit cancellation. The next smallest extension is live
-start-failure coverage and richer recursive failure inspection, followed by
-general external-Workflow signal/cancel operations.
+await, signal, and explicit cancellation. A live duplicate-ID case proves the
+Core-local `WorkflowAlreadyExists` start failure. External Workflow signal and
+cancellation are also implemented and live-proven. The next smallest durable
+control-flow extension is `ContinueAsNewWorkflowExecution`; richer recursive
+failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1574,6 +1578,12 @@ command. Signal failures expose Core's not-found, namespace-not-found, and
 signal-count-limit causes. Both signal command bytes and their generated input
 Payloads are covered by eviction/fresh-stack replay properties.
 
+The API enum for `StartChildWorkflowExecutionFailedCause` has additional
+namespace/versioning values, but the pinned Core activation schema deliberately
+uses its narrower Core-local enum containing only `Unspecified` and
+`WorkflowAlreadyExists`. Odin therefore does not expose causes that Core cannot
+deliver across this boundary.
+
 The CLI-devserver acceptance test registers parent and child Workflow types on
 one Odin worker and task queue. Temporal starts the child as a distinct durable
 execution. Success returns the child's typed result, failure produces a real
@@ -1586,3 +1596,43 @@ Temporal Service -> child activation -> Core -> Odin child fiber
 Odin child completion -> Core -> Temporal Service
 Temporal Service -> child completion resolution -> Core -> Odin parent fiber
 ```
+
+### External Workflow operation boundary
+
+External Workflow signal and cancellation likewise require no new C symbol.
+They use the existing activation/completion protobuf channel:
+
+- `SignalExternalWorkflowExecution` targets a
+  `NamespacedWorkflowExecution { namespace, workflow_id, run_id }`, carries one
+  language-assigned signal sequence and generic Payload arguments, and resolves
+  through `ResolveSignalExternalWorkflow`.
+- `RequestCancelExternalWorkflowExecution` targets the same identity, uses its
+  own language-assigned cancellation sequence and optional reason, and resolves
+  through `ResolveRequestCancelExternalWorkflow`.
+- A missing run ID means the current execution for that Workflow ID. Namespace
+  and Workflow ID are required by the Odin boundary.
+- Signals and cancellation requests have independent sequence spaces because
+  Core resolves them through different activation job types.
+
+The execution identity, signal name, reason, Payload, failure text, and encoded
+failure bytes are copied into the Workflow instance arena before the user fiber
+can suspend. `signal_external_workflow_payload` clones its borrowed Payload;
+`signal_external_workflow_owned` consumes an owned Payload. Returned strings are
+Workflow-owned views and must not escape the execution. Eviction destroys this
+state; deterministic replay recreates it from Workflow code and history.
+
+Core owns server delivery and maps history events back to the matching `seq`.
+Odin owns validation, sequence allocation, command construction, suspension,
+resolution lookup, failure-cause mapping, and fiber resumption. Signal failures
+map `WorkflowNotFound`, `NamespaceNotFound`, and `SignalCountLimitExceeded`;
+cancellation failures map the first two. Root Workflow cancellation can cancel
+an in-flight signal through `CancelSignalWorkflow`. An already-issued external
+cancellation request is itself cleanup work and remains awaited until Core
+resolves it rather than being canceled locally.
+
+The acceptance test starts two independent Odin Workflow executions. The caller
+signals the target, waits for acknowledgement, requests target cancellation,
+waits for that acknowledgement, and completes. The target observes the signal
+and then closes as canceled. Unit and 500-case property tests additionally
+require both outbound command completions to be byte-identical after eviction
+and fresh-stack replay.

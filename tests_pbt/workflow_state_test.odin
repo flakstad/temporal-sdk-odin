@@ -1557,6 +1557,282 @@ child_workflow_options_replay_for_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_External_Workflow_Input :: struct {
+	namespace:   string,
+	workflow_id: string,
+	run_id:      string,
+	signal_name: string,
+	signal_value: string,
+	cancel_reason: string,
+}
+
+generated_external_workflow_operations :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_External_Workflow_Input,
+) -> string {
+	execution := workflow.External_Workflow_Execution{
+		namespace = input.namespace,
+		workflow_id = input.workflow_id,
+		run_id = input.run_id,
+	}
+	signal := workflow.signal_external_workflow_json(
+		ctx,
+		execution,
+		input.signal_name,
+		input.signal_value,
+	)
+	if signal.status != .Succeeded {
+		return "signal failed"
+	}
+	cancel := workflow.request_cancel_external_workflow(ctx, execution, input.cancel_reason)
+	if cancel.status != .Succeeded {
+		return "cancel failed"
+	}
+	return "done"
+}
+
+generated_external_signal_match :: proc(
+	data: []u8,
+	expected: ^Generated_External_Workflow_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
+			if variant.value == nil || variant.value.seq != 1 ||
+			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 {
+				return false
+			}
+			#partial switch target in variant.value.target {
+			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Workflow_Execution:
+				if target.value == nil || target.value.namespace != expected.namespace ||
+				   target.value.workflow_id != expected.workflow_id || target.value.run_id != expected.run_id {
+					return false
+				}
+			case:
+				return false
+			}
+			expected_payload, encode_error := codec.encode_json(expected.signal_value)
+			if encode_error != .None {
+				return false
+			}
+			defer codec.payload_free(&expected_payload)
+			return bytes.equal(variant.value.args[0].data, expected_payload.data)
+		}
+	}
+	return false
+}
+
+generated_external_cancel_match :: proc(
+	data: []u8,
+	expected: ^Generated_External_Workflow_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_External_Workflow_Execution:
+			request := variant.value
+			return request != nil && request.seq == 1 && request.reason == expected.cancel_reason &&
+				request.workflow_execution != nil &&
+				request.workflow_execution.namespace == expected.namespace &&
+				request.workflow_execution.workflow_id == expected.workflow_id &&
+				request.workflow_execution.run_id == expected.run_id
+		}
+	}
+	return false
+}
+
+external_workflow_operations_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	input_value := Generated_External_Workflow_Input{
+		namespace = pbt.draw(t, pbt.string_ascii(1, 24)),
+		workflow_id = pbt.draw(t, pbt.string_ascii(1, 48)),
+		run_id = pbt.draw(t, pbt.string_ascii(0, 48)),
+		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
+		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		cancel_reason = pbt.draw(t, pbt.string_ascii(0, 64)),
+	}
+	pbt.cover(t, len(input_value.run_id) == 0, 0.2, "current run target")
+	pbt.cover(t, len(input_value.run_id) > 32, 15.0, "specific long run id")
+	pbt.cover(t, len(input_value.cancel_reason) == 0, 0.2, "empty cancellation reason")
+
+	owned_queue, queue_error := strings.clone("pbt-external-workflow-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate external Workflow queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_external_workflow_operations",
+		generated_external_workflow_operations,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register external Workflow operation Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated external Workflow input")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_external_workflow_operations",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-external-workflow-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.signaled_external_workflow ||
+	   initial.signaled_child_workflow ||
+	   !generated_external_signal_match(initial.completion[:], &input_value) {
+		return pbt.fail("generated external Workflow signal changed across command encoding")
+	}
+
+	resolve_signal := proto.Coresdk_Workflow_Activation_ResolveSignalExternalWorkflow{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Signal_External_Workflow{
+				value = &resolve_signal,
+			},
+		},
+	)
+	canceled := process_activation(runtime, &activation)
+	defer destroy_process_result(&canceled)
+	if canceled.error.message != nil || !canceled.requested_external_workflow_cancellation ||
+	   !generated_external_cancel_match(canceled.completion[:], &input_value) {
+		return pbt.fail("generated external Workflow cancellation changed across command encoding")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated external Workflow operation Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_signal := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed_signal)
+	if replayed_signal.error.message != nil ||
+	   !bytes.equal(initial.completion[:], replayed_signal.completion[:]) {
+		return pbt.fail("generated external Workflow signal replay changed command bytes")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Signal_External_Workflow{
+				value = &resolve_signal,
+			},
+		},
+	)
+	replayed_cancel := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed_cancel)
+	if replayed_cancel.error.message != nil ||
+	   !bytes.equal(canceled.completion[:], replayed_cancel.completion[:]) {
+		return pbt.fail("generated external Workflow cancellation replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+external_workflow_operations_replay_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"External Workflow signals and cancellations survive generated encoding and replay",
+		external_workflow_operations_replay_property,
+		{num_tests = 500, seed = 0x4558_5445_524e_414c},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

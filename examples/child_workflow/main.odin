@@ -17,6 +17,9 @@ FAILURE_CHILD_WORKFLOW_TYPE :: "odin_failing_child_workflow"
 SIGNAL_PARENT_WORKFLOW_TYPE :: "odin_child_signal_parent_workflow"
 SIGNAL_CHILD_WORKFLOW_TYPE :: "odin_signaled_child_workflow"
 EXPLICIT_CANCEL_PARENT_WORKFLOW_TYPE :: "odin_child_explicit_cancel_parent_workflow"
+DUPLICATE_PARENT_WORKFLOW_TYPE :: "odin_child_duplicate_parent_workflow"
+EXTERNAL_TARGET_WORKFLOW_TYPE :: "odin_external_target_workflow"
+EXTERNAL_CALLER_WORKFLOW_TYPE :: "odin_external_caller_workflow"
 
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if strings.has_prefix(name, "cancel-") {
@@ -117,9 +120,70 @@ explicit_cancel_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: stri
 	return "Observed explicit Child Workflow cancellation"
 }
 
+duplicate_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	options := workflow.Child_Workflow_Options{
+		workflow_id = "odin-live-duplicate-child",
+		workflow_execution_timeout = time.Minute,
+	}
+	first := workflow.start_child_workflow_json(ctx, CHILD_WORKFLOW_TYPE, name, options)
+	first_start := workflow.await_child_workflow_start(ctx, first)
+	if first_start.status != .Succeeded {
+		return "First Child Workflow did not start"
+	}
+	duplicate := workflow.start_child_workflow_json(ctx, CHILD_WORKFLOW_TYPE, name, options)
+	duplicate_start := workflow.await_child_workflow_start(ctx, duplicate)
+	if duplicate_start.status != .Failed ||
+	   duplicate_start.cause != .Workflow_Already_Exists {
+		return "Duplicate Child Workflow did not produce an Already Exists start failure"
+	}
+	if !workflow.cancel_child_workflow(ctx, first, "duplicate start test cleanup") {
+		return "Duplicate Child Workflow cleanup cancellation failed"
+	}
+	first_result := workflow.await_child_workflow_result(ctx, first)
+	if first_result.status != .Canceled {
+		return "Duplicate Child Workflow cleanup did not resolve"
+	}
+	return "Observed Child Workflow Already Exists start failure"
+}
+
+external_target_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	_ = name
+	approval := workflow.await_signal(ctx, "external-approve")
+	if approval != "approval-from-external-caller" {
+		return "External Workflow signal payload mismatch"
+	}
+	workflow.sleep(ctx, time.Hour)
+	return "External target was not canceled"
+}
+
+external_caller_workflow :: proc(ctx: ^workflow.Fiber_Context, target_workflow_id: string) -> string {
+	execution := workflow.External_Workflow_Execution{
+		namespace = "default",
+		workflow_id = target_workflow_id,
+	}
+	signal := workflow.signal_external_workflow_json(
+		ctx,
+		execution,
+		"external-approve",
+		"approval-from-external-caller",
+	)
+	if signal.status != .Succeeded {
+		return "External Workflow signal failed"
+	}
+	cancel := workflow.request_cancel_external_workflow(
+		ctx,
+		execution,
+		"external caller completed its signal test",
+	)
+	if cancel.status != .Succeeded {
+		return "External Workflow cancellation failed"
+	}
+	return "External Workflow signaled and cancellation requested"
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	fmt.printf(
-		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d signaled=%d signal_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v completed=%v evicted=%v\n",
+		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d child_signaled=%d child_signal_resolved=%d external_signaled=%d external_signal_resolved=%d external_cancel_requested=%v external_cancel_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.started_child_workflow_count,
@@ -127,6 +191,10 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.resolved_child_workflow_seq,
 		processed.signaled_child_workflow_count,
 		processed.resolved_child_workflow_signal_seq,
+		processed.signaled_external_workflow_count,
+		processed.resolved_external_workflow_signal_seq,
+		processed.requested_external_workflow_cancellation,
+		processed.resolved_external_workflow_cancellation_seq,
 		processed.requested_child_workflow_cancellation,
 		processed.canceled_child_workflow_seq,
 		processed.canceled_workflow,
@@ -249,6 +317,36 @@ main :: proc() {
 	if explicit_cancel_parent_error.message != nil {
 		fmt.eprintf("Explicit-cancel parent registration failed: %s\n", string(explicit_cancel_parent_error.message))
 		worker.error_free(&explicit_cancel_parent_error)
+		os.exit(1)
+	}
+	duplicate_parent_error := worker.register_workflow(
+		&sdk_worker,
+		DUPLICATE_PARENT_WORKFLOW_TYPE,
+		duplicate_parent_workflow,
+	)
+	if duplicate_parent_error.message != nil {
+		fmt.eprintf("Duplicate parent registration failed: %s\n", string(duplicate_parent_error.message))
+		worker.error_free(&duplicate_parent_error)
+		os.exit(1)
+	}
+	external_target_error := worker.register_workflow(
+		&sdk_worker,
+		EXTERNAL_TARGET_WORKFLOW_TYPE,
+		external_target_workflow,
+	)
+	if external_target_error.message != nil {
+		fmt.eprintf("External target registration failed: %s\n", string(external_target_error.message))
+		worker.error_free(&external_target_error)
+		os.exit(1)
+	}
+	external_caller_error := worker.register_workflow(
+		&sdk_worker,
+		EXTERNAL_CALLER_WORKFLOW_TYPE,
+		external_caller_workflow,
+	)
+	if external_caller_error.message != nil {
+		fmt.eprintf("External caller registration failed: %s\n", string(external_caller_error.message))
+		worker.error_free(&external_caller_error)
 		os.exit(1)
 	}
 

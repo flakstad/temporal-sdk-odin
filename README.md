@@ -32,8 +32,12 @@ explicit or inherited cancellation through `CancelChildWorkflowExecution`. The
 signal API waits for Core's resolution and reports server failure causes. Unhandled
 child failures preserve Core's original Temporal Failure wrapper and cause
 chain when the parent fails. The CLI-devserver suite proves successful child
-completion, a caught server-generated child failure, and parent cancellation
-that waits for child cancellation before closing. The offline suite requires
+completion, a caught server-generated child failure, duplicate-ID start failure,
+and parent cancellation that waits for child cancellation before closing.
+Workflow code can also signal and request cancellation of arbitrary external
+Workflow executions by namespace/Workflow ID/optional Run ID, suspending until
+Core resolves each outbound operation. The live suite proves this against two
+independent executions. The offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
 multiple outstanding Activities, catchable Activity failure,
@@ -64,8 +68,7 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, arbitrary external-Workflow handles, local
-Activities, client cancellation of an accepted
+nested cancellation-token trees, local Activities, client cancellation of an accepted
 Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
@@ -335,6 +338,36 @@ generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
 typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
 the `json/plain` string compatibility adapter.
 
+Outbound operations on another Workflow use an explicit execution identity and
+wait for Core's durable acknowledgement:
+
+```odin
+target := workflow.External_Workflow_Execution{
+    namespace = "default",
+    workflow_id = order_workflow_id,
+    // Empty run_id targets the current execution.
+}
+signal := workflow.signal_external_workflow_json(
+    ctx,
+    target,
+    "approve",
+    approval,
+)
+if signal.status == .Succeeded {
+    cancel := workflow.request_cancel_external_workflow(
+        ctx,
+        target,
+        "superseded order",
+    )
+}
+```
+
+The identity and signal name are borrowed for the call and copied into the
+Workflow arena before suspension. The `_payload` signal form clones a borrowed
+Payload; `_owned` consumes its Payload. Failure results map Core's not-found,
+namespace-not-found, and signal-count-limit causes. This remains a low-level
+execution reference rather than a general client-style handle.
+
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:
 
@@ -544,6 +577,7 @@ examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
+examples/child_workflow/  child and external Workflow operation proofs
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests
 tests_pbt/                generated activation-order and replay properties
 test-deps/pbt/            pinned, test-only property-testing submodule
