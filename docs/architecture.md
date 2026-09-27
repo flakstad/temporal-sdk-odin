@@ -991,9 +991,20 @@ resumes the same routine and produces the terminal Update response. Completed
 native coroutine resources are destroyed immediately, while routing metadata
 and arena-backed result bytes remain valid through completion serialization.
 If the main Workflow routine returns while an accepted Update is still active,
-the Odin runtime currently delays the terminal Workflow command until those
-Update routines finish. This is a safe initial unfinished-handler policy, not
-yet a configurable public contract.
+the terminal Workflow command is emitted and that handler cannot continue.
+This matches the established SDK contract: the default
+`Handler_Unfinished_Policy.Warn_And_Abandon` records a worker warning, while
+`.Abandon` deliberately suppresses it. `await_all_handlers_finished` is the
+explicit Workflow primitive for applications whose terminal result depends on
+all accepted handlers. It suspends only the main fiber; Update completions are
+emitted before the main fiber resumes and closes. Calling it from an Update
+handler is rejected because the handler would wait on itself. This follows
+Core's Rust
+[`WorkflowContext::all_handlers_finished`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/workflow_context.rs#L2302-L2312)
+condition and the same opt-in waiting model documented for
+[Python message handlers](https://docs.temporal.io/develop/python/message-passing#ensure-your-handlers-finish-before-the-workflow-completes)
+and Go's
+[`HandlerUnfinishedPolicy`](https://pkg.go.dev/go.temporal.io/sdk/workflow#HandlerUnfinishedPolicy).
 
 Concurrency is now exercised rather than only implied by the routine table.
 Two accepted routines can schedule Activity sequences 1 and 2, sequence 2 can
@@ -1040,8 +1051,8 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are cancellation semantics, configurable
-unfinished-handler policy when the main Workflow closes, shared-state races between handlers,
+The remaining Update-runtime risks are complete cancellation semantics,
+shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
 
@@ -1160,13 +1171,15 @@ checked against a small event-outcome model, then evicted and replayed from a
 fresh fiber; the decisive completion must be byte-identical. Coverage
 constraints ensure every class appears in a successful run.
 
-The sibling `statecharts` library was initially deferred because the first
-model had one wait state and three event kinds. Root cancellation, detached
-cleanup, late Activity resolutions, eviction, and replay now create the
-orthogonal state threshold where an independent statechart oracle is useful.
-The next test-hardening slice should prototype that model against
-`~/Projects/statecharts` and generate event traces through `~/Projects/pbt`;
-the model must remain independent of the runtime implementation.
+The pinned, test-only
+[flakstad/statecharts](https://github.com/flakstad/statecharts) library now
+provides an independent Update lifecycle oracle. PBT generates 1,000 traces
+across handler start/finish, main return, explicit handler await, cancellation,
+and late resolution. The model asserts one-shot terminal emission, no changes
+after close, explicit-wait blocking, and deterministic re-execution of the same
+trace. `PBT_ROOT=~/Projects/pbt` and
+`STATECHARTS_ROOT=~/Projects/statecharts` allow deeper testing against the
+sibling checkouts without weakening the reproducible submodule pins.
 
 ### Reusable worker registry and poll boundary
 
@@ -1323,9 +1336,10 @@ Workflows are enabled.
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
    a durable timer/signal race, generic/typed Payload flow, read-only queries,
-   synchronous and Activity-awaiting validated Updates, root cancellation, and detached Activity
+   synchronous and Activity-awaiting validated Updates, default/suppressed
+   unfinished-handler warnings, explicit handler draining, root cancellation, and detached Activity
    cleanup across fresh-stack replay. It does not yet prove general nested
-   cancellation scopes, Update close/cancellation policy, panic containment,
+   cancellation scopes, complete Update cancellation policy, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -1345,7 +1359,7 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, and termination are live-proven, but the
-   public Client still lacks Update handles, describe/history iteration, query reject conditions, headers,
+   public Client still lacks describe/history iteration, query reject conditions, headers,
    search attributes, memo, retry/options completeness, and failure-detail conversion.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
@@ -1356,7 +1370,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, synchronous and Activity-awaiting Updates, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Define unfinished-handler/cancellation policy and test concurrent Update routines without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, explicit handler draining/default abandonment, detached cancellation cleanup, registered dispatch, eviction, and replay on macOS arm64 | Complete handler cancellation semantics and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1375,21 +1389,16 @@ proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
-500 single-Update protocol response sequences, and 500 two-Update completion-order sequences,
+500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
+and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should define Update cancellation and
-unfinished-handler policy. It should model cancellation while a handler awaits,
-main-Workflow completion with unfinished handlers, and late Activity
-resolutions after cancellation. Concurrent out-of-order completion and public
-Client Update handles are now implemented and tested.
-
-Before widening cancellation further, model root cancellation, late
-resolutions, detached cleanup, eviction, and replay with an independent
-statechart oracle and drive it from `~/Projects/pbt`. The direct transition
-table remains useful, but cancellation cleanup now has enough orthogonal states
-to justify the sibling `~/Projects/statecharts` experiment suggested for this
-threshold.
+The next smallest feature milestone should complete Update cancellation and
+handler-shutdown behavior. It should exercise cancellation while handlers await
+Activities, timers, and signals; detached handler cleanup; and late Core
+resolutions after Workflow close. Concurrent out-of-order completion, public
+Client Update handles, explicit handler draining, default abandonment warnings,
+and the independent statechart oracle are now implemented and tested.
 
 Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
 containment should be designed as subprocess isolation unless Odin gains
@@ -1398,8 +1407,8 @@ statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
-dependency. The Update routine table now has explicit ownership and replay
-tests, but its cancellation and Workflow-close policies remain experimental.
+dependency. The Update routine table now has explicit ownership, replay tests,
+and a defined Workflow-close policy, but cancellation remains experimental.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

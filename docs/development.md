@@ -10,6 +10,9 @@ contains `sdk-core` crate 0.9.0 and client/common crates 1.0.0, and is pinned by
 Property tests pin `flakstad/pbt` at
 `3b465330bd3a11c45990ef2d7f44f1cf25a18145` as the `test-deps/pbt`
 submodule. It is not linked into SDK or application artifacts.
+They also pin `flakstad/statecharts` at
+`9e82885f0ae4669061aa5505b30db43537e83d19` as
+`test-deps/statecharts`. Both dependencies remain test-only.
 
 `native/Cargo.toml` is a wrapper workspace. SDK Core deliberately does not
 commit a workspace lockfile, while a language SDK needs reproducible native
@@ -91,11 +94,13 @@ resumption without requiring a server:
 
 The script runs the repository tests with Odin vetting, strict style, and
 warnings promoted to errors. It then runs a separate property suite from
-`tests_pbt` against the pinned `test-deps/pbt` submodule. That suite generates
+`tests_pbt` against the pinned PBT and statechart submodules. That suite generates
 500 signal/timer/cancellation activation batches across nine ordering classes,
 forces eviction, reconstructs a fresh fiber, and requires the decisive
 `WorkflowActivationCompletion` bytes to match replay exactly. PBT is a
-test-only dependency. Its own package tests currently contain an upstream
+test-only dependency. The Update handler suite additionally generates 1,000
+close/await/cancel/late-event traces and checks them against an independent
+statechart lifecycle model. Its own package tests currently contain an upstream
 unused-variable warning, so dependency warnings are not promoted to errors in
 that second compilation; SDK-owned tests remain strict.
 
@@ -433,8 +438,11 @@ the Workflow instance's deterministic operation tables and sequence numbers.
 The first completion contains `Accepted` and any commands scheduled before the
 routine yields. A later activation resumes it and carries `Completed` or the
 post-acceptance `Rejected` failure. Update cancellation and unfinished-handler
-policy are not stable yet. For now, a main Workflow that returns waits to emit
-its terminal command until every accepted Update routine has finished.
+policy remain experimental. A main Workflow that returns now emits its terminal
+command even when an accepted routine is unfinished. The registration default
+is `Handler_Unfinished_Policy.Warn_And_Abandon`; `.Abandon` suppresses the
+warning. Workflow code that requires handler results calls
+`await_all_handlers_finished` before returning.
 Multiple routines are driven in registration order, while only the routine
 whose wait condition resolved resumes. The unit and live suites start two
 Updates, resolve Activity sequence 2 before sequence 1, and require replay to
@@ -568,6 +576,14 @@ protocol instance ID, requires `Accepted` to precede the terminal response, and
 round-trips typed result Payloads plus Application Failure types. A second 500
 case property varies which of two accepted Updates finishes first and verifies
 that each result stays attached to its own protocol instance ID.
+The Update lifecycle property compiles a small pinned statechart and generates
+1,000 traces through handler start/finish, main return, explicit await,
+Workflow cancellation, and late resolution. It requires at most one Workflow
+terminal command, no state changes after close, no premature close during an
+explicit await, and identical observations when replaying the same trace. Use
+`STATECHARTS_ROOT=~/Projects/statecharts ./scripts/test.sh` to exercise a local
+statecharts checkout without changing the pin; both root overrides can be set
+together.
 
 Finally, the script starts `examples/hello_workflow` and invokes it with
 `temporal workflow execute` in the background. After the Workflow has

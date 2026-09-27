@@ -18,8 +18,13 @@ odin test "$repo_root/tests" \
 	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
 
 pbt_root="${PBT_ROOT:-$repo_root/test-deps/pbt}"
+statecharts_root="${STATECHARTS_ROOT:-$repo_root/test-deps/statecharts}"
 if [[ ! -f "$pbt_root/pbt/check.odin" ]]; then
 	echo "PBT test dependency is missing; run: git submodule update --init --recursive" >&2
+	exit 1
+fi
+if [[ ! -f "$statecharts_root/statecharts/runtime.odin" ]]; then
+	echo "statecharts test dependency is missing; run: git submodule update --init --recursive" >&2
 	exit 1
 fi
 
@@ -30,4 +35,5 @@ odin test "$repo_root/tests_pbt" \
 	-thread-count:"$odin_thread_count" \
 	-no-threaded-checker \
 	-collection:pbt="$pbt_root" \
+	-collection:statecharts="$statecharts_root" \
 	-extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"

@@ -75,6 +75,19 @@ Update_Validation :: struct {
 	failure_type: string,
 }
 
+// Handler_Unfinished_Policy controls observability when the main Workflow
+// closes while a concurrent Update routine is still running. Temporal cannot
+// preserve that routine after Workflow close. The default mirrors the other
+// Core-based SDKs: abandon it and report a warning through Process_Result.
+Handler_Unfinished_Policy :: enum {
+	Warn_And_Abandon,
+	Abandon,
+}
+
+Update_Handler_Options :: struct {
+	unfinished_policy: Handler_Unfinished_Policy,
+}
+
 update_accept :: proc() -> Update_Validation {
 	return {accepted = true}
 }
@@ -137,6 +150,7 @@ Fiber_Phase :: enum {
 	Waiting_Timer,
 	Waiting_Signal,
 	Waiting_Signal_Or_Timer,
+	Waiting_Handlers,
 	Canceled,
 	Completed,
 	Failed,
@@ -258,6 +272,7 @@ Fiber_Update_Handler :: struct {
 	validate:      Update_Validate_Proc,
 	invoke:        Update_Invoke_Proc,
 	invoke_routine: Update_Routine_Invoke_Proc,
+	unfinished_policy: Handler_Unfinished_Policy,
 }
 
 Pending_Query_Response :: struct {
@@ -322,6 +337,7 @@ Fiber_Update_Routine :: struct {
 	phase:                  Fiber_Phase,
 	fiber:                  fiber_raw.Handle,
 	response_emitted:       bool,
+	unfinished_policy:      Handler_Unfinished_Policy,
 }
 
 Fiber_Instance :: struct {
@@ -948,6 +964,7 @@ set_update_handler_payload :: proc(
 	validator: Update_Validate_Proc,
 	callback: Update_Invoke_Proc,
 	routine_callback: Update_Routine_Invoke_Proc = nil,
+	options := Update_Handler_Options{},
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
 	   len(name) == 0 || callback_data == nil || (callback == nil) == (routine_callback == nil) {
@@ -975,6 +992,7 @@ set_update_handler_payload :: proc(
 			validate = validator,
 			invoke = callback,
 			invoke_routine = routine_callback,
+			unfinished_policy = options.unfinished_policy,
 		},
 	)
 	return true
@@ -989,6 +1007,7 @@ set_validated_update_routine_json :: proc(
 	state: ^$State,
 	validator: proc(state: State, input: $Input) -> Update_Validation,
 	callback: proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> $Output,
+	options := Update_Handler_Options{},
 ) -> bool {
 	Validator :: #type proc(state: State, input: Input) -> Update_Validation
 	Callback :: #type proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> Output
@@ -1052,6 +1071,7 @@ set_validated_update_routine_json :: proc(
 			}
 			return payload_complete(payload)
 		},
+		options,
 	)
 }
 
@@ -1060,6 +1080,7 @@ set_update_routine_json :: proc(
 	name: string,
 	state: ^$State,
 	callback: proc(ctx: ^Fiber_Context, state: ^State, input: $Input) -> $Output,
+	options := Update_Handler_Options{},
 ) -> bool {
 	Callback :: #type proc(ctx: ^Fiber_Context, state: ^State, input: Input) -> Output
 	Data :: struct {
@@ -1110,6 +1131,7 @@ set_update_routine_json :: proc(
 			}
 			return payload_complete(payload)
 		},
+		options,
 	)
 }
 
@@ -2170,6 +2192,41 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	}
 }
 
+// all_handlers_finished reports whether every accepted concurrent Workflow
+// Update routine has produced its terminal response. Signal handlers are not
+// yet part of this runtime slice, so Updates are the complete handler set.
+all_handlers_finished :: proc(ctx: ^Fiber_Context) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return true
+	}
+	return !has_active_update_routines(ctx.instance)
+}
+
+// await_all_handlers_finished suspends the main Workflow routine until every
+// accepted Update routine has finished. Calling it from an Update routine would
+// wait on itself, so that is rejected as a deterministic Workflow failure.
+await_all_handlers_finished :: proc(ctx: ^Fiber_Context) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	instance := ctx.instance
+	if ctx != &instance.workflow_context || instance.phase != .Ready {
+		instance.failure_message = "await_all_handlers_finished must be called by the main Workflow routine"
+		instance.failure_type = "OdinWorkflowHandlerAwaitError"
+		instance.phase = .Failed
+		return
+	}
+	if !has_active_update_routines(instance) {
+		return
+	}
+	instance.phase = .Waiting_Handlers
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		instance.failure_message = "could not resume Workflow handler await"
+		instance.failure_type = "OdinWorkflowHandlerAwaitError"
+		instance.phase = .Failed
+	}
+}
+
 duration_to_proto :: proc(duration: time.Duration) -> ^proto.Google_Protobuf_Duration {
 	if duration <= 0 {
 		return nil
@@ -2533,6 +2590,7 @@ start_update_routine :: proc(
 	routine.input = owned_input
 	routine.callback_data = handler.callback_data
 	routine.invoke = handler.invoke_routine
+	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
 	routine.phase = .Ready
 	create_result := fiber_raw.create(
@@ -2622,7 +2680,7 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		return signal_found || cancellation_applies ||
 			(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
 			timer.state == .Canceled))
-	case .Ready, .Canceled, .Completed, .Failed:
+	case .Waiting_Handlers, .Ready, .Canceled, .Completed, .Failed:
 	}
 	return false
 }
@@ -2858,6 +2916,8 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Signal_Or_Timer:
 		result.waiting_signal = true
 		result.waiting_timer_seq = instance.waiting_timer_seq
+	case .Waiting_Handlers:
+		result.waiting_handlers = true
 	case .Ready, .Canceled, .Completed, .Failed:
 		return error_from_string("Workflow fiber suspended without a supported pending operation")
 	}
@@ -2872,6 +2932,21 @@ has_active_update_routines :: proc(instance: ^Fiber_Instance) -> bool {
 		}
 	}
 	return false
+}
+
+observe_unfinished_update_routines :: proc(
+	result: ^Process_Result,
+	instance: ^Fiber_Instance,
+) {
+	for routine in instance.update_routines {
+		if routine.response_emitted {
+			continue
+		}
+		result.unfinished_update_handlers += 1
+		if routine.unfinished_policy == .Warn_And_Abandon {
+			result.warned_unfinished_update_handlers += 1
+		}
+	}
 }
 
 commands_are_update_responses :: proc(
@@ -3007,18 +3082,15 @@ append_fiber_progress_command :: proc(
 		return {}
 	}
 	if instance.phase == .Canceled {
+		observe_unfinished_update_routines(result, instance)
 		return append_fiber_cancellation_commands(result, commands, instance)
 	}
 	main_status := fiber_raw.status(instance.fiber)
-	if main_status == .Dead && has_active_update_routines(instance) {
-		append_shared_operation_commands(result, commands, instance, task_queue)
-		result.run_id = instance.run_id
-		return {}
-	}
 	switch main_status {
 	case .Suspended:
 		return append_fiber_pending_commands(result, commands, instance, task_queue)
 	case .Dead:
+		observe_unfinished_update_routines(result, instance)
 		if instance.phase == .Completed {
 			return append_fiber_completion_command(result, commands, instance)
 		}
@@ -3320,6 +3392,8 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			should_resume = signal_found || root_cancellation_applies(instance) ||
 				(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
 				timer.state == .Canceled))
+		case .Waiting_Handlers:
+			should_resume = !has_active_update_routines(instance) || root_cancellation_applies(instance)
 		case .Ready, .Canceled, .Completed, .Failed:
 		}
 		if should_resume {

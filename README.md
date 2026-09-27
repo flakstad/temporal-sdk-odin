@@ -16,7 +16,11 @@ mutate Workflow-owned state, return a typed result in a later activation, and
 replay without rerunning validators. Two accepted Updates can now remain live
 at once, resolve their Activities out of order, and replay with stable protocol
 identity. The Client exposes owned Update handles that separate acceptance from
-waiting for the result. It also proves
+waiting for the result. Concurrent handler close semantics now match the
+established language SDKs: unfinished Update routines are abandoned with a
+warning by default, registration can suppress that warning, and
+`workflow.await_all_handlers_finished` explicitly keeps the main Workflow open.
+It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
@@ -41,8 +45,8 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-scope trees, signal handlers, complete Update
-cancellation or configurable unfinished-handler policies, multiple Activity arguments, in-process panic
+nested/child cancellation-scope trees, signal handlers, complete handler
+cancellation semantics, multiple Activity arguments, in-process panic
 containment, or a stable public API.
 Do not use it in production.
 
@@ -73,7 +77,8 @@ The fiber experiment also builds pinned
 shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
 payload/failure contracts and activation races, and verifies byte-identical
-replay completions.
+replay completions. A pinned [statecharts](https://github.com/flakstad/statecharts)
+model independently checks Update close/await/late-event lifecycle traces.
 
 Clone submodules and build the pinned Core bridge:
 
@@ -359,6 +364,16 @@ resolution in a later activation. Validator rejection emits only `Rejected`;
 validators are skipped during replay exactly as directed by Core. The original
 synchronous handler APIs remain available for immediate Updates.
 
+The main Workflow is allowed to close while a routine is unfinished. The
+default handler option reports that abandonment through the worker; use
+`.Abandon` only when silence is intentional. When completion depends on every
+accepted handler result, wait explicitly before returning:
+
+```odin
+workflow.await_all_handlers_finished(ctx)
+return result
+```
+
 Catchable Activity failures expose both the outer Activity metadata and the
 nested Application Failure:
 
@@ -471,6 +486,7 @@ examples/hello_workflow/  sequential suspension/replay/eviction proof
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests
 tests_pbt/                generated activation-order and replay properties
 test-deps/pbt/            pinned, test-only property-testing submodule
+test-deps/statecharts/    pinned, test-only lifecycle-model submodule
 ```
 
 ## License

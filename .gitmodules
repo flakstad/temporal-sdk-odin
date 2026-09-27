@@ -7,3 +7,6 @@
 [submodule "test-deps/pbt"]
 	path = test-deps/pbt
 	url = https://github.com/flakstad/pbt.git
+[submodule "test-deps/statecharts"]
+	path = test-deps/statecharts
+	url = https://github.com/flakstad/statecharts.git

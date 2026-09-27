@@ -71,6 +71,8 @@ Run_Stats :: struct {
 	workflow_updates_accepted:             int,
 	workflow_updates_rejected:             int,
 	workflow_updates_completed:            int,
+	workflow_update_handlers_abandoned:    int,
+	workflow_update_handler_warnings:      int,
 	workflow_cancellations_received:      int,
 	timers_canceled:                      int,
 	activity_cancellations_requested:     int,
@@ -1156,6 +1158,8 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 		stats.workflow_updates_accepted += processed.updates_accepted
 		stats.workflow_updates_rejected += processed.updates_rejected
 		stats.workflow_updates_completed += processed.updates_completed
+		stats.workflow_update_handlers_abandoned += processed.unfinished_update_handlers
+		stats.workflow_update_handler_warnings += processed.warned_unfinished_update_handlers
 		if processed.received_cancellation {
 			stats.workflow_cancellations_received += 1
 		}
@@ -1203,6 +1207,13 @@ run_workflow_loop :: proc(
 			return stats, error_from_core(&complete_error)
 		}
 		record_workflow_result(&stats, &processed)
+		if !processed.is_replaying && processed.warned_unfinished_update_handlers > 0 {
+			fmt.eprintf(
+				"Temporal warning: Workflow %s closed with %d unfinished Update handler(s); handlers were abandoned\n",
+				processed.run_id,
+				processed.warned_unfinished_update_handlers,
+			)
+		}
 		if processed.error.message != nil {
 			if !processed.activation_failed {
 				message := string(processed.error.message)

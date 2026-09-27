@@ -347,6 +347,63 @@ fiber_update_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 	if !registered {
 		return "Workflow Update routine registration failed"
 	}
+	result := workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	return result
+}
+
+fiber_abandon_update_routine_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	state := Update_Routine_State{name = name}
+	registered := workflow.set_update_routine_json(
+		ctx,
+		"rename_with_activity",
+		&state,
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			state: ^Update_Routine_State,
+			input: Update_Routine_Input,
+		) -> Update_Routine_Output {
+			previous := state.name
+			activity_result := workflow.execute_activity(routine_ctx, "decorate_name", input.name)
+			state.name = activity_result
+			return {
+				previous = previous,
+				current = state.name,
+				activity_result = activity_result,
+			}
+		},
+	)
+	if !registered {
+		return "Workflow Update routine registration failed"
+	}
+	return workflow.await_signal(ctx, "finish")
+}
+
+fiber_silent_abandon_registration_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	state := Update_Routine_State{name = name}
+	registered := workflow.set_update_routine_json(
+		ctx,
+		"silent_update",
+		&state,
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			_: ^Update_Routine_State,
+			input: Update_Routine_Input,
+		) -> Update_Routine_Output {
+			_ = workflow.await_signal(routine_ctx, "release_silent_update")
+			return {current = input.name}
+		},
+		{unfinished_policy = .Abandon},
+	)
+	if !registered {
+		return "silent Workflow Update routine registration failed"
+	}
 	return workflow.await_signal(ctx, "finish")
 }
 
@@ -3385,6 +3442,7 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect_value(t, processed.updates_completed, 0)
 	testing.expect(t, processed.scheduled_activity)
 	testing.expect(t, !processed.completed)
+	testing.expect(t, processed.waiting_handlers)
 	testing.expect_value(t, processed.activity_seq, u32(1))
 	started_update := inspect_update_responses(
 		processed.completion[:],
@@ -3429,6 +3487,7 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect_value(t, processed.updates_accepted, 0)
 	testing.expect_value(t, processed.updates_completed, 1)
 	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.waiting_handlers)
 	completed_update := inspect_update_responses(
 		processed.completion[:],
 		"update-routine-protocol-1",
@@ -3529,6 +3588,244 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	delete(update_finish_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_close_abandons_unfinished_update_routine_and_replays :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_abandon_update_routine_workflow",
+		"test-queue",
+		fiber_abandon_update_routine_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_abandon_update_routine_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-abandon-update-routine-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	update_input, update_error := codec.encode_json(Update_Routine_Input{name = "Temporal"})
+	testing.expect(t, update_error == .None)
+	defer codec.payload_free(&update_input)
+	update_input_proto := proto.encode_payload(codec.payload_view(&update_input))
+	defer delete(update_input_proto.metadata)
+	defer delete(update_input_proto.external_payloads)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "rename-abandoned",
+		protocol_instance_id = "update-routine-abandoned",
+		name = "rename_with_activity",
+	}
+	defer delete(update.input)
+	append(&update.input, update_input_proto)
+	finish_input, finish_error := codec.encode_json("done")
+	testing.expect(t, finish_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Workflow close failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.scheduled_activity)
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect_value(t, processed.updates_completed, 0)
+	testing.expect_value(t, processed.unfinished_update_handlers, 1)
+	testing.expect_value(t, processed.warned_unfinished_update_handlers, 1)
+	closed := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, closed.decoded)
+	testing.expect(t, closed.completed)
+	testing.expect_value(t, closed.command_count, 2)
+	delete(closed.failure_message)
+	delete(closed.completion_result)
+	update_closed := inspect_update_responses(processed.completion[:], "update-routine-abandoned")
+	testing.expect_value(t, update_closed.accepted, 1)
+	testing.expect_value(t, update_closed.completed, 0)
+	update_response_inspection_free(&update_closed)
+	close_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Workflow close replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(close_completion[:], processed.completion[:]))
+	testing.expect_value(t, processed.unfinished_update_handlers, 1)
+	testing.expect_value(t, processed.warned_unfinished_update_handlers, 1)
+	delete(close_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_unfinished_update_policy_can_suppress_warning :: proc(t: ^testing.T) {
+	warn_routine := workflow.Fiber_Update_Routine{}
+	abandon_routine := workflow.Fiber_Update_Routine{
+		unfinished_policy = .Abandon,
+	}
+	finished_routine := workflow.Fiber_Update_Routine{response_emitted = true}
+	instance := workflow.Fiber_Instance{}
+	defer delete(instance.update_routines)
+	append(&instance.update_routines, &warn_routine, &abandon_routine, &finished_routine)
+	result := workflow.Process_Result{}
+	workflow.observe_unfinished_update_routines(&result, &instance)
+	testing.expect_value(t, result.unfinished_update_handlers, 2)
+	testing.expect_value(t, result.warned_unfinished_update_handlers, 1)
+}
+
+@(test)
+workflow_update_routine_registration_preserves_unfinished_policy :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_silent_update_registration_workflow",
+		"test-queue",
+		fiber_silent_abandon_registration_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_silent_update_registration_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "silent-update-registration-run",
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	defer delete(processed.completion)
+	defer workflow.error_free(&processed.error)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, len(runtime.instances), 1)
+	if len(runtime.instances) == 1 {
+		instance := runtime.instances[0]
+		testing.expect_value(t, len(instance.update_handlers), 1)
+		if len(instance.update_handlers) == 1 {
+			testing.expect(
+				t,
+				instance.update_handlers[0].unfinished_policy == .Abandon,
+			)
+		}
+	}
 }
 
 @(test)

@@ -416,6 +416,94 @@ grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updat
 grep -Eq "replay=true .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=abandon-update \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Update-abandonment Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+abandon_workflow_id="odin-sdk-abandon-update-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$abandon_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Odin"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Update-abandonment Workflow did not reach its main await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$abandon_workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=hold_greeting_name \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Never-applied \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$slow_update_output_file" 2>&1 &
+slow_update_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
+    echo "Held Workflow Update was not accepted" >&2
+    cat "$worker_log" >&2
+    cat "$slow_update_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$abandon_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=approval \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=Approved \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+workflow_output="$(<"$workflow_output_file")"
+echo "$workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$workflow_output"
+grep -q '"result": "Hello Approved"' <<<"$workflow_output"
+
+abandoned_update_status=0
+wait "$slow_update_pid" || abandoned_update_status=$?
+slow_update_pid=""
+abandoned_update_output="$(<"$slow_update_output_file")"
+echo "$abandoned_update_output"
+[[ "$abandoned_update_status" -ne 0 ]]
+grep -q 'kind=Workflow_Update_Failed' <<<"$abandoned_update_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*unfinished_updates=1 update_warnings=1 .*completed=true" "$worker_log"
+grep -q "Temporal warning: Workflow .* closed with 1 unfinished Update handler(s); handlers were abandoned" "$worker_log"
+grep -q "Workflow close abandoned the unfinished Update handler with a warning" "$worker_log"
+
 run_workflow_cancellation_case() {
   local scenario="$1"
   local input="$2"

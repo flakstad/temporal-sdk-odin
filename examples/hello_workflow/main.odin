@@ -95,6 +95,17 @@ update_greeting_name :: proc(
 	return {previous_name = previous, current_name = state.name}
 }
 
+hold_greeting_name :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Greeting_Query_State,
+	input: Greeting_Update_Input,
+) -> Greeting_Update_Output {
+	previous := state.name
+	_ = workflow.await_signal(ctx, "release_held_update")
+	state.name = input.name
+	return {previous_name = previous, current_name = state.name}
+}
+
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	// The integration scenario deliberately resolves the second concurrent
 	// Workflow Update first. Sleeping in an Activity is safe: the ordering is
@@ -211,6 +222,14 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register greeting name Update"
 	}
+	if !workflow.set_update_routine_json(
+		ctx,
+		"hold_greeting_name",
+		&query_state,
+		hold_greeting_name,
+	) {
+		return "could not register held greeting name Update"
+	}
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
@@ -290,7 +309,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -305,6 +324,8 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.updates_accepted,
 		processed.updates_rejected,
 		processed.updates_completed,
+		processed.unfinished_update_handlers,
+		processed.warned_unfinished_update_handlers,
 		processed.received_cancellation,
 		processed.canceled_workflow,
 		processed.started_timer,
@@ -313,6 +334,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.waiting_activity_seq,
 		processed.waiting_timer_seq,
 		processed.waiting_signal,
+		processed.waiting_handlers,
 		processed.completed,
 		processed.evicted,
 	)
@@ -429,6 +451,7 @@ main :: proc() {
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
 	expect_update := scenario == "update"
+	expect_abandon_update := scenario == "abandon-update"
 	expect_query := scenario == "query" || expect_update
 	expect_typed_payload := scenario == "typed-payload"
 	expect_failure_details := scenario == "failure-details"
@@ -477,6 +500,15 @@ main :: proc() {
 				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
 				failed = true
 			}
+		} else if expect_abandon_update {
+			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 1 ||
+			   run_stats.timers_canceled != 1 || run_stats.workflow_updates_accepted != 1 ||
+			   run_stats.workflow_updates_completed != 0 ||
+			   run_stats.workflow_update_handlers_abandoned != 1 ||
+			   run_stats.workflow_update_handler_warnings != 1 {
+				fmt.eprintln("Workflow Update abandonment stats did not match")
+				failed = true
+			}
 		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
@@ -518,6 +550,8 @@ main :: proc() {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_failure_details {
 		fmt.println("structured Activity failure details reached Workflow code")
+	} else if expect_abandon_update {
+		fmt.println("Workflow close abandoned the unfinished Update handler with a warning")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}
