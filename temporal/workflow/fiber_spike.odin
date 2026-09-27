@@ -597,6 +597,14 @@ Fiber_Continue_As_New_Operation :: struct {
 	present: bool,
 }
 
+Fiber_Patch_Decision :: struct {
+	patch_id:     string,
+	present:      bool,
+	deprecated:   bool,
+	emit_command: bool,
+	command_sent: bool,
+}
+
 Fiber_Signal :: struct {
 	name:     string,
 	payload:  codec.Payload,
@@ -667,6 +675,8 @@ Fiber_Instance :: struct {
 	external_signals: [dynamic]Fiber_External_Signal_Operation,
 	external_cancels: [dynamic]Fiber_External_Cancel_Operation,
 	continue_as_new: Fiber_Continue_As_New_Operation,
+	patches:          [dynamic]Fiber_Patch_Decision,
+	notified_patches: [dynamic]string,
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
 	signal_handlers:  [dynamic]Fiber_Signal_Handler,
@@ -696,6 +706,7 @@ Fiber_Instance :: struct {
 	next_external_signal_seq: u32,
 	next_external_cancel_seq: u32,
 	next_timer_seq:    u32,
+	activation_is_replaying: bool,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
 	arena:           virtual.Arena,
@@ -1245,6 +1256,8 @@ add_fiber_instance :: proc(
 	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.external_signals = make([dynamic]Fiber_External_Signal_Operation)
 	instance.external_cancels = make([dynamic]Fiber_External_Cancel_Operation)
+	instance.patches = make([dynamic]Fiber_Patch_Decision)
+	instance.notified_patches = make([dynamic]string)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
 	instance.signal_handlers = make([dynamic]Fiber_Signal_Handler)
@@ -2039,6 +2052,104 @@ cancellation_reason :: proc(ctx: ^Fiber_Context) -> string {
 		return ""
 	}
 	return ctx.instance.cancellation_reason
+}
+
+is_replaying :: proc(ctx: ^Fiber_Context) -> bool {
+	return ctx != nil && ctx.instance != nil && ctx.instance.activation_is_replaying
+}
+
+find_patch_decision :: proc(
+	instance: ^Fiber_Instance,
+	patch_id: string,
+) -> (^Fiber_Patch_Decision, bool) {
+	if instance == nil {
+		return nil, false
+	}
+	for index in 0..<len(instance.patches) {
+		if instance.patches[index].patch_id == patch_id {
+			return &instance.patches[index], true
+		}
+	}
+	return nil, false
+}
+
+has_notified_patch :: proc(instance: ^Fiber_Instance, patch_id: string) -> bool {
+	if instance == nil {
+		return false
+	}
+	for notified in instance.notified_patches {
+		if notified == patch_id {
+			return true
+		}
+	}
+	return false
+}
+
+notify_patch :: proc(instance: ^Fiber_Instance, patch_id: string) -> bool {
+	if instance == nil || len(patch_id) == 0 {
+		return false
+	}
+	if has_notified_patch(instance, patch_id) {
+		return true
+	}
+	owned_id, allocation_error := strings.clone(patch_id, instance.odin_context.allocator)
+	if allocation_error != nil {
+		return false
+	}
+	append(&instance.notified_patches, owned_id)
+	return true
+}
+
+patch_impl :: proc(ctx: ^Fiber_Context, patch_id: string, deprecated: bool) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	instance := ctx.instance
+	if len(patch_id) == 0 {
+		instance.failure_message = "Workflow patch ID must not be empty"
+		instance.failure_type = "OdinWorkflowPatchError"
+		instance.phase = .Failed
+		return false
+	}
+	if decision, found := find_patch_decision(instance, patch_id); found {
+		return decision.present
+	}
+
+	notified := has_notified_patch(instance, patch_id)
+	present := true
+	if instance.activation_is_replaying {
+		present = notified
+	}
+	owned_id, allocation_error := strings.clone(patch_id, instance.odin_context.allocator)
+	if allocation_error != nil {
+		instance.failure_message = "could not preserve Workflow patch ID"
+		instance.failure_type = "OdinWorkflowPatchError"
+		instance.phase = .Failed
+		return false
+	}
+	append(
+		&instance.patches,
+		Fiber_Patch_Decision{
+			patch_id = owned_id,
+			present = present,
+			deprecated = deprecated,
+			emit_command = present,
+		},
+	)
+	return present
+}
+
+// patched gates a deterministic code change. Keep the call in both old and new
+// branches until every open execution has recorded this patch ID.
+patched :: proc(ctx: ^Fiber_Context, patch_id: string) -> bool {
+	return patch_impl(ctx, patch_id, false)
+}
+
+// deprecate_patch records that the old branch has been removed. Once histories
+// containing the non-deprecated marker can no longer exist, this call may also
+// be removed.
+deprecate_patch :: proc(ctx: ^Fiber_Context, patch_id: string) -> bool {
+	return patch_impl(ctx, patch_id, true)
 }
 
 // detached_cancellation_scope prevents operations created inside the scope from
@@ -4424,6 +4535,7 @@ Workflow_Command_State :: struct {
 	child_workflow_count: int,
 	external_signal_count: int,
 	external_cancel_count: int,
+	patch_count:          int,
 }
 
 workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_State {
@@ -4439,6 +4551,7 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 		child_workflow_count = len(instance.child_workflows),
 		external_signal_count = len(instance.external_signals),
 		external_cancel_count = len(instance.external_cancels),
+		patch_count = len(instance.patches),
 	}
 }
 
@@ -4456,7 +4569,8 @@ workflow_command_state_changed :: proc(
 		len(instance.timers) != before.timer_count ||
 		len(instance.child_workflows) != before.child_workflow_count ||
 		len(instance.external_signals) != before.external_signal_count ||
-		len(instance.external_cancels) != before.external_cancel_count
+		len(instance.external_cancels) != before.external_cancel_count ||
+		len(instance.patches) != before.patch_count
 }
 
 restore_workflow_command_state :: proc(
@@ -4483,6 +4597,9 @@ restore_workflow_command_state :: proc(
 	}
 	for len(instance.external_cancels) > before.external_cancel_count {
 		ordered_remove(&instance.external_cancels, len(instance.external_cancels) - 1)
+	}
+	for len(instance.patches) > before.patch_count {
+		ordered_remove(&instance.patches, len(instance.patches) - 1)
 	}
 }
 
@@ -5178,6 +5295,35 @@ append_shared_operation_commands :: proc(
 	append_fiber_external_signal_cancellations(result, commands, instance)
 }
 
+append_fiber_patch_commands :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) {
+	for index in 0..<len(instance.patches) {
+		decision := &instance.patches[index]
+		if !decision.emit_command || decision.command_sent {
+			continue
+		}
+		marker := new(proto.Coresdk_Workflow_Commands_SetPatchMarker)
+		marker.patch_id = decision.patch_id
+		marker.deprecated = decision.deprecated
+		append(
+			commands,
+			proto.Coresdk_Workflow_Commands_WorkflowCommand{
+				variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Set_Patch_Marker{
+					value = marker,
+				},
+			},
+		)
+		decision.command_sent = true
+		result.patch_markers_emitted += 1
+		if decision.deprecated {
+			result.deprecated_patch_markers_emitted += 1
+		}
+	}
+}
+
 append_fiber_pending_commands :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -5261,16 +5407,18 @@ observe_unfinished_update_routines :: proc(
 	}
 }
 
-commands_are_update_responses :: proc(
+commands_are_nonterminal_prefix :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 ) -> bool {
 	for command in commands^ {
-		is_update_response := false
+		allowed := false
 		#partial switch variant in command.variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
-			is_update_response = variant.value != nil
+			allowed = variant.value != nil
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Set_Patch_Marker:
+			allowed = variant.value != nil
 		}
-		if !is_update_response {
+		if !allowed {
 			return false
 		}
 	}
@@ -5285,7 +5433,7 @@ append_fiber_continue_as_new_command :: proc(
 	if !instance.continue_as_new.present {
 		return error_from_string("Workflow requested Continue-As-New without preserved input")
 	}
-	if !commands_are_update_responses(commands) {
+	if !commands_are_nonterminal_prefix(commands) {
 		return error_from_string("fiber spike emitted Continue-As-New after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
@@ -5322,7 +5470,7 @@ append_fiber_completion_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if !commands_are_update_responses(commands) {
+	if !commands_are_nonterminal_prefix(commands) {
 		return error_from_string("fiber spike emitted completion after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
@@ -5349,7 +5497,7 @@ append_fiber_failure_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if !commands_are_update_responses(commands) {
+	if !commands_are_nonterminal_prefix(commands) {
 		return error_from_string("fiber spike emitted failure after another command")
 	}
 	failure := new(proto.Temporal_Api_Failure_V1_Failure)
@@ -5414,7 +5562,7 @@ append_fiber_cancellation_commands :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	instance: ^Fiber_Instance,
 ) -> Error {
-	if !commands_are_update_responses(commands) {
+	if !commands_are_nonterminal_prefix(commands) {
 		return error_from_string("fiber spike emitted cancellation after another command")
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
@@ -5448,6 +5596,7 @@ append_fiber_progress_command :: proc(
 		result.run_id = instance.run_id
 		return {}
 	}
+	append_fiber_patch_commands(result, commands, instance)
 	if instance.terminal_failure_requested {
 		instance.failure_message = instance.terminal_failure_message
 		instance.failure_type = instance.terminal_failure_type
@@ -5486,6 +5635,27 @@ append_fiber_progress_command :: proc(
 	case .Normal, .Running:
 	}
 	return error_from_string("Workflow fiber reached an invalid state after resolution")
+}
+
+apply_activation_patch_notifications :: proc(
+	instance: ^Fiber_Instance,
+	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
+) -> Error {
+	if instance == nil || activation == nil {
+		return error_from_string("Workflow patch notification has no active fiber")
+	}
+	for job in activation.jobs {
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Notify_Has_Patch:
+			if variant.value == nil || len(variant.value.patch_id) == 0 {
+				return error_from_string("Workflow patch notification has no patch ID")
+			}
+			if !notify_patch(instance, variant.value.patch_id) {
+				return error_from_string("could not preserve Workflow patch notification")
+			}
+		}
+	}
+	return {}
 }
 
 process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result: Process_Result) {
@@ -5531,6 +5701,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		}
 	}
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
+	if instance_found {
+		instance.activation_is_replaying = activation.is_replaying
+		notification_error := apply_activation_patch_notifications(instance, &activation)
+		if notification_error.message != nil {
+			message := string(notification_error.message)
+			error_free(&notification_error)
+			process_error(&result, activation.run_id, message)
+			return
+		}
+	}
 	for job in activation.jobs {
 		handled := false
 		#partial switch variant in job.variant {
@@ -5549,12 +5729,27 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			instance_found = true
+			instance.activation_is_replaying = activation.is_replaying
+			notification_error := apply_activation_patch_notifications(instance, &activation)
+			if notification_error.message != nil {
+				message := string(notification_error.message)
+				error_free(&notification_error)
+				process_error(&result, activation.run_id, message)
+				return
+			}
 			if activation.is_replaying {
 				runtime.replay_initializations += 1
 			}
 			resume_result := fiber_raw.resume(instance.fiber)
 			if resume_result != .Success {
 				process_error(&result, activation.run_id, "could not start Workflow fiber")
+				return
+			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Notify_Has_Patch:
+			handled = true
+			if variant.value == nil || len(variant.value.patch_id) == 0 || !instance_found {
+				process_error(&result, activation.run_id, "Workflow patch notification has no active fiber or patch ID")
 				return
 			}
 

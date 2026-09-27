@@ -8,7 +8,9 @@ initialize -> schedule hello Activity -> resolve Activity -> complete
 
 `fiber_spike.odin` drives serial commands, multiple outstanding Activities,
 handled Activity failures, buffered signals, a durable signal/timer race, and
-Activity-awaiting Workflow Update routines through stackful coroutines. The
+Activity-awaiting Workflow Update routines through stackful coroutines. It also
+implements Core's `NotifyHasPatch`/`SetPatchMarker` replay protocol through
+`patched` and `deprecate_patch`. The
 current live Workflow includes:
 
 ```odin

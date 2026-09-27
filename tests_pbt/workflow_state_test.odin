@@ -2055,6 +2055,193 @@ continue_as_new_replay_for_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Patch_Input :: struct {
+	patch_id:   string,
+	deprecated: bool,
+}
+
+Generated_Patch_Output :: struct {
+	first:  bool,
+	second: bool,
+}
+
+generated_patch_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Patch_Input,
+) -> Generated_Patch_Output {
+	if input.deprecated {
+		return {
+			first = workflow.deprecate_patch(ctx, input.patch_id),
+			second = workflow.deprecate_patch(ctx, input.patch_id),
+		}
+	}
+	return {
+		first = workflow.patched(ctx, input.patch_id),
+		second = workflow.patched(ctx, input.patch_id),
+	}
+}
+
+generated_patch_completion_matches :: proc(
+	data: []u8,
+	input: ^Generated_Patch_Input,
+	expected_present: bool,
+) -> bool {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	if !proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion) {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != (expected_present ? 2 : 1) {
+			return false
+		}
+		marker_count := 0
+		completed := false
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Set_Patch_Marker:
+				if variant.value == nil || variant.value.patch_id != input.patch_id ||
+				   variant.value.deprecated != input.deprecated {
+					return false
+				}
+				marker_count += 1
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+				if variant.value == nil || variant.value.result == nil {
+					return false
+				}
+				owned, clone_error := proto.clone_payload(variant.value.result)
+				if clone_error != .None {
+					return false
+				}
+				output: Generated_Patch_Output
+				decode_error := codec.decode_json(codec.payload_view(&owned), &output)
+				codec.payload_free(&owned)
+				if decode_error != .None ||
+				   output.first != expected_present || output.second != expected_present {
+					return false
+				}
+				completed = true
+			}
+		}
+		return completed && marker_count == (expected_present ? 1 : 0)
+	}
+	return false
+}
+
+workflow_patch_truth_table_property :: proc(t: ^pbt.T) -> pbt.Result {
+	replaying := pbt.draw(t, pbt.boolean())
+	notified := pbt.draw(t, pbt.boolean())
+	deprecated := pbt.draw(t, pbt.boolean())
+	input_value := Generated_Patch_Input{
+		patch_id = pbt.draw(t, pbt.string_ascii(1, 64)),
+		deprecated = deprecated,
+	}
+	pbt.cover(t, !replaying, 20.0, "fresh history")
+	pbt.cover(t, replaying && !notified, 15.0, "replay without marker")
+	pbt.cover(t, replaying && notified, 15.0, "replay with marker")
+	pbt.cover(t, deprecated, 30.0, "deprecated marker")
+
+	owned_queue, queue_error := strings.clone("pbt-patch-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate patch queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_patch_workflow",
+		generated_patch_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register generated patch Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated patch input")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_patch_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	notification := proto.Coresdk_Workflow_Activation_NotifyHasPatch{
+		patch_id = input_value.patch_id,
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-patch-run",
+		is_replaying = replaying,
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	if notified {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Notify_Has_Patch{
+					value = &notification,
+				},
+			},
+		)
+	}
+	processed := process_activation(runtime, &activation)
+	defer destroy_process_result(&processed)
+	expected_present := !replaying || notified
+	if processed.error.message != nil ||
+	   processed.patch_markers_emitted != (expected_present ? 1 : 0) ||
+	   processed.deprecated_patch_markers_emitted !=
+		(expected_present && deprecated ? 1 : 0) ||
+	   !generated_patch_completion_matches(
+		processed.completion[:],
+		&input_value,
+		expected_present,
+	) {
+		return pbt.fail("generated patch case violated Core's patch truth table")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_patch_truth_table_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow patches follow replay/notification/deprecation truth table",
+		workflow_patch_truth_table_property,
+		{num_tests = 500, seed = 0x5041_5443_485f_4f44},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

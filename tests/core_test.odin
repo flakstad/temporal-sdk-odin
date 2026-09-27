@@ -1197,6 +1197,196 @@ continue_as_new_invalid_options_fail_the_workflow :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_patch_marker_obeys_fresh_and_replay_semantics :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"patch_test_workflow",
+		"patch-task-queue",
+		patch_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("odin-patch-v1")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "patch_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	notification := proto.Coresdk_Workflow_Activation_NotifyHasPatch{
+		patch_id = "odin-patch-v1",
+	}
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "patch-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	fresh := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, fresh.error.message == nil, "fresh patch activation failed: %s", string(fresh.error.message))
+	testing.expect_value(t, fresh.patch_markers_emitted, 1)
+	fresh_inspection := inspect_workflow_completion(fresh.completion[:])
+	testing.expect_value(t, fresh_inspection.command_count, 2)
+	testing.expect_value(t, fresh_inspection.patch_marker_count, 1)
+	testing.expect_value(t, string(fresh_inspection.patch_id), "odin-patch-v1")
+	testing.expect(t, !fresh_inspection.patch_deprecated)
+	testing.expect_value(t, string(fresh_inspection.completion_result), `"new"`)
+	delete(fresh_inspection.patch_id)
+	delete(fresh_inspection.completion_result)
+	delete(fresh.completion)
+	workflow.error_free(&fresh.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	without_marker := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, without_marker.error.message == nil, "patchless replay failed: %s", string(without_marker.error.message))
+	testing.expect_value(t, without_marker.patch_markers_emitted, 0)
+	without_inspection := inspect_workflow_completion(without_marker.completion[:])
+	testing.expect_value(t, without_inspection.command_count, 1)
+	testing.expect_value(t, without_inspection.patch_marker_count, 0)
+	testing.expect_value(t, string(without_inspection.completion_result), `"old"`)
+	delete(without_inspection.completion_result)
+	delete(without_marker.completion)
+	workflow.error_free(&without_marker.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Notify_Has_Patch{
+				value = &notification,
+			},
+		},
+	)
+	with_marker := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, with_marker.error.message == nil, "marked replay failed: %s", string(with_marker.error.message))
+	testing.expect_value(t, with_marker.patch_markers_emitted, 1)
+	with_inspection := inspect_workflow_completion(with_marker.completion[:])
+	testing.expect_value(t, with_inspection.command_count, 2)
+	testing.expect_value(t, with_inspection.patch_marker_count, 1)
+	testing.expect_value(t, string(with_inspection.patch_id), "odin-patch-v1")
+	testing.expect_value(t, string(with_inspection.completion_result), `"new"`)
+	delete(with_inspection.patch_id)
+	delete(with_inspection.completion_result)
+	delete(with_marker.completion)
+	workflow.error_free(&with_marker.error)
+}
+
+@(test)
+deprecated_workflow_patch_emits_one_deprecated_marker :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"deprecated_patch_test_workflow",
+		"patch-task-queue",
+		deprecated_patch_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("odin-deprecated-v1")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "deprecated_patch_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "deprecated-patch-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deprecated patch activation failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.patch_markers_emitted, 1)
+	testing.expect_value(t, processed.deprecated_patch_markers_emitted, 1)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect_value(t, inspection.command_count, 2)
+	testing.expect_value(t, inspection.patch_marker_count, 1)
+	testing.expect_value(t, string(inspection.patch_id), "odin-deprecated-v1")
+	testing.expect(t, inspection.patch_deprecated)
+	testing.expect_value(t, string(inspection.completion_result), `"deprecated"`)
+	delete(inspection.patch_id)
+	delete(inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2059,6 +2249,24 @@ continue_as_new_invalid_options_test_workflow :: proc(
 	)
 }
 
+patch_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	first := workflow.patched(ctx, input)
+	second := workflow.patched(ctx, input)
+	if first && second {
+		return "new"
+	}
+	return "old"
+}
+
+deprecated_patch_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	first := workflow.deprecate_patch(ctx, input)
+	second := workflow.deprecate_patch(ctx, input)
+	if first && second {
+		return "deprecated"
+	}
+	return "missing"
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -2282,6 +2490,9 @@ Workflow_Completion_Inspection :: struct {
 	external_workflow_cancel_run_id: []u8,
 	external_workflow_cancel_reason: []u8,
 	continued_as_new: bool,
+	patch_marker_count: int,
+	patch_id:          []u8,
+	patch_deprecated:  bool,
 	continue_workflow_type: []u8,
 	continue_task_queue: []u8,
 	continue_input: []u8,
@@ -2323,6 +2534,12 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 		inspection.command_count = len(status.value.commands)
 		for command in status.value.commands {
 			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Set_Patch_Marker:
+				if variant.value != nil {
+					inspection.patch_marker_count += 1
+					inspection.patch_id = bytes.clone(transmute([]u8)variant.value.patch_id)
+					inspection.patch_deprecated = variant.value.deprecated
+				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
 				if variant.value != nil {
 					inspection.scheduled_activity_seq = variant.value.seq

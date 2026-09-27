@@ -236,6 +236,45 @@ worker_pid=""
 cat "$worker_log"
 grep -q "structured Activity failure details reached Workflow code" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=patch \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Patch Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+patch_workflow_id="odin-sdk-patch-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$patch_workflow_id" \
+  --type odin_patch_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Odin"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+patch_workflow_output="$(<"$workflow_output_file")"
+echo "$patch_workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$patch_workflow_output"
+grep -q 'Patched Odin' <<<"$patch_workflow_output"
+temporal workflow show \
+  --workflow-id "$patch_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'core_patch' "$typed_history_file"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
+grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

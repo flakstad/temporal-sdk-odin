@@ -96,6 +96,8 @@ Process_Result :: struct {
 	canceled_child_workflow_seq: u32,
 	canceled_workflow:     bool,
 	continued_as_new:      bool,
+	patch_markers_emitted: int,
+	deprecated_patch_markers_emitted: int,
 	completed:          bool,
 	evicted:            bool,
 	is_replaying:       bool,

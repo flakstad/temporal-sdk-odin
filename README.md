@@ -40,6 +40,11 @@ Core resolves each outbound operation. The live suite proves this against two
 independent executions. `continue_as_new_json/payload/owned` now terminate the
 current fiber run and carry new input plus timeout/retry/backoff options into a
 new durable run; the CLI-devserver suite follows that chain to completion. The
+Workflow runtime now implements Core's patch protocol through
+`workflow.patched` and `workflow.deprecate_patch`. It consumes preemptive
+`NotifyHasPatch` jobs, memoizes each decision per run, emits at most one
+`SetPatchMarker`, and takes the legacy branch when replay encounters no marker.
+The CLI-devserver suite verifies the resulting `core_patch` history marker. The
 offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
@@ -392,6 +397,25 @@ headers, search attributes, and versioning overrides are not exposed yet.
 The primitive may only be called from the main Workflow context; misuse fails
 the Workflow with an SDK Application Failure rather than returning past the
 terminal command.
+
+Version Workflow code with a stable patch ID:
+
+```odin
+if workflow.patched(ctx, "orders-use-v2") {
+    // New deterministic command path.
+} else {
+    // Historical path for executions started before the change.
+}
+```
+
+Repeated calls with the same ID return the memoized decision and emit no extra
+command. On a new execution `patched` returns `true` and records the marker; on
+replay it returns `true` only when Core supplied `NotifyHasPatch`. After all old
+executions have passed the migration window, replace the branch with
+`workflow.deprecate_patch(ctx, "orders-use-v2")` before eventually removing the
+call. Patch IDs are part of durable history and must not be reused for a
+different change. This is Workflow code versioning, not Worker Deployment
+Versioning; deployment routing is not exposed yet.
 
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:

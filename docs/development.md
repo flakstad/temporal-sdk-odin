@@ -100,7 +100,9 @@ forces eviction, reconstructs a fresh fiber, and requires the decisive
 `WorkflowActivationCompletion` bytes to match replay exactly. Separate
 500-case properties cover Child and external Workflow commands and exact
 fresh-stack replay. Another 500 cases vary Continue-As-New identity,
-timeouts, Retry Policy, backoff, Payload, and exact replay. PBT is a
+timeouts, Retry Policy, backoff, Payload, and exact replay. A patch property
+generates another 500 replay/notified/deprecated combinations, checks Core's
+truth table, and requires duplicate calls to emit at most one marker. PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
 statechart lifecycle model. Its own package tests currently contain an upstream
@@ -708,7 +710,7 @@ The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
 request reason, runs a second Activity in `detached_cancellation_scope`, and
 closes the Workflow as canceled only after that Activity resolves.
 
-## Child, external, and Continue-As-New acceptance test
+## Child, external, Continue-As-New, and patch acceptance test
 
 `examples/child_workflow` registers successful, failing, and cancellation-aware
 parent/child Workflows on task queue `odin-child-workflow`. The normal parent
@@ -749,7 +751,9 @@ server-backed paths automatically:
   as canceled;
 - a Workflow that emits `ContinueAsNewWorkflowExecution` with replacement
   input/timeouts, is evicted, starts a second run under the same Workflow ID,
-  and returns the second run's result to Temporal CLI.
+  and returns the second run's result to Temporal CLI; and
+- a Workflow that takes its new `patched` branch, emits `SetPatchMarker`, and
+  leaves a server-side `core_patch` marker visible through `temporal workflow show`.
 
 The unit suite additionally evicts the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
@@ -764,7 +768,9 @@ the parent closes as canceled. External-operation unit tests inspect namespace,
 Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
 and fresh-stack replay bytes. Continue-As-New unit tests additionally prove the
 non-returning terminal path, default type/queue reuse, options encoding, invalid
-option failure, second-run initialization, and exact replay.
+option failure, second-run initialization, and exact replay. Patch unit tests
+cover fresh history, replay with and without a preemptive notification, Core's
+actual initialize-then-notify job order, memoization, and deprecated markers.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

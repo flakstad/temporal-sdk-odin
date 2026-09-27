@@ -1449,7 +1449,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, registered dispatch, eviction, and replay on macOS arm64 | Add patch/versioning primitives and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, and replay on macOS arm64 | Stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1470,7 +1470,8 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
-signal/cancel/replay cases, 500 Continue-As-New option/replay cases, and 1,000
+signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
+truth-table cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
@@ -1480,9 +1481,10 @@ await, signal, and explicit cancellation. A live duplicate-ID case proves the
 Core-local `WorkflowAlreadyExists` start failure. External Workflow signal and
 cancellation are also implemented and live-proven. Continue-As-New now provides
 the next-run Payload and the main timeout/retry/backoff options through a
-non-returning terminal fiber primitive. The next smallest determinism extension
-is Core's patch/versioning protocol; richer recursive failure inspection can
-proceed independently.
+non-returning terminal fiber primitive. Core's patch/versioning protocol is now
+implemented and live-proven. The next smallest runtime extension is
+deterministic Workflow time/randomness, while richer recursive failure
+inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1676,3 +1678,52 @@ reruns user code and must reconstruct identical command bytes. Unit and
 500-case property tests enforce that invariant. The live dev-server case proves
 the Service creates run two and that the same Odin worker completes it under
 the original Workflow ID.
+
+### Workflow patch/versioning boundary
+
+Workflow code patching also uses the existing protobuf completion boundary and
+requires no new C ABI symbol. The pinned Core schema exposes
+`WorkflowActivationJob.notify_has_patch` (field 9) and
+`WorkflowCommand.set_patch_marker` (field 10). `NotifyHasPatch` contains the
+patch ID; `SetPatchMarker` contains the same ID plus `deprecated`.
+
+Core owns history lookahead and marker state machines. While replaying, it scans
+through the next Workflow Task for `core_patch` marker events and sends
+`NotifyHasPatch` preemptively. The language runtime owns the synchronous API
+decision and must return before waiting for any resolution. The exact pinned
+Core behavior, verified in `crates/workflow/src/workflow_context.rs` and
+`crates/sdk-core/src/worker/workflow/machines/patch_state_machine.rs`, is:
+
+| Activation state | `patched(id)` result | Odin completion |
+| --- | --- | --- |
+| Not replaying | `true` | one non-deprecated `SetPatchMarker` |
+| Replaying, notified by Core | `true` | matching `SetPatchMarker` |
+| Replaying, no notification | `false` | no patch command |
+
+`deprecate_patch` uses the same decision table and sets `deprecated=true` when
+it emits a marker. A patch ID is memoized on first use, so subsequent calls in
+the run return the same decision and emit no duplicate command.
+
+Core's first replay activation is observably ordered as `InitializeWorkflow`
+followed by `NotifyHasPatch`. Rust can construct its async Workflow before
+polling it; Odin's stackful fiber begins executing immediately when resumed for
+initialization. The Odin runtime therefore pre-scans and arena-copies every
+patch notification before it starts or resumes user code. This is a real
+language-runtime adaptation, not a change to Core semantics. On later
+activations the same pre-scan happens before signals, Updates, resolutions, or
+the main fiber can run.
+
+Patch IDs and memoized decisions live in the per-run arena. Activation strings
+borrow the decode arena only until copied. Completion command strings then
+borrow the run arena through encoding; eviction destroys them with the fiber.
+Read-only query and synchronous Update validation snapshots include the patch
+decision count, so an attempted first patch decision is rolled back and
+reported as a mutation.
+
+The unit suite covers fresh history, replay with and without notification,
+Core's initialize-then-notify order, duplicate calls, and deprecated markers.
+A 500-case property generates the replay/notified/deprecated truth table. The
+CLI-devserver test executes the new branch, observes one emitted marker, and
+requires `core_patch` in server history. This API concerns deterministic code
+changes inside a Workflow. Worker Deployment Versioning, build-ID routing, and
+Core's experimental rollout callback remain separate and unimplemented.
