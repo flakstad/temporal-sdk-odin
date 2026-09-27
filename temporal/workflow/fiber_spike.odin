@@ -207,8 +207,8 @@ Owned_Activity_Options :: struct {
 
 // Local Activities execute in the same Worker process as the Workflow but are
 // still dispatched by Core as Activity tasks. They do not have a task queue or
-// heartbeat timeout. The first slice deliberately permits one attempt only;
-// Core's timer-backed local retry protocol is added separately.
+// heartbeat timeout. Retries longer than Core's local threshold are bridged
+// through durable Workflow timers without changing the public Activity_Future.
 Local_Activity_Options :: struct {
 	activity_id:               string,
 	schedule_to_close_timeout: time.Duration,
@@ -554,10 +554,19 @@ Pending_Update_Response :: struct {
 }
 
 Fiber_Activity_Operation :: struct {
+	// seq is the stable, language-runtime handle exposed through Activity_Future.
+	// command_seq identifies the current Core command. Local Activity retries keep
+	// the former and allocate a fresh latter after their backoff timer fires.
 	seq:           u32,
+	command_seq:   u32,
 	activity_id:   string,
 	activity_type: string,
 	is_local:      bool,
+	attempt:       u32,
+	backoff_timer_seq: u32,
+	has_original_schedule_time: bool,
+	original_schedule_seconds:  i64,
+	original_schedule_nanos:    i32,
 	options:       Owned_Activity_Options,
 	local_options: Owned_Local_Activity_Options,
 	input:         codec.Payload,
@@ -1343,6 +1352,31 @@ find_activity_operation :: proc(instance: ^Fiber_Instance, seq: u32) -> (^Fiber_
 	return nil, false
 }
 
+find_activity_operation_by_command_seq :: proc(
+	instance: ^Fiber_Instance,
+	command_seq: u32,
+) -> (^Fiber_Activity_Operation, bool) {
+	for index in 0..<len(instance.activities) {
+		if instance.activities[index].command_seq == command_seq {
+			return &instance.activities[index], true
+		}
+	}
+	return nil, false
+}
+
+find_local_activity_by_backoff_timer :: proc(
+	instance: ^Fiber_Instance,
+	timer_seq: u32,
+) -> (^Fiber_Activity_Operation, bool) {
+	for index in 0..<len(instance.activities) {
+		operation := &instance.activities[index]
+		if operation.is_local && operation.backoff_timer_seq == timer_seq {
+			return operation, true
+		}
+	}
+	return nil, false
+}
+
 find_child_workflow_operation :: proc(
 	instance: ^Fiber_Instance,
 	seq: u32,
@@ -2020,7 +2054,21 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 		case .Scheduled:
 			operation.state = .Canceled
 		case .Commanded:
-			operation.state = .Cancel_Requested
+			if operation.is_local && operation.backoff_timer_seq != 0 {
+				timer, found := find_timer_operation(instance, operation.backoff_timer_seq)
+				if found {
+					switch timer.state {
+					case .Scheduled:
+						timer.state = .Canceled
+					case .Commanded:
+						timer.state = .Cancel_Requested
+					case .Resolved, .Failed, .Cancel_Requested, .Canceled:
+					}
+				}
+				operation.state = .Canceled
+			} else {
+				operation.state = .Cancel_Requested
+			}
 		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
 		}
 	}
@@ -2397,6 +2445,7 @@ start_activity_owned :: proc(
 			&instance.activities,
 			Fiber_Activity_Operation{
 				seq = instance.next_activity_seq,
+				command_seq = instance.next_activity_seq,
 				state = .Canceled,
 			},
 		)
@@ -2441,6 +2490,7 @@ start_activity_owned :: proc(
 	}
 	operation := Fiber_Activity_Operation{
 		seq = instance.next_activity_seq,
+		command_seq = instance.next_activity_seq,
 		activity_id = activity_id,
 		activity_type = owned_activity_type,
 		options = owned_options,
@@ -2576,9 +2626,6 @@ local_activity_options_error :: proc(
 		   policy.maximum_interval < policy.initial_interval {
 			return "Local Activity Retry Policy maximum interval must not be shorter than its initial interval"
 		}
-		if policy.maximum_attempts != 1 {
-			return "Local Activity timer-backed retries are not implemented; maximum attempts must be one"
-		}
 	}
 	return ""
 }
@@ -2637,7 +2684,9 @@ start_local_activity_owned :: proc(
 			&instance.activities,
 			Fiber_Activity_Operation{
 				seq = instance.next_activity_seq,
+				command_seq = instance.next_activity_seq,
 				is_local = true,
+				attempt = 1,
 				state = .Canceled,
 			},
 		)
@@ -2674,9 +2723,11 @@ start_local_activity_owned :: proc(
 	}
 	operation := Fiber_Activity_Operation{
 		seq = instance.next_activity_seq,
+		command_seq = instance.next_activity_seq,
 		activity_id = activity_id,
 		activity_type = owned_activity_type,
 		is_local = true,
+		attempt = 1,
 		local_options = owned_options,
 		input = owned_input,
 		state = .Scheduled,
@@ -3676,6 +3727,22 @@ failure_duration_from_proto :: proc(value: ^proto.Google_Protobuf_Duration) -> t
 		return 0
 	}
 	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+}
+
+positive_duration_from_proto :: proc(
+	value: ^proto.Google_Protobuf_Duration,
+) -> (duration: time.Duration, ok: bool) {
+	if value == nil || value.seconds < 0 || value.nanos < 0 || value.nanos >= 1_000_000_000 {
+		return 0, false
+	}
+	// time.Duration is a signed nanosecond count. Reject malformed Core input
+	// instead of allowing the multiplication to wrap.
+	if value.seconds > 9_223_372_036 ||
+	   (value.seconds == 9_223_372_036 && value.nanos > 854_775_807) {
+		return 0, false
+	}
+	duration = time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
+	return duration, duration > 0
 }
 
 clone_failure_string :: proc(value: string) -> (string, bool) {
@@ -4714,11 +4781,18 @@ append_fiber_schedule_command :: proc(
 		payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 		options := &operation.local_options
 		schedule := new(proto.Coresdk_Workflow_Commands_ScheduleLocalActivity)
+		original_schedule_time: ^proto.Google_Protobuf_Timestamp
+		if operation.has_original_schedule_time {
+			original_schedule_time = new(proto.Google_Protobuf_Timestamp)
+			original_schedule_time.seconds = operation.original_schedule_seconds
+			original_schedule_time.nanos = operation.original_schedule_nanos
+		}
 		schedule^ = {
-			seq = operation.seq,
+			seq = operation.command_seq,
 			activity_id = operation.activity_id,
 			activity_type = operation.activity_type,
-			attempt = 1,
+			attempt = operation.attempt,
+			original_schedule_time = original_schedule_time,
 			schedule_to_close_timeout = duration_to_proto(options.schedule_to_close_timeout),
 			schedule_to_start_timeout = duration_to_proto(options.schedule_to_start_timeout),
 			start_to_close_timeout = duration_to_proto(options.start_to_close_timeout),
@@ -4739,7 +4813,7 @@ append_fiber_schedule_command :: proc(
 		operation.state = .Commanded
 		result.scheduled_local_activity = true
 		result.scheduled_local_activity_count += 1
-		result.activity_seq = operation.seq
+		result.activity_seq = operation.command_seq
 		return
 	}
 	payload := new(proto.Temporal_Api_Common_V1_Payload)
@@ -4754,7 +4828,7 @@ append_fiber_schedule_command :: proc(
 	}
 	schedule := new(proto.Coresdk_Workflow_Commands_ScheduleActivity)
 	schedule^ = proto.Coresdk_Workflow_Commands_ScheduleActivity{
-		seq = operation.seq,
+		seq = operation.command_seq,
 		activity_id = operation.activity_id,
 		activity_type = operation.activity_type,
 		task_queue = activity_task_queue,
@@ -4778,7 +4852,7 @@ append_fiber_schedule_command :: proc(
 	operation.state = .Commanded
 	result.scheduled_activity = true
 	result.scheduled_activity_count += 1
-	result.activity_seq = operation.seq
+	result.activity_seq = operation.command_seq
 }
 
 append_fiber_timer_command :: proc(
@@ -4848,7 +4922,7 @@ append_fiber_cancel_activity_command :: proc(
 ) {
 	if operation.is_local {
 		request := new(proto.Coresdk_Workflow_Commands_RequestCancelLocalActivity)
-		request.seq = operation.seq
+		request.seq = operation.command_seq
 		append(
 			commands,
 			proto.Coresdk_Workflow_Commands_WorkflowCommand{
@@ -4860,11 +4934,11 @@ append_fiber_cancel_activity_command :: proc(
 		operation.state = .Canceled
 		result.requested_local_activity_cancellation = true
 		result.requested_local_activity_cancellation_count += 1
-		result.canceled_activity_seq = operation.seq
+		result.canceled_activity_seq = operation.command_seq
 		return
 	}
 	request := new(proto.Coresdk_Workflow_Commands_RequestCancelActivity)
-	request.seq = operation.seq
+	request.seq = operation.command_seq
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{
@@ -4876,7 +4950,7 @@ append_fiber_cancel_activity_command :: proc(
 	operation.state = .Canceled
 	result.requested_activity_cancellation = true
 	result.requested_activity_cancellation_count += 1
-	result.canceled_activity_seq = operation.seq
+	result.canceled_activity_seq = operation.command_seq
 }
 
 append_fiber_activity_cancellations :: proc(
@@ -6339,7 +6413,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, "Activity resolution has no Workflow fiber")
 				return
 			}
-			operation, operation_found := find_activity_operation(instance, variant.value.seq)
+			operation, operation_found := find_activity_operation_by_command_seq(
+				instance,
+				variant.value.seq,
+			)
 			if !operation_found {
 				process_error(&result, activation.run_id, "Activity resolution does not match a pending Workflow operation")
 				return
@@ -6351,7 +6428,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			if operation.state == .Canceled {
 				// Core may report the terminal resolution of a requested Activity
 				// while detached cleanup is running or before cache eviction.
-				result.resolved_activity_seq = operation.seq
+				result.resolved_activity_seq = operation.command_seq
 				continue
 			}
 			if operation.state != .Commanded && operation.state != .Cancel_Requested {
@@ -6375,7 +6452,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 				operation.result = owned_result
 				operation.state = .Resolved
-				result.resolved_activity_seq = operation.seq
+				result.resolved_activity_seq = operation.command_seq
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed:
 				resolution_handled = true
 				if status.value == nil || status.value.failure == nil {
@@ -6394,7 +6471,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				operation.failure_message = failure_message
 				operation.failure_proto = failure_proto[:]
 				operation.state = .Failed
-				result.resolved_activity_seq = operation.seq
+				result.resolved_activity_seq = operation.command_seq
 				result.resolved_activity_failed = true
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Cancelled:
 				resolution_handled = true
@@ -6403,15 +6480,48 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				operation.state = .Canceled
-				result.resolved_activity_seq = operation.seq
+				result.resolved_activity_seq = operation.command_seq
 			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Backoff:
 				resolution_handled = true
-				process_error(
-					&result,
-					activation.run_id,
-					"Local Activity requested timer-backed retry, which is not implemented",
+				if operation.state == .Cancel_Requested {
+					// Cancellation won the race with Core's backoff resolution. There
+					// is no longer a running local attempt to cancel and no retry timer
+					// should be created; resume the waiter as canceled.
+					operation.state = .Canceled
+					result.resolved_activity_seq = operation.command_seq
+					continue
+				}
+				if !operation.is_local || operation.state != .Commanded ||
+				   operation.backoff_timer_seq != 0 || status.value == nil ||
+				   status.value.attempt <= operation.attempt ||
+				   status.value.original_schedule_time == nil {
+					process_error(&result, activation.run_id, "Local Activity backoff is invalid")
+					return
+				}
+				backoff_duration, duration_ok := positive_duration_from_proto(
+					status.value.backoff_duration,
 				)
-				return
+				timestamp := status.value.original_schedule_time
+				if !duration_ok || timestamp.nanos < 0 || timestamp.nanos >= 1_000_000_000 {
+					process_error(&result, activation.run_id, "Local Activity backoff metadata is invalid")
+					return
+				}
+				instance.next_timer_seq += 1
+				operation.attempt = status.value.attempt
+				operation.backoff_timer_seq = instance.next_timer_seq
+				operation.has_original_schedule_time = true
+				operation.original_schedule_seconds = timestamp.seconds
+				operation.original_schedule_nanos = timestamp.nanos
+				append(
+					&instance.timers,
+					Fiber_Timer_Operation{
+						seq = instance.next_timer_seq,
+						duration = backoff_duration,
+						state = .Scheduled,
+						detached_from_root_cancellation = operation.detached_from_root_cancellation,
+					},
+				)
+				result.resolved_activity_seq = operation.command_seq
 			}
 			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
@@ -6743,6 +6853,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			timer_operation.state = .Resolved
+			local_activity, is_backoff_timer := find_local_activity_by_backoff_timer(
+				instance,
+				variant.value.seq,
+			)
+			if is_backoff_timer && local_activity.state == .Commanded {
+				instance.next_activity_seq += 1
+				local_activity.command_seq = instance.next_activity_seq
+				local_activity.backoff_timer_seq = 0
+				local_activity.state = .Scheduled
+			}
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
 			handled = true

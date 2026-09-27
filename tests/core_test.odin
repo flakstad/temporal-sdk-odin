@@ -1624,6 +1624,325 @@ workflow_local_activity_command_resolution_and_replay :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_local_activity_timer_backoff_retries_and_replays :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"local_activity_retry_test_workflow",
+		"local-retry-queue",
+		local_activity_retry_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "local_activity_retry_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "local-activity-retry-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "initial Local Activity failed: %s", string(initial.error.message))
+	testing.expect(t, initial.scheduled_local_activity)
+	testing.expect_value(t, initial.activity_seq, u32(1))
+	initial_bytes := bytes.clone(initial.completion[:])
+	initial_inspection := inspect_scheduled_local_activity(initial.completion[:])
+	testing.expect(t, initial_inspection.found)
+	testing.expect_value(t, initial_inspection.attempt, u32(1))
+	testing.expect(t, !initial_inspection.has_original_schedule_time)
+	testing.expect_value(t, initial_inspection.retry_maximum_attempts, i32(3))
+	scheduled_local_activity_inspection_free(&initial_inspection)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	backoff_duration := proto.Google_Protobuf_Duration{nanos = 250_000_000}
+	original_schedule_time := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_000_123,
+		nanos = 456_789_123,
+	}
+	backoff := proto.Coresdk_Activity_Result_DoBackoff{
+		attempt = 2,
+		backoff_duration = &backoff_duration,
+		original_schedule_time = &original_schedule_time,
+	}
+	backoff_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Backoff{value = &backoff},
+	}
+	resolve_backoff := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &backoff_resolution,
+		is_local = true,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_backoff,
+			},
+		},
+	)
+	backing_off := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, backing_off.error.message == nil, "Local Activity backoff failed: %s", string(backing_off.error.message))
+	testing.expect(t, backing_off.started_timer)
+	testing.expect_value(t, backing_off.timer_seq, u32(1))
+	testing.expect(t, !backing_off.completed)
+	backoff_bytes := bytes.clone(backing_off.completion[:])
+	backoff_inspection := inspect_workflow_completion(backing_off.completion[:])
+	testing.expect_value(t, backoff_inspection.command_count, 1)
+	testing.expect_value(t, backoff_inspection.started_timer_seq, u32(1))
+	testing.expect_value(t, backoff_inspection.started_timer_duration, 250 * time.Millisecond)
+	delete(backing_off.completion)
+	workflow.error_free(&backing_off.error)
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 11
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	retried := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, retried.error.message == nil, "Local Activity retry scheduling failed: %s", string(retried.error.message))
+	testing.expect(t, retried.scheduled_local_activity)
+	testing.expect_value(t, retried.activity_seq, u32(2))
+	testing.expect_value(t, retried.waiting_activity_seq, u32(1))
+	retry_bytes := bytes.clone(retried.completion[:])
+	retry_inspection := inspect_scheduled_local_activity(retried.completion[:])
+	testing.expect(t, retry_inspection.found)
+	testing.expect_value(t, retry_inspection.seq, u32(2))
+	testing.expect_value(t, retry_inspection.activity_id, "retrying-local-id")
+	testing.expect_value(t, retry_inspection.attempt, u32(2))
+	testing.expect(t, retry_inspection.has_original_schedule_time)
+	testing.expect_value(t, retry_inspection.original_schedule_seconds, original_schedule_time.seconds)
+	testing.expect_value(t, retry_inspection.original_schedule_nanos, original_schedule_time.nanos)
+	scheduled_local_activity_inspection_free(&retry_inspection)
+	delete(retried.completion)
+	workflow.error_free(&retried.error)
+
+	output, output_error := codec.encode_json("Hello after retry")
+	testing.expect(t, output_error == .None)
+	defer codec.payload_free(&output)
+	proto_output := proto.encode_payload(codec.payload_view(&output))
+	defer delete(proto_output.metadata)
+	defer delete(proto_output.external_payloads)
+	success := proto.Coresdk_Activity_Result_Success{result = &proto_output}
+	success_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &success},
+	}
+	resolve_success := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 2,
+		result = &success_resolution,
+		is_local = true,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 15
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_success,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "retried Local Activity resolution failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	testing.expect_value(t, completed.resolved_activity_seq, u32(2))
+	completed_bytes := bytes.clone(completed.completion[:])
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	activation.is_replaying = true
+	activation.history_length = 3
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+	})
+	replay_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replay_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_bytes, replay_initial.completion[:]))
+	delete(replay_initial.completion)
+	workflow.error_free(&replay_initial.error)
+
+	activation.history_length = 7
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{value = &resolve_backoff},
+	})
+	replay_backoff := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replay_backoff.error.message == nil)
+	testing.expect(t, bytes.equal(backoff_bytes, replay_backoff.completion[:]))
+	delete(replay_backoff.completion)
+	workflow.error_free(&replay_backoff.error)
+
+	activation.history_length = 11
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{value = &fire_timer},
+	})
+	replay_retry := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replay_retry.error.message == nil)
+	testing.expect(t, bytes.equal(retry_bytes, replay_retry.completion[:]))
+	delete(replay_retry.completion)
+	workflow.error_free(&replay_retry.error)
+
+	activation.history_length = 15
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{value = &resolve_success},
+	})
+	replay_completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replay_completed.error.message == nil)
+	testing.expect(t, replay_completed.completed)
+	testing.expect(t, bytes.equal(completed_bytes, replay_completed.completion[:]))
+	delete(replay_completed.completion)
+	workflow.error_free(&replay_completed.error)
+
+	delete(initial_bytes)
+	delete(backoff_bytes)
+	delete(retry_bytes)
+	delete(completed_bytes)
+}
+
+@(test)
+workflow_cancellation_during_local_activity_backoff_cancels_timer :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"local_activity_retry_test_workflow",
+		"local-retry-cancel-queue",
+		local_activity_retry_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Cancel")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "local_activity_retry_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "local-activity-backoff-cancel-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+	})
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.scheduled_local_activity)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	duration := proto.Google_Protobuf_Duration{seconds = 30}
+	timestamp := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000}
+	backoff := proto.Coresdk_Activity_Result_DoBackoff{
+		attempt = 2,
+		backoff_duration = &duration,
+		original_schedule_time = &timestamp,
+	}
+	resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Backoff{value = &backoff},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &resolution,
+		is_local = true,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{value = &resolve},
+	})
+	backing_off := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, backing_off.error.message == nil)
+	testing.expect(t, backing_off.started_timer)
+	delete(backing_off.completion)
+	workflow.error_free(&backing_off.error)
+
+	cancel := proto.Coresdk_Workflow_Activation_CancelWorkflow{
+		reason = "cancel during Local Activity backoff",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow{value = &cancel},
+	})
+	canceled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, canceled.error.message == nil, "backoff cancellation failed: %s", string(canceled.error.message))
+	testing.expect(t, canceled.canceled_timer)
+	testing.expect_value(t, canceled.canceled_timer_seq, u32(1))
+	testing.expect(t, !canceled.requested_local_activity_cancellation)
+	testing.expect(t, canceled.canceled_workflow)
+	testing.expect(t, canceled.completed)
+	inspection := inspect_workflow_completion(canceled.completion[:])
+	testing.expect_value(t, inspection.command_count, 2)
+	testing.expect_value(t, inspection.canceled_timer_seq, u32(1))
+	testing.expect(t, inspection.canceled_workflow)
+	delete(inspection.completion_result)
+	delete(canceled.completion)
+	workflow.error_free(&canceled.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2546,6 +2865,31 @@ local_activity_test_workflow :: proc(
 	)
 }
 
+local_activity_retry_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = 100 * time.Millisecond,
+		backoff_coefficient = 2,
+		maximum_interval = time.Second,
+		maximum_attempts = 3,
+	}
+	return workflow.execute_local_activity_with_options(
+		ctx,
+		"retrying-local",
+		input,
+		{
+			activity_id = "retrying-local-id",
+			schedule_to_close_timeout = 30 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+			local_retry_threshold = 10 * time.Millisecond,
+			include_arguments_in_marker = true,
+		},
+	)
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -2782,6 +3126,8 @@ Workflow_Completion_Inspection :: struct {
 	continue_retry_initial: time.Duration,
 	canceled_external_signal_seq: u32,
 	canceled_timer_seq:     u32,
+	started_timer_seq:      u32,
+	started_timer_duration: time.Duration,
 	canceled_activity_seq:  u32,
 	canceled_workflow:      bool,
 	completed:        bool,
@@ -2818,6 +3164,13 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 					inspection.patch_marker_count += 1
 					inspection.patch_id = bytes.clone(transmute([]u8)variant.value.patch_id)
 					inspection.patch_deprecated = variant.value.deprecated
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer:
+				if variant.value != nil {
+					inspection.started_timer_seq = variant.value.seq
+					inspection.started_timer_duration = proto_duration_value(
+						variant.value.start_to_fire_timeout,
+					)
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
 				if variant.value != nil {
@@ -3172,6 +3525,9 @@ Scheduled_Local_Activity_Inspection :: struct {
 	activity_id:                 string,
 	activity_type:               string,
 	attempt:                     u32,
+	has_original_schedule_time:  bool,
+	original_schedule_seconds:   i64,
+	original_schedule_nanos:     i32,
 	schedule_to_close_timeout:   time.Duration,
 	schedule_to_start_timeout:   time.Duration,
 	start_to_close_timeout:      time.Duration,
@@ -3248,6 +3604,11 @@ inspect_scheduled_local_activity :: proc(
 				inspection.activity_id, _ = strings.clone(schedule.activity_id)
 				inspection.activity_type, _ = strings.clone(schedule.activity_type)
 				inspection.attempt = schedule.attempt
+				if schedule.original_schedule_time != nil {
+					inspection.has_original_schedule_time = true
+					inspection.original_schedule_seconds = schedule.original_schedule_time.seconds
+					inspection.original_schedule_nanos = schedule.original_schedule_time.nanos
+				}
 				inspection.schedule_to_close_timeout = proto_duration_value(schedule.schedule_to_close_timeout)
 				inspection.schedule_to_start_timeout = proto_duration_value(schedule.schedule_to_start_timeout)
 				inspection.start_to_close_timeout = proto_duration_value(schedule.start_to_close_timeout)

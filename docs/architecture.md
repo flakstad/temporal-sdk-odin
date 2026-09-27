@@ -1484,9 +1484,9 @@ cancellation are also implemented and live-proven. Continue-As-New now provides
 the next-run Payload and the main timeout/retry/backoff options through a
 non-returning terminal fiber primitive. Core's patch/versioning protocol is now
 implemented and live-proven. The first Local Activity
-command/dispatch/resolution path is also live-proven with one attempt. The next
-smallest runtime extensions are timer-backed Local Activity `DoBackoff`, the
-remaining Workflow-information surface, and Search Attribute/memo commands,
+command/dispatch/resolution path and timer-backed `DoBackoff` retries are now
+live-proven. The next smallest runtime extensions are the remaining
+Workflow-information surface and Search Attribute/memo commands,
 while richer recursive failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
@@ -1803,8 +1803,14 @@ task queue nor a heartbeat timeout.
 Core may resolve a retrying Local Activity with `DoBackoff` when the retry delay
 should become a durable timer. Correct language handling must schedule that
 timer and then emit a new Local Activity command with Core's next attempt and
-original schedule time. The current bounded slice does not fake this behavior:
-it requires `maximum_attempts=1` and fails explicitly if a `DoBackoff` somehow
-arrives. A unit test covers command encoding, local resolution, eviction, and
-byte-identical replay; a 500-case PBT varies every exposed option; and the CLI
-dev-server scenario proves the real local dispatch/result/marker path.
+original schedule time. The Odin runtime now keeps a stable logical operation
+sequence for the public Future and a separate Core command sequence. On
+`DoBackoff` it records Core's next attempt/original timestamp and emits a normal
+`StartTimer`; `FireTimer` allocates a fresh Core sequence and re-emits
+`ScheduleLocalActivity`, while the suspended fiber continues waiting on the
+original logical sequence. Cancellation during backoff cancels that timer.
+A unit test covers the full transition and fresh-stack replay, one 500-case PBT
+varies every exposed option, a second 500-case PBT varies retry metadata and
+requires byte-identical timer/retry commands, and the CLI dev-server suite
+proves a failed first attempt followed by the durable timer and successful
+second local attempt.

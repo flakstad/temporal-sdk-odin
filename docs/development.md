@@ -828,6 +828,14 @@ odin-local-manual --output json` contains a `core_local_activity` marker and an
 `input` detail because the example opts into marker argument recording. The
 full `./scripts/integration-test.sh` checks this path automatically.
 
+To exercise Core's timer-backed Local Activity retry contract manually, run
+the worker with `TEMPORAL_ODIN_SCENARIO=local-activity-retry` and execute
+`odin_local_activity_retry_workflow` on the same task queue. Its first local
+attempt returns a retryable failure with a 250 ms next-retry delay. Because the
+Workflow sets a 10 ms local retry threshold, Core returns `DoBackoff`; Odin
+emits a durable Workflow timer and schedules attempt 2 after it fires. The
+history contains both `core_local_activity` and `EVENT_TYPE_TIMER_STARTED`.
+
 ## Troubleshooting
 
 - `library not found for -ltemporalio_sdk_core_c_bridge`: run

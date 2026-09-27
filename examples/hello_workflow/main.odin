@@ -13,6 +13,7 @@ TASK_QUEUE :: "odin-hello-workflow"
 WORKFLOW_TYPE :: "odin_hello_workflow"
 TYPED_WORKFLOW_TYPE :: "odin_typed_workflow"
 LOCAL_ACTIVITY_WORKFLOW_TYPE :: "odin_local_activity_workflow"
+LOCAL_ACTIVITY_RETRY_WORKFLOW_TYPE :: "odin_local_activity_retry_workflow"
 FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
@@ -214,6 +215,22 @@ failure_details_activity :: proc(
 	)
 }
 
+local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.Result(string) {
+	if activity.info(ctx).attempt == 1 {
+		return activity.result_failure(
+			string,
+			"retry the Local Activity through a Workflow timer",
+			failure_type = "TransientLocalFailure",
+			next_retry_delay = 250 * time.Millisecond,
+		)
+	}
+	greeting, allocation_error := strings.concatenate({"Hello after Local Activity retry, ", name})
+	if allocation_error != nil {
+		return activity.result_failure(string, "could not allocate retry greeting")
+	}
+	return activity.result_success(greeting)
+}
+
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if name == "cancel-activity" {
 		return workflow.execute_activity(ctx, "hello", name)
@@ -343,6 +360,31 @@ local_activity_workflow :: proc(
 			retry_policy = &retry_policy,
 			local_retry_threshold = 2 * time.Second,
 			cancellation_type = .Wait_Cancellation_Completed,
+			include_arguments_in_marker = true,
+		},
+	)
+}
+
+local_activity_retry_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = 250 * time.Millisecond,
+		backoff_coefficient = 2,
+		maximum_interval = time.Second,
+		maximum_attempts = 2,
+	}
+	return workflow.execute_local_activity_with_options(
+		ctx,
+		"local_retry",
+		name,
+		{
+			activity_id = "local-retry",
+			schedule_to_close_timeout = 30 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+			local_retry_threshold = 10 * time.Millisecond,
 			include_arguments_in_marker = true,
 		},
 	)
@@ -512,6 +554,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	register_local_retry_error := worker.register_json_activity_result(
+		&activity_worker,
+		"local_retry",
+		local_retry_activity,
+	)
+	if register_local_retry_error.message != nil {
+		fmt.eprintf("Retrying Local Activity registration failed: %s\n", string(register_local_retry_error.message))
+		worker.error_free(&register_local_retry_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	workflow_register_error := worker.register_workflow(
 		&activity_worker,
@@ -547,6 +602,19 @@ main :: proc() {
 	if local_activity_workflow_register_error.message != nil {
 		fmt.eprintf("Local Activity Workflow registration failed: %s\n", string(local_activity_workflow_register_error.message))
 		worker.error_free(&local_activity_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
+	local_activity_retry_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		LOCAL_ACTIVITY_RETRY_WORKFLOW_TYPE,
+		local_activity_retry_workflow,
+	)
+	if local_activity_retry_workflow_register_error.message != nil {
+		fmt.eprintf("Retrying Local Activity Workflow registration failed: %s\n", string(local_activity_retry_workflow_register_error.message))
+		worker.error_free(&local_activity_retry_workflow_register_error)
 		_ = worker.close(&activity_worker)
 		temporal_core.client_close(&client)
 		temporal_core.runtime_close(&runtime)
@@ -592,16 +660,17 @@ main :: proc() {
 	expect_query := scenario == "query" || expect_update || expect_signal_handler
 	expect_typed_payload := scenario == "typed-payload"
 	expect_local_activity := scenario == "local-activity"
+	expect_local_activity_retry := scenario == "local-activity-retry"
 	expect_failure_details := scenario == "failure-details"
 	expect_patch := scenario == "patch"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : (expect_signal_handler ? 2 : 1)),
+			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer || expect_patch,
-			enable_local_activities = expect_local_activity,
+			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
 	)
@@ -639,6 +708,12 @@ main :: proc() {
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 ||
 			   run_stats.timers_canceled != 0 {
 				fmt.eprintln("Workflow patch path produced unexpected worker stats")
+				failed = true
+			}
+		} else if expect_local_activity_retry {
+			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 0 ||
+			   run_stats.timers_canceled != 0 {
+				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
 				failed = true
 			}
 		} else if expect_typed_payload || expect_failure_details || expect_local_activity {
@@ -717,6 +792,8 @@ main :: proc() {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_local_activity {
 		fmt.println("Local Activity completed through Core in the Workflow Worker")
+	} else if expect_local_activity_retry {
+		fmt.println("Local Activity timer-backed retry completed through Core and Temporal Server")
 	} else if expect_failure_details {
 		fmt.println("structured Activity failure details reached Workflow code")
 	} else if expect_patch {

@@ -246,6 +246,47 @@ cat "$worker_log"
 grep -Eq 'replay=false .*local_scheduled=1 .*waiting_activity=1' "$worker_log"
 grep -q "Local Activity completed through Core in the Workflow Worker" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=local-activity-retry \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Retrying Local Activity Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+local_activity_retry_workflow_id="odin-sdk-local-activity-retry-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$local_activity_retry_workflow_id" \
+  --type odin_local_activity_retry_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Retry"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+local_activity_retry_output="$(<"$workflow_output_file")"
+echo "$local_activity_retry_output"
+grep -q '"status": "COMPLETED"' <<<"$local_activity_retry_output"
+grep -q 'Hello after Local Activity retry, Retry' <<<"$local_activity_retry_output"
+temporal workflow show \
+  --workflow-id "$local_activity_retry_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'core_local_activity' "$typed_history_file"
+grep -q 'EVENT_TYPE_TIMER_STARTED' "$typed_history_file"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq 'replay=false .*started_timer=true .*waiting_activity=1' "$worker_log"
+grep -Eq 'replay=false .*local_scheduled=1 .*last_activity=2 .*waiting_activity=1' "$worker_log"
+grep -q "Local Activity timer-backed retry completed through Core and Temporal Server" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=failure-details \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

@@ -54,8 +54,12 @@ Activity registry receives a callback with `activity.info(ctx).is_local`, and
 `ResolveActivity(is_local=true)` resumes the fiber. The API exposes typed JSON
 and generic Payload forms, timeout/cancellation options, marker-input control,
 and exact eviction/replay. The live suite verifies the server-side
-`core_local_activity` marker. Timer-backed Local Activity retry (`DoBackoff`)
-is intentionally rejected for now, so this first slice requires one attempt.
+`core_local_activity` marker. Timer-backed Local Activity retry now follows
+Core's `DoBackoff` contract: the runtime schedules a durable Workflow timer,
+then emits a fresh Local Activity command carrying Core's attempt and original
+schedule time while preserving the Odin Future. Both transitions replay to
+byte-identical commands, and the CLI-devserver suite exercises a real failed
+first attempt followed by timer-backed success.
 Workers must also set `Run_Options.enable_local_activities`; the opt-in keeps
 the still-unhardened mixed remote-cancellation/local shutdown path out of
 workers that do not use Local Activities.
@@ -91,7 +95,7 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, timer-backed Local Activity retries, client
+nested cancellation-token trees, client
 cancellation of an accepted Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
