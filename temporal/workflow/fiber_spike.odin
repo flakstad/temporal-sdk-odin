@@ -196,6 +196,28 @@ Owned_Activity_Options :: struct {
 	disable_eager_execution:   bool,
 }
 
+// Continue_As_New_Options borrows its strings, slices, and retry_policy only
+// for the call. Empty workflow_type/task_queue values reuse the current run's
+// registered values. A zero duration means "not specified".
+Continue_As_New_Options :: struct {
+	workflow_type:        string,
+	task_queue:           string,
+	workflow_run_timeout: time.Duration,
+	workflow_task_timeout: time.Duration,
+	retry_policy:         ^Retry_Policy,
+	backoff_start_interval: time.Duration,
+}
+
+Owned_Continue_As_New_Options :: struct {
+	workflow_type:        string,
+	task_queue:           string,
+	workflow_run_timeout: time.Duration,
+	workflow_task_timeout: time.Duration,
+	retry_policy:         Retry_Policy,
+	has_retry_policy:     bool,
+	backoff_start_interval: time.Duration,
+}
+
 Fiber_Phase :: enum {
 	Ready,
 	Waiting_Activity,
@@ -207,6 +229,7 @@ Fiber_Phase :: enum {
 	Waiting_Signal,
 	Waiting_Signal_Or_Timer,
 	Waiting_Handlers,
+	Continued_As_New,
 	Canceled,
 	Completed,
 	Failed,
@@ -568,6 +591,12 @@ Fiber_External_Cancel_Operation :: struct {
 	state:           Fiber_Operation_State,
 }
 
+Fiber_Continue_As_New_Operation :: struct {
+	input:   codec.Payload,
+	options: Owned_Continue_As_New_Options,
+	present: bool,
+}
+
 Fiber_Signal :: struct {
 	name:     string,
 	payload:  codec.Payload,
@@ -626,6 +655,8 @@ Fiber_Update_Routine :: struct {
 
 Fiber_Instance :: struct {
 	run_id:          string,
+	workflow_type:   string,
+	task_queue:      string,
 	input:           codec.Payload,
 	output:          codec.Payload,
 	callback_data:   rawptr,
@@ -635,6 +666,7 @@ Fiber_Instance :: struct {
 	child_workflows:  [dynamic]Fiber_Child_Workflow_Operation,
 	external_signals: [dynamic]Fiber_External_Signal_Operation,
 	external_cancels: [dynamic]Fiber_External_Cancel_Operation,
+	continue_as_new: Fiber_Continue_As_New_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
 	signal_handlers:  [dynamic]Fiber_Signal_Handler,
@@ -652,6 +684,9 @@ Fiber_Instance :: struct {
 	cancellation_requested: bool,
 	detached_scope_depth:   int,
 	terminal_command_sent: bool,
+	terminal_failure_requested: bool,
+	terminal_failure_message:   string,
+	terminal_failure_type:      string,
 	unhandled_activity_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:       string,
@@ -1091,6 +1126,9 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	for &operation in instance.external_signals {
 		codec.payload_free(&operation.input)
 	}
+	if instance.continue_as_new.present {
+		codec.payload_free(&instance.continue_as_new.input)
+	}
 	for &signal in instance.signals {
 		codec.payload_free(&signal.payload)
 	}
@@ -1197,6 +1235,10 @@ add_fiber_instance :: proc(
 	context.allocator = instance.odin_context.allocator
 	owned_run_id, run_id_error := strings.clone(run_id)
 	instance.run_id = owned_run_id
+	owned_workflow_type, workflow_type_error := strings.clone(runtime.workflow_type)
+	instance.workflow_type = owned_workflow_type
+	owned_task_queue, task_queue_error := strings.clone(runtime.task_queue)
+	instance.task_queue = owned_task_queue
 	owned_input, clone_error := proto.clone_payload(input_payload)
 	instance.input = owned_input
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
@@ -1211,7 +1253,8 @@ add_fiber_instance :: proc(
 	instance.update_handlers = make([dynamic]Fiber_Update_Handler)
 	instance.update_routines = make([dynamic]^Fiber_Update_Routine)
 	context.allocator = previous_allocator
-	if run_id_error != nil || clone_error != .None {
+	if run_id_error != nil || workflow_type_error != nil || task_queue_error != nil ||
+	   clone_error != .None {
 		virtual.arena_destroy(&instance.arena)
 		free(instance, instance.owner_allocator)
 		return nil, error_from_string("could not preserve Workflow input Payload")
@@ -2979,6 +3022,181 @@ request_cancel_external_workflow :: proc(
 	}
 }
 
+continue_as_new_options_error :: proc(options: Continue_As_New_Options) -> string {
+	if options.workflow_run_timeout < 0 || options.workflow_task_timeout < 0 ||
+	   options.backoff_start_interval < 0 {
+		return "Continue-As-New timeouts and backoff must not be negative"
+	}
+	if options.workflow_run_timeout > 0 &&
+	   options.workflow_task_timeout > options.workflow_run_timeout {
+		return "Continue-As-New Workflow Task timeout must not exceed Run timeout"
+	}
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		if policy.initial_interval < 0 || policy.maximum_interval < 0 ||
+		   policy.maximum_attempts < 0 {
+			return "Continue-As-New Retry Policy values must not be negative"
+		}
+		if math.is_nan(policy.backoff_coefficient) || math.is_inf(policy.backoff_coefficient) ||
+		   (policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1) {
+			return "Continue-As-New Retry Policy backoff coefficient must be zero or at least one"
+		}
+		if policy.maximum_interval > 0 && policy.initial_interval > 0 &&
+		   policy.maximum_interval < policy.initial_interval {
+			return "Continue-As-New Retry Policy maximum interval must not be shorter than its initial interval"
+		}
+	}
+	return ""
+}
+
+clone_continue_as_new_options :: proc(
+	instance: ^Fiber_Instance,
+	options: Continue_As_New_Options,
+) -> (owned: Owned_Continue_As_New_Options, ok: bool) {
+	allocator := instance.odin_context.allocator
+	workflow_type := options.workflow_type
+	if len(workflow_type) == 0 {
+		workflow_type = instance.workflow_type
+	}
+	task_queue := options.task_queue
+	if len(task_queue) == 0 {
+		task_queue = instance.task_queue
+	}
+	owned.workflow_type, _ = strings.clone(workflow_type, allocator)
+	owned.task_queue, _ = strings.clone(task_queue, allocator)
+	if len(owned.workflow_type) == 0 || len(owned.task_queue) == 0 {
+		return {}, false
+	}
+	owned.workflow_run_timeout = options.workflow_run_timeout
+	owned.workflow_task_timeout = options.workflow_task_timeout
+	owned.backoff_start_interval = options.backoff_start_interval
+	if options.retry_policy != nil {
+		owned.has_retry_policy = true
+		owned.retry_policy = options.retry_policy^
+		owned.retry_policy.non_retryable_error_types = make(
+			[]string,
+			len(options.retry_policy.non_retryable_error_types),
+			allocator,
+		)
+		for error_type, index in options.retry_policy.non_retryable_error_types {
+			cloned, clone_error := strings.clone(error_type, allocator)
+			if clone_error != nil {
+				return {}, false
+			}
+			owned.retry_policy.non_retryable_error_types[index] = cloned
+		}
+	}
+	return owned, true
+}
+
+continue_as_new_stop_with_failure :: proc(
+	ctx: ^Fiber_Context,
+	message, failure_type: string,
+) -> ! {
+	if ctx == nil || ctx.instance == nil {
+		panic("Continue-As-New requires a Workflow context")
+	}
+	instance := ctx.instance
+	instance.terminal_failure_requested = true
+	instance.terminal_failure_message = message
+	instance.terminal_failure_type = failure_type
+	instance.failure_message = message
+	instance.failure_type = failure_type
+	instance.phase = .Failed
+	if fiber_raw.yield(instance.fiber) != .Success {
+		panic("could not yield failed Continue-As-New Workflow")
+	}
+	panic("failed Continue-As-New Workflow was resumed")
+}
+
+continue_as_new_owned :: proc(
+	ctx: ^Fiber_Context,
+	input: codec.Payload,
+	options := Continue_As_New_Options{},
+) -> ! {
+	owned_input := input
+	if ctx == nil || ctx.instance == nil || ctx != &ctx.instance.workflow_context ||
+	   ctx.instance.phase != .Ready {
+		codec.payload_free(&owned_input)
+		continue_as_new_stop_with_failure(
+			ctx,
+			"Continue-As-New requires the ready main Workflow context",
+			"OdinContinueAsNewContextError",
+		)
+	}
+	options_error := continue_as_new_options_error(options)
+	if len(options_error) > 0 {
+		codec.payload_free(&owned_input)
+		continue_as_new_stop_with_failure(ctx, options_error, "OdinContinueAsNewOptionsError")
+	}
+	instance := ctx.instance
+	owned_options, options_cloned := clone_continue_as_new_options(instance, options)
+	if !options_cloned {
+		codec.payload_free(&owned_input)
+		continue_as_new_stop_with_failure(
+			ctx,
+			"could not preserve Continue-As-New options",
+			"OdinContinueAsNewOptionsError",
+		)
+	}
+	instance.continue_as_new = {
+		input = owned_input,
+		options = owned_options,
+		present = true,
+	}
+	instance.phase = .Continued_As_New
+	if fiber_raw.yield(instance.fiber) != .Success {
+		panic("could not yield continued Workflow")
+	}
+	panic("continued Workflow was resumed")
+}
+
+continue_as_new_payload :: proc(
+	ctx: ^Fiber_Context,
+	input: codec.Payload_View,
+	options := Continue_As_New_Options{},
+) -> ! {
+	if ctx == nil || ctx.instance == nil {
+		continue_as_new_stop_with_failure(
+			ctx,
+			"Continue-As-New requires a Workflow context",
+			"OdinContinueAsNewContextError",
+		)
+	}
+	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		continue_as_new_stop_with_failure(
+			ctx,
+			"could not preserve Continue-As-New Payload",
+			"OdinContinueAsNewPayloadError",
+		)
+	}
+	continue_as_new_owned(ctx, owned_input, options)
+}
+
+continue_as_new_json :: proc(
+	ctx: ^Fiber_Context,
+	input: $T,
+	options := Continue_As_New_Options{},
+) -> ! {
+	if ctx == nil || ctx.instance == nil {
+		continue_as_new_stop_with_failure(
+			ctx,
+			"Continue-As-New requires a Workflow context",
+			"OdinContinueAsNewContextError",
+		)
+	}
+	payload, encode_error := codec.encode_json(input, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		continue_as_new_stop_with_failure(
+			ctx,
+			"could not encode Continue-As-New input as json/plain",
+			"OdinContinueAsNewPayloadError",
+		)
+	}
+	continue_as_new_owned(ctx, payload, options)
+}
+
 activity_retry_state_from_proto :: proc(
 	value: proto.Temporal_Api_Enums_V1_RetryState,
 ) -> Activity_Retry_State {
@@ -4491,7 +4709,7 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		return signal_found || cancellation_applies ||
 			(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
 			timer.state == .Canceled))
-	case .Waiting_Handlers, .Ready, .Canceled, .Completed, .Failed:
+	case .Waiting_Handlers, .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
 	}
 	return false
 }
@@ -4717,7 +4935,7 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		return signal_found || cancellation_applies ||
 			(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
 			timer.state == .Canceled))
-	case .Waiting_Handlers, .Ready, .Canceled, .Completed, .Failed:
+	case .Waiting_Handlers, .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
 	}
 	return false
 }
@@ -4984,7 +5202,7 @@ append_fiber_pending_commands :: proc(
 		result.waiting_timer_seq = instance.waiting_timer_seq
 	case .Waiting_Handlers:
 		result.waiting_handlers = true
-	case .Ready, .Canceled, .Completed, .Failed:
+	case .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
 		return error_from_string("Workflow fiber suspended without a supported pending operation")
 	}
 	result.run_id = instance.run_id
@@ -5057,6 +5275,46 @@ commands_are_update_responses :: proc(
 		}
 	}
 	return true
+}
+
+append_fiber_continue_as_new_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) -> Error {
+	if !instance.continue_as_new.present {
+		return error_from_string("Workflow requested Continue-As-New without preserved input")
+	}
+	if !commands_are_update_responses(commands) {
+		return error_from_string("fiber spike emitted Continue-As-New after another command")
+	}
+	append_fiber_timer_cancellations(result, commands, instance)
+	operation := &instance.continue_as_new
+	options := &operation.options
+	payload := proto.encode_payload(codec.payload_view(&operation.input))
+	request := new(proto.Coresdk_Workflow_Commands_ContinueAsNewWorkflowExecution)
+	request.workflow_type = options.workflow_type
+	request.task_queue = options.task_queue
+	append(&request.arguments, payload)
+	request.workflow_run_timeout = duration_to_proto(options.workflow_run_timeout)
+	request.workflow_task_timeout = duration_to_proto(options.workflow_task_timeout)
+	if options.has_retry_policy {
+		request.retry_policy = retry_policy_to_proto(&options.retry_policy)
+	}
+	request.backoff_start_interval = duration_to_proto(options.backoff_start_interval)
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Continue_As_New_Workflow_Execution{
+				value = request,
+			},
+		},
+	)
+	result.continued_as_new = true
+	result.completed = true
+	result.run_id = instance.run_id
+	instance.terminal_command_sent = true
+	return {}
 }
 
 append_fiber_completion_command :: proc(
@@ -5190,12 +5448,29 @@ append_fiber_progress_command :: proc(
 		result.run_id = instance.run_id
 		return {}
 	}
+	if instance.terminal_failure_requested {
+		instance.failure_message = instance.terminal_failure_message
+		instance.failure_type = instance.terminal_failure_type
+		observe_unfinished_signal_routines(result, instance)
+		observe_unfinished_update_routines(result, instance)
+		return append_fiber_failure_command(result, commands, instance)
+	}
+	if instance.continue_as_new.present {
+		observe_unfinished_signal_routines(result, instance)
+		observe_unfinished_update_routines(result, instance)
+		return append_fiber_continue_as_new_command(result, commands, instance)
+	}
 	if instance.phase == .Canceled {
 		observe_unfinished_signal_routines(result, instance)
 		observe_unfinished_update_routines(result, instance)
 		return append_fiber_cancellation_commands(result, commands, instance)
 	}
 	main_status := fiber_raw.status(instance.fiber)
+	if instance.phase == .Failed && main_status == .Suspended {
+		observe_unfinished_signal_routines(result, instance)
+		observe_unfinished_update_routines(result, instance)
+		return append_fiber_failure_command(result, commands, instance)
+	}
 	switch main_status {
 	case .Suspended:
 		return append_fiber_pending_commands(result, commands, instance, task_queue)
@@ -5773,7 +6048,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				timer.state == .Canceled))
 		case .Waiting_Handlers:
 			should_resume = !has_active_handlers(instance) || root_cancellation_applies(instance)
-		case .Ready, .Canceled, .Completed, .Failed:
+		case .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
 		}
 		if should_resume {
 			instance.phase = .Ready

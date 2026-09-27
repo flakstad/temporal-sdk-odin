@@ -1001,6 +1001,202 @@ external_workflow_cancel_failure_cause_is_catchable :: proc(t: ^testing.T) {
 }
 
 @(test)
+continue_as_new_is_terminal_and_replay_safe :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"continue_as_new_test_workflow",
+		"continue-task-queue",
+		continue_as_new_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("first")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "continue_as_new_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "continue-first-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "Continue-As-New command failed: %s", string(initial.error.message))
+	testing.expect(t, initial.continued_as_new)
+	testing.expect(t, initial.completed)
+	initial_bytes := bytes.clone(initial.completion[:])
+	inspection := inspect_workflow_completion(initial.completion[:])
+	testing.expect_value(t, inspection.command_count, 1)
+	testing.expect(t, inspection.continued_as_new)
+	testing.expect_value(t, string(inspection.continue_workflow_type), "continue_as_new_test_workflow")
+	testing.expect_value(t, string(inspection.continue_task_queue), "continue-task-queue")
+	testing.expect_value(t, string(inspection.continue_input), `"second"`)
+	testing.expect_value(t, inspection.continue_run_timeout, 5 * time.Minute)
+	testing.expect_value(t, inspection.continue_task_timeout, 12 * time.Second)
+	testing.expect_value(t, inspection.continue_backoff, 3 * time.Second)
+	testing.expect_value(t, inspection.continue_retry_attempts, i32(7))
+	testing.expect_value(t, inspection.continue_retry_initial, 2 * time.Second)
+	delete(inspection.continue_workflow_type)
+	delete(inspection.continue_task_queue)
+	delete(inspection.continue_input)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, replayed.continued_as_new)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	replay_evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replay_evicted.error.message == nil)
+	delete(replay_evicted.completion)
+	workflow.error_free(&replay_evicted.error)
+
+	second_input, second_input_error := codec.encode_json("second")
+	testing.expect(t, second_input_error == .None)
+	defer codec.payload_free(&second_input)
+	proto_second_input := proto.encode_payload(codec.payload_view(&second_input))
+	defer delete(proto_second_input.metadata)
+	defer delete(proto_second_input.external_payloads)
+	delete(initialize.arguments)
+	initialize.arguments = nil
+	append(&initialize.arguments, proto_second_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.run_id = "continue-second-run"
+	activation.is_replaying = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	second := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, second.error.message == nil)
+	testing.expect(t, second.completed)
+	testing.expect(t, !second.continued_as_new)
+	second_inspection := inspect_workflow_completion(second.completion[:])
+	testing.expect(t, second_inspection.completed)
+	testing.expect_value(t, string(second_inspection.completion_result), `"second"`)
+	delete(second_inspection.completion_result)
+	delete(second.completion)
+	workflow.error_free(&second.error)
+}
+
+@(test)
+continue_as_new_invalid_options_fail_the_workflow :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"continue_as_new_invalid_options_test_workflow",
+		"continue-task-queue",
+		continue_as_new_invalid_options_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("invalid")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "continue_as_new_invalid_options_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "continue-invalid-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "invalid Continue-As-New handling failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.failure_type), "OdinContinueAsNewOptionsError")
+	testing.expect_value(
+		t,
+		string(inspection.message),
+		"Continue-As-New timeouts and backoff must not be negative",
+	)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -1827,6 +2023,42 @@ external_cancel_failure_test_workflow :: proc(
 	return "External Workflow cancellation failure mismatch"
 }
 
+continue_as_new_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	if input == "first" {
+		retry_policy := workflow.Retry_Policy{
+			initial_interval = 2 * time.Second,
+			backoff_coefficient = 2,
+			maximum_interval = 30 * time.Second,
+			maximum_attempts = 7,
+		}
+		workflow.continue_as_new_json(
+			ctx,
+			"second",
+			{
+				workflow_run_timeout = 5 * time.Minute,
+				workflow_task_timeout = 12 * time.Second,
+				retry_policy = &retry_policy,
+				backoff_start_interval = 3 * time.Second,
+			},
+		)
+	}
+	return input
+}
+
+continue_as_new_invalid_options_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	workflow.continue_as_new_json(
+		ctx,
+		input,
+		{workflow_run_timeout = -time.Second},
+	)
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -2049,6 +2281,15 @@ Workflow_Completion_Inspection :: struct {
 	external_workflow_cancel_id: []u8,
 	external_workflow_cancel_run_id: []u8,
 	external_workflow_cancel_reason: []u8,
+	continued_as_new: bool,
+	continue_workflow_type: []u8,
+	continue_task_queue: []u8,
+	continue_input: []u8,
+	continue_run_timeout: time.Duration,
+	continue_task_timeout: time.Duration,
+	continue_backoff: time.Duration,
+	continue_retry_attempts: i32,
+	continue_retry_initial: time.Duration,
 	canceled_external_signal_seq: u32,
 	canceled_timer_seq:     u32,
 	canceled_activity_seq:  u32,
@@ -2148,6 +2389,34 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 						)
 						inspection.external_workflow_cancel_run_id = bytes.clone(
 							transmute([]u8)variant.value.workflow_execution.run_id,
+						)
+					}
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Continue_As_New_Workflow_Execution:
+				if variant.value != nil {
+					inspection.continued_as_new = true
+					inspection.continue_workflow_type = bytes.clone(
+						transmute([]u8)variant.value.workflow_type,
+					)
+					inspection.continue_task_queue = bytes.clone(
+						transmute([]u8)variant.value.task_queue,
+					)
+					if len(variant.value.arguments) == 1 {
+						inspection.continue_input = bytes.clone(variant.value.arguments[0].data)
+					}
+					inspection.continue_run_timeout = proto_duration_value(
+						variant.value.workflow_run_timeout,
+					)
+					inspection.continue_task_timeout = proto_duration_value(
+						variant.value.workflow_task_timeout,
+					)
+					inspection.continue_backoff = proto_duration_value(
+						variant.value.backoff_start_interval,
+					)
+					if variant.value.retry_policy != nil {
+						inspection.continue_retry_attempts = variant.value.retry_policy.maximum_attempts
+						inspection.continue_retry_initial = proto_duration_value(
+							variant.value.retry_policy.initial_interval,
 						)
 					}
 				}

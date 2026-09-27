@@ -20,6 +20,7 @@ EXPLICIT_CANCEL_PARENT_WORKFLOW_TYPE :: "odin_child_explicit_cancel_parent_workf
 DUPLICATE_PARENT_WORKFLOW_TYPE :: "odin_child_duplicate_parent_workflow"
 EXTERNAL_TARGET_WORKFLOW_TYPE :: "odin_external_target_workflow"
 EXTERNAL_CALLER_WORKFLOW_TYPE :: "odin_external_caller_workflow"
+CONTINUE_AS_NEW_WORKFLOW_TYPE :: "odin_continue_as_new_workflow"
 
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if strings.has_prefix(name, "cancel-") {
@@ -181,9 +182,27 @@ external_caller_workflow :: proc(ctx: ^workflow.Fiber_Context, target_workflow_i
 	return "External Workflow signaled and cancellation requested"
 }
 
+continue_as_new_workflow :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
+	if value == "first-run" {
+		workflow.continue_as_new_json(
+			ctx,
+			"continued-run",
+			{
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+	}
+	result, allocation_error := strings.concatenate({"Continue-As-New completed on ", value})
+	if allocation_error != nil {
+		return ""
+	}
+	return result
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	fmt.printf(
-		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d child_signaled=%d child_signal_resolved=%d external_signaled=%d external_signal_resolved=%d external_cancel_requested=%v external_cancel_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v completed=%v evicted=%v\n",
+		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d child_signaled=%d child_signal_resolved=%d external_signaled=%d external_signal_resolved=%d external_cancel_requested=%v external_cancel_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v continued_as_new=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.started_child_workflow_count,
@@ -198,6 +217,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.requested_child_workflow_cancellation,
 		processed.canceled_child_workflow_seq,
 		processed.canceled_workflow,
+		processed.continued_as_new,
 		processed.completed,
 		processed.evicted,
 	)
@@ -347,6 +367,16 @@ main :: proc() {
 	if external_caller_error.message != nil {
 		fmt.eprintf("External caller registration failed: %s\n", string(external_caller_error.message))
 		worker.error_free(&external_caller_error)
+		os.exit(1)
+	}
+	continue_as_new_error := worker.register_workflow(
+		&sdk_worker,
+		CONTINUE_AS_NEW_WORKFLOW_TYPE,
+		continue_as_new_workflow,
+	)
+	if continue_as_new_error.message != nil {
+		fmt.eprintf("Continue-As-New registration failed: %s\n", string(continue_as_new_error.message))
+		worker.error_free(&continue_as_new_error)
 		os.exit(1)
 	}
 

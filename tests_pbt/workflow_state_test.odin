@@ -1833,6 +1833,228 @@ external_workflow_operations_replay_for_generated_values :: proc(t: ^testing.T) 
 	pbt.require_pass(t, result)
 }
 
+Generated_Continue_As_New_Input :: struct {
+	value:               string,
+	workflow_type:       string,
+	task_queue:          string,
+	run_timeout_ms:      int,
+	task_timeout_ms:     int,
+	retry_initial_ms:    int,
+	retry_maximum_ms:    int,
+	retry_attempts:      int,
+	backoff_ms:          int,
+}
+
+generated_continue_as_new_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Continue_As_New_Input,
+) -> string {
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = time.Duration(input.retry_initial_ms) * time.Millisecond,
+		backoff_coefficient = 2,
+		maximum_interval = time.Duration(input.retry_maximum_ms) * time.Millisecond,
+		maximum_attempts = i32(input.retry_attempts),
+	}
+	workflow.continue_as_new_json(
+		ctx,
+		input.value,
+		{
+			workflow_type = input.workflow_type,
+			task_queue = input.task_queue,
+			workflow_run_timeout = time.Duration(input.run_timeout_ms) * time.Millisecond,
+			workflow_task_timeout = time.Duration(input.task_timeout_ms) * time.Millisecond,
+			retry_policy = &retry_policy,
+			backoff_start_interval = time.Duration(input.backoff_ms) * time.Millisecond,
+		},
+	)
+}
+
+generated_continue_as_new_match :: proc(
+	data: []u8,
+	expected: ^Generated_Continue_As_New_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Continue_As_New_Workflow_Execution:
+			command := variant.value
+			if command == nil || len(command.arguments) != 1 || command.retry_policy == nil {
+				return false
+			}
+			expected_type := expected.workflow_type
+			if len(expected_type) == 0 {
+				expected_type = "generated_continue_as_new_workflow"
+			}
+			expected_queue := expected.task_queue
+			if len(expected_queue) == 0 {
+				expected_queue = "pbt-continue-as-new-queue"
+			}
+			expected_payload, encode_error := codec.encode_json(expected.value)
+			if encode_error != .None {
+				return false
+			}
+			defer codec.payload_free(&expected_payload)
+			return command.workflow_type == expected_type && command.task_queue == expected_queue &&
+				bytes.equal(command.arguments[0].data, expected_payload.data) &&
+				pbt_proto_duration(command.workflow_run_timeout) ==
+					time.Duration(expected.run_timeout_ms) * time.Millisecond &&
+				pbt_proto_duration(command.workflow_task_timeout) ==
+					time.Duration(expected.task_timeout_ms) * time.Millisecond &&
+				pbt_proto_duration(command.backoff_start_interval) ==
+					time.Duration(expected.backoff_ms) * time.Millisecond &&
+				pbt_proto_duration(command.retry_policy.initial_interval) ==
+					time.Duration(expected.retry_initial_ms) * time.Millisecond &&
+				pbt_proto_duration(command.retry_policy.maximum_interval) ==
+					time.Duration(expected.retry_maximum_ms) * time.Millisecond &&
+				command.retry_policy.backoff_coefficient == 2 &&
+				command.retry_policy.maximum_attempts == i32(expected.retry_attempts)
+		}
+	}
+	return false
+}
+
+continue_as_new_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	run_timeout_ms := pbt.draw(t, pbt.int_range(1, 120_000))
+	task_timeout_ms := pbt.draw(t, pbt.int_range(1, run_timeout_ms))
+	retry_initial_ms := pbt.draw(t, pbt.int_range(1, 10_000))
+	retry_maximum_ms := pbt.draw(t, pbt.int_range(retry_initial_ms, 120_000))
+	input_value := Generated_Continue_As_New_Input{
+		value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		workflow_type = pbt.draw(t, pbt.string_ascii(0, 32)),
+		task_queue = pbt.draw(t, pbt.string_ascii(0, 32)),
+		run_timeout_ms = run_timeout_ms,
+		task_timeout_ms = task_timeout_ms,
+		retry_initial_ms = retry_initial_ms,
+		retry_maximum_ms = retry_maximum_ms,
+		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
+		backoff_ms = pbt.draw(t, pbt.int_range(0, 30_000)),
+	}
+	pbt.cover(t, len(input_value.workflow_type) == 0, 0.2, "reuse Workflow type")
+	pbt.cover(t, len(input_value.task_queue) == 0, 0.2, "reuse task queue")
+
+	owned_queue, queue_error := strings.clone("pbt-continue-as-new-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate Continue-As-New queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_continue_as_new_workflow",
+		generated_continue_as_new_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register Continue-As-New Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Continue-As-New input")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_continue_as_new_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-continue-as-new-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.continued_as_new ||
+	   !generated_continue_as_new_match(initial.completion[:], &input_value) {
+		return pbt.fail("generated Continue-As-New options changed across command encoding")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated Continue-As-New Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !replayed.continued_as_new ||
+	   !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated Continue-As-New replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+continue_as_new_replay_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Continue-As-New options survive generated command encoding and replay",
+		continue_as_new_replay_property,
+		{num_tests = 500, seed = 0x434f_4e54_494e_5545},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

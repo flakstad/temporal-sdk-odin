@@ -1415,8 +1415,8 @@ Workflows are enabled.
    synchronous and Activity-awaiting validated Updates, default/suppressed
    unfinished-handler warnings, explicit handler draining, root cancellation,
    synchronous/asynchronous Signal handlers, preemptively detached operations,
-   detached Update/Activity cleanup, Child Workflows, and external Workflow
-   signal/cancel operations across fresh-stack replay. It does not
+   detached Update/Activity cleanup, Child Workflows, external Workflow
+   signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
    accepted Updates, panic containment,
    nondeterminism diagnostics, bounded stack policy, or a production
@@ -1449,7 +1449,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, registered dispatch, eviction, and replay on macOS arm64 | Add Continue-As-New and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, registered dispatch, eviction, and replay on macOS arm64 | Add patch/versioning primitives and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1470,16 +1470,19 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
-signal/cancel/replay cases, and 1,000 statechart-backed Update lifecycle traces,
+signal/cancel/replay cases, 500 Continue-As-New option/replay cases, and 1,000
+statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for
 await, signal, and explicit cancellation. A live duplicate-ID case proves the
 Core-local `WorkflowAlreadyExists` start failure. External Workflow signal and
-cancellation are also implemented and live-proven. The next smallest durable
-control-flow extension is `ContinueAsNewWorkflowExecution`; richer recursive
-failure inspection can proceed independently.
+cancellation are also implemented and live-proven. Continue-As-New now provides
+the next-run Payload and the main timeout/retry/backoff options through a
+non-returning terminal fiber primitive. The next smallest determinism extension
+is Core's patch/versioning protocol; richer recursive failure inspection can
+proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1636,3 +1639,40 @@ waits for that acknowledgement, and completes. The target observes the signal
 and then closes as canceled. Unit and 500-case property tests additionally
 require both outbound command completions to be byte-identical after eviction
 and fresh-stack replay.
+
+### Continue-As-New boundary
+
+Continue-As-New is another existing Core completion command and adds no C ABI:
+Odin emits `ContinueAsNewWorkflowExecution`; Core and the Service close the
+current run, create the next run in the same Workflow execution chain, and later
+deliver an ordinary `InitializeWorkflow` activation for it. There is no
+resolution job for the old run because the command is terminal.
+
+The Odin primitive is typed `-> !`. It copies/owns the new input Payload and
+options, marks the active fiber run terminal, yields to the language scheduler,
+and is never resumed. The completion builder emits exactly one terminal command
+after any Update responses. Empty Workflow type or task queue values reuse the
+current registered values. The initial slice maps:
+
+- one generic input Payload;
+- Workflow type and task queue;
+- Workflow Run and Workflow Task timeouts;
+- Retry Policy; and
+- first-task backoff.
+
+Core's memo, headers, search attributes, versioning intent, and initial
+versioning behavior fields remain intentionally unexposed until their public
+Odin models exist. Negative/contradictory durations and invalid Retry Policies
+fail the Workflow with a non-retryable SDK Application Failure. Calls outside
+the main Workflow context follow the same failure path. This restriction avoids
+letting a concurrent Signal or Update handler silently terminate main while the
+handler scheduler still owns a different execution-state snapshot.
+
+Ownership mirrors other commands: the `_payload` form clones a borrowed view,
+the `_owned` form consumes its Payload, and JSON encodes directly into the
+Workflow allocator. Options and Retry Policy strings are cloned before the
+fiber yields. Eviction frees the suspended terminal fiber and its arena; replay
+reruns user code and must reconstruct identical command bytes. Unit and
+500-case property tests enforce that invariant. The live dev-server case proves
+the Service creates run two and that the same Odin worker completes it under
+the original Workflow ID.

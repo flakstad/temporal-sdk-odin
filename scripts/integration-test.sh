@@ -1082,3 +1082,38 @@ grep -q 'external_cancel_requested=true' "$worker_log"
 grep -q 'external_cancel_resolved=1' "$worker_log"
 grep -q 'canceled_workflow=true' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Continue-As-New Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+continue_workflow_id="odin-sdk-continue-as-new-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$continue_workflow_id" \
+  --type odin_continue_as_new_workflow \
+  --task-queue odin-child-workflow \
+  --input '"first-run"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+continue_output="$(<"$workflow_output_file")"
+echo "$continue_output"
+grep -q '"status": "COMPLETED"' <<<"$continue_output"
+grep -q 'Continue-As-New completed on continued-run' <<<"$continue_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'continued_as_new=true' "$worker_log"
+grep -q 'continued_as_new=false completed=true' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"

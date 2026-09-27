@@ -95,6 +95,7 @@ Process_Result :: struct {
 	requested_child_workflow_cancellation_count: int,
 	canceled_child_workflow_seq: u32,
 	canceled_workflow:     bool,
+	continued_as_new:      bool,
 	completed:          bool,
 	evicted:            bool,
 	is_replaying:       bool,

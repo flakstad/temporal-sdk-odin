@@ -37,7 +37,10 @@ and parent cancellation that waits for child cancellation before closing.
 Workflow code can also signal and request cancellation of arbitrary external
 Workflow executions by namespace/Workflow ID/optional Run ID, suspending until
 Core resolves each outbound operation. The live suite proves this against two
-independent executions. The offline suite requires
+independent executions. `continue_as_new_json/payload/owned` now terminate the
+current fiber run and carry new input plus timeout/retry/backoff options into a
+new durable run; the CLI-devserver suite follows that chain to completion. The
+offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
 multiple outstanding Activities, catchable Activity failure,
@@ -367,6 +370,28 @@ Workflow arena before suspension. The `_payload` signal form clones a borrowed
 Payload; `_owned` consumes its Payload. Failure results map Core's not-found,
 namespace-not-found, and signal-count-limit causes. This remains a low-level
 execution reference rather than a general client-style handle.
+
+Continue-As-New is deliberately non-returning:
+
+```odin
+if state.events_processed >= 10_000 {
+    workflow.continue_as_new_json(
+        ctx,
+        compacted_state,
+        {
+            workflow_run_timeout = 24 * time.Hour,
+            workflow_task_timeout = 10 * time.Second,
+        },
+    )
+}
+```
+
+Empty Workflow type and task queue options reuse the current registration.
+The current slice also supports Retry Policy and first-task backoff. Memo,
+headers, search attributes, and versioning overrides are not exposed yet.
+The primitive may only be called from the main Workflow context; misuse fails
+the Workflow with an SDK Application Failure rather than returning past the
+terminal command.
 
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:

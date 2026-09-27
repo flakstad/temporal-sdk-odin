@@ -99,7 +99,8 @@ warnings promoted to errors. It then runs a separate property suite from
 forces eviction, reconstructs a fresh fiber, and requires the decisive
 `WorkflowActivationCompletion` bytes to match replay exactly. Separate
 500-case properties cover Child and external Workflow commands and exact
-fresh-stack replay. PBT is a
+fresh-stack replay. Another 500 cases vary Continue-As-New identity,
+timeouts, Retry Policy, backoff, Payload, and exact replay. PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
 statechart lifecycle model. Its own package tests currently contain an upstream
@@ -603,7 +604,11 @@ property generates 500 namespace/Workflow ID/optional Run ID identities,
 signal names, JSON payloads, and cancellation reasons. It checks exact
 `NamespacedWorkflowExecution` targets for signal and cancellation commands and
 requires both completions to be byte-identical after eviction and fresh-stack
-replay. The Client property generates another
+replay. The Continue-As-New property generates 500 replacement Workflow types,
+task queues, input Payloads, valid Run/Task timeout pairs, Retry Policies, and
+backoffs. Empty identity options exercise reuse of the current registration;
+every `ContinueAsNewWorkflowExecution` must encode exactly and remain
+byte-identical after fresh-stack replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
 the generated value. The query property generates 500 success/failure
@@ -703,7 +708,7 @@ The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
 request reason, runs a second Activity in `detached_cancellation_scope`, and
 closes the Workflow as canceled only after that Activity resolves.
 
-## Child Workflow acceptance test
+## Child, external, and Continue-As-New acceptance test
 
 `examples/child_workflow` registers successful, failing, and cancellation-aware
 parent/child Workflows on task queue `odin-child-workflow`. The normal parent
@@ -741,7 +746,10 @@ server-backed paths automatically:
 - two independent Workflows where one sends an external signal, waits for
   `ResolveSignalExternalWorkflow`, requests target cancellation, waits for
   `ResolveRequestCancelExternalWorkflow`, and completes while the target closes
-  as canceled.
+  as canceled;
+- a Workflow that emits `ContinueAsNewWorkflowExecution` with replacement
+  input/timeouts, is evicted, starts a second run under the same Workflow ID,
+  and returns the second run's result to Temporal CLI.
 
 The unit suite additionally evicts the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
@@ -754,7 +762,9 @@ both commands. A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
 the parent closes as canceled. External-operation unit tests inspect namespace,
 Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
-and fresh-stack replay bytes.
+and fresh-stack replay bytes. Continue-As-New unit tests additionally prove the
+non-returning terminal path, default type/queue reuse, options encoding, invalid
+option failure, second-run initialization, and exact replay.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:
