@@ -779,3 +779,37 @@ run_workflow_cancellation_case \
   'cancel-cleanup heartbeat recorded' \
   'replay=false .*scheduled=1 last_activity=2 .*cancel=true canceled_workflow=false .*canceled_timer=false canceled_activity=true .*waiting_activity=2' \
   'Workflow ran detached cleanup before acknowledging cancellation'
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Child Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_parent_id="odin-sdk-child-parent-$$-$(date +%s)"
+child_input="Odin-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$child_parent_id" \
+  --type odin_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input "\"$child_input\"" \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+child_output="$(<"$workflow_output_file")"
+echo "$child_output"
+grep -q '"status": "COMPLETED"' <<<"$child_output"
+grep -q "Hello from child, $child_input" <<<"$child_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"

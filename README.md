@@ -24,6 +24,12 @@ Typed Signals may now be registered as immediate handlers or independent
 stackful routines. An asynchronous Signal handler can await an Activity, mutate
 Workflow-owned state, participate in handler draining, and replay on a fresh
 stack; the CLI-devserver suite proves the state through a public Client Query.
+Child Workflows now have a first vertical path: Odin emits Core's
+`StartChildWorkflowExecution`, awaits its separate start and completion
+resolutions, decodes a typed JSON result, and requests cancellation through
+`CancelChildWorkflowExecution`. The parent/child example completes two Odin
+Workflow Executions through the CLI dev server, and the offline test requires
+the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
@@ -53,8 +59,8 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested/child cancellation-token trees, child Workflows, local Activities,
-client cancellation of an accepted Update, multiple Activity arguments,
+nested cancellation-token trees, structured Child Workflow failure decoding,
+local Activities, client cancellation of an accepted Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
 
@@ -126,6 +132,19 @@ Run it with:
 
 ```bash
 ./scripts/integration-test.sh
+```
+
+The minimal parent/child sample can also be run independently. Start the worker,
+then execute the parent from another terminal:
+
+```bash
+./scripts/run-child-workflow.sh
+
+temporal workflow execute \
+  --workflow-id odin-parent-manual \
+  --type odin_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"Odin"'
 ```
 
 With `examples/hello_workflow` polling, the public Client example performs

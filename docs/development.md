@@ -691,6 +691,32 @@ The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
 request reason, runs a second Activity in `detached_cancellation_scope`, and
 closes the Workflow as canceled only after that Activity resolves.
 
+## Child Workflow acceptance test
+
+`examples/child_workflow` registers a parent and child Workflow on task queue
+`odin-child-workflow`. The parent assigns an explicit deterministic child ID,
+starts the child through SDK Core, waits first for start and then completion,
+and returns the child's JSON result. Run it with the CLI dev server:
+
+```bash
+temporal server start-dev
+./scripts/run-child-workflow.sh
+
+temporal workflow execute \
+  --workflow-id odin-parent-manual \
+  --type odin_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"Odin"'
+```
+
+The example stops after both durable Workflow Executions complete and Core
+evicts both cached fibers. `scripts/integration-test.sh` runs this path
+automatically. The unit suite additionally evicts the parent immediately after
+its start command, replays onto a fresh stack, compares the completions byte for
+byte, then applies separate start and completion resolutions. A second test
+requires inherited cancellation to emit `CancelChildWorkflowExecution(seq=1)`
+and waits for Core's canceled start resolution before closing the parent.
+
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:
 

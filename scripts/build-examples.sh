@@ -21,3 +21,4 @@ build_example client_start temporal-odin-client-start
 build_example client_control temporal-odin-client-control
 build_example hello_activity temporal-odin-hello-activity
 build_example hello_workflow temporal-odin-hello-workflow
+build_example child_workflow temporal-odin-child-workflow

@@ -1471,13 +1471,9 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should add Child Workflow start/result and
-cancellation. Core already exposes the start command plus separate start and
-completion resolutions, so the slice can reuse the proven future tables,
-sequence matching, failure preservation, fiber suspension, eviction, and replay
-without adding a new native ABI symbol. The first vertical path should start one
-child on the same task queue, await its typed result, propagate one child
-failure, and cancel one pending child through the public Workflow API.
+The Child Workflow start/result slice is now implemented. The next smallest
+extension is structured Child Workflow failure propagation plus live
+cancellation coverage, followed by signal/cancel handles for a started child.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1508,3 +1504,56 @@ The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and
 eviction. The findings add protobuf/tooling, language-runtime, and version-skew
 obligations but give no reason to bypass Core or implement direct server gRPC.
+
+### Child Workflow boundary
+
+Child Workflows required no new native ABI surface. They are entirely expressed
+through the existing serialized Workflow Activation and Activation Completion
+messages:
+
+- Odin emits `StartChildWorkflowExecution`, including one language-assigned
+  `seq`, explicit Workflow ID/type, task queue, input Payload, timeouts, Retry
+  Policy, Parent Close Policy, and Child Cancellation Type.
+- Core later emits `ResolveChildWorkflowExecutionStart(seq, status)`. Success
+  carries the child Run ID; failure carries Workflow ID/type and
+  `WorkflowAlreadyExists`; cancellation carries a Failure.
+- Independently, Core emits `ResolveChildWorkflowExecution(seq, result)` with a
+  completed Payload, Failure, or cancellation Failure.
+- Odin emits `CancelChildWorkflowExecution(child_workflow_seq, reason)` when an
+  inherited parent cancellation reaches a commanded child. Core applies the
+  cancellation type carried by the original start command.
+
+This means one child sequence has two independent readiness milestones. The
+Odin operation table registers both conceptually at start time, even when user
+code awaits only completion. `await_child_workflow_start` suspends on the first;
+`await_child_workflow_payload_result` and the typed JSON wrapper then suspend on
+the second. A completion delivered in the same activation as the start
+resolution is retained before either fiber resume, so activation ordering does
+not lose it.
+
+Owned Workflow ID/type/options/input, Run ID, output Payload, and failure bytes
+live in the Workflow instance arena. Activation decode values remain borrowed
+only for that callback and are cloned before the decode arena is destroyed.
+Eviction destroys the entire operation table; replay recreates it by rerunning
+deterministic Odin code. The offline acceptance test evicts immediately after
+the start command and requires a byte-identical command from a fresh stack.
+
+The default Odin cancellation enum intentionally maps its zero value to Core's
+`WAIT_CANCELLATION_COMPLETED`, matching the safe Core SDK default rather than
+the protobuf enum's zero-valued `ABANDON`. `ABANDON` and `TRY_CANCEL` can resume
+the parent locally; the wait policies remain suspended until Core supplies the
+corresponding resolution. A unit test covers cancellation while waiting for the
+start resolution. Full live cancellation and structured Child Workflow Failure
+decoding remain open hardening work.
+
+The CLI-devserver acceptance test registers parent and child Workflow types on
+one Odin worker and task queue. Temporal starts the child as a distinct durable
+execution, both executions complete, and the parent returns the child's result.
+This confirms the intended boundary:
+
+```text
+Odin parent fiber -> StartChild command -> Core -> Temporal Service
+Temporal Service -> child activation -> Core -> Odin child fiber
+Odin child completion -> Core -> Temporal Service
+Temporal Service -> child completion resolution -> Core -> Odin parent fiber
+```

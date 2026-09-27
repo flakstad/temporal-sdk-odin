@@ -123,6 +123,44 @@ Activity_Cancellation_Type :: enum {
 	Abandon,
 }
 
+// The zero value deliberately matches the safest Core SDK default: a canceled
+// parent waits until the child reports that cancellation completed.
+Child_Workflow_Cancellation_Type :: enum {
+	Wait_Cancellation_Completed,
+	Abandon,
+	Try_Cancel,
+	Wait_Cancellation_Requested,
+}
+
+Parent_Close_Policy :: enum {
+	Unspecified,
+	Terminate,
+	Abandon,
+	Request_Cancel,
+}
+
+Child_Workflow_Options :: struct {
+	workflow_id:               string,
+	task_queue:                string,
+	workflow_execution_timeout: time.Duration,
+	workflow_run_timeout:       time.Duration,
+	workflow_task_timeout:      time.Duration,
+	retry_policy:              ^Retry_Policy,
+	cancellation_type:         Child_Workflow_Cancellation_Type,
+	parent_close_policy:       Parent_Close_Policy,
+}
+
+Owned_Child_Workflow_Options :: struct {
+	task_queue:                string,
+	workflow_execution_timeout: time.Duration,
+	workflow_run_timeout:       time.Duration,
+	workflow_task_timeout:      time.Duration,
+	retry_policy:              Retry_Policy,
+	has_retry_policy:          bool,
+	cancellation_type:         Child_Workflow_Cancellation_Type,
+	parent_close_policy:       Parent_Close_Policy,
+}
+
 Retry_Policy :: struct {
 	initial_interval:          time.Duration,
 	backoff_coefficient:       f64,
@@ -161,6 +199,8 @@ Owned_Activity_Options :: struct {
 Fiber_Phase :: enum {
 	Ready,
 	Waiting_Activity,
+	Waiting_Child_Workflow_Start,
+	Waiting_Child_Workflow,
 	Waiting_Timer,
 	Waiting_Signal,
 	Waiting_Signal_Or_Timer,
@@ -181,6 +221,68 @@ Fiber_Operation_State :: enum {
 
 Activity_Future :: struct {
 	seq: u32,
+}
+
+Child_Workflow_Future :: struct {
+	seq: u32,
+}
+
+Child_Workflow_Start_Status :: enum {
+	Succeeded,
+	Failed,
+	Canceled,
+}
+
+Child_Workflow_Start_Failure_Cause :: enum {
+	Unspecified,
+	Workflow_Already_Exists,
+}
+
+Child_Workflow_Start_Result :: struct {
+	status:        Child_Workflow_Start_Status,
+	run_id:        string,
+	workflow_id:   string,
+	workflow_type: string,
+	cause:         Child_Workflow_Start_Failure_Cause,
+	failure_message: string,
+}
+
+Child_Workflow_Result_Status :: enum {
+	Succeeded,
+	Failed,
+	Canceled,
+}
+
+Payload_Child_Workflow_Result :: struct {
+	status:          Child_Workflow_Result_Status,
+	value:           codec.Payload_View,
+	failure_message: string,
+}
+
+Json_Child_Workflow_Result :: struct($T: typeid) {
+	status:          Child_Workflow_Result_Status,
+	value:           T,
+	failure_message: string,
+}
+
+Child_Workflow_Result :: struct {
+	status:          Child_Workflow_Result_Status,
+	value:           string,
+	failure_message: string,
+}
+
+Child_Workflow_Start_State :: enum {
+	Pending,
+	Succeeded,
+	Failed,
+	Canceled,
+}
+
+Child_Workflow_Completion_State :: enum {
+	Pending,
+	Succeeded,
+	Failed,
+	Canceled,
 }
 
 Activity_Result_Status :: enum {
@@ -337,6 +439,23 @@ Fiber_Timer_Operation :: struct {
 	detached_from_root_cancellation: bool,
 }
 
+Fiber_Child_Workflow_Operation :: struct {
+	seq:           u32,
+	workflow_id:   string,
+	workflow_type: string,
+	options:       Owned_Child_Workflow_Options,
+	input:         codec.Payload,
+	run_id:        string,
+	result:        codec.Payload,
+	failure_message: string,
+	failure_proto:   []u8,
+	command_state:   Fiber_Operation_State,
+	start_state:     Child_Workflow_Start_State,
+	completion_state: Child_Workflow_Completion_State,
+	start_failure_cause: Child_Workflow_Start_Failure_Cause,
+	detached_from_root_cancellation: bool,
+}
+
 Fiber_Signal :: struct {
 	name:     string,
 	payload:  codec.Payload,
@@ -352,6 +471,7 @@ Fiber_Signal_Routine :: struct {
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
+	waiting_child_workflow_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -373,6 +493,7 @@ Fiber_Update_Routine :: struct {
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
+	waiting_child_workflow_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -393,6 +514,7 @@ Fiber_Instance :: struct {
 	invoke:          Workflow_Invoke_Proc,
 	workflow_context: Fiber_Context,
 	activities:       [dynamic]Fiber_Activity_Operation,
+	child_workflows:  [dynamic]Fiber_Child_Workflow_Operation,
 	timers:           [dynamic]Fiber_Timer_Operation,
 	signals:          [dynamic]Fiber_Signal,
 	signal_handlers:  [dynamic]Fiber_Signal_Handler,
@@ -401,6 +523,7 @@ Fiber_Instance :: struct {
 	update_handlers:  [dynamic]Fiber_Update_Handler,
 	update_routines:  [dynamic]^Fiber_Update_Routine,
 	waiting_activity_seq: u32,
+	waiting_child_workflow_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	cancellation_reason:  string,
@@ -411,6 +534,7 @@ Fiber_Instance :: struct {
 	failure_message:       string,
 	failure_type:          string,
 	next_activity_seq: u32,
+	next_child_workflow_seq: u32,
 	next_timer_seq:    u32,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
@@ -555,6 +679,7 @@ fiber_result_error :: proc(operation: string, result: fiber_raw.Result) -> Error
 
 Fiber_Execution_State :: struct {
 	waiting_activity_seq: u32,
+	waiting_child_workflow_seq: u32,
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
@@ -568,6 +693,7 @@ Fiber_Execution_State :: struct {
 capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = instance.waiting_activity_seq,
+		waiting_child_workflow_seq = instance.waiting_child_workflow_seq,
 		waiting_timer_seq = instance.waiting_timer_seq,
 		waiting_signal_name = instance.waiting_signal_name,
 		detached_scope_depth = instance.detached_scope_depth,
@@ -581,6 +707,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 
 apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Execution_State) {
 	instance.waiting_activity_seq = state.waiting_activity_seq
+	instance.waiting_child_workflow_seq = state.waiting_child_workflow_seq
 	instance.waiting_timer_seq = state.waiting_timer_seq
 	instance.waiting_signal_name = state.waiting_signal_name
 	instance.detached_scope_depth = state.detached_scope_depth
@@ -594,6 +721,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = routine.waiting_activity_seq,
+		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
@@ -610,6 +738,7 @@ capture_signal_routine_execution :: proc(
 	instance: ^Fiber_Instance,
 ) {
 	routine.waiting_activity_seq = instance.waiting_activity_seq
+	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
@@ -673,6 +802,7 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = routine.waiting_activity_seq,
+		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
@@ -689,6 +819,7 @@ capture_update_routine_execution :: proc(
 	instance: ^Fiber_Instance,
 ) {
 	routine.waiting_activity_seq = instance.waiting_activity_seq
+	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
@@ -786,6 +917,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		for &detail in operation.failure_detail_payloads {
 			codec.payload_free(&detail)
 		}
+	}
+	for &operation in instance.child_workflows {
+		codec.payload_free(&operation.input)
+		codec.payload_free(&operation.result)
 	}
 	for &signal in instance.signals {
 		codec.payload_free(&signal.payload)
@@ -896,6 +1031,7 @@ add_fiber_instance :: proc(
 	owned_input, clone_error := proto.clone_payload(input_payload)
 	instance.input = owned_input
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
+	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.timers = make([dynamic]Fiber_Timer_Operation)
 	instance.signals = make([dynamic]Fiber_Signal)
 	instance.signal_handlers = make([dynamic]Fiber_Signal_Handler)
@@ -933,6 +1069,18 @@ find_activity_operation :: proc(instance: ^Fiber_Instance, seq: u32) -> (^Fiber_
 	for index in 0..<len(instance.activities) {
 		if instance.activities[index].seq == seq {
 			return &instance.activities[index], true
+		}
+	}
+	return nil, false
+}
+
+find_child_workflow_operation :: proc(
+	instance: ^Fiber_Instance,
+	seq: u32,
+) -> (^Fiber_Child_Workflow_Operation, bool) {
+	for index in 0..<len(instance.child_workflows) {
+		if instance.child_workflows[index].seq == seq {
+			return &instance.child_workflows[index], true
 		}
 	}
 	return nil, false
@@ -1596,6 +1744,36 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
 		}
 	}
+	for index in 0..<len(instance.child_workflows) {
+		operation := &instance.child_workflows[index]
+		if operation.detached_from_root_cancellation {
+			continue
+		}
+		switch operation.command_state {
+		case .Scheduled:
+			operation.command_state = .Canceled
+			operation.start_state = .Canceled
+			operation.completion_state = .Canceled
+			operation.failure_message = reason
+		case .Commanded:
+			operation.failure_message = reason
+			switch operation.options.cancellation_type {
+			case .Abandon:
+				operation.command_state = .Resolved
+				operation.start_state = .Canceled
+				operation.completion_state = .Canceled
+				operation.failure_message = reason
+			case .Try_Cancel:
+				operation.command_state = .Cancel_Requested
+				operation.start_state = .Canceled
+				operation.completion_state = .Canceled
+				operation.failure_message = reason
+			case .Wait_Cancellation_Completed, .Wait_Cancellation_Requested:
+				operation.command_state = .Cancel_Requested
+			}
+		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
+		}
+	}
 }
 
 is_cancellation_requested :: proc(ctx: ^Fiber_Context) -> bool {
@@ -1890,6 +2068,305 @@ start_activity_with_options :: proc(
 	options: Activity_Options,
 ) -> Activity_Future {
 	return start_activity_json_with_options(ctx, activity_type, input, options)
+}
+
+child_workflow_options_error :: proc(
+	workflow_type: string,
+	options: Child_Workflow_Options,
+) -> string {
+	if len(workflow_type) == 0 {
+		return "Child Workflow type must not be empty"
+	}
+	if len(options.workflow_id) == 0 {
+		return "Child Workflow ID must not be empty"
+	}
+	if options.workflow_execution_timeout < 0 || options.workflow_run_timeout < 0 ||
+	   options.workflow_task_timeout < 0 {
+		return "Child Workflow timeouts must not be negative"
+	}
+	if options.workflow_execution_timeout > 0 && options.workflow_run_timeout > options.workflow_execution_timeout {
+		return "Child Workflow Run timeout must not exceed Execution timeout"
+	}
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		if policy.initial_interval < 0 || policy.maximum_interval < 0 || policy.maximum_attempts < 0 {
+			return "Child Workflow Retry Policy values must not be negative"
+		}
+		if math.is_nan(policy.backoff_coefficient) || math.is_inf(policy.backoff_coefficient) ||
+		   (policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1) {
+			return "Child Workflow Retry Policy backoff coefficient must be zero or at least one"
+		}
+	}
+	return ""
+}
+
+clone_child_workflow_options :: proc(
+	instance: ^Fiber_Instance,
+	options: Child_Workflow_Options,
+) -> (owned: Owned_Child_Workflow_Options, ok: bool) {
+	allocator := instance.odin_context.allocator
+	if len(options.task_queue) > 0 {
+		owned.task_queue, _ = strings.clone(options.task_queue, allocator)
+		if owned.task_queue == "" {
+			return {}, false
+		}
+	}
+	owned.workflow_execution_timeout = options.workflow_execution_timeout
+	owned.workflow_run_timeout = options.workflow_run_timeout
+	owned.workflow_task_timeout = options.workflow_task_timeout
+	owned.cancellation_type = options.cancellation_type
+	owned.parent_close_policy = options.parent_close_policy
+	if options.retry_policy != nil {
+		owned.has_retry_policy = true
+		owned.retry_policy = options.retry_policy^
+		owned.retry_policy.non_retryable_error_types = make(
+			[]string,
+			len(options.retry_policy.non_retryable_error_types),
+			allocator,
+		)
+		for error_type, index in options.retry_policy.non_retryable_error_types {
+			cloned, clone_error := strings.clone(error_type, allocator)
+			if clone_error != nil {
+				return {}, false
+			}
+			owned.retry_policy.non_retryable_error_types[index] = cloned
+		}
+	}
+	return owned, true
+}
+
+mark_child_workflow_failure :: proc(ctx: ^Fiber_Context, message, failure_type: string) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	ctx.instance.failure_message = message
+	ctx.instance.failure_type = failure_type
+	ctx.instance.phase = .Failed
+}
+
+start_child_workflow_owned :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	input: codec.Payload,
+	options: Child_Workflow_Options,
+) -> Child_Workflow_Future {
+	owned_input := input
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		codec.payload_free(&owned_input)
+		return {}
+	}
+	instance := ctx.instance
+	validation_error := child_workflow_options_error(workflow_type, options)
+	if len(validation_error) > 0 {
+		codec.payload_free(&owned_input)
+		mark_child_workflow_failure(ctx, validation_error, "OdinChildWorkflowOptionsError")
+		return {}
+	}
+	owned_type, type_error := strings.clone(workflow_type, instance.odin_context.allocator)
+	owned_id, id_error := strings.clone(options.workflow_id, instance.odin_context.allocator)
+	owned_options, options_ok := clone_child_workflow_options(instance, options)
+	if type_error != nil || id_error != nil || !options_ok {
+		codec.payload_free(&owned_input)
+		mark_child_workflow_failure(ctx, "could not preserve Child Workflow options", "OdinChildWorkflowOptionsError")
+		return {}
+	}
+	instance.next_child_workflow_seq += 1
+	operation := Fiber_Child_Workflow_Operation{
+		seq = instance.next_child_workflow_seq,
+		workflow_id = owned_id,
+		workflow_type = owned_type,
+		options = owned_options,
+		input = owned_input,
+		command_state = .Scheduled,
+		start_state = .Pending,
+		completion_state = .Pending,
+		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+	}
+	append(&instance.child_workflows, operation)
+	return {seq = operation.seq}
+}
+
+start_child_workflow_payload :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Child_Workflow_Options,
+) -> Child_Workflow_Future {
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		mark_child_workflow_failure(ctx, "could not preserve Child Workflow input Payload", "OdinWorkflowPayloadConversionError")
+		return {}
+	}
+	return start_child_workflow_owned(ctx, workflow_type, owned_input, options)
+}
+
+start_child_workflow_json :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	input: $T,
+	options: Child_Workflow_Options,
+) -> Child_Workflow_Future {
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	payload, encode_error := codec.encode_json(input, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		mark_child_workflow_failure(ctx, "could not encode Child Workflow input as json/plain", "OdinWorkflowPayloadConversionError")
+		return {}
+	}
+	return start_child_workflow_owned(ctx, workflow_type, payload, options)
+}
+
+child_workflow_start_result_from_operation :: proc(
+	operation: ^Fiber_Child_Workflow_Operation,
+) -> Child_Workflow_Start_Result {
+	switch operation.start_state {
+	case .Succeeded:
+		return {status = .Succeeded, run_id = operation.run_id}
+	case .Failed:
+		return {
+			status = .Failed,
+			workflow_id = operation.workflow_id,
+			workflow_type = operation.workflow_type,
+			cause = operation.start_failure_cause,
+			failure_message = operation.failure_message,
+		}
+	case .Canceled:
+		return {status = .Canceled, failure_message = operation.failure_message}
+	case .Pending:
+	}
+	return {status = .Failed, failure_message = "Child Workflow start has not resolved"}
+}
+
+await_child_workflow_start :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+) -> Child_Workflow_Start_Result {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
+		return {status = .Failed, failure_message = "invalid Child Workflow start await"}
+	}
+	instance := ctx.instance
+	operation, found := find_child_workflow_operation(instance, future.seq)
+	if !found {
+		mark_child_workflow_failure(ctx, "Child Workflow operation was not found", "OdinChildWorkflowRuntimeError")
+		return {status = .Failed, failure_message = "Child Workflow operation was not found"}
+	}
+	if operation.start_state == .Pending {
+		instance.waiting_child_workflow_seq = future.seq
+		instance.phase = .Waiting_Child_Workflow_Start
+		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+			mark_child_workflow_failure(ctx, "could not resume Child Workflow start await", "OdinChildWorkflowRuntimeError")
+			return {status = .Failed, failure_message = "could not resume Child Workflow start await"}
+		}
+		operation, found = find_child_workflow_operation(instance, future.seq)
+	}
+	if !found || operation.start_state == .Pending {
+		mark_child_workflow_failure(ctx, "Child Workflow start resumed without a resolution", "OdinChildWorkflowRuntimeError")
+		return {status = .Failed, failure_message = "Child Workflow start resumed without a resolution"}
+	}
+	return child_workflow_start_result_from_operation(operation)
+}
+
+payload_child_workflow_result_from_operation :: proc(
+	operation: ^Fiber_Child_Workflow_Operation,
+) -> Payload_Child_Workflow_Result {
+	switch operation.completion_state {
+	case .Succeeded:
+		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
+	case .Failed:
+		return {status = .Failed, failure_message = operation.failure_message}
+	case .Canceled:
+		return {status = .Canceled, failure_message = operation.failure_message}
+	case .Pending:
+	}
+	return {status = .Failed, failure_message = "Child Workflow has not completed"}
+}
+
+await_child_workflow_payload_result :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+) -> Payload_Child_Workflow_Result {
+	start_result := await_child_workflow_start(ctx, future)
+	if start_result.status == .Failed {
+		return {status = .Failed, failure_message = start_result.failure_message}
+	}
+	if start_result.status == .Canceled {
+		return {status = .Canceled, failure_message = start_result.failure_message}
+	}
+	instance := ctx.instance
+	operation, found := find_child_workflow_operation(instance, future.seq)
+	if !found {
+		return {status = .Failed, failure_message = "Child Workflow operation was not found"}
+	}
+	if operation.completion_state == .Pending {
+		instance.waiting_child_workflow_seq = future.seq
+		instance.phase = .Waiting_Child_Workflow
+		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+			mark_child_workflow_failure(ctx, "could not resume Child Workflow completion await", "OdinChildWorkflowRuntimeError")
+			return {status = .Failed, failure_message = "could not resume Child Workflow completion await"}
+		}
+		operation, found = find_child_workflow_operation(instance, future.seq)
+	}
+	if !found || operation.completion_state == .Pending {
+		mark_child_workflow_failure(ctx, "Child Workflow resumed without a completion", "OdinChildWorkflowRuntimeError")
+		return {status = .Failed, failure_message = "Child Workflow resumed without a completion"}
+	}
+	return payload_child_workflow_result_from_operation(operation)
+}
+
+await_child_workflow_json_result :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	$T: typeid,
+) -> Json_Child_Workflow_Result(T) {
+	result := await_child_workflow_payload_result(ctx, future)
+	if result.status != .Succeeded {
+		return {status = result.status, failure_message = result.failure_message}
+	}
+	value: T
+	if codec.decode_json(result.value, &value) != .None {
+		mark_child_workflow_failure(ctx, "could not decode Child Workflow result as json/plain", "OdinWorkflowPayloadConversionError")
+		return {status = .Failed, failure_message = "could not decode Child Workflow result as json/plain"}
+	}
+	return {status = .Succeeded, value = value}
+}
+
+await_child_workflow_result :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+) -> Child_Workflow_Result {
+	result := await_child_workflow_json_result(ctx, future, string)
+	return {status = result.status, value = result.value, failure_message = result.failure_message}
+}
+
+execute_child_workflow_json_result :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	input: $Input,
+	options: Child_Workflow_Options,
+	$Output: typeid,
+) -> Json_Child_Workflow_Result(Output) {
+	return await_child_workflow_json_result(
+		ctx,
+		start_child_workflow_json(ctx, workflow_type, input, options),
+		Output,
+	)
+}
+
+execute_child_workflow :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type, input: string,
+	options: Child_Workflow_Options,
+) -> string {
+	result := execute_child_workflow_json_result(ctx, workflow_type, input, options, string)
+	if result.status == .Failed {
+		mark_child_workflow_failure(ctx, result.failure_message, "OdinChildWorkflowExecutionError")
+		return ""
+	}
+	return result.value
 }
 
 activity_retry_state_from_proto :: proc(
@@ -2562,6 +3039,38 @@ activity_cancellation_type_to_proto :: proc(
 	return .TRY_CANCEL
 }
 
+child_workflow_cancellation_type_to_proto :: proc(
+	cancellation_type: Child_Workflow_Cancellation_Type,
+) -> proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType {
+	switch cancellation_type {
+	case .Wait_Cancellation_Completed:
+		return .WAIT_CANCELLATION_COMPLETED
+	case .Abandon:
+		return .ABANDON
+	case .Try_Cancel:
+		return .TRY_CANCEL
+	case .Wait_Cancellation_Requested:
+		return .WAIT_CANCELLATION_REQUESTED
+	}
+	return .WAIT_CANCELLATION_COMPLETED
+}
+
+parent_close_policy_to_proto :: proc(
+	policy: Parent_Close_Policy,
+) -> proto.Coresdk_Child_Workflow_ParentClosePolicy {
+	switch policy {
+	case .Unspecified:
+		return .PARENT_CLOSE_POLICY_UNSPECIFIED
+	case .Terminate:
+		return .PARENT_CLOSE_POLICY_TERMINATE
+	case .Abandon:
+		return .PARENT_CLOSE_POLICY_ABANDON
+	case .Request_Cancel:
+		return .PARENT_CLOSE_POLICY_REQUEST_CANCEL
+	}
+	return .PARENT_CLOSE_POLICY_UNSPECIFIED
+}
+
 retry_policy_to_proto :: proc(
 	policy: ^Retry_Policy,
 ) -> ^proto.Temporal_Api_Common_V1_RetryPolicy {
@@ -2577,6 +3086,50 @@ retry_policy_to_proto :: proc(
 		append(&result.non_retryable_error_types, error_type)
 	}
 	return result
+}
+
+append_fiber_start_child_workflow_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	operation: ^Fiber_Child_Workflow_Operation,
+	default_task_queue: string,
+) {
+	payload := new(proto.Temporal_Api_Common_V1_Payload)
+	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
+	task_queue := operation.options.task_queue
+	if len(task_queue) == 0 {
+		task_queue = default_task_queue
+	}
+	retry_policy: ^proto.Temporal_Api_Common_V1_RetryPolicy
+	if operation.options.has_retry_policy {
+		retry_policy = retry_policy_to_proto(&operation.options.retry_policy)
+	}
+	start := new(proto.Coresdk_Workflow_Commands_StartChildWorkflowExecution)
+	start^ = {
+		seq = operation.seq,
+		workflow_id = operation.workflow_id,
+		workflow_type = operation.workflow_type,
+		task_queue = task_queue,
+		workflow_execution_timeout = duration_to_proto(operation.options.workflow_execution_timeout),
+		workflow_run_timeout = duration_to_proto(operation.options.workflow_run_timeout),
+		workflow_task_timeout = duration_to_proto(operation.options.workflow_task_timeout),
+		parent_close_policy = parent_close_policy_to_proto(operation.options.parent_close_policy),
+		retry_policy = retry_policy,
+		cancellation_type = child_workflow_cancellation_type_to_proto(operation.options.cancellation_type),
+	}
+	append(&start.input, payload^)
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Child_Workflow_Execution{
+				value = start,
+			},
+		},
+	)
+	operation.command_state = .Commanded
+	result.started_child_workflow = true
+	result.started_child_workflow_count += 1
+	result.child_workflow_seq = operation.seq
 }
 
 append_fiber_schedule_command :: proc(
@@ -2718,12 +3271,49 @@ append_fiber_activity_cancellations :: proc(
 	}
 }
 
+append_fiber_cancel_child_workflow_command :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	operation: ^Fiber_Child_Workflow_Operation,
+) {
+	request := new(proto.Coresdk_Workflow_Commands_CancelChildWorkflowExecution)
+	request.child_workflow_seq = operation.seq
+	request.reason = operation.failure_message
+	append(
+		commands,
+		proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Child_Workflow_Execution{
+				value = request,
+			},
+		},
+	)
+	operation.command_state = .Canceled
+	result.requested_child_workflow_cancellation = true
+	result.requested_child_workflow_cancellation_count += 1
+	result.canceled_child_workflow_seq = operation.seq
+}
+
+append_fiber_child_workflow_cancellations :: proc(
+	result: ^Process_Result,
+	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	instance: ^Fiber_Instance,
+) {
+	for index in 0..<len(instance.child_workflows) {
+		operation := &instance.child_workflows[index]
+		if operation.command_state == .Cancel_Requested {
+			append_fiber_cancel_child_workflow_command(result, commands, operation)
+		}
+	}
+}
+
 Workflow_Command_State :: struct {
 	phase:             Fiber_Phase,
 	next_activity_seq: u32,
 	next_timer_seq:    u32,
+	next_child_workflow_seq: u32,
 	activity_count:    int,
 	timer_count:       int,
+	child_workflow_count: int,
 }
 
 workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_State {
@@ -2731,8 +3321,10 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 		phase = instance.phase,
 		next_activity_seq = instance.next_activity_seq,
 		next_timer_seq = instance.next_timer_seq,
+		next_child_workflow_seq = instance.next_child_workflow_seq,
 		activity_count = len(instance.activities),
 		timer_count = len(instance.timers),
+		child_workflow_count = len(instance.child_workflows),
 	}
 }
 
@@ -2743,8 +3335,10 @@ workflow_command_state_changed :: proc(
 	return instance.phase != before.phase ||
 		instance.next_activity_seq != before.next_activity_seq ||
 		instance.next_timer_seq != before.next_timer_seq ||
+		instance.next_child_workflow_seq != before.next_child_workflow_seq ||
 		len(instance.activities) != before.activity_count ||
-		len(instance.timers) != before.timer_count
+		len(instance.timers) != before.timer_count ||
+		len(instance.child_workflows) != before.child_workflow_count
 }
 
 restore_workflow_command_state :: proc(
@@ -2754,11 +3348,15 @@ restore_workflow_command_state :: proc(
 	instance.phase = before.phase
 	instance.next_activity_seq = before.next_activity_seq
 	instance.next_timer_seq = before.next_timer_seq
+	instance.next_child_workflow_seq = before.next_child_workflow_seq
 	for len(instance.activities) > before.activity_count {
 		ordered_remove(&instance.activities, len(instance.activities) - 1)
 	}
 	for len(instance.timers) > before.timer_count {
 		ordered_remove(&instance.timers, len(instance.timers) - 1)
+	}
+	for len(instance.child_workflows) > before.child_workflow_count {
+		ordered_remove(&instance.child_workflows, len(instance.child_workflows) - 1)
 	}
 }
 
@@ -2959,6 +3557,12 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && (operation.state == .Resolved || operation.state == .Failed ||
 			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_Child_Workflow_Start:
+		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
+		return found && operation.start_state != .Pending
+	case .Waiting_Child_Workflow:
+		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
+		return found && operation.completion_state != .Pending
 	case .Waiting_Timer:
 		operation, found := find_timer_operation(instance, routine.waiting_timer_seq)
 		return found && (operation.state == .Resolved || operation.state == .Cancel_Requested ||
@@ -2984,6 +3588,7 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		}
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
+		routine.waiting_child_workflow_seq = 0
 		routine.waiting_timer_seq = 0
 		routine.waiting_signal_name = ""
 		resume_error := resume_signal_routine(routine)
@@ -3169,6 +3774,12 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && (operation.state == .Resolved || operation.state == .Failed ||
 			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_Child_Workflow_Start:
+		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
+		return found && operation.start_state != .Pending
+	case .Waiting_Child_Workflow:
+		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
+		return found && operation.completion_state != .Pending
 	case .Waiting_Timer:
 		operation, found := find_timer_operation(instance, routine.waiting_timer_seq)
 		return found && (operation.state == .Resolved || operation.state == .Cancel_Requested ||
@@ -3194,6 +3805,7 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		}
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
+		routine.waiting_child_workflow_seq = 0
 		routine.waiting_timer_seq = 0
 		routine.waiting_signal_name = ""
 		resume_error := resume_update_routine(routine)
@@ -3398,8 +4010,15 @@ append_shared_operation_commands :: proc(
 			append_fiber_timer_command(result, commands, operation)
 		}
 	}
+	for index in 0..<len(instance.child_workflows) {
+		operation := &instance.child_workflows[index]
+		if operation.command_state == .Scheduled {
+			append_fiber_start_child_workflow_command(result, commands, operation, task_queue)
+		}
+	}
 	append_fiber_activity_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
+	append_fiber_child_workflow_cancellations(result, commands, instance)
 }
 
 append_fiber_pending_commands :: proc(
@@ -3412,6 +4031,10 @@ append_fiber_pending_commands :: proc(
 	switch instance.phase {
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
+	case .Waiting_Child_Workflow_Start:
+		result.waiting_child_workflow_start_seq = instance.waiting_child_workflow_seq
+	case .Waiting_Child_Workflow:
+		result.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	case .Waiting_Timer:
 	case .Waiting_Signal:
 		result.waiting_signal = true
@@ -3584,6 +4207,7 @@ append_fiber_cancellation_commands :: proc(
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
+	append_fiber_child_workflow_cancellations(result, commands, instance)
 	cancel := new(proto.Coresdk_Workflow_Commands_CancelWorkflowExecution)
 	append(
 		commands,
@@ -3777,6 +4401,127 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution_Start:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "Child Workflow start resolution has no Workflow fiber")
+				return
+			}
+			operation, operation_found := find_child_workflow_operation(instance, variant.value.seq)
+			if !operation_found ||
+			   (operation.command_state != .Commanded && operation.command_state != .Cancel_Requested && operation.command_state != .Canceled) {
+				process_error(&result, activation.run_id, "Child Workflow start resolution does not match a pending operation")
+				return
+			}
+			if operation.start_state != .Pending {
+				result.resolved_child_workflow_start_seq = operation.seq
+				continue
+			}
+			resolution_handled := false
+			#partial switch status in variant.value.status {
+			case proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Succeeded:
+				resolution_handled = true
+				if status.value == nil || len(status.value.run_id) == 0 {
+					process_error(&result, activation.run_id, "started Child Workflow has no Run ID")
+					return
+				}
+				context.allocator = instance.odin_context.allocator
+				operation.run_id, _ = strings.clone(status.value.run_id)
+				context.allocator = previous_allocator
+				if len(operation.run_id) == 0 {
+					process_error(&result, activation.run_id, "could not preserve Child Workflow Run ID")
+					return
+				}
+				operation.start_state = .Succeeded
+			case proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Failed:
+				resolution_handled = true
+				if status.value == nil {
+					process_error(&result, activation.run_id, "failed Child Workflow start has no result")
+					return
+				}
+				operation.start_state = .Failed
+				operation.failure_message = "Child Workflow failed to start"
+				if status.value.cause == .START_CHILD_WORKFLOW_EXECUTION_FAILED_CAUSE_WORKFLOW_ALREADY_EXISTS {
+					operation.start_failure_cause = .Workflow_Already_Exists
+				}
+			case proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Cancelled:
+				resolution_handled = true
+				if status.value == nil || status.value.failure == nil {
+					process_error(&result, activation.run_id, "canceled Child Workflow start has no failure")
+					return
+				}
+				context.allocator = instance.odin_context.allocator
+				operation.failure_message, _ = strings.clone(status.value.failure.message)
+				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+				operation.failure_proto = failure_proto[:]
+				context.allocator = previous_allocator
+				operation.start_state = .Canceled
+			}
+			if !resolution_handled {
+				process_error(&result, activation.run_id, "Child Workflow start result is unsupported")
+				return
+			}
+			result.resolved_child_workflow_start_seq = operation.seq
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution:
+			handled = true
+			if variant.value == nil || variant.value.result == nil || !instance_found {
+				process_error(&result, activation.run_id, "Child Workflow completion has no Workflow fiber")
+				return
+			}
+			operation, operation_found := find_child_workflow_operation(instance, variant.value.seq)
+			if !operation_found ||
+			   (operation.command_state != .Commanded && operation.command_state != .Cancel_Requested && operation.command_state != .Canceled) {
+				process_error(&result, activation.run_id, "Child Workflow completion does not match a pending operation")
+				return
+			}
+			if operation.completion_state != .Pending {
+				result.resolved_child_workflow_seq = operation.seq
+				continue
+			}
+			resolution_handled := false
+			#partial switch status in variant.value.result.status {
+			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Completed:
+				resolution_handled = true
+				if status.value == nil || status.value.result == nil {
+					process_error(&result, activation.run_id, "completed Child Workflow has no result")
+					return
+				}
+				context.allocator = instance.odin_context.allocator
+				operation.result, _ = proto.clone_payload(status.value.result)
+				context.allocator = previous_allocator
+				operation.completion_state = .Succeeded
+			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Failed:
+				resolution_handled = true
+				if status.value == nil || status.value.failure == nil {
+					process_error(&result, activation.run_id, "failed Child Workflow has no failure")
+					return
+				}
+				context.allocator = instance.odin_context.allocator
+				operation.failure_message, _ = strings.clone(status.value.failure.message)
+				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+				operation.failure_proto = failure_proto[:]
+				context.allocator = previous_allocator
+				operation.completion_state = .Failed
+			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Cancelled:
+				resolution_handled = true
+				if status.value == nil || status.value.failure == nil {
+					process_error(&result, activation.run_id, "canceled Child Workflow has no failure")
+					return
+				}
+				context.allocator = instance.odin_context.allocator
+				operation.failure_message, _ = strings.clone(status.value.failure.message)
+				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+				operation.failure_proto = failure_proto[:]
+				context.allocator = previous_allocator
+				operation.completion_state = .Canceled
+			}
+			if !resolution_handled {
+				process_error(&result, activation.run_id, "Child Workflow result is unsupported")
+				return
+			}
+			result.resolved_child_workflow_seq = operation.seq
+
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow:
 			handled = true
 			if variant.value == nil || !instance_found {
@@ -3922,6 +4667,12 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
 			should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
 				operation.state == .Cancel_Requested || operation.state == .Canceled)
+		case .Waiting_Child_Workflow_Start:
+			operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
+			should_resume = found && operation.start_state != .Pending
+		case .Waiting_Child_Workflow:
+			operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
+			should_resume = found && operation.completion_state != .Pending
 		case .Waiting_Timer:
 			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
 			should_resume = found && (operation.state == .Resolved ||
@@ -3942,6 +4693,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		if should_resume {
 			instance.phase = .Ready
 			instance.waiting_activity_seq = 0
+			instance.waiting_child_workflow_seq = 0
 			instance.waiting_timer_seq = 0
 			instance.waiting_signal_name = ""
 			resume_result := fiber_raw.resume(instance.fiber)
