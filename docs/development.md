@@ -695,7 +695,13 @@ every `ContinueAsNewWorkflowExecution` must encode exactly and remain
 byte-identical after fresh-stack replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
-the generated value. The query property generates 500 success/failure
+the generated value. A separate 500-case Client history property varies event
+counts, IDs, event types, versions, task IDs, ignore flags, archival state, and
+opaque pagination tokens. It destroys the source response and requires every
+owned event plus its canonical protobuf encoding to remain readable. Focused
+unit tests perform the same arena-lifetime check for rich Describe results,
+including memo/Search Attribute Payloads and pending execution summaries. The
+query property generates 500 success/failure
 responses, destroys the command arena after encoding, and verifies query IDs,
 typed success Payloads, and non-retryable Application Failure types after a
 fresh decode.
@@ -878,7 +884,11 @@ The registration command is only needed for a new dev server. The Workflow
 reads the Odin Client's header, memo, and Search Attribute and returns
 `Workflow properties updated`; its history contains two memo-property events
 (one upsert and one empty-Payload removal) and one Search Attribute upsert
-event.
+event. The same client invocation now calls `DescribeWorkflowExecution`, checks
+the completed identity/status plus updated memo/Search Attribute keys, then
+walks `GetWorkflowExecutionHistory` with a requested page size of one until the
+opaque next-page token is empty. This is the live ownership and pagination
+acceptance path for the typed read APIs.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

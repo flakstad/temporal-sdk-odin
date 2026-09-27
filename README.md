@@ -8,7 +8,13 @@ fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
-sends typed signals, requests cancellation, and terminates executions. It proves
+sends typed signals, requests cancellation, and terminates executions. It now
+owns and types `DescribeWorkflowExecution` results—including identity, status,
+timeouts, priority, memo/Search Attributes, and pending execution summaries—and
+iterates full Workflow history with explicit pagination tokens. Each history
+event includes stable metadata plus an owned canonical protobuf representation.
+The live suite requests one-event pages against the CLI dev server and follows
+every returned token. It proves
 typed read-only Workflow queries through the public Odin Client, including
 query failure responses, eviction, and fresh-stack replay. Typed Workflow
 Updates now validate, run on independent stackful routines, await Activities,
@@ -251,6 +257,15 @@ defer temporal_client.workflow_handle_free(&handle)
 
 result: Order_Result
 err = temporal_client.get_result_json(&handle, &result)
+
+description, err := temporal_client.describe_workflow(&handle)
+defer temporal_client.workflow_description_free(&description)
+
+page, err := temporal_client.fetch_history_page(
+    &handle,
+    {maximum_page_size = 100, filter = .All, skip_archival = true},
+)
+defer temporal_client.history_page_free(&page)
 ```
 
 The Client owns its Core runtime, connection, and namespace. A Workflow handle
@@ -267,6 +282,14 @@ Temporal namespace. Retry Policy and Priority are borrowed only during request
 encoding. Zero values inside them preserve Temporal Service defaults. Start
 delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
 policy combinations are rejected before the RPC.
+
+`Workflow_Description` and `History_Page` are allocator-owned snapshots; they
+do not borrow Core response buffers or protobuf decode arenas. Call their
+matching `_free` procedures. A history page's `next_page_token` is opaque and
+must be passed unchanged to the next call. Event `protobuf` bytes are
+canonically re-encoded from the pinned schema, so unknown fields from a newer
+server are not retained. The typed history API currently rejects raw history
+blobs rather than silently returning an incomplete page.
 
 Existing executions can be addressed without an RPC when creating the handle:
 

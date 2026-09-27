@@ -221,10 +221,118 @@ run :: proc() -> int {
 			temporal_client.error_free(&result_error)
 			return 1
 		}
+		description, describe_error := temporal_client.describe_workflow(&handle)
+		defer temporal_client.workflow_description_free(&description)
+		if describe_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties Describe failed (status=%d): %s\n",
+				describe_error.status_code,
+				string(describe_error.message),
+			)
+			temporal_client.error_free(&describe_error)
+			return 1
+		}
+		if description.workflow_id != workflow_id ||
+		   description.run_id != handle.run_id ||
+		   description.workflow_type != "odin_workflow_properties" ||
+		   description.task_queue != "odin-hello-workflow" ||
+		   description.status != .Completed ||
+		   description.history_length <= 0 {
+			fmt.eprintf(
+				"Workflow-properties Describe returned unexpected identity/status: id=%s run=%s type=%s queue=%s status=%v history=%d\n",
+				description.workflow_id,
+				description.run_id,
+				description.workflow_type,
+				description.task_queue,
+				description.status,
+				description.history_length,
+			)
+			return 1
+		}
+		memo_updated := false
+		for entry in description.memo {
+			if entry.key == "odin-status" {
+				memo_updated = true
+				break
+			}
+		}
+		search_updated := false
+		for entry in description.search_attributes {
+			if entry.key == "OdinSdkKeyword" {
+				search_updated = true
+				break
+			}
+		}
+		if !memo_updated || !search_updated {
+			fmt.eprintf("Workflow-properties Describe omitted updated memo/Search Attributes\n")
+			return 1
+		}
+
+		next_page_token: []u8
+		defer delete(next_page_token)
+		history_event_count := 0
+		history_page_count := 0
+		first_event_type := temporal_client.History_Event_Type.Unspecified
+		last_event_type := temporal_client.History_Event_Type.Unspecified
+		for {
+			page, page_error := temporal_client.fetch_history_page(
+				&handle,
+				{
+					maximum_page_size = 1,
+					next_page_token = next_page_token,
+					filter = .All,
+					skip_archival = true,
+				},
+			)
+			if page_error.message != nil {
+				fmt.eprintf(
+					"Workflow-properties history page failed (status=%d): %s\n",
+					page_error.status_code,
+					string(page_error.message),
+				)
+				temporal_client.error_free(&page_error)
+				temporal_client.history_page_free(&page)
+				return 1
+			}
+			history_page_count += 1
+			for event in page.events {
+				if history_event_count == 0 {
+					first_event_type = event.event_type
+				}
+				last_event_type = event.event_type
+				history_event_count += 1
+			}
+			delete(next_page_token)
+			next_page_token = page.next_page_token
+			page.next_page_token = nil
+			finished := len(next_page_token) == 0
+			temporal_client.history_page_free(&page)
+			if finished {
+				break
+			}
+			if history_page_count > 1_000 {
+				fmt.eprintf("Workflow-properties history pagination did not terminate\n")
+				return 1
+			}
+		}
+		if history_event_count < 2 ||
+		   first_event_type != .Workflow_Execution_Started ||
+		   last_event_type != .Workflow_Execution_Completed {
+			fmt.eprintf(
+				"Workflow-properties history was incomplete: events=%d first=%v last=%v\n",
+				history_event_count,
+				first_event_type,
+				last_event_type,
+			)
+			return 1
+		}
 		fmt.printf(
-			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true result=%q\n",
+			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true describe_status=%v history_events=%d history_pages=%d result=%q\n",
 			workflow_id,
 			handle.run_id,
+			description.status,
+			history_event_count,
+			history_page_count,
 			result,
 		)
 		return 0

@@ -50,6 +50,8 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.StartWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryRequest \
   temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse \
+  temporal.api.workflowservice.v1.DescribeWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.DescribeWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.QueryWorkflowRequest \
   temporal.api.workflowservice.v1.QueryWorkflowResponse \

@@ -153,6 +153,34 @@ true`. Core owns gRPC transport and retries. The handle result loop maps
 completed, failed, canceled, terminated, timed-out, and Continue-As-New close
 events, following the next run by default as the current .NET SDK does.
 
+The same generic RPC boundary now implements two read APIs without adding C
+symbols:
+
+- `DescribeWorkflowExecution` decodes the API response in a temporary arena,
+  then copies the public snapshot into the caller's allocator. The current
+  typed surface owns Workflow identity/type/task queue, status and timing,
+  execution timeouts and counters, priority, memo/Search Attribute Payloads,
+  pending Activity/child summaries, and the pending Workflow Task. Callbacks,
+  pending Nexus operations, and some newer deployment/pause details remain in
+  the generated raw schema until their language-level shape is justified.
+- `GetWorkflowExecutionHistory` accepts the Service's opaque next-page token,
+  page size, wait/filter, and archival flags. It returns owned event metadata
+  and a canonical protobuf encoding of each decoded event. The re-encoding
+  preserves every field known by the pinned Temporal API schema, but not
+  unknown future fields. A response containing only `raw_history` is rejected;
+  supporting encoded history blobs will require explicit codec/decompression
+  handling instead of pretending that the typed event list is complete.
+
+The ownership rule is the same for both calls: Core's callback response buffer
+is copied by `temporal/core`, generated decoding borrows a short-lived virtual
+arena, and the language-facing result records its own allocator. Its matching
+free procedure releases nested strings, Payload metadata/data, repeated lists,
+pagination tokens, and per-event protobuf buffers. The Workflow handle and
+Client are only borrowed for the blocking call. The CLI-devserver acceptance
+case requests a maximum page size of one and observes eight events over five
+Service pages, demonstrating that the token is opaque and page size is a
+request rather than an exact event-count promise.
+
 Start requests now accept an explicitly owned `Start_Metadata` builder.
 Codec-neutral and JSON helpers clone named header, memo, and Search Attribute
 Payloads through the builder's recorded allocator; duplicate names replace the

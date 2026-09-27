@@ -10383,3 +10383,169 @@ workflow_fiber_cancellation_before_initial_commands_are_sent :: proc(t: ^testing
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
+
+@(test)
+client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "describe-workflow",
+		run_id = "describe-run",
+	}
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "describe_type"}
+	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "describe-queue"}
+	start_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000, nanos = 123}
+	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_005}
+	execution_duration := proto.Google_Protobuf_Duration{seconds = 5}
+	run_timeout := proto.Google_Protobuf_Duration{seconds = 60}
+	priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 7,
+		fairness_key = "tenant-a",
+		fairness_weight = 1.5,
+	}
+	memo_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"memo-value"`)}
+	defer delete(memo_payload.metadata)
+	append(&memo_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	memo := proto.Temporal_Api_Common_V1_Memo{}
+	defer delete(memo.fields)
+	append(&memo.fields, proto.Temporal_Api_Common_V1_Memo_FieldsEntry{key = "note", value = &memo_payload})
+	search_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"blue"`)}
+	defer delete(search_payload.metadata)
+	append(&search_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	defer delete(search_attributes.indexed_fields)
+	append(&search_attributes.indexed_fields, proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+		key = "Color",
+		value = &search_payload,
+	})
+	heartbeat := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`{"step":2}`)}
+	heartbeats := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(heartbeats.payloads)
+	append(&heartbeats.payloads, heartbeat)
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge_card"}
+	failure := proto.Temporal_Api_Failure_V1_Failure{message = "card declined"}
+	pending_activity := proto.Temporal_Api_Workflow_V1_PendingActivityInfo{
+		activity_id = "activity-1",
+		activity_type = &activity_type,
+		state = .PENDING_ACTIVITY_STATE_STARTED,
+		heartbeat_details = &heartbeats,
+		attempt = 2,
+		maximum_attempts = 5,
+		last_failure = &failure,
+		last_worker_identity = "worker-1",
+		priority = &priority,
+	}
+	pending_child := proto.Temporal_Api_Workflow_V1_PendingChildExecutionInfo{
+		workflow_id = "child-id",
+		run_id = "child-run",
+		workflow_type_name = "child_type",
+		initiated_id = 19,
+		parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL,
+	}
+	pending_task := proto.Temporal_Api_Workflow_V1_PendingWorkflowTaskInfo{
+		state = .PENDING_WORKFLOW_TASK_STATE_SCHEDULED,
+		attempt = 3,
+	}
+	info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionInfo{
+		execution = &execution,
+		type = &workflow_type,
+		start_time = &start_time,
+		close_time = &close_time,
+		status = .WORKFLOW_EXECUTION_STATUS_COMPLETED,
+		history_length = 17,
+		memo = &memo,
+		search_attributes = &search_attributes,
+		state_transition_count = 8,
+		history_size_bytes = 4096,
+		execution_duration = &execution_duration,
+		first_run_id = "first-run",
+		priority = &priority,
+		external_payload_size_bytes = 99,
+		external_payload_count = 2,
+	}
+	config := proto.Temporal_Api_Workflow_V1_WorkflowExecutionConfig{
+		task_queue = &task_queue,
+		workflow_run_timeout = &run_timeout,
+	}
+	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{cancel_requested = true}
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse{
+		execution_config = &config,
+		workflow_execution_info = &info,
+		pending_workflow_task = &pending_task,
+		workflow_extended_info = &extended,
+	}
+	defer delete(response.pending_activities)
+	defer delete(response.pending_children)
+	append(&response.pending_activities, pending_activity)
+	append(&response.pending_children, pending_child)
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse(&response)
+	description, decode_error := temporal_client.decode_workflow_description(encoded[:])
+	delete(encoded)
+	defer temporal_client.workflow_description_free(&description)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "Describe decode failed: %s", string(decode_error.message))
+	testing.expect_value(t, description.workflow_id, "describe-workflow")
+	testing.expect_value(t, description.run_id, "describe-run")
+	testing.expect_value(t, description.workflow_type, "describe_type")
+	testing.expect_value(t, description.task_queue, "describe-queue")
+	testing.expect_value(t, description.status, temporal_client.Workflow_Status.Completed)
+	testing.expect(t, description.start_time.present)
+	testing.expect(t, description.close_time.present)
+	testing.expect_value(t, description.history_length, i64(17))
+	testing.expect_value(t, description.history_size_bytes, i64(4096))
+	testing.expect(t, description.cancel_requested)
+	testing.expect_value(t, description.priority.fairness_key, "tenant-a")
+	testing.expect_value(t, len(description.memo), 1)
+	testing.expect_value(t, description.memo[0].key, "note")
+	testing.expect(t, bytes.equal(description.memo[0].payload.data, transmute([]u8)string(`"memo-value"`)))
+	testing.expect_value(t, len(description.search_attributes), 1)
+	testing.expect_value(t, len(description.pending_activities), 1)
+	testing.expect_value(t, description.pending_activities[0].activity_type, "charge_card")
+	testing.expect_value(t, description.pending_activities[0].last_failure_message, "card declined")
+	testing.expect_value(t, len(description.pending_activities[0].heartbeat_details), 1)
+	testing.expect_value(t, len(description.pending_children), 1)
+	testing.expect_value(t, description.pending_children[0].parent_close_policy, temporal_client.Parent_Close_Policy.Request_Cancel)
+	testing.expect(t, description.pending_workflow_task.present)
+}
+
+@(test)
+client_history_page_is_owned_and_preserves_event_protobuf :: proc(t: ^testing.T) {
+	event_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_001, nanos = 456}
+	event := proto.Temporal_Api_History_V1_HistoryEvent{
+		event_id = 11,
+		event_time = &event_time,
+		event_type = .EVENT_TYPE_WORKFLOW_TASK_COMPLETED,
+		version = 3,
+		task_id = 44,
+		worker_may_ignore = true,
+	}
+	history := proto.Temporal_Api_History_V1_History{}
+	defer delete(history.events)
+	append(&history.events, event)
+	response := proto.Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse{
+		history = &history,
+		next_page_token = transmute([]u8)string("next-token"),
+		archived = true,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_GetWorkflowExecutionHistoryResponse(&response)
+	page, decode_error := temporal_client.decode_history_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.history_page_free(&page)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "history decode failed: %s", string(decode_error.message))
+	testing.expect_value(t, len(page.events), 1)
+	testing.expect_value(t, page.events[0].event_id, i64(11))
+	testing.expect_value(t, page.events[0].event_type, temporal_client.History_Event_Type.Workflow_Task_Completed)
+	testing.expect(t, page.events[0].event_time.present)
+	testing.expect(t, page.events[0].worker_may_ignore)
+	testing.expect(t, page.archived)
+	testing.expect(t, bytes.equal(page.next_page_token, transmute([]u8)string("next-token")))
+	decoded_event := proto.Temporal_Api_History_V1_HistoryEvent{}
+	testing.expect(t, proto.decode_Temporal_Api_History_V1_HistoryEvent(page.events[0].protobuf[:], &decoded_event))
+	defer free(decoded_event.event_time)
+	testing.expect_value(t, decoded_event.event_id, i64(11))
+}

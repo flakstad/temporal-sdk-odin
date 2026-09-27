@@ -391,6 +391,8 @@ properties_workflow_output="$(<"$workflow_output_file")"
 echo "$properties_workflow_output"
 grep -q "Odin client completed workflow-properties workflow_id=$properties_workflow_id" <<<"$properties_workflow_output"
 grep -q 'use_existing=true' <<<"$properties_workflow_output"
+grep -q 'describe_status=Completed' <<<"$properties_workflow_output"
+grep -Eq 'history_events=[1-9][0-9]* history_pages=([2-9]|[1-9][0-9]+)' <<<"$properties_workflow_output"
 grep -q 'Workflow properties updated' <<<"$properties_workflow_output"
 temporal workflow show \
   --workflow-id "$properties_workflow_id" \
