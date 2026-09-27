@@ -27,7 +27,9 @@ stack; the CLI-devserver suite proves the state through a public Client Query.
 Child Workflows now have a vertical start/result/failure/cancellation path:
 Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and completion
 resolutions, decodes typed JSON results and structured Child Workflow failures,
-and requests cancellation through `CancelChildWorkflowExecution`. Unhandled
+signals a started child through `SignalExternalWorkflowExecution`, and requests
+explicit or inherited cancellation through `CancelChildWorkflowExecution`. The
+signal API waits for Core's resolution and reports server failure causes. Unhandled
 child failures preserve Core's original Temporal Failure wrapper and cause
 chain when the parent fails. The CLI-devserver suite proves successful child
 completion, a caught server-generated child failure, and parent cancellation
@@ -62,8 +64,8 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, explicit Child Workflow handles for signaling
-or direct cancellation, local Activities, client cancellation of an accepted
+nested cancellation-token trees, arbitrary external-Workflow handles, local
+Activities, client cancellation of an accepted
 Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.

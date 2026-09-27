@@ -593,9 +593,10 @@ retry, queue, ID, cancellation, and eager-execution combinations. It checks
 every encoded `ScheduleActivity` field and requires byte-identical commands
 after eviction and fresh-stack replay. The Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
-and Parent Close Policy combinations. It checks every encoded
-`StartChildWorkflowExecution` field and requires byte-identical commands after
-eviction and fresh-stack replay. The Client property generates another
+and Parent Close Policy combinations, plus generated signal names and JSON
+payloads. It checks every encoded `StartChildWorkflowExecution` and
+`SignalExternalWorkflowExecution` field and requires both commands to be
+byte-identical after eviction and fresh-stack replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
 the generated value. The query property generates 500 success/failure
@@ -723,15 +724,22 @@ server-backed paths automatically:
   typed Application Failure detail;
 - cancellation of a waiting parent through the public Odin Client, which emits
   `CancelChildWorkflowExecution(seq=1)` and does not close the parent until Core
-  resolves the child as canceled.
+  resolves the child as canceled;
+- signaling a child through its Workflow-local Future and waiting for Core's
+  `ResolveSignalExternalWorkflow` acknowledgement;
+- explicit child cancellation through the Future while the parent remains live
+  and completes normally after observing the canceled child result.
 
 The unit suite additionally evicts the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
 then applies separate start and completion resolutions. It verifies the exact
 cancellation reason, structured failure ownership after the activation decode
 arena is gone, and lossless propagation of an unhandled original Temporal
-Failure wrapper. The 500-case Child Workflow property varies start options and
-requires exact fresh-stack replay.
+Failure wrapper. The 500-case Child Workflow property varies start options,
+signal names, and signal Payloads, then requires exact fresh-stack replay of
+both commands. A cancellation unit test also requires an in-flight child signal
+to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
+the parent closes as canceled.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

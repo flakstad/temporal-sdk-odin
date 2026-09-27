@@ -906,3 +906,73 @@ cat "$worker_log"
 grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
 grep -q 'resolved=1 .*canceled_workflow=true' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Child Workflow signal Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_signal_parent_id="odin-sdk-child-signal-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$child_signal_parent_id" \
+  --type odin_child_signal_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"Odin"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+child_signal_output="$(<"$workflow_output_file")"
+echo "$child_signal_output"
+grep -q '"status": "COMPLETED"' <<<"$child_signal_output"
+grep -q 'Odin received approval-from-parent' <<<"$child_signal_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'signaled=1' "$worker_log"
+grep -q 'signal_resolved=1' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin explicit Child Workflow cancellation Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_explicit_cancel_parent_id="odin-sdk-child-explicit-cancel-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$child_explicit_cancel_parent_id" \
+  --type odin_child_explicit_cancel_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"cancel-explicit"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+child_explicit_cancel_output="$(<"$workflow_output_file")"
+echo "$child_explicit_cancel_output"
+grep -q '"status": "COMPLETED"' <<<"$child_explicit_cancel_output"
+grep -q 'Observed explicit Child Workflow cancellation' <<<"$child_explicit_cancel_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
+grep -q 'resolved=1 .*completed=true' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"

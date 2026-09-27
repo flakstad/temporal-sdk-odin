@@ -14,6 +14,9 @@ PARENT_WORKFLOW_TYPE :: "odin_parent_workflow"
 CHILD_WORKFLOW_TYPE :: "odin_child_workflow"
 FAILURE_PARENT_WORKFLOW_TYPE :: "odin_child_failure_parent_workflow"
 FAILURE_CHILD_WORKFLOW_TYPE :: "odin_failing_child_workflow"
+SIGNAL_PARENT_WORKFLOW_TYPE :: "odin_child_signal_parent_workflow"
+SIGNAL_CHILD_WORKFLOW_TYPE :: "odin_signaled_child_workflow"
+EXPLICIT_CANCEL_PARENT_WORKFLOW_TYPE :: "odin_child_explicit_cancel_parent_workflow"
 
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if strings.has_prefix(name, "cancel-") {
@@ -60,14 +63,70 @@ failure_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> s
 	return "Observed structured Child Workflow failure"
 }
 
+signaled_child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	approval := workflow.await_signal(ctx, "approve")
+	message, allocation_error := strings.concatenate({name, " received ", approval})
+	if allocation_error != nil {
+		return ""
+	}
+	return message
+}
+
+signal_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	future := workflow.start_child_workflow_json(
+		ctx,
+		SIGNAL_CHILD_WORKFLOW_TYPE,
+		name,
+		{
+			workflow_id = "odin-signaled-child",
+			workflow_execution_timeout = time.Minute,
+		},
+	)
+	signal := workflow.signal_child_workflow_json(ctx, future, "approve", "approval-from-parent")
+	if signal.status != .Succeeded {
+		return "Child Workflow signal failed"
+	}
+	result := workflow.await_child_workflow_result(ctx, future)
+	if result.status != .Succeeded {
+		return "Signaled Child Workflow did not complete"
+	}
+	return result.value
+}
+
+explicit_cancel_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	future := workflow.start_child_workflow_json(
+		ctx,
+		CHILD_WORKFLOW_TYPE,
+		name,
+		{
+			workflow_id = "odin-explicitly-canceled-child",
+			workflow_execution_timeout = time.Minute,
+		},
+	)
+	start := workflow.await_child_workflow_start(ctx, future)
+	if start.status != .Succeeded {
+		return "Explicitly canceled Child Workflow did not start"
+	}
+	if !workflow.cancel_child_workflow(ctx, future, "parent explicitly canceled child") {
+		return "Explicit Child Workflow cancellation was rejected"
+	}
+	result := workflow.await_child_workflow_result(ctx, future)
+	if result.status != .Canceled {
+		return "Explicit Child Workflow cancellation did not resolve"
+	}
+	return "Observed explicit Child Workflow cancellation"
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	fmt.printf(
-		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v completed=%v evicted=%v\n",
+		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d signaled=%d signal_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.started_child_workflow_count,
 		processed.resolved_child_workflow_start_seq,
 		processed.resolved_child_workflow_seq,
+		processed.signaled_child_workflow_count,
+		processed.resolved_child_workflow_signal_seq,
 		processed.requested_child_workflow_cancellation,
 		processed.canceled_child_workflow_seq,
 		processed.canceled_workflow,
@@ -160,6 +219,36 @@ main :: proc() {
 	if failure_child_error.message != nil {
 		fmt.eprintf("Failure child registration failed: %s\n", string(failure_child_error.message))
 		worker.error_free(&failure_child_error)
+		os.exit(1)
+	}
+	signal_parent_error := worker.register_workflow(
+		&sdk_worker,
+		SIGNAL_PARENT_WORKFLOW_TYPE,
+		signal_parent_workflow,
+	)
+	if signal_parent_error.message != nil {
+		fmt.eprintf("Signal parent registration failed: %s\n", string(signal_parent_error.message))
+		worker.error_free(&signal_parent_error)
+		os.exit(1)
+	}
+	signal_child_error := worker.register_workflow(
+		&sdk_worker,
+		SIGNAL_CHILD_WORKFLOW_TYPE,
+		signaled_child_workflow,
+	)
+	if signal_child_error.message != nil {
+		fmt.eprintf("Signal child registration failed: %s\n", string(signal_child_error.message))
+		worker.error_free(&signal_child_error)
+		os.exit(1)
+	}
+	explicit_cancel_parent_error := worker.register_workflow(
+		&sdk_worker,
+		EXPLICIT_CANCEL_PARENT_WORKFLOW_TYPE,
+		explicit_cancel_parent_workflow,
+	)
+	if explicit_cancel_parent_error.message != nil {
+		fmt.eprintf("Explicit-cancel parent registration failed: %s\n", string(explicit_cancel_parent_error.message))
+		worker.error_free(&explicit_cancel_parent_error)
 		os.exit(1)
 	}
 

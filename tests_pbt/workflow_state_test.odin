@@ -1205,6 +1205,8 @@ Generated_Child_Options_Input :: struct {
 	retry_attempts:       int,
 	cancellation_type:    int,
 	parent_close_policy:  int,
+	signal_name:          string,
+	signal_value:         string,
 }
 
 generated_child_options_workflow :: proc(
@@ -1252,8 +1254,15 @@ generated_child_options_workflow :: proc(
 			parent_close_policy = parent_close_policy,
 		},
 	)
-	_ = workflow.await_child_workflow_start(ctx, future)
-	return "started"
+	start := workflow.await_child_workflow_start(ctx, future)
+	if start.status != .Succeeded {
+		return "start failed"
+	}
+	result := workflow.signal_child_workflow_json(ctx, future, input.signal_name, input.signal_value)
+	if result.status != .Succeeded {
+		return "signal failed"
+	}
+	return "signaled"
 }
 
 generated_child_options_match :: proc(
@@ -1322,6 +1331,53 @@ generated_child_options_match :: proc(
 	return false
 }
 
+generated_child_signal_match :: proc(
+	data: []u8,
+	expected: ^Generated_Child_Options_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
+			if variant.value == nil || variant.value.seq != 1 ||
+			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 {
+				return false
+			}
+			#partial switch target in variant.value.target {
+			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id:
+				if target.value != expected.workflow_id {
+					return false
+				}
+			case:
+				return false
+			}
+			expected_payload, encode_error := codec.encode_json(expected.signal_value)
+			if encode_error != .None {
+				return false
+			}
+			defer codec.payload_free(&expected_payload)
+			return bytes.equal(variant.value.args[0].data, expected_payload.data)
+		}
+	}
+	return false
+}
+
 child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	execution_timeout_ms := pbt.draw(t, pbt.int_range(1000, 120_000))
 	run_timeout_ms := pbt.draw(t, pbt.int_range(1, execution_timeout_ms))
@@ -1339,6 +1395,8 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		cancellation_type = pbt.draw(t, pbt.int_range(0, 3)),
 		parent_close_policy = pbt.draw(t, pbt.int_range(0, 3)),
+		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
+		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
 	pbt.cover(t, input_value.cancellation_type == 0, 15.0, "wait cancellation completed")
 	pbt.cover(t, input_value.cancellation_type == 1, 15.0, "abandon child")
@@ -1405,6 +1463,33 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.fail("generated Child Workflow options changed across command encoding")
 	}
 
+	start_success := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStartSuccess{
+		run_id = "generated-child-run",
+	}
+	resolve_start := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Succeeded{
+			value = &start_success,
+		},
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution_Start{
+				value = &resolve_start,
+			},
+		},
+	)
+	signaled := process_activation(runtime, &activation)
+	defer destroy_process_result(&signaled)
+	if signaled.error.message != nil || !signaled.signaled_child_workflow ||
+	   !generated_child_signal_match(signaled.completion[:], &input_value) {
+		return pbt.fail("generated Child Workflow signal changed across command encoding")
+	}
+
 	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
 	delete(activation.jobs)
 	activation.jobs = nil
@@ -1426,6 +1511,7 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	delete(activation.jobs)
 	activation.jobs = nil
 	activation.is_replaying = true
+	activation.history_length = 3
 	append(
 		&activation.jobs,
 		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
@@ -1439,13 +1525,31 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if replayed.error.message != nil || !bytes.equal(initial.completion[:], replayed.completion[:]) {
 		return pbt.fail("generated Child Workflow options replay changed command bytes")
 	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution_Start{
+				value = &resolve_start,
+			},
+		},
+	)
+	replayed_signal := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed_signal)
+	if replayed_signal.error.message != nil ||
+	   !bytes.equal(signaled.completion[:], replayed_signal.completion[:]) {
+		return pbt.fail("generated Child Workflow signal replay changed command bytes")
+	}
 	return pbt.pass()
 }
 
 @(test)
 child_workflow_options_replay_for_generated_values :: proc(t: ^testing.T) {
 	result := pbt.check(
-		"Child Workflow options survive generated command encoding and replay",
+		"Child Workflow options and signals survive generated command encoding and replay",
 		child_options_replay_property,
 		{num_tests = 500, seed = 0x4348_494c_445f_4f50},
 	)
