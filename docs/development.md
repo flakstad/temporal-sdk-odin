@@ -424,6 +424,25 @@ IDs by default. Set `follow_runs = false` to receive
 `Workflow_Continued_As_New` instead. RPC failures retain the gRPC status code
 and binary status-details protobuf.
 
+Failed Workflow close events and failed Update outcomes retain the encoded
+Temporal `Failure` in `Error.details`. Decode it through the shared owned model:
+
+```odin
+failure, decode_error := temporal_client.decode_error_failure(&result_error)
+defer temporal_failure.failure_free(&failure)
+
+activity_failure := temporal_failure.find_kind(&failure, .Activity)
+application_failure := temporal_failure.find_kind(&failure, .Application)
+```
+
+`temporal/failure.decode` accepts an explicit allocator. The resulting tree
+owns cloned common fields, variant fields, Payload metadata/data/external
+references, and recursively allocated cause nodes. Free it with
+`failure.failure_free`; it does not borrow `Error.details`, a Core response, or
+the protobuf decode arena. The decoder covers all current pinned Failure
+variants, rejects malformed protobuf/duration values, and caps cause depth at
+128. A decoded `.Unknown` node still preserves common fields and its cause.
+
 The same handle supports control operations:
 
 ```odin
@@ -597,6 +616,13 @@ ID/type and `Maximum_Attempts_Reached` retry state, then decodes the nested
 Application Failure message, type, retryability, details, and delay. It
 completes with `"Observed structured Activity failure"`; this proves the fields
 crossed both Core and the Service rather than only the local completion encoder.
+
+The immediately following `terminal-failure` case deliberately leaves the same
+Activity failure unhandled. Odin emits `FailWorkflowExecution`, Temporal stores
+the failed close event, and `examples/client_start` retrieves and decodes its
+owned `ActivityFailure -> ApplicationFailure` chain. The assertion covers the
+Activity ID/type/retry state and Application message/type/detail/delay after the
+original Core RPC buffer has been released.
 
 The `cancel-cleanup` live case blocks in an Odin Activity, requests Workflow
 cancellation through the public Odin Client, and requires the cancellation

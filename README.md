@@ -9,6 +9,11 @@ bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
 sends typed signals, requests cancellation, and terminates executions. It now
+preserves terminal Workflow and Update Failure protobufs and decodes all ten
+current Temporal Failure variants into an allocator-owned recursive Odin tree.
+The live suite proves an unhandled `ActivityFailure -> ApplicationFailure`
+chain from Odin Activity through Server history and back to the Odin Client. It
+also
 owns and types `DescribeWorkflowExecution` results—including identity, status,
 timeouts, priority, memo/Search Attributes, and pending execution summaries—and
 iterates full Workflow history with explicit pagination tokens. Each history
@@ -425,6 +430,27 @@ err = temporal_client.cancel_workflow(&handle, "customer canceled")
 
 `execute_update_json` remains the one-call convenience wrapper around
 `start_update_json` plus `wait_update_json`.
+
+Terminal Workflow and Update errors may carry a complete Temporal Failure:
+
+```odin
+result_error := temporal_client.get_result_json(&handle, &result)
+if result_error.kind == .Workflow_Failed {
+    failure, decode_error := temporal_client.decode_error_failure(&result_error)
+    defer temporal_failure.failure_free(&failure)
+
+    activity_failure := temporal_failure.find_kind(&failure, .Activity)
+    application_failure := temporal_failure.find_kind(&failure, .Application)
+}
+temporal_client.error_free(&result_error)
+```
+
+The decoded tree owns every string, Payload, repeated field, and cause node
+through the allocator passed to `decode_error_failure`. It remains valid after
+the Client error is freed. `temporal/failure` represents Application, Timeout,
+Canceled, Terminated, Server, Reset Workflow, Activity, Child Workflow, Nexus
+Operation, and Nexus Handler failures; unknown/absent variants retain their
+common fields as `.Unknown`.
 
 An empty run ID targets the current execution. Signal and cancellation calls
 generate UUIDv4 request IDs unless the caller supplies one. Termination has
@@ -867,6 +893,7 @@ temporal/worker/          Activity/Workflow registry and concurrent Core polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/client/          owned Client and Workflow handle/control APIs
+temporal/failure/         owned recursive Temporal Failure model
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof

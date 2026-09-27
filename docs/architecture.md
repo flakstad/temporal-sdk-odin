@@ -1023,6 +1023,45 @@ with `Maximum_Attempts_Reached`, decodes `{dependency: "billing", code: 409}`
 from the nested Application Failure, and completes normally. Core eviction and
 fresh-stack replay occur before that resolution.
 
+### Shared recursive Failure boundary
+
+`temporal/failure` is the language-facing, allocator-owned representation of
+Temporal's recursive `Failure` protobuf. It is deliberately independent of
+Client, Worker, and Workflow packages so every boundary can converge on one
+model without introducing dependency cycles. It currently covers the complete
+pinned union: Application, Timeout, Canceled, Terminated, Server, Reset
+Workflow, Activity, Child Workflow, Nexus Operation, and Nexus Handler.
+Common message/source/stack fields, encoded attributes, all variant strings and
+Payload lists, enum values, and recursive causes are cloned before the
+protobuf decode arena is destroyed.
+
+The ownership path for a terminal Workflow failure is:
+
+```text
+Core RPC response bytes (Core-owned until rpc result release)
+  -> GetWorkflowExecutionHistory decode arena (borrowed fields)
+  -> canonically encoded Failure in Result_Page (Odin-owned bytes)
+  -> Error.details (ownership transferred, no copy)
+  -> failure.decode (allocator-owned recursive tree)
+```
+
+`result_page_free`, `client.error_free`, and `failure.failure_free` each release
+their own layer. A decoded tree therefore survives freeing both the raw RPC
+response and `Error.details`. Update failures already used `Error.details`; the
+same decoder now serves both result paths. No Core C-ABI change or new symbol is
+involved—the generic WorkflowService RPC and generated protobuf graph are
+sufficient.
+
+The decoder limits a cause chain to 128 nodes, validates protobuf durations
+before converting to `time.Duration`, and treats malformed present union
+pointers as errors. A valid protobuf with no known union member becomes
+`.Unknown`, preserving its common fields and cause. Unit coverage constructs a
+single chain containing every current variant; a 500-case PBT suite varies
+every node kind and depths 1–32. The CLI-devserver test proves an unhandled Odin
+Activity failure crosses Odin Worker -> Core -> Service close history -> Core
+Client RPC and returns as `ActivityFailure -> ApplicationFailure` with owned
+details and next-retry delay.
+
 ### Buffered Workflow signal
 
 Core delivers external signals as `SignalWorkflow` activation jobs containing
@@ -1601,10 +1640,12 @@ Workflows are enabled.
 6. **Core version skew.** Server compatibility is broad, but Core-local
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.
-7. **Error/cancellation completeness.** The Workflow runtime preserves the raw
-   Temporal failure protobuf for propagation and exposes Activity plus nested
-   Application Failure metadata/details to catchable code. Other nested failure
-   kinds and encoded failure attributes are not yet converted. Activity cancellation preserves Core's
+7. **Error/cancellation completeness.** The shared Client-facing failure model
+   converts every current pinned Failure variant, recursive cause, Payload list,
+   and encoded attribute. The Workflow runtime still exposes its older flattened
+   Activity/Child views to catchable Workflow code while preserving raw bytes
+   for lossless propagation; those views should converge on the shared model.
+   Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
    The Activity API now models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
@@ -1614,9 +1655,8 @@ Workflows are enabled.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
    Visibility list/count are live-proven, but the public Client still lacks
-   query reject conditions, static summary/details, eager start,
-   complete failure-detail conversion and a supported-server matrix for newer
-   Schedule methods.
+   query reject conditions, static summary/details, eager start, and a
+   supported-server matrix for newer Schedule methods.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
@@ -1650,7 +1690,8 @@ proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
-500 Client close-event/result round trips, 500 Client start request
+500 Client close-event/result round trips, 500 recursive Failure chains,
+500 Client start request
 round trips, 500 paginated Visibility list/count round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
@@ -1677,10 +1718,13 @@ Schedule create/describe/list/pause/unpause/trigger/delete are now implemented
 and live-proven without new C symbols. Full replace-update with optimistic
 conflict tokens and matching-time queries are also live-proven; structured and
 excluded calendars, TZif data, and backfill have exact wire/property coverage.
-The next smallest client-facing slice is richer recursive failure inspection
-and query reject-condition/static summary support; backfill should gain a
-dedicated multi-execution live case without overloading the one-shot Schedule
-example.
+Recursive Client failure inspection is now implemented and live-proven. The
+next smallest client-facing slice is query reject-condition/static
+summary/details support; backfill should gain a dedicated multi-execution live
+case without overloading the one-shot Schedule example. The next failure-model
+step is to replace the Workflow runtime's duplicated flattened Activity/Child
+conversion with adapters over `temporal/failure`, retaining ergonomic typed
+detail helpers.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

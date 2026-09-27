@@ -317,6 +317,36 @@ worker_pid=""
 cat "$worker_log"
 grep -q "structured Activity failure details reached Workflow code" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=terminal-failure \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Terminal-failure Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+terminal_failure_workflow_id="odin-sdk-terminal-failure-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=terminal-failure \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$terminal_failure_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+terminal_failure_output="$(<"$workflow_output_file")"
+echo "$terminal_failure_output"
+grep -q "Odin client decoded recursive terminal failure workflow_id=$terminal_failure_workflow_id" <<<"$terminal_failure_output"
+grep -q "activity_id=terminal-failure-activity application_type=DependencyRejected" <<<"$terminal_failure_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "unhandled Activity failure reached the Client as a recursive Temporal Failure" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=patch \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

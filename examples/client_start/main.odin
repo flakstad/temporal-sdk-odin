@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import temporal_client "../../temporal/client"
+import temporal_failure "../../temporal/failure"
 
 Typed_Greeting_Input :: struct {
 	name:       string,
@@ -106,6 +107,68 @@ run :: proc() -> int {
 	}
 	scenario_buffer: [64]u8
 	scenario := os.get_env(scenario_buffer[:], "TEMPORAL_CLIENT_SCENARIO")
+	if scenario == "terminal-failure" {
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_terminal_failure_workflow",
+			"Odin",
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf("Terminal-failure Workflow start failed: %s\n", string(start_error.message))
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.kind != .Workflow_Failed {
+			fmt.eprintf(
+				"Expected terminal Workflow failure, got kind=%v message=%s\n",
+				result_error.kind,
+				string(result_error.message),
+			)
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		decoded, decode_error := temporal_client.decode_error_failure(&result_error)
+		defer temporal_failure.failure_free(&decoded)
+		if decode_error != .None {
+			fmt.eprintf("Could not decode terminal Workflow Failure: %v\n", decode_error)
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		activity_failure := temporal_failure.find_kind(&decoded, .Activity)
+		application_failure := temporal_failure.find_kind(&decoded, .Application)
+		if activity_failure == nil || application_failure == nil ||
+		   activity_failure.activity.activity_id != "terminal-failure-activity" ||
+		   activity_failure.activity.activity_type != "failure_details" ||
+		   activity_failure.activity.retry_state != .Maximum_Attempts_Reached ||
+		   application_failure.message != "billing dependency rejected request" ||
+		   application_failure.application.type != "DependencyRejected" ||
+		   !application_failure.application.has_next_retry_delay ||
+		   application_failure.application.next_retry_delay != 250 * time.Millisecond ||
+		   len(application_failure.application.details) != 1 {
+			fmt.eprintln("Terminal Workflow Failure did not preserve the Activity/Application chain")
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		fmt.printf(
+			"Odin client decoded recursive terminal failure workflow_id=%s activity_id=%s application_type=%s\n",
+			workflow_id,
+			activity_failure.activity.activity_id,
+			application_failure.application.type,
+		)
+		temporal_client.error_free(&result_error)
+		return 0
+	}
 	if scenario == "failure-details" {
 		handle, start_error := temporal_client.start_workflow_json(
 			&client,

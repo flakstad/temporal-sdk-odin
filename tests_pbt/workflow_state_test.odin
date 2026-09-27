@@ -11,6 +11,7 @@ import activity "../temporal/activity"
 import temporal_client "../temporal/client"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
+import temporal_failure "../temporal/failure"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 
@@ -94,6 +95,116 @@ json_payloads_preserve_generated_values_and_metadata :: proc(t: ^testing.T) {
 		"JSON payloads preserve generated Odin values and metadata",
 		json_payload_round_trip_property,
 		{num_tests = 500, seed = 0x5041_594c_4f41_4453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+generated_failure_kind :: proc(value: int) -> temporal_failure.Kind {
+	switch value {
+	case 0: return .Application
+	case 1: return .Timeout
+	case 2: return .Canceled
+	case 3: return .Terminated
+	case 4: return .Server
+	case 5: return .Reset_Workflow
+	case 6: return .Activity
+	case 7: return .Child_Workflow
+	case 8: return .Nexus_Operation
+	case 9: return .Nexus_Handler
+	}
+	return .Unknown
+}
+
+recursive_failure_round_trip_property :: proc(t: ^pbt.T) -> pbt.Result {
+	depth := pbt.draw(t, pbt.int_range(1, 32))
+	message := pbt.draw(t, pbt.string_ascii(0, 40))
+	pbt.cover(t, depth == 1, 2.0, "single failure")
+	pbt.cover(t, depth >= 24, 20.0, "deep failure chain")
+	pbt.cover(t, len(message) == 0, 1.0, "empty message")
+
+	failures: [32]proto.Temporal_Api_Failure_V1_Failure
+	application: [32]proto.Temporal_Api_Failure_V1_ApplicationFailureInfo
+	timeout: [32]proto.Temporal_Api_Failure_V1_TimeoutFailureInfo
+	canceled: [32]proto.Temporal_Api_Failure_V1_CanceledFailureInfo
+	terminated: [32]proto.Temporal_Api_Failure_V1_TerminatedFailureInfo
+	server: [32]proto.Temporal_Api_Failure_V1_ServerFailureInfo
+	reset: [32]proto.Temporal_Api_Failure_V1_ResetWorkflowFailureInfo
+	activity: [32]proto.Temporal_Api_Failure_V1_ActivityFailureInfo
+	child: [32]proto.Temporal_Api_Failure_V1_ChildWorkflowExecutionFailureInfo
+	nexus_operation: [32]proto.Temporal_Api_Failure_V1_NexusOperationFailureInfo
+	nexus_handler: [32]proto.Temporal_Api_Failure_V1_NexusHandlerFailureInfo
+	kinds: [32]int
+
+	for index in 0..<depth {
+		kind := pbt.draw(t, pbt.int_range(0, 9))
+		kinds[index] = kind
+		failures[index].message = message
+		switch kind {
+		case 0:
+			application[index].type = "GeneratedApplication"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{value = &application[index]}
+		case 1:
+			timeout[index].timeout_type = .TIMEOUT_TYPE_START_TO_CLOSE
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Timeout_Failure_Info{value = &timeout[index]}
+		case 2:
+			canceled[index].identity = "generated"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{value = &canceled[index]}
+		case 3:
+			terminated[index].identity = "generated"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Terminated_Failure_Info{value = &terminated[index]}
+		case 4:
+			server[index].non_retryable = index % 2 == 0
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Server_Failure_Info{value = &server[index]}
+		case 5:
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Reset_Workflow_Failure_Info{value = &reset[index]}
+		case 6:
+			activity[index].activity_id = "generated-activity"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{value = &activity[index]}
+		case 7:
+			child[index].namespace = "default"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info{value = &child[index]}
+		case 8:
+			nexus_operation[index].operation = "generated-operation"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Operation_Execution_Failure_Info{value = &nexus_operation[index]}
+		case 9:
+			nexus_handler[index].type = "GeneratedHandler"
+			failures[index].failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Handler_Failure_Info{value = &nexus_handler[index]}
+		}
+		if index + 1 < depth {
+			failures[index].cause = &failures[index + 1]
+		}
+	}
+
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(&failures[0])
+	decoded, decode_error := temporal_failure.decode(encoded[:])
+	delete(encoded)
+	if decode_error != .None {
+		return pbt.fail("generated Temporal Failure could not be decoded")
+	}
+	defer temporal_failure.failure_free(&decoded)
+	current := &decoded
+	for index in 0..<depth {
+		if current == nil {
+			return pbt.fail("decoded Temporal Failure chain was truncated")
+		}
+		if current.kind != generated_failure_kind(kinds[index]) || current.message != message {
+			return pbt.fail("decoded Temporal Failure node changed")
+		}
+		current = current.cause
+	}
+	if current != nil {
+		return pbt.fail("decoded Temporal Failure chain gained nodes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+recursive_temporal_failures_preserve_generated_chains :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"recursive Temporal Failures preserve generated chains",
+		recursive_failure_round_trip_property,
+		{num_tests = 500, seed = 0x4641_494c_5552_4553},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

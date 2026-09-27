@@ -15,6 +15,7 @@ TYPED_WORKFLOW_TYPE :: "odin_typed_workflow"
 LOCAL_ACTIVITY_WORKFLOW_TYPE :: "odin_local_activity_workflow"
 LOCAL_ACTIVITY_RETRY_WORKFLOW_TYPE :: "odin_local_activity_retry_workflow"
 FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
+TERMINAL_FAILURE_WORKFLOW_TYPE :: "odin_terminal_failure_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
 WORKFLOW_PROPERTIES_TYPE :: "odin_workflow_properties"
 PATCH_ID :: "odin-sdk-live-patch-v1"
@@ -425,6 +426,20 @@ failure_details_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> 
 	return "Observed structured Activity failure"
 }
 
+terminal_failure_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	return workflow.execute_activity_with_options(
+		ctx,
+		"failure_details",
+		name,
+		{
+			activity_id = "terminal-failure-activity",
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+		},
+	)
+}
+
 patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if workflow.patched(ctx, PATCH_ID) {
 		activation_time, has_time := workflow.now(ctx)
@@ -698,6 +713,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	terminal_failure_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		TERMINAL_FAILURE_WORKFLOW_TYPE,
+		terminal_failure_workflow,
+	)
+	if terminal_failure_workflow_register_error.message != nil {
+		fmt.eprintf("Terminal Failure Workflow registration failed: %s\n", string(terminal_failure_workflow_register_error.message))
+		worker.error_free(&terminal_failure_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	patch_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		PATCH_WORKFLOW_TYPE,
@@ -743,6 +771,7 @@ main :: proc() {
 	expect_local_activity := scenario == "local-activity"
 	expect_local_activity_retry := scenario == "local-activity-retry"
 	expect_failure_details := scenario == "failure-details"
+	expect_terminal_failure := scenario == "terminal-failure"
 	expect_patch := scenario == "patch"
 	expect_properties := scenario == "workflow-properties"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
@@ -798,7 +827,7 @@ main :: proc() {
 				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
 				failed = true
 			}
-		} else if expect_typed_payload || expect_failure_details || expect_local_activity {
+		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure || expect_local_activity {
 			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
 				fmt.eprintln("Single-Activity Workflow path produced unexpected worker stats")
 				failed = true
@@ -878,6 +907,8 @@ main :: proc() {
 		fmt.println("Local Activity timer-backed retry completed through Core and Temporal Server")
 	} else if expect_failure_details {
 		fmt.println("structured Activity failure details reached Workflow code")
+	} else if expect_terminal_failure {
+		fmt.println("unhandled Activity failure reached the Client as a recursive Temporal Failure")
 	} else if expect_patch {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
 	} else if expect_properties {

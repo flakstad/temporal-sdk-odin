@@ -12,6 +12,7 @@ import "core:time"
 import codec "../codec"
 import temporal_core "../core"
 import proto "../core/proto"
+import temporal_failure "../failure"
 
 Error_Kind :: enum {
 	None,
@@ -43,6 +44,19 @@ error_free :: proc(error: ^Error) {
 	delete(error.message)
 	delete(error.details)
 	error^ = {}
+}
+
+// decode_error_failure decodes the complete recursive Temporal Failure kept in
+// Error.details. Workflow execution and Workflow Update failures populate this
+// field; other error kinds return No_Data.
+decode_error_failure :: proc(
+	error: ^Error,
+	allocator := context.allocator,
+) -> (temporal_failure.Failure, temporal_failure.Decode_Error) {
+	if error == nil {
+		return {}, .No_Data
+	}
+	return temporal_failure.decode(error.details, allocator)
 }
 
 error_from_string :: proc(kind: Error_Kind, message: string) -> Error {
@@ -1569,11 +1583,12 @@ Result_Page_Kind :: enum {
 }
 
 Result_Page :: struct {
-	kind:         Result_Page_Kind,
-	payload:      codec.Payload,
-	has_payload:  bool,
-	next_run_id:  string,
-	message:      string,
+	kind:          Result_Page_Kind,
+	payload:       codec.Payload,
+	has_payload:   bool,
+	next_run_id:   string,
+	message:       string,
+	failure_proto: []u8,
 }
 
 result_page_free :: proc(page: ^Result_Page) {
@@ -1583,6 +1598,7 @@ result_page_free :: proc(page: ^Result_Page) {
 	codec.payload_free(&page.payload)
 	delete(page.next_run_id)
 	delete(page.message)
+	delete(page.failure_proto)
 	page^ = {}
 }
 
@@ -1654,6 +1670,10 @@ decode_result_page :: proc(data: []u8) -> (page: Result_Page, error: Error) {
 			message := "Workflow failed"
 			if attributes.value.failure != nil && len(attributes.value.failure.message) > 0 {
 				message = attributes.value.failure.message
+			}
+			if attributes.value.failure != nil {
+				encoded_failure := proto.encode_Temporal_Api_Failure_V1_Failure(attributes.value.failure)
+				page.failure_proto = encoded_failure[:]
 			}
 			message_ok: bool
 			page.message, message_ok = clone_result_string(message)
@@ -1802,6 +1822,8 @@ get_result_payload :: proc(
 			continue
 		case .Failed:
 			error = error_from_string(.Workflow_Failed, page.message)
+			error.details = page.failure_proto
+			page.failure_proto = nil
 		case .Canceled:
 			error = error_from_string(.Workflow_Canceled, page.message)
 		case .Terminated:

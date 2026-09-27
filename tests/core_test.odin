@@ -12,6 +12,7 @@ import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
+import temporal_failure "../temporal/failure"
 import protobuf "../temporal/protobuf"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
@@ -5026,7 +5027,29 @@ client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
 
 @(test)
 client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
-	failure := proto.Temporal_Api_Failure_V1_Failure{message = "order workflow failed"}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "OrderRejected",
+		non_retryable = true,
+	}
+	application_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "order was rejected",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge_card"}
+	activity_info := proto.Temporal_Api_Failure_V1_ActivityFailureInfo{
+		activity_type = &activity_type,
+		activity_id = "charge-card-1",
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "order workflow failed",
+		cause = &application_failure,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{
+			value = &activity_info,
+		},
+	}
 	failed := proto.Temporal_Api_History_V1_WorkflowExecutionFailedEventAttributes{
 		failure = &failure,
 	}
@@ -5048,6 +5071,17 @@ client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
 	testing.expect(t, page_error.message == nil)
 	testing.expect(t, page.kind == .Failed)
 	testing.expect_value(t, page.message, "order workflow failed")
+	testing.expect(t, len(page.failure_proto) > 0)
+	decoded_failure, failure_error := temporal_failure.decode(page.failure_proto)
+	defer temporal_failure.failure_free(&decoded_failure)
+	testing.expect_value(t, failure_error, temporal_failure.Decode_Error.None)
+	testing.expect_value(t, decoded_failure.kind, temporal_failure.Kind.Activity)
+	testing.expect_value(t, decoded_failure.activity.activity_type, "charge_card")
+	testing.expect(t, decoded_failure.cause != nil)
+	if decoded_failure.cause != nil {
+		testing.expect_value(t, decoded_failure.cause.kind, temporal_failure.Kind.Application)
+		testing.expect_value(t, decoded_failure.cause.application.type, "OrderRejected")
+	}
 	temporal_client.result_page_free(&page)
 	temporal_client.error_free(&page_error)
 
@@ -5068,6 +5102,165 @@ client_close_event_maps_failure_and_follow_run :: proc(t: ^testing.T) {
 	testing.expect(t, page_error.message == nil)
 	testing.expect(t, page.kind == .Continued_As_New)
 	testing.expect_value(t, page.next_run_id, "continued-run-id")
+}
+
+@(test)
+failure_decoder_owns_complete_recursive_temporal_failure :: proc(t: ^testing.T) {
+	detail := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`{"code":409}`)}
+	defer delete(detail.metadata)
+	append(&detail.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	details := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(details.payloads)
+	append(&details.payloads, detail)
+	retry_delay := proto.Google_Protobuf_Duration{seconds = 2, nanos = 250_000_000}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "DependencyRejected",
+		details = &details,
+		next_retry_delay = &retry_delay,
+		category = .APPLICATION_ERROR_CATEGORY_BENIGN,
+	}
+	timeout_info := proto.Temporal_Api_Failure_V1_TimeoutFailureInfo{
+		timeout_type = .TIMEOUT_TYPE_HEARTBEAT,
+		last_heartbeat_details = &details,
+	}
+	canceled_info := proto.Temporal_Api_Failure_V1_CanceledFailureInfo{
+		details = &details,
+		identity = "cancel-worker",
+	}
+	terminated_info := proto.Temporal_Api_Failure_V1_TerminatedFailureInfo{identity = "operator"}
+	server_info := proto.Temporal_Api_Failure_V1_ServerFailureInfo{non_retryable = true}
+	reset_info := proto.Temporal_Api_Failure_V1_ResetWorkflowFailureInfo{last_heartbeat_details = &details}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "child-id",
+		run_id = "child-run",
+	}
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "child-type"}
+	child_info := proto.Temporal_Api_Failure_V1_ChildWorkflowExecutionFailureInfo{
+		namespace = "default",
+		workflow_execution = &execution,
+		workflow_type = &workflow_type,
+		initiated_event_id = 41,
+		started_event_id = 42,
+		retry_state = .RETRY_STATE_TIMEOUT,
+	}
+	nexus_operation_info := proto.Temporal_Api_Failure_V1_NexusOperationFailureInfo{
+		scheduled_event_id = 51,
+		endpoint = "payments",
+		service = "checkout",
+		operation = "charge",
+		operation_id = "operation-id",
+		operation_token = "operation-token",
+	}
+	nexus_handler_info := proto.Temporal_Api_Failure_V1_NexusHandlerFailureInfo{
+		type = "UpstreamUnavailable",
+		retry_behavior = .NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE,
+	}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge_card"}
+	activity_info := proto.Temporal_Api_Failure_V1_ActivityFailureInfo{
+		scheduled_event_id = 11,
+		started_event_id = 12,
+		identity = "activity-worker",
+		activity_type = &activity_type,
+		activity_id = "activity-id",
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+
+	failures: [10]proto.Temporal_Api_Failure_V1_Failure
+	failures[9] = {message = "nexus handler", failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Handler_Failure_Info{value = &nexus_handler_info}}
+	failures[8] = {message = "nexus operation", cause = &failures[9], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Operation_Execution_Failure_Info{value = &nexus_operation_info}}
+	failures[7] = {message = "child", cause = &failures[8], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info{value = &child_info}}
+	failures[6] = {message = "reset", cause = &failures[7], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Reset_Workflow_Failure_Info{value = &reset_info}}
+	failures[5] = {message = "server", cause = &failures[6], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Server_Failure_Info{value = &server_info}}
+	failures[4] = {message = "terminated", cause = &failures[5], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Terminated_Failure_Info{value = &terminated_info}}
+	failures[3] = {message = "canceled", cause = &failures[4], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{value = &canceled_info}}
+	failures[2] = {message = "timeout", cause = &failures[3], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Timeout_Failure_Info{value = &timeout_info}}
+	failures[1] = {message = "application", cause = &failures[2], failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{value = &application_info}}
+	failures[0] = {
+		message = "activity",
+		source = "OdinSDK",
+		stack_trace = "test stack",
+		encoded_attributes = &detail,
+		cause = &failures[1],
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{value = &activity_info},
+	}
+
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(&failures[0])
+	error := temporal_client.Error{kind = .Workflow_Failed, details = encoded[:]}
+	decoded, decode_error := temporal_client.decode_error_failure(&error)
+	delete(encoded)
+	error.details = nil
+	defer temporal_failure.failure_free(&decoded)
+	testing.expect_value(t, decode_error, temporal_failure.Decode_Error.None)
+	testing.expect_value(t, decoded.message, "activity")
+	testing.expect_value(t, decoded.source, "OdinSDK")
+	testing.expect(t, decoded.has_encoded_attributes)
+	testing.expect_value(t, decoded.activity.activity_id, "activity-id")
+	testing.expect_value(t, decoded.activity.retry_state, temporal_failure.Retry_State.Maximum_Attempts_Reached)
+	application := temporal_failure.find_kind(&decoded, .Application)
+	testing.expect(t, application != nil)
+	if application != nil {
+		testing.expect_value(t, application.application.type, "DependencyRejected")
+		testing.expect_value(t, application.application.category, temporal_failure.Application_Error_Category.Benign)
+		testing.expect_value(t, application.application.next_retry_delay, 2 * time.Second + 250 * time.Millisecond)
+		testing.expect_value(t, len(application.application.details), 1)
+	}
+	timeout := temporal_failure.find_kind(&decoded, .Timeout)
+	testing.expect(t, timeout != nil)
+	if timeout != nil {
+		testing.expect_value(t, timeout.timeout.timeout_type, temporal_failure.Timeout_Type.Heartbeat)
+		testing.expect_value(t, len(timeout.timeout.last_heartbeat_details), 1)
+	}
+	child := temporal_failure.find_kind(&decoded, .Child_Workflow)
+	testing.expect(t, child != nil)
+	if child != nil {
+		testing.expect_value(t, child.child_workflow.workflow_id, "child-id")
+		testing.expect_value(t, child.child_workflow.workflow_type, "child-type")
+	}
+	nexus := temporal_failure.find_kind(&decoded, .Nexus_Operation)
+	testing.expect(t, nexus != nil)
+	if nexus != nil {
+		testing.expect_value(t, nexus.nexus_operation.operation_token, "operation-token")
+	}
+	root := temporal_failure.root_cause(&decoded)
+	testing.expect(t, root != nil)
+	if root != nil {
+		testing.expect_value(t, root.kind, temporal_failure.Kind.Nexus_Handler)
+		testing.expect_value(t, root.nexus_handler.retry_behavior, temporal_failure.Nexus_Handler_Retry_Behavior.Retryable)
+	}
+}
+
+@(test)
+failure_decoder_rejects_invalid_input_and_excessive_depth :: proc(t: ^testing.T) {
+	_, empty_error := temporal_failure.decode(nil)
+	testing.expect_value(t, empty_error, temporal_failure.Decode_Error.No_Data)
+	_, malformed_error := temporal_failure.decode({0xff, 0xff, 0xff})
+	testing.expect_value(t, malformed_error, temporal_failure.Decode_Error.Malformed)
+
+	invalid_duration := proto.Google_Protobuf_Duration{seconds = 1, nanos = 1_000_000_000}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		next_retry_delay = &invalid_duration,
+	}
+	invalid_failure := proto.Temporal_Api_Failure_V1_Failure{
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(&invalid_failure)
+	_, duration_error := temporal_failure.decode(encoded[:])
+	delete(encoded)
+	testing.expect_value(t, duration_error, temporal_failure.Decode_Error.Malformed)
+
+	deep_chain: [temporal_failure.MAX_CAUSE_DEPTH + 1]proto.Temporal_Api_Failure_V1_Failure
+	for index in 0..<len(deep_chain) - 1 {
+		deep_chain[index].cause = &deep_chain[index + 1]
+	}
+	encoded = proto.encode_Temporal_Api_Failure_V1_Failure(&deep_chain[0])
+	_, depth_error := temporal_failure.decode(encoded[:])
+	delete(encoded)
+	testing.expect_value(t, depth_error, temporal_failure.Decode_Error.Too_Deep)
 }
 
 @(test)
@@ -5151,6 +5344,16 @@ client_update_handle_owns_immediate_nested_failure :: proc(t: ^testing.T) {
 	defer temporal_client.error_free(&update_error)
 	testing.expect(t, update_error.kind == .Workflow_Update_Failed)
 	testing.expect_value(t, string(update_error.message), "greeting name is invalid")
+	decoded_failure, decode_error := temporal_client.decode_error_failure(&update_error)
+	defer temporal_failure.failure_free(&decoded_failure)
+	testing.expect_value(t, decode_error, temporal_failure.Decode_Error.None)
+	application_failure := temporal_failure.find_kind(&decoded_failure, .Application)
+	testing.expect(t, application_failure != nil)
+	if application_failure != nil {
+		testing.expect_value(t, application_failure.message, "greeting name is invalid")
+		testing.expect_value(t, application_failure.application.type, "InvalidGreetingName")
+		testing.expect(t, application_failure.application.non_retryable)
+	}
 }
 
 @(test)
