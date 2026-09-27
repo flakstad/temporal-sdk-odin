@@ -96,6 +96,12 @@ update_greeting_name :: proc(
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
+	// The integration scenario deliberately resolves the second concurrent
+	// Workflow Update first. Sleeping in an Activity is safe: the ordering is
+	// recorded in history and Workflow replay only observes the resolutions.
+	if name == "Temporal-slow" {
+		time.sleep(2 * time.Second)
+	}
 	if name == "cancel-activity" || name == "cancel-cleanup" {
 		first_heartbeat := true
 		for !activity.is_cancellation_requested(ctx) {
@@ -430,7 +436,7 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 2 : 1),
+			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : 1),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer,
 			on_workflow_activation = observe_activation,
@@ -471,9 +477,9 @@ main :: proc() {
 				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
 				failed = true
 			}
-		} else if run_stats.activity_tasks_completed != (expect_update ? 2 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
+		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
-		   (expect_update && (run_stats.workflow_updates_accepted != 1 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 1)) {
+		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
 			fmt.eprintf(
 				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d timers_canceled=%d replay_activations=%d\n",
 				run_stats.activity_tasks_completed,

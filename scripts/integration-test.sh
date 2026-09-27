@@ -5,11 +5,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 server_pid=""
 worker_pid=""
 workflow_cli_pid=""
+slow_update_pid=""
 unknown_workflow_id=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
 workflow_control_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-control.XXXXXX")"
+slow_update_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-slow-update.XXXXXX")"
 unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
 typed_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-typed-history.XXXXXX")"
 
@@ -25,6 +27,10 @@ cleanup() {
     kill "$workflow_cli_pid" 2>/dev/null || true
     wait "$workflow_cli_pid" 2>/dev/null || true
   fi
+  if [[ -n "$slow_update_pid" ]]; then
+    kill "$slow_update_pid" 2>/dev/null || true
+    wait "$slow_update_pid" 2>/dev/null || true
+  fi
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
@@ -33,7 +39,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file" "$workflow_control_output_file" "$unknown_history_file" "$typed_history_file"
+  rm -f "$workflow_output_file" "$workflow_control_output_file" "$slow_update_output_file" "$unknown_history_file" "$typed_history_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -333,13 +339,41 @@ grep -q 'greeting name is invalid' <<<"$rejected_update_output"
 TEMPORAL_CLIENT_ACTION=update \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
   TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
-  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal-slow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$slow_update_output_file" 2>&1 &
+slow_update_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
+    echo "First concurrent Workflow Update did not suspend on its Activity" >&2
+    cat "$worker_log" >&2
+    cat "$slow_update_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal-fast \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file"
-update_output="$(<"$workflow_control_output_file")"
-echo "$update_output"
-grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$update_output"
-grep -q 'previous="Odin" current="Temporal"' <<<"$update_output"
+fast_update_output="$(<"$workflow_control_output_file")"
+echo "$fast_update_output"
+grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$fast_update_output"
+grep -q 'previous="Odin" current="Temporal-fast"' <<<"$fast_update_output"
+
+wait "$slow_update_pid"
+slow_update_pid=""
+slow_update_output="$(<"$slow_update_output_file")"
+echo "$slow_update_output"
+grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$slow_update_output"
+grep -q 'previous="Odin" current="Temporal-slow"' <<<"$slow_update_output"
 
 TEMPORAL_CLIENT_ACTION=query \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
@@ -349,7 +383,7 @@ TEMPORAL_CLIENT_ACTION=query \
 query_output="$(<"$workflow_control_output_file")"
 echo "$query_output"
 grep -q "Odin client query=greeting_status workflow_id=$workflow_id" <<<"$query_output"
-grep -q 'phase="waiting-for-approval" name="Temporal"' <<<"$query_output"
+grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$query_output"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
@@ -368,13 +402,17 @@ grep -q '"result": "Hello Approved"' <<<"$workflow_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=2" "$worker_log"
-grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=2" "$worker_log"
+grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=3" "$worker_log"
+grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=3" "$worker_log"
 grep -Eq "replay=(true|false) .*queries=1 query_failures=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=false .*scheduled=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=true .*scheduled=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=1 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 

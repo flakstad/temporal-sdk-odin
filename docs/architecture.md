@@ -995,6 +995,13 @@ the Odin runtime currently delays the terminal Workflow command until those
 Update routines finish. This is a safe initial unfinished-handler policy, not
 yet a configurable public contract.
 
+Concurrency is now exercised rather than only implied by the routine table.
+Two accepted routines can schedule Activity sequences 1 and 2, sequence 2 can
+resolve and complete its Update first, and sequence 1 can complete later. Only
+the routine whose own wait condition is ready resumes; registration order is
+the deterministic tie-breaker when several become ready in one activation.
+Forced eviction and replay reproduce every completion byte-for-byte.
+
 Typed handler input is decoded in the Workflow instance arena—not the
 activation decode arena—because a state mutation may retain strings or slices
 from that input beyond the current activation. It remains valid until eviction.
@@ -1006,24 +1013,35 @@ Replay then constructs a new arena and reapplies accepted Updates to rebuild
 state.
 
 The public Client uses the C bridge's existing generic RPC symbol for
-`UpdateWorkflowExecution`, requests lifecycle stage `COMPLETED`, and falls back
-to `PollWorkflowExecutionUpdate` when the first server response has no outcome.
+`UpdateWorkflowExecution`. `start_update_payload/json` requests lifecycle stage
+`ACCEPTED` and returns an owned `Update_Handle` containing the server's Workflow,
+run, and Update IDs. `wait_update_payload/json` uses
+`PollWorkflowExecutionUpdate` with lifecycle stage `COMPLETED`.
+`execute_update_payload/json` composes those operations for callers that prefer
+a blocking one-call API.
 Successful outcomes are cloned out of the protobuf decode arena. Failure
 outcomes become `.Workflow_Update_Failed`, with an owned message and encoded
 Temporal Failure bytes in `Error.details`. No new native ABI symbol is needed.
+The generated decoder borrows protobuf strings and byte fields directly from
+the C-bridge RPC response buffer. That buffer therefore remains alive until the
+Update reference and any immediate outcome have been cloned. An outcome already
+returned by the start RPC is owned by `Update_Handle` and served locally by
+`wait_update_*`; this is required for validator rejections, whose completed
+reference is not guaranteed to be pollable as a later accepted Update.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
-then accepts a typed rename Update. Its independent routine schedules and waits
-for an Odin Activity, receives the typed previous/current result in a later
-activation, and exposes the changed state through a query. Core evicts the
-instance and replay reconstructs the main fiber, Update routine, scheduled
-Activity, Activity resolution, and terminal Update response with validation
-disabled. Offline tests require byte-identical completions for each of those
-activations. Property tests still generate validator rejection, immediate
-completion, and accepted-then-handler-rejection wire sequences.
+then holds two typed rename Updates concurrently. Their independent routines
+schedule Activity sequences 1 and 2; sequence 2 resolves first, then sequence 1.
+Both Client handles receive the correct typed result, and a query observes the
+last-completed mutation. Core repeatedly evicts the instance and replay
+reconstructs the main fiber, both Update routines, both scheduled Activities,
+both resolutions, and both terminal Update responses with validation disabled.
+Offline tests require byte-identical completions for the same out-of-order
+sequence. Property tests generate both completion orderings in addition to
+validator rejection, immediate completion, and accepted-then-handler-rejection.
 
 The remaining Update-runtime risks are cancellation semantics, configurable
-unfinished-handler policy when the main Workflow closes, concurrent-handler interaction,
+unfinished-handler policy when the main Workflow closes, shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
 
@@ -1357,15 +1375,14 @@ proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
-500 Update protocol response sequences,
+500 single-Update protocol response sequences, and 500 two-Update completion-order sequences,
 against both the pinned library and `~/Projects/pbt`.
 
-The next smallest feature milestone should harden concurrent Update routines
-and their lifecycle. It should model two accepted Updates resolving out of
-order, cancellation while a handler awaits, and main-Workflow completion with
-unfinished handlers. Public Update handles should then separate start/wait from
-`execute_update_json`; the current Client already polls when an execute call
-does not receive an immediate outcome.
+The next smallest feature milestone should define Update cancellation and
+unfinished-handler policy. It should model cancellation while a handler awaits,
+main-Workflow completion with unfinished handlers, and late Activity
+resolutions after cancellation. Concurrent out-of-order completion and public
+Client Update handles are now implemented and tested.
 
 Before widening cancellation further, model root cancellation, late
 resolutions, detached cleanup, eviction, and replay with an independent

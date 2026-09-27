@@ -395,21 +395,27 @@ Updates use the same Workflow handle:
 
 ```odin
 result: Rename_Result
-update_error := temporal_client.execute_update_json(
-    &existing,
-    "rename_order",
-    Rename_Input{name = "priority-order"},
-    &result,
+update, update_error := temporal_client.start_update_json(
+	&existing,
+	"rename_order",
+	Rename_Input{name = "priority-order"},
 )
+defer temporal_client.update_handle_free(&update)
+update_error = temporal_client.wait_update_json(&update, &result)
 ```
 
-`execute_update_payload` is the codec-neutral form. It creates UUIDv4 Update
-and request IDs unless an explicit Update ID is supplied, asks
-`UpdateWorkflowExecution` to wait for `COMPLETED`, and long-polls
-`PollWorkflowExecutionUpdate` if the Service returns before an outcome exists.
-The successful Payload is caller-owned. Update failure returns
+`start_update_payload` and `wait_update_payload` are the codec-neutral forms;
+`execute_update_payload` composes them as a convenience. Start creates UUIDv4
+Update and request IDs unless an explicit Update ID is supplied, asks
+`UpdateWorkflowExecution` to wait for `ACCEPTED`, and returns an owned handle.
+Wait long-polls `PollWorkflowExecutionUpdate` for `COMPLETED`. The successful
+Payload is caller-owned. Update failure returns
 `.Workflow_Update_Failed`; `Error.message` owns the Temporal failure message and
 `Error.details` owns the encoded Failure protobuf.
+If start returns an immediate completed outcome (notably validator rejection),
+the handle owns that outcome and wait returns it without an extra poll. The raw
+RPC protobuf buffer stays alive until all decoder-borrowed Update IDs, strings,
+and Payload bytes have been cloned.
 
 Workflow code uses `set_update_handler_json` or
 `set_validated_update_handler_json` for immediate handlers. The
@@ -429,6 +435,10 @@ routine yields. A later activation resumes it and carries `Completed` or the
 post-acceptance `Rejected` failure. Update cancellation and unfinished-handler
 policy are not stable yet. For now, a main Workflow that returns waits to emit
 its terminal command until every accepted Update routine has finished.
+Multiple routines are driven in registration order, while only the routine
+whose wait condition resolved resumes. The unit and live suites start two
+Updates, resolve Activity sequence 2 before sequence 1, and require replay to
+preserve both protocol IDs and the out-of-order completion sequence.
 
 Workflow-side signal buffering is codec-neutral. Use
 `workflow.await_signal_payload` for the borrowed Payload or
@@ -552,21 +562,24 @@ the generated value. The query property generates 500 success/failure
 responses, destroys the command arena after encoding, and verifies query IDs,
 typed success Payloads, and non-retryable Application Failure types after a
 fresh decode.
-The Update property adds 500 immediate protocol sequences across validator
+The Update properties add 500 immediate protocol sequences across validator
 rejection, accepted completion, and accepted handler rejection. It checks the
 protocol instance ID, requires `Accepted` to precede the terminal response, and
-round-trips typed result Payloads plus Application Failure types.
+round-trips typed result Payloads plus Application Failure types. A second 500
+case property varies which of two accepted Updates finishes first and verifies
+that each result stays attached to its own protocol instance ID.
 
 Finally, the script starts `examples/hello_workflow` and invokes it with
 `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
 `approval` signal, `examples/client_control` first proves a validator rejection,
-then executes a typed Update that changes the name from `Odin` to `Temporal`.
-The Update routine first waits for an Odin Activity and completes in a later
-activation. A typed query returns phase `waiting-for-approval` and the changed
-name without resuming the main fiber; Core evicts and replays the accepted
-Update, its Activity, and its terminal response with validation disabled while
-reconstructing query state. The Client then sends the typed signal. The signal
+then starts two typed Updates using the public start/wait handle API. Their
+independent routines wait for separate Odin Activities; the second Activity
+finishes first and the first Update finishes last. A typed query returns phase
+`waiting-for-approval` and the last-completed name without resuming the main
+fiber; Core evicts and replays both accepted Updates, Activities, and terminal
+responses with validation disabled while reconstructing query state. The Client
+then sends the typed signal. The signal
 wins, so the Odin runtime emits `CancelTimer` and schedules an
 Activity in the
 same completion. The reusable worker's Activity poll thread completes that

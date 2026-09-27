@@ -47,6 +47,48 @@ error_from_string :: proc(kind: Error_Kind, message: string) -> Error {
 	return {kind = kind, message = bytes.clone(transmute([]u8)message)}
 }
 
+error_clone :: proc(error: ^Error) -> Error {
+	if error == nil {
+		return {}
+	}
+	result := Error{
+		kind = error.kind,
+		message = bytes.clone(error.message),
+		status_code = error.status_code,
+		details = bytes.clone(error.details),
+	}
+	if result.kind == .Workflow_Update_Failed && len(error.details) > 0 {
+		delete(result.message)
+		result.message = nil
+		decode_arena: virtual.Arena
+		if virtual.arena_init_growing(&decode_arena) == nil {
+			previous_allocator := context.allocator
+			context.allocator = virtual.arena_allocator(&decode_arena)
+			failure := proto.Temporal_Api_Failure_V1_Failure{}
+			decoded := proto.decode_Temporal_Api_Failure_V1_Failure(error.details, &failure)
+			context.allocator = previous_allocator
+			if decoded {
+				current := &failure
+				for current != nil && len(current.message) == 0 {
+					current = current.cause
+				}
+				if current != nil {
+					result.message = bytes.clone(
+						transmute([]u8)current.message,
+						previous_allocator,
+					)
+				}
+			}
+			virtual.arena_destroy(&decode_arena)
+		}
+	}
+	if result.kind == .Workflow_Update_Failed && len(result.message) == 0 {
+		fallback := "Workflow Update failed"
+		result.message = bytes.clone(transmute([]u8)fallback)
+	}
+	return result
+}
+
 error_from_core :: proc(core_error: ^temporal_core.Error, kind := Error_Kind.Rpc) -> Error {
 	if core_error == nil || core_error.message == nil {
 		return {}
@@ -148,6 +190,19 @@ Workflow_Handle :: struct {
 	first_execution_run_id: string,
 }
 
+// Update_Handle owns the stable server reference returned after an Update has
+// reached Accepted (or Completed). It does not own the Client; the Client must
+// remain open until the handle is no longer used.
+Update_Handle :: struct {
+	client:          ^Client,
+	workflow_id:     string,
+	run_id:          string,
+	update_id:       string,
+	outcome_present: bool,
+	outcome:         codec.Payload,
+	outcome_error:   Error,
+}
+
 workflow_handle_free :: proc(handle: ^Workflow_Handle) {
 	if handle == nil {
 		return
@@ -156,6 +211,20 @@ workflow_handle_free :: proc(handle: ^Workflow_Handle) {
 	delete(handle.id, heap)
 	delete(handle.run_id, heap)
 	delete(handle.first_execution_run_id, heap)
+	handle^ = {}
+}
+
+update_handle_free :: proc(handle: ^Update_Handle) {
+	if handle == nil {
+		return
+	}
+	heap := allocator_runtime.heap_allocator()
+	delete(handle.workflow_id, heap)
+	delete(handle.run_id, heap)
+	delete(handle.update_id, heap)
+	codec.payload_free(&handle.outcome)
+	delete(handle.outcome_error.message, heap)
+	delete(handle.outcome_error.details, heap)
 	handle^ = {}
 }
 
@@ -316,6 +385,12 @@ start_workflow_json :: proc(
 workflow_handle_valid :: proc(handle: ^Workflow_Handle) -> bool {
 	return handle != nil && handle.client != nil && handle.client.connection != nil &&
 		handle.client.connection.handle != nil && len(handle.id) > 0
+}
+
+update_handle_valid :: proc(handle: ^Update_Handle) -> bool {
+	return handle != nil && handle.client != nil && handle.client.connection != nil &&
+		handle.client.connection.handle != nil && len(handle.workflow_id) > 0 &&
+		len(handle.update_id) > 0
 }
 
 workflow_execution :: proc(handle: ^Workflow_Handle) -> proto.Temporal_Api_Common_V1_WorkflowExecution {
@@ -548,10 +623,19 @@ update_outcome_payload :: proc(
 		if value.value == nil {
 			return {}, error_from_string(.Malformed_Response, "Workflow Update failure is missing")
 		}
+		failure_message := value.value.message
+		cause := value.value.cause
+		for len(failure_message) == 0 && cause != nil {
+			failure_message = cause.message
+			cause = cause.cause
+		}
+		if len(failure_message) == 0 {
+			failure_message = "Workflow Update failed"
+		}
 		details := proto.encode_Temporal_Api_Failure_V1_Failure(value.value)
 		return {}, Error{
 			kind = .Workflow_Update_Failed,
-			message = bytes.clone(transmute([]u8)value.value.message),
+			message = bytes.clone(transmute([]u8)failure_message),
 			details = details[:],
 		}
 	}
@@ -607,26 +691,28 @@ poll_update_result_payload :: proc(
 			&response,
 		)
 		context.allocator = previous_allocator
-		delete(rpc_result.protobuf)
 		if !decoded {
+			delete(rpc_result.protobuf)
 			virtual.arena_destroy(&decode_arena)
 			return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Update poll response")
 		}
 		if response.outcome != nil {
 			payload, outcome_error := update_outcome_payload(response.outcome)
+			delete(rpc_result.protobuf)
 			virtual.arena_destroy(&decode_arena)
 			return payload, outcome_error
 		}
+		delete(rpc_result.protobuf)
 		virtual.arena_destroy(&decode_arena)
 	}
 }
 
-execute_update_payload :: proc(
+start_update_payload :: proc(
 	handle: ^Workflow_Handle,
 	update_name: string,
 	input: codec.Payload_View,
 	explicit_update_id := "",
-) -> (codec.Payload, Error) {
+) -> (Update_Handle, Error) {
 	if !workflow_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
@@ -657,7 +743,7 @@ execute_update_payload :: proc(
 		request_id = resolve_request_id("", request_id_buffer[:]),
 	}
 	wait_policy := proto.Temporal_Api_Update_V1_WaitPolicy{
-		lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+		lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED,
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest{
 		namespace = handle.client.namespace,
@@ -668,54 +754,177 @@ execute_update_payload :: proc(
 	}
 	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(&request)
 	defer delete(request_bytes)
-	rpc_result := temporal_core.client_rpc_call(
-		handle.client.connection,
-		.Workflow,
-		"UpdateWorkflowExecution",
-		request_bytes[:],
-		timeout_millis = 0,
-	)
-	defer delete(rpc_result.protobuf)
-	if rpc_result.error.message != nil {
-		return {}, error_from_core(&rpc_result.error)
-	}
+	for {
+		rpc_result := temporal_core.client_rpc_call(
+			handle.client.connection,
+			.Workflow,
+			"UpdateWorkflowExecution",
+			request_bytes[:],
+			timeout_millis = 0,
+		)
+		if rpc_result.error.message != nil {
+			delete(rpc_result.protobuf)
+			return {}, error_from_core(&rpc_result.error)
+		}
 
-	decode_arena: virtual.Arena
-	if virtual.arena_init_growing(&decode_arena) != nil {
-		return {}, error_from_string(.Malformed_Response, "could not initialize Update response arena")
+		decode_arena: virtual.Arena
+		if virtual.arena_init_growing(&decode_arena) != nil {
+			delete(rpc_result.protobuf)
+			return {}, error_from_string(.Malformed_Response, "could not initialize Update response arena")
+		}
+		previous_allocator := context.allocator
+		context.allocator = virtual.arena_allocator(&decode_arena)
+		response := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse{}
+		decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse(
+			rpc_result.protobuf,
+			&response,
+		)
+		context.allocator = previous_allocator
+		if !decoded || response.update_ref == nil ||
+		   response.update_ref.workflow_execution == nil ||
+		   len(response.update_ref.workflow_execution.workflow_id) == 0 ||
+		   len(response.update_ref.update_id) == 0 {
+			delete(rpc_result.protobuf)
+			virtual.arena_destroy(&decode_arena)
+			return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Update response")
+		}
+		accepted := response.outcome != nil ||
+			response.stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED ||
+			response.stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED
+		if !accepted {
+			delete(rpc_result.protobuf)
+			virtual.arena_destroy(&decode_arena)
+			continue
+		}
+
+		heap := allocator_runtime.heap_allocator()
+		workflow_id, workflow_id_error := strings.clone(
+			response.update_ref.workflow_execution.workflow_id,
+			heap,
+		)
+		if workflow_id_error != nil {
+			delete(rpc_result.protobuf)
+			virtual.arena_destroy(&decode_arena)
+			return {}, error_from_string(.Malformed_Response, "could not preserve Update Workflow ID")
+		}
+		run_id, run_id_error := strings.clone(
+			response.update_ref.workflow_execution.run_id,
+			heap,
+		)
+		if run_id_error != nil {
+			delete(workflow_id, heap)
+			delete(rpc_result.protobuf)
+			virtual.arena_destroy(&decode_arena)
+			return {}, error_from_string(.Malformed_Response, "could not preserve Update run ID")
+		}
+		owned_update_id, update_id_error := strings.clone(response.update_ref.update_id, heap)
+		if update_id_error != nil {
+			delete(run_id, heap)
+			delete(workflow_id, heap)
+			delete(rpc_result.protobuf)
+			virtual.arena_destroy(&decode_arena)
+			return {}, error_from_string(.Malformed_Response, "could not preserve Update ID")
+		}
+		outcome_present := response.outcome != nil
+		outcome: codec.Payload
+		outcome_error: Error
+		if outcome_present {
+			context.allocator = heap
+			outcome, outcome_error = update_outcome_payload(response.outcome)
+			context.allocator = previous_allocator
+			if outcome_error.message != nil && outcome_error.kind != .Workflow_Update_Failed {
+				codec.payload_free(&outcome)
+				delete(owned_update_id, heap)
+				delete(run_id, heap)
+				delete(workflow_id, heap)
+				delete(rpc_result.protobuf)
+				virtual.arena_destroy(&decode_arena)
+				return {}, outcome_error
+			}
+		}
+		result := Update_Handle{
+			client = handle.client,
+			workflow_id = workflow_id,
+			run_id = run_id,
+			update_id = owned_update_id,
+			outcome_present = outcome_present,
+			outcome = outcome,
+			outcome_error = outcome_error,
+		}
+		delete(rpc_result.protobuf)
+		virtual.arena_destroy(&decode_arena)
+		return result, {}
 	}
-	defer virtual.arena_destroy(&decode_arena)
-	previous_allocator := context.allocator
-	context.allocator = virtual.arena_allocator(&decode_arena)
-	response := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse{}
-	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse(
-		rpc_result.protobuf,
-		&response,
+}
+
+start_update_json :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: $Input,
+	explicit_update_id := "",
+) -> (Update_Handle, Error) {
+	payload, encode_error := codec.encode_json(input)
+	if encode_error != .None {
+		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow Update input")
+	}
+	defer codec.payload_free(&payload)
+	return start_update_payload(
+		handle,
+		update_name,
+		codec.payload_view(&payload),
+		explicit_update_id,
 	)
-	context.allocator = previous_allocator
-	if !decoded || response.update_ref == nil ||
-	   response.update_ref.workflow_execution == nil || len(response.update_ref.update_id) == 0 {
-		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Update response")
+}
+
+wait_update_payload :: proc(handle: ^Update_Handle) -> (codec.Payload, Error) {
+	if !update_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update handle is not initialized")
 	}
-	if response.outcome != nil {
-		return update_outcome_payload(response.outcome)
+	if handle.outcome_present {
+		if handle.outcome_error.message != nil {
+			return {}, error_clone(&handle.outcome_error)
+		}
+		result, clone_error := codec.payload_clone(codec.payload_view(&handle.outcome))
+		if clone_error != .None {
+			return {}, error_from_string(.Payload_Conversion, "could not clone Workflow Update result")
+		}
+		return result, {}
 	}
-	workflow_id, workflow_id_error := strings.clone(response.update_ref.workflow_execution.workflow_id)
-	if workflow_id_error != nil {
-		return {}, error_from_string(.Malformed_Response, "could not preserve Update Workflow ID")
+	return poll_update_result_payload(
+		handle.client,
+		handle.workflow_id,
+		handle.run_id,
+		handle.update_id,
+	)
+}
+
+wait_update_json :: proc(handle: ^Update_Handle, value: ^$Output) -> Error {
+	if value == nil {
+		return error_from_string(.Invalid_Argument, "Workflow Update output pointer is required")
 	}
-	defer delete(workflow_id)
-	run_id, run_id_error := strings.clone(response.update_ref.workflow_execution.run_id)
-	if run_id_error != nil {
-		return {}, error_from_string(.Malformed_Response, "could not preserve Update run ID")
+	result, update_error := wait_update_payload(handle)
+	if update_error.message != nil {
+		return update_error
 	}
-	defer delete(run_id)
-	owned_update_id, update_id_error := strings.clone(response.update_ref.update_id)
-	if update_id_error != nil {
-		return {}, error_from_string(.Malformed_Response, "could not preserve Update ID")
+	defer codec.payload_free(&result)
+	if codec.decode_json(codec.payload_view(&result), value) != .None {
+		return error_from_string(.Payload_Conversion, "could not decode Workflow Update result")
 	}
-	defer delete(owned_update_id)
-	return poll_update_result_payload(handle.client, workflow_id, run_id, owned_update_id)
+	return {}
+}
+
+execute_update_payload :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: codec.Payload_View,
+	explicit_update_id := "",
+) -> (codec.Payload, Error) {
+	update, start_error := start_update_payload(handle, update_name, input, explicit_update_id)
+	if start_error.message != nil {
+		return {}, start_error
+	}
+	defer update_handle_free(&update)
+	return wait_update_payload(&update)
 }
 
 execute_update_json :: proc(

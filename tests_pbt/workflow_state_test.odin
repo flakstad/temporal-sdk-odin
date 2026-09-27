@@ -560,6 +560,155 @@ update_responses_preserve_protocol_order_and_results :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+concurrent_update_completion_order_property :: proc(t: ^pbt.T) -> pbt.Result {
+	second_finishes_first := pbt.draw(t, pbt.boolean())
+	first_value := pbt.draw(t, pbt.int_range(-100_000, 100_000))
+	second_value := pbt.draw(t, pbt.int_range(-100_000, 100_000))
+	pbt.cover(t, second_finishes_first, 40.0, "second Update finishes first")
+	pbt.cover(t, !second_finishes_first, 40.0, "first Update finishes first")
+
+	first_payload, first_error := codec.encode_json(first_value)
+	second_payload, second_error := codec.encode_json(second_value)
+	if first_error != .None || second_error != .None {
+		codec.payload_free(&first_payload)
+		codec.payload_free(&second_payload)
+		return pbt.error("could not encode concurrent Update results")
+	}
+	defer codec.payload_free(&first_payload)
+	defer codec.payload_free(&second_payload)
+
+	command_arena: virtual.Arena
+	if virtual.arena_init_growing(&command_arena) != nil {
+		return pbt.error("could not initialize concurrent Update command arena")
+	}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&command_arena)
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	first_accepted := workflow.Pending_Update_Response{
+		protocol_instance_id = "concurrent-update-first",
+		kind = .Accepted,
+	}
+	second_accepted := workflow.Pending_Update_Response{
+		protocol_instance_id = "concurrent-update-second",
+		kind = .Accepted,
+	}
+	first_completed := workflow.Pending_Update_Response{
+		protocol_instance_id = "concurrent-update-first",
+		kind = .Completed,
+		result = workflow.payload_complete(first_payload),
+	}
+	second_completed := workflow.Pending_Update_Response{
+		protocol_instance_id = "concurrent-update-second",
+		kind = .Completed,
+		result = workflow.payload_complete(second_payload),
+	}
+	workflow.append_update_response_command(&commands, &first_accepted)
+	workflow.append_update_response_command(&commands, &second_accepted)
+	if second_finishes_first {
+		workflow.append_update_response_command(&commands, &second_completed)
+		workflow.append_update_response_command(&commands, &first_completed)
+	} else {
+		workflow.append_update_response_command(&commands, &first_completed)
+		workflow.append_update_response_command(&commands, &second_completed)
+	}
+	context.allocator = previous_allocator
+	success := proto.Coresdk_Workflow_Completion_Success{commands = commands}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{
+		run_id = "generated-concurrent-update-run",
+		status = proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful{
+			value = &success,
+		},
+	}
+	encoded := proto.encode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(&completion)
+	virtual.arena_destroy(&command_arena)
+	defer delete(encoded)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize concurrent Update decode arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded_ok := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		encoded[:],
+		&decoded,
+	)
+	context.allocator = previous_allocator
+	if !decoded_ok {
+		return pbt.fail("concurrent Update responses did not decode")
+	}
+
+	valid := true
+	#partial switch status in decoded.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 4 {
+			return pbt.fail("concurrent Update response command count changed")
+		}
+		for command, index in status.value.commands {
+			expected_id := "concurrent-update-first"
+			expected_value := first_value
+			if index == 1 || (index == 2 && second_finishes_first) ||
+			   (index == 3 && !second_finishes_first) {
+				expected_id = "concurrent-update-second"
+				expected_value = second_value
+			}
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Update_Response:
+				if variant.value == nil || variant.value.protocol_instance_id != expected_id {
+					valid = false
+					continue
+				}
+				if index < 2 {
+					#partial switch response in variant.value.response {
+					case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Accepted:
+						// google.protobuf.Empty may decode as a nil zero-size pointer.
+						_ = response.value
+					case:
+						valid = false
+					}
+				} else {
+					#partial switch response in variant.value.response {
+					case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Completed:
+						if response.value == nil {
+							valid = false
+							continue
+						}
+						owned, clone_error := proto.clone_payload(response.value)
+						if clone_error != .None {
+							valid = false
+							continue
+						}
+						actual := 0
+						decode_error := codec.decode_json(codec.payload_view(&owned), &actual)
+						valid = valid && decode_error == .None && actual == expected_value
+						codec.payload_free(&owned)
+					case:
+						valid = false
+					}
+				}
+			case:
+				valid = false
+			}
+		}
+	}
+	if !valid {
+		return pbt.fail("concurrent Update protocol identity or completion order changed")
+	}
+	return pbt.pass()
+}
+
+@(test)
+concurrent_update_responses_preserve_resolution_order :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Concurrent Workflow Updates preserve protocol identity and resolution order",
+		concurrent_update_completion_order_property,
+		{num_tests = 500, seed = 0x5550_4441_5445_324f},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 activity_deadline_property :: proc(t: ^pbt.T) -> pbt.Result {
 	scheduled_seconds := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
 	started_offset := i64(pbt.draw(t, pbt.int_range(0, 2_000)))

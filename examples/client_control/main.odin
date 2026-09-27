@@ -110,13 +110,19 @@ run :: proc() -> int {
 		if len(new_name) == 0 {
 			new_name = "Temporal"
 		}
-		output: Greeting_Update_Output
-		operation_error = temporal_client.execute_update_json(
+		update_handle, start_update_error := temporal_client.start_update_json(
 			&handle,
 			update_name,
 			Greeting_Update_Input{name = new_name},
-			&output,
 		)
+		if start_update_error.message != nil {
+			operation_error = start_update_error
+			print_error(action, &operation_error)
+			return 1
+		}
+		defer temporal_client.update_handle_free(&update_handle)
+		output: Greeting_Update_Output
+		operation_error = temporal_client.wait_update_json(&update_handle, &output)
 		if operation_error.message != nil {
 			print_error(action, &operation_error)
 			return 1

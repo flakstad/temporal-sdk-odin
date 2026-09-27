@@ -13,7 +13,10 @@ typed read-only Workflow queries through the public Odin Client, including
 query failure responses, eviction, and fresh-stack replay. Typed Workflow
 Updates now validate, run on independent stackful routines, await Activities,
 mutate Workflow-owned state, return a typed result in a later activation, and
-replay without rerunning validators. It also proves
+replay without rerunning validators. Two accepted Updates can now remain live
+at once, resolve their Activities out of order, and replay with stable protocol
+identity. The Client exposes owned Update handles that separate acceptance from
+waiting for the result. It also proves
 multiple outstanding Activities, catchable Activity failure,
 buffered Workflow signals, and a durable signal/timer race across fresh-stack
 replay. The live Workflow starts a timer, lets an `approval` signal win, emits
@@ -140,7 +143,8 @@ err = temporal_client.get_result_json(&handle, &result)
 
 The Client owns its Core runtime, connection, and namespace. A Workflow handle
 owns its ID/run-ID strings but borrows the Client, so handles must be freed
-before `client.close`. The Payload variants expose the codec-neutral boundary;
+before `client.close`. An Update handle follows the same rule and owns the
+Workflow/run/Update IDs needed for later polling. The Payload variants expose the codec-neutral boundary;
 the JSON variants currently send and receive exactly one Payload.
 
 Existing executions can be addressed without an RPC when creating the handle:
@@ -158,14 +162,18 @@ err = temporal_client.query_workflow_json(
     &status,
 )
 updated: Rename_Result
-err = temporal_client.execute_update_json(
+update, err := temporal_client.start_update_json(
     &handle,
     "rename_order",
     Rename_Input{name = "priority-order"},
-    &updated,
 )
+defer temporal_client.update_handle_free(&update)
+err = temporal_client.wait_update_json(&update, &updated)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 ```
+
+`execute_update_json` remains the one-call convenience wrapper around
+`start_update_json` plus `wait_update_json`.
 
 An empty run ID targets the current execution. Signal and cancellation calls
 generate UUIDv4 request IDs unless the caller supplies one. Termination has
