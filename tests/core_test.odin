@@ -10549,3 +10549,194 @@ client_history_page_is_owned_and_preserves_event_protobuf :: proc(t: ^testing.T)
 	defer free(decoded_event.event_time)
 	testing.expect_value(t, decoded_event.event_id, i64(11))
 }
+
+raw_byte_ref_slice :: proc(value: raw.Byte_Array_Ref) -> []u8 {
+	if value.data == nil || value.size == 0 {
+		return nil
+	}
+	return ([^]u8)(value.data)[:int(value.size)]
+}
+
+@(test)
+client_connection_options_bind_every_core_transport_field :: proc(t: ^testing.T) {
+	metadata := [?]temporal_core.Client_Metadata_Entry{
+		{key = "x-odin-trace", value = transmute([]u8)string("trace-42")},
+		{key = "x-odin-tenant", value = transmute([]u8)string("tenant-a")},
+	}
+	binary_value := [?]u8{0, 1, 2, 255}
+	binary_metadata := [?]temporal_core.Client_Metadata_Entry{{
+		key = "x-odin-token-bin",
+		value = binary_value[:],
+	}}
+	root_ca := transmute([]u8)string("root-ca-pem")
+	client_cert := transmute([]u8)string("client-cert-pem")
+	client_key := transmute([]u8)string("client-key-pem")
+	tls := temporal_core.Client_TLS_Options{
+		server_root_ca_cert = root_ca,
+		domain = "cloud.example.test",
+		client_cert = client_cert,
+		client_private_key = client_key,
+	}
+	retry := temporal_core.Client_Retry_Options{
+		initial_interval = 125 * time.Millisecond,
+		randomization_factor = 0.25,
+		multiplier = 2,
+		maximum_interval = 4 * time.Second,
+		maximum_elapsed_time = 30 * time.Second,
+		maximum_retries = 17,
+	}
+	keep_alive := temporal_core.Client_Keep_Alive_Options{
+		interval = 20 * time.Second,
+		timeout = 7 * time.Second,
+	}
+	proxy := temporal_core.Client_HTTP_Connect_Proxy_Options{
+		target_host = "proxy.example.test:8443",
+		username = "odin-user",
+		password = "odin-password",
+	}
+	dns := temporal_core.Client_DNS_Load_Balancing_Options{
+		resolution_interval = 45 * time.Second,
+	}
+	bindings := temporal_core.Client_Connection_Bindings{}
+	bindings_error := temporal_core.client_connection_bindings_init(&bindings, {
+		target_url = "https://namespace.tmprl.cloud:7233",
+		client_name = "temporal-sdk-odin",
+		client_version = "test-version",
+		identity = "worker@example",
+		metadata = metadata[:],
+		binary_metadata = binary_metadata[:],
+		api_key = "secret-api-key",
+		tls = &tls,
+		retry = &retry,
+		keep_alive = &keep_alive,
+		http_connect_proxy = &proxy,
+		dns_load_balancing = &dns,
+		grpc_compression = .None,
+		payloads_warn_size = 512_000,
+		memo_warn_size = 4_096,
+	})
+	defer temporal_core.client_connection_bindings_free(&bindings)
+	defer temporal_core.error_free(&bindings_error)
+	testing.expectf(t, bindings_error.message == nil, "connection option binding failed: %s", string(bindings_error.message))
+	options := &bindings.raw_options
+	testing.expect_value(t, string(raw_byte_ref_slice(options.target_url)), "https://namespace.tmprl.cloud:7233")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.client_name)), "temporal-sdk-odin")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.client_version)), "test-version")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.identity)), "worker@example")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.api_key)), "secret-api-key")
+	testing.expect_value(t, int(options.metadata.size), 2)
+	metadata_refs := ([^]raw.Byte_Array_Ref)(options.metadata.data)[:int(options.metadata.size)]
+	testing.expect_value(t, string(raw_byte_ref_slice(metadata_refs[0])), "x-odin-trace\ntrace-42")
+	testing.expect_value(t, string(raw_byte_ref_slice(metadata_refs[1])), "x-odin-tenant\ntenant-a")
+	testing.expect_value(t, int(options.binary_metadata.size), 1)
+	binary_refs := ([^]raw.Byte_Array_Ref)(options.binary_metadata.data)[:int(options.binary_metadata.size)]
+	expected_binary := [?]u8{'x','-','o','d','i','n','-','t','o','k','e','n','-','b','i','n','\n',0,1,2,255}
+	testing.expect(t, bytes.equal(raw_byte_ref_slice(binary_refs[0]), expected_binary[:]))
+	testing.expect(t, options.tls_options == &bindings.tls)
+	testing.expect_value(t, string(raw_byte_ref_slice(options.tls_options.domain)), "cloud.example.test")
+	testing.expect(t, bytes.equal(raw_byte_ref_slice(options.tls_options.server_root_ca_cert), root_ca))
+	testing.expect(t, bytes.equal(raw_byte_ref_slice(options.tls_options.client_cert), client_cert))
+	testing.expect(t, bytes.equal(raw_byte_ref_slice(options.tls_options.client_private_key), client_key))
+	testing.expect_value(t, options.retry_options.initial_interval_millis, u64(125))
+	testing.expect_value(t, options.retry_options.randomization_factor, 0.25)
+	testing.expect_value(t, options.retry_options.multiplier, 2.0)
+	testing.expect_value(t, options.retry_options.max_interval_millis, u64(4_000))
+	testing.expect_value(t, options.retry_options.max_elapsed_time_millis, u64(30_000))
+	testing.expect_value(t, options.retry_options.max_retries, uintptr(17))
+	testing.expect_value(t, options.keep_alive_options.interval_millis, u64(20_000))
+	testing.expect_value(t, options.keep_alive_options.timeout_millis, u64(7_000))
+	testing.expect_value(t, string(raw_byte_ref_slice(options.http_connect_proxy_options.target_host)), "proxy.example.test:8443")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.http_connect_proxy_options.username)), "odin-user")
+	testing.expect_value(t, string(raw_byte_ref_slice(options.http_connect_proxy_options.password)), "odin-password")
+	testing.expect_value(t, options.dns_load_balancing_options.resolution_interval_millis, u64(45_000))
+	testing.expect_value(t, options.grpc_compression, raw.Client_Grpc_Compression.None)
+	testing.expect_value(t, options.payloads_warn_size, u64(512_000))
+	testing.expect_value(t, options.memo_warn_size, u64(4_096))
+}
+
+@(test)
+client_connection_options_validate_security_and_metadata_contracts :: proc(t: ^testing.T) {
+	binary_value := [?]u8{0}
+	base := temporal_core.Client_Connection_Options{
+		target_url = "https://namespace.tmprl.cloud:7233",
+		client_name = "temporal-sdk-odin",
+		client_version = "test-version",
+		identity = "test-identity",
+	}
+	api_key_options := base
+	api_key_options.api_key = "api-key-enables-tls"
+	bindings := temporal_core.Client_Connection_Bindings{}
+	api_key_error := temporal_core.client_connection_bindings_init(&bindings, api_key_options)
+	testing.expect(t, api_key_error.message == nil)
+	testing.expect(t, bindings.raw_options.tls_options == &bindings.tls)
+	temporal_core.error_free(&api_key_error)
+	temporal_core.client_connection_bindings_free(&bindings)
+
+	invalid_metadata := [?]temporal_core.Client_Metadata_Entry{{
+		key = "Uppercase-Key",
+		value = transmute([]u8)string("value"),
+	}}
+	invalid := base
+	invalid.metadata = invalid_metadata[:]
+	error := temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	text_binary_key := [?]temporal_core.Client_Metadata_Entry{{
+		key = "wrong-bin",
+		value = transmute([]u8)string("value"),
+	}}
+	invalid = base
+	invalid.metadata = text_binary_key[:]
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	bad_binary_key := [?]temporal_core.Client_Metadata_Entry{{key = "missing-suffix", value = binary_value[:1]}}
+	invalid = base
+	invalid.binary_metadata = bad_binary_key[:]
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	invalid = base
+	invalid.api_key = "invalid\napi-key"
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	client_cert_only := temporal_core.Client_TLS_Options{client_cert = transmute([]u8)string("cert")}
+	invalid = base
+	invalid.tls = &client_cert_only
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	bad_retry := temporal_core.Client_Retry_Options{
+		initial_interval = time.Microsecond,
+		randomization_factor = 0.2,
+		multiplier = 2,
+		maximum_interval = time.Second,
+	}
+	invalid = base
+	invalid.retry = &bad_retry
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	bad_proxy := temporal_core.Client_HTTP_Connect_Proxy_Options{
+		target_host = "proxy.example.test:443",
+		username = "user-without-password",
+	}
+	invalid = base
+	invalid.http_connect_proxy = &bad_proxy
+	error = temporal_core.client_connection_options_validate(invalid)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	invalid_client, public_error := temporal_client.connect_with_options({namespace = "default"})
+	testing.expect_value(t, public_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	testing.expect(t, public_error.message != nil)
+	temporal_client.error_free(&public_error)
+	temporal_client.close(&invalid_client)
+}

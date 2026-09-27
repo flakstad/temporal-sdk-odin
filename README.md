@@ -14,7 +14,11 @@ timeouts, priority, memo/Search Attributes, and pending execution summaries—an
 iterates full Workflow history with explicit pagination tokens. Each history
 event includes stable metadata plus an owned canonical protobuf representation.
 The live suite requests one-event pages against the CLI dev server and follows
-every returned token. It proves
+every returned token. Client connection options now expose Core's TLS/mTLS,
+API-key, ASCII/binary RPC metadata, retry, keepalive, HTTP CONNECT proxy, DNS
+load-balancing, compression, identity, and payload-warning controls. API-key
+connections enable TLS automatically, and metadata/API keys can be replaced on
+a live connection. It proves
 typed read-only Workflow queries through the public Odin Client, including
 query failure responses, eviction, and fresh-stack replay. Typed Workflow
 Updates now validate, run on independent stackful routines, await Activities,
@@ -212,7 +216,7 @@ close event, and decodes the result Payload without Temporal CLI:
 ./scripts/run-client-start.sh
 ```
 
-The core API is intentionally small:
+The public Client API remains explicit:
 
 ```odin
 client, err := temporal_client.connect()
@@ -267,6 +271,33 @@ page, err := temporal_client.fetch_history_page(
 )
 defer temporal_client.history_page_free(&page)
 ```
+
+Temporal Cloud API-key authentication uses the same Core connection:
+
+```odin
+rpc_metadata := [?]temporal_client.RPC_Metadata_Entry{{
+    key = "x-application",
+    value = transmute([]u8)string("orders"),
+}}
+
+client, err := temporal_client.connect_with_options({
+    target_url = "https://my-namespace.account-id.tmprl.cloud:7233",
+    namespace = "my-namespace.account-id",
+    api_key = temporal_api_key,
+    metadata = rpc_metadata[:],
+})
+defer temporal_client.close(&client)
+```
+
+Supplying an API key automatically supplies an empty TLS configuration, which
+uses system root certificates and the target hostname. Self-hosted TLS can pass
+`TLS_Options` with custom root CA bytes and an optional domain. mTLS additionally
+requires both PEM client-certificate and private-key bytes. `update_rpc_metadata`
+replaces connection-wide ASCII/binary headers; `update_api_key` replaces or,
+with an empty string, clears the bearer token. Certificate files are deliberately
+loaded by application code rather than hidden inside the SDK. Connection option
+strings and byte slices are borrowed only until the blocking connect call
+returns; Core owns its connection-state copies afterward.
 
 The Client owns its Core runtime, connection, and namespace. A Workflow handle
 owns its ID/run-ID strings but borrows the Client, so handles must be freed

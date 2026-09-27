@@ -110,20 +110,31 @@ wait_until :: proc(done: ^sync.One_Shot_Event) {
 }
 
 client_connect :: proc(runtime: ^Runtime, target_url := "http://localhost:7233") -> (client: Client, error: Error) {
+	return client_connect_with_options(runtime, {
+		target_url = target_url,
+		client_name = "temporal-sdk-odin",
+		client_version = "0.0.1-experimental",
+		identity = "temporal-sdk-odin@local",
+		grpc_compression = .Gzip,
+	})
+}
+
+client_connect_with_options :: proc(
+	runtime: ^Runtime,
+	options: Client_Connection_Options,
+) -> (client: Client, error: Error) {
 	if runtime == nil || runtime.handle == nil {
 		error.message = bytes.clone(transmute([]u8)string("runtime is not initialized"))
 		return
 	}
-
-	options := raw.Connection_Options{
-		target_url     = byte_ref(target_url),
-		client_name    = byte_ref("temporal-sdk-odin"),
-		client_version = byte_ref("0.0.1-experimental"),
-		identity       = byte_ref("temporal-sdk-odin@local"),
-		grpc_compression = .Gzip,
+	bindings := Client_Connection_Bindings{}
+	bindings_error := client_connection_bindings_init(&bindings, options)
+	if bindings_error.message != nil {
+		return {}, bindings_error
 	}
+	defer client_connection_bindings_free(&bindings)
 	state := Connect_State{}
-	raw.client_connect(runtime.handle, &options, &state, connect_callback)
+	raw.client_connect(runtime.handle, &bindings.raw_options, &state, connect_callback)
 	wait_until(&state.done)
 
 	if state.fail != nil {
@@ -134,6 +145,43 @@ client_connect :: proc(runtime: ^Runtime, target_url := "http://localhost:7233")
 	client.handle = state.success
 	client.runtime = runtime
 	return
+}
+
+client_update_metadata :: proc(
+	client: ^Client,
+	metadata: []Client_Metadata_Entry,
+	binary_metadata: []Client_Metadata_Entry = nil,
+) -> Error {
+	if client == nil || client.handle == nil {
+		return client_option_error("Temporal Client is not connected")
+	}
+	bindings := Client_Connection_Bindings{}
+	bindings_error := client_connection_bindings_init(&bindings, {
+		target_url = "http://localhost:7233",
+		client_name = "temporal-sdk-odin",
+		client_version = "0.0.1-experimental",
+		identity = "temporal-sdk-odin@local",
+		metadata = metadata,
+		binary_metadata = binary_metadata,
+	})
+	if bindings_error.message != nil {
+		return bindings_error
+	}
+	defer client_connection_bindings_free(&bindings)
+	raw.client_update_metadata(client.handle, bindings.raw_options.metadata)
+	raw.client_update_binary_metadata(client.handle, bindings.raw_options.binary_metadata)
+	return {}
+}
+
+client_update_api_key :: proc(client: ^Client, api_key: string) -> Error {
+	if client == nil || client.handle == nil {
+		return client_option_error("Temporal Client is not connected")
+	}
+	if len(api_key) > 0 && !client_text_metadata_value_valid(transmute([]u8)api_key) {
+		return client_option_error("Temporal API key is not valid ASCII metadata")
+	}
+	raw.client_update_api_key(client.handle, byte_ref(api_key))
+	return {}
 }
 
 client_close :: proc(client: ^Client) {

@@ -657,6 +657,12 @@ The Activity-context property adds 500 timestamp/timeout combinations and
 requires the derived deadline to be the earliest applicable endpoint. A unit
 test separately destroys the protobuf decode arena before reading every copied
 context field and decoding a heartbeat detail.
+The Client connection property adds 500 generated binary metadata values,
+retry durations/counts, API-key states, and explicit TLS states. It checks the
+exact C ABI buffers and requires API-key-only configurations to enable TLS.
+Focused validation tests cover all connection option layouts, invalid metadata,
+one-sided mTLS material, sub-millisecond retry values, and incomplete proxy
+credentials.
 The Workflow Payload property adds another 500 generated structs, creates and
 evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,
@@ -909,8 +915,15 @@ TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
 ```
 
 The default endpoint is `http://localhost:7233` inside the Core connection
-options. The wrapper accepts another URL, but TLS, API keys, metadata, and
-configuration profiles are not exposed yet.
+options. `client.connect_with_options` exposes TLS/mTLS, API keys, connection
+metadata, retry/keepalive, proxy, DNS load balancing, compression, identity,
+and warning thresholds. The checked-in example exercises every non-TLS network
+option against the CLI dev server and calls the live metadata/API-key update
+symbols (the smoke API key is immediately cleared before a Workflow RPC).
+Cloud and mTLS credentials are not stored in this repository, so certificate
+verification and Temporal Cloud authentication still require an external
+credentialed acceptance environment. Temporal TOML/environment configuration
+profiles are not exposed yet.
 
 ### Local Activity live path
 

@@ -145,6 +145,28 @@ compression, and cancellation mechanics. The Odin layer must still provide
 typed client methods, generate request IDs where required, encode the Temporal
 API protobuf messages, convert user payloads, and map errors into an Odin API.
 
+`client.Connect_Options` now maps the complete stable connection subset exposed
+by the pinned C bridge: TLS/mTLS byte material and domain override, API key,
+ASCII and binary gRPC metadata, retry and keepalive timing, HTTP CONNECT proxy,
+DNS refresh, gzip selection, identity, and experimental payload/memo warning
+thresholds. It intentionally does not expose the bridge's custom gRPC transport
+override because that callback has a separate asynchronous lifetime contract.
+
+The raw metadata ABI is an array where every element is `key + "\n" + value`.
+Odin validates lowercase gRPC key syntax, `-bin` placement, printable ASCII
+values, duplicate keys, certificate/key pairing, and millisecond duration
+constraints before creating a runtime. It owns the joined metadata buffers
+through the connect callback; other option bytes are borrowed from the blocking
+call and therefore remain live for the same interval. Core copies all options
+into Rust-owned connection state before completing the callback. An API key
+implicitly installs empty TLS options, matching upstream's configuration-profile
+semantics and system-root behavior. Dynamic metadata and API-key replacement
+use `temporal_core_client_update_metadata`,
+`temporal_core_client_update_binary_metadata`, and
+`temporal_core_client_update_api_key`; those calls synchronously copy their
+inputs. Updating an API key cannot retrofit TLS onto an already-open plaintext
+connection.
+
 The implemented Client slice calls `StartWorkflowExecution` and
 `GetWorkflowExecutionHistory` through `temporal_core_client_rpc_call`. Odin
 constructs the WorkflowService request protobufs, generates a UUIDv4 request
@@ -563,6 +585,9 @@ temporal_core_runtime_free
 temporal_core_byte_array_free
 temporal_core_client_connect
 temporal_core_client_free
+temporal_core_client_update_metadata
+temporal_core_client_update_binary_metadata
+temporal_core_client_update_api_key
 temporal_core_client_rpc_call
 temporal_core_worker_new
 temporal_core_worker_validate

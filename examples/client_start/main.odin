@@ -28,13 +28,75 @@ Typed_Greeting_Output :: struct {
 }
 
 run :: proc() -> int {
-	client, connect_error := temporal_client.connect()
+	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
+		key = "x-odin-sdk",
+		value = transmute([]u8)string("client-start"),
+	}}
+	connection_binary_value := [?]u8{0x4f, 0x44, 0x49, 0x4e}
+	connection_binary_metadata := [?]temporal_client.RPC_Metadata_Entry{{
+		key = "x-odin-sdk-bin",
+		value = connection_binary_value[:],
+	}}
+	connection_retry := temporal_client.Client_Retry_Options{
+		initial_interval = 100 * time.Millisecond,
+		randomization_factor = 0.2,
+		multiplier = 1.7,
+		maximum_interval = 5 * time.Second,
+		maximum_elapsed_time = 10 * time.Second,
+		maximum_retries = 10,
+	}
+	connection_keep_alive := temporal_client.Keep_Alive_Options{
+		interval = 30 * time.Second,
+		timeout = 15 * time.Second,
+	}
+	connection_dns := temporal_client.DNS_Load_Balancing_Options{
+		resolution_interval = 30 * time.Second,
+	}
+	client, connect_error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		identity = "temporal-sdk-odin-client-example",
+		metadata = connection_metadata[:],
+		binary_metadata = connection_binary_metadata[:],
+		retry = &connection_retry,
+		keep_alive = &connection_keep_alive,
+		dns_load_balancing = &connection_dns,
+		grpc_compression = .Gzip,
+		payloads_warn_size = 512 * 1024,
+		memo_warn_size = 2 * 1024,
+	})
 	if connect_error.message != nil {
 		fmt.eprintf("Temporal client connection failed: %s\n", string(connect_error.message))
 		temporal_client.error_free(&connect_error)
 		return 1
 	}
 	defer temporal_client.close(&client)
+	updated_metadata := [?]temporal_client.RPC_Metadata_Entry{{
+		key = "x-odin-sdk",
+		value = transmute([]u8)string("client-start-updated"),
+	}}
+	metadata_error := temporal_client.update_rpc_metadata(
+		&client,
+		updated_metadata[:],
+		connection_binary_metadata[:],
+	)
+	if metadata_error.message != nil {
+		fmt.eprintf("Temporal client metadata update failed: %s\n", string(metadata_error.message))
+		temporal_client.error_free(&metadata_error)
+		return 1
+	}
+	api_key_error := temporal_client.update_api_key(&client, "integration-smoke-key")
+	if api_key_error.message != nil {
+		fmt.eprintf("Temporal client API-key update failed: %s\n", string(api_key_error.message))
+		temporal_client.error_free(&api_key_error)
+		return 1
+	}
+	api_key_error = temporal_client.update_api_key(&client, "")
+	if api_key_error.message != nil {
+		fmt.eprintf("Temporal client API-key clear failed: %s\n", string(api_key_error.message))
+		temporal_client.error_free(&api_key_error)
+		return 1
+	}
 
 	env_buffer: [128]u8
 	workflow_id := os.get_env(env_buffer[:], "TEMPORAL_CLIENT_WORKFLOW_ID")

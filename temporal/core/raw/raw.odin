@@ -81,6 +81,37 @@ Client_Grpc_Compression :: enum c.int {
 
 Client_Grpc_Override_Callback :: #type proc "c" (request, user_data: rawptr)
 
+Client_TLS_Options :: struct {
+	server_root_ca_cert: Byte_Array_Ref,
+	domain:              Byte_Array_Ref,
+	client_cert:         Byte_Array_Ref,
+	client_private_key:  Byte_Array_Ref,
+}
+
+Client_Retry_Options :: struct {
+	initial_interval_millis: u64,
+	randomization_factor:    f64,
+	multiplier:              f64,
+	max_interval_millis:     u64,
+	max_elapsed_time_millis: u64,
+	max_retries:             uintptr,
+}
+
+Client_Keep_Alive_Options :: struct {
+	interval_millis: u64,
+	timeout_millis:  u64,
+}
+
+Client_HTTP_Connect_Proxy_Options :: struct {
+	target_host: Byte_Array_Ref,
+	username:    Byte_Array_Ref,
+	password:    Byte_Array_Ref,
+}
+
+Client_DNS_Load_Balancing_Options :: struct {
+	resolution_interval_millis: u64,
+}
+
 Connection_Options :: struct {
 	target_url:                       Byte_Array_Ref,
 	client_name:                      Byte_Array_Ref,
@@ -89,13 +120,13 @@ Connection_Options :: struct {
 	binary_metadata:                  Metadata_Ref,
 	api_key:                          Byte_Array_Ref,
 	identity:                         Byte_Array_Ref,
-	tls_options:                      rawptr,
-	retry_options:                    rawptr,
-	keep_alive_options:               rawptr,
-	http_connect_proxy_options:       rawptr,
+	tls_options:                      ^Client_TLS_Options,
+	retry_options:                    ^Client_Retry_Options,
+	keep_alive_options:               ^Client_Keep_Alive_Options,
+	http_connect_proxy_options:       ^Client_HTTP_Connect_Proxy_Options,
 	grpc_override_callback:           Client_Grpc_Override_Callback,
 	grpc_override_callback_user_data: rawptr,
-	dns_load_balancing_options:       rawptr,
+	dns_load_balancing_options:       ^Client_DNS_Load_Balancing_Options,
 	grpc_compression:                 Client_Grpc_Compression,
 	payloads_warn_size:               u64,
 	memo_warn_size:                   u64,
@@ -284,8 +315,16 @@ when size_of(uintptr) == 8 {
 	#assert(size_of(Runtime_Options) == 40)
 	#assert(offset_of(Runtime_Options, disable_environment_info) == 32)
 	#assert(size_of(Connection_Options) == 192)
+	#assert(offset_of(Connection_Options, tls_options) == 112)
 	#assert(offset_of(Connection_Options, grpc_compression) == 168)
 	#assert(offset_of(Connection_Options, memo_warn_size) == 184)
+	#assert(size_of(Client_TLS_Options) == 64)
+	#assert(offset_of(Client_TLS_Options, client_private_key) == 48)
+	#assert(size_of(Client_Retry_Options) == 48)
+	#assert(offset_of(Client_Retry_Options, max_retries) == 40)
+	#assert(size_of(Client_Keep_Alive_Options) == 16)
+	#assert(size_of(Client_HTTP_Connect_Proxy_Options) == 48)
+	#assert(size_of(Client_DNS_Load_Balancing_Options) == 8)
 	#assert(size_of(Rpc_Call_Options) == 96)
 	#assert(offset_of(Rpc_Call_Options, retry) == 40)
 	#assert(offset_of(Rpc_Call_Options, cancellation_token) == 88)
@@ -322,6 +361,9 @@ foreign temporal_core {
 		callback: Client_Connect_Callback,
 	) ---
 	client_free       :: proc(client: ^Connection) ---
+	client_update_metadata :: proc(client: ^Connection, metadata: Metadata_Ref) ---
+	client_update_binary_metadata :: proc(client: ^Connection, metadata: Metadata_Ref) ---
+	client_update_api_key :: proc(client: ^Connection, api_key: Byte_Array_Ref) ---
 	client_rpc_call   :: proc(
 		client: ^Connection,
 		options: ^Rpc_Call_Options,

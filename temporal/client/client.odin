@@ -115,14 +115,40 @@ connect :: proc(
 	target_url := "http://localhost:7233",
 	namespace := "default",
 ) -> (client: Client, error: Error) {
-	if len(target_url) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Temporal target URL must not be empty")
-	}
-	if len(namespace) == 0 {
+	return connect_with_options({target_url = target_url, namespace = namespace})
+}
+
+connect_with_options :: proc(options: Connect_Options) -> (client: Client, error: Error) {
+	if len(options.namespace) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
 	}
+	identity := options.identity
+	if len(identity) == 0 {
+		identity = "temporal-sdk-odin@local"
+	}
+	core_options := temporal_core.Client_Connection_Options{
+		target_url = options.target_url,
+		client_name = "temporal-sdk-odin",
+		client_version = "0.0.1-experimental",
+		identity = identity,
+		metadata = options.metadata,
+		binary_metadata = options.binary_metadata,
+		api_key = options.api_key,
+		tls = options.tls,
+		retry = options.retry,
+		keep_alive = options.keep_alive,
+		http_connect_proxy = options.http_connect_proxy,
+		dns_load_balancing = options.dns_load_balancing,
+		grpc_compression = options.grpc_compression,
+		payloads_warn_size = options.payloads_warn_size,
+		memo_warn_size = options.memo_warn_size,
+	}
+	validation_error := temporal_core.client_connection_options_validate(core_options)
+	if validation_error.message != nil {
+		return {}, error_from_core(&validation_error, .Invalid_Argument)
+	}
 	heap := allocator_runtime.heap_allocator()
-	owned_namespace, allocation_error := strings.clone(namespace, heap)
+	owned_namespace, allocation_error := strings.clone(options.namespace, heap)
 	if allocation_error != nil {
 		return {}, error_from_string(.Connection, "could not allocate Temporal namespace")
 	}
@@ -136,7 +162,7 @@ connect :: proc(
 	}
 	runtime^ = created_runtime
 	connection := new(temporal_core.Client, heap)
-	created_connection, connect_error := temporal_core.client_connect(runtime, target_url)
+	created_connection, connect_error := temporal_core.client_connect_with_options(runtime, core_options)
 	if connect_error.message != nil {
 		temporal_core.runtime_close(runtime)
 		free(connection, heap)
