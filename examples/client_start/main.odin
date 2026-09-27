@@ -87,6 +87,93 @@ run :: proc() -> int {
 		)
 		return 0
 	}
+	if scenario == "workflow-properties" {
+		metadata := temporal_client.Start_Metadata{}
+		metadata_init_error := temporal_client.start_metadata_init(&metadata)
+		if metadata_init_error.message != nil {
+			fmt.eprintf("Workflow metadata initialization failed: %s\n", string(metadata_init_error.message))
+			temporal_client.error_free(&metadata_init_error)
+			return 1
+		}
+		temporal_client.error_free(&metadata_init_error)
+		defer temporal_client.start_metadata_free(&metadata)
+		header_error := temporal_client.start_metadata_add_header_json(
+			&metadata,
+			"odin-header",
+			"client-header",
+		)
+		if header_error.message != nil {
+			fmt.eprintf("Workflow header encoding failed: %s\n", string(header_error.message))
+			temporal_client.error_free(&header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		memo_error := temporal_client.start_metadata_add_memo_json(
+			&metadata,
+			"odin-start",
+			"before",
+		)
+		if memo_error.message != nil {
+			fmt.eprintf("Workflow memo encoding failed: %s\n", string(memo_error.message))
+			temporal_client.error_free(&memo_error)
+			return 1
+		}
+		temporal_client.error_free(&memo_error)
+		search_error := temporal_client.start_metadata_add_search_attribute_json(
+			&metadata,
+			"OdinSdkKeyword",
+			.Keyword,
+			"before",
+		)
+		if search_error.message != nil {
+			fmt.eprintf("Search Attribute encoding failed: %s\n", string(search_error.message))
+			temporal_client.error_free(&search_error)
+			return 1
+		}
+		temporal_client.error_free(&search_error)
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_workflow_properties",
+			workflow_id,
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+				metadata = &metadata,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties start failed (status=%d): %s\n",
+				start_error.status_code,
+				string(start_error.message),
+			)
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties result failed (kind=%v status=%d): %s\n",
+				result_error.kind,
+				result_error.status_code,
+				string(result_error.message),
+			)
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed workflow-properties workflow_id=%s result=%q\n",
+			workflow_id,
+			result,
+		)
+		return 0
+	}
 	handle, start_error := temporal_client.start_workflow_json(
 		&client,
 		"odin_typed_workflow",

@@ -4,6 +4,7 @@ package client
 import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:encoding/uuid"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
@@ -181,6 +182,228 @@ Start_Workflow_Options :: struct {
 	workflow_execution_timeout: time.Duration,
 	workflow_run_timeout:       time.Duration,
 	workflow_task_timeout:      time.Duration,
+	metadata:                   ^Start_Metadata,
+}
+
+Search_Attribute_Type :: codec.Search_Attribute_Type
+
+Start_Metadata_Named_Payload :: struct {
+	key:     string,
+	payload: codec.Payload,
+}
+
+Start_Metadata_Search_Attribute :: struct {
+	key:            string,
+	attribute_type: Search_Attribute_Type,
+	payload:        codec.Payload,
+}
+
+// Start_Metadata explicitly owns cloned header, memo, and Search Attribute
+// Payloads. Initialize it before adding values and free it after the synchronous
+// start call returns.
+Start_Metadata :: struct {
+	headers:           [dynamic]Start_Metadata_Named_Payload,
+	memo:              [dynamic]Start_Metadata_Named_Payload,
+	search_attributes: [dynamic]Start_Metadata_Search_Attribute,
+	allocator:         mem.Allocator,
+}
+
+start_metadata_init :: proc(
+	metadata: ^Start_Metadata,
+	allocator := context.allocator,
+) -> Error {
+	if metadata == nil || allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata requires an allocator")
+	}
+	if metadata.allocator.procedure != nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is already initialized")
+	}
+	metadata.headers = make([dynamic]Start_Metadata_Named_Payload, allocator)
+	metadata.memo = make([dynamic]Start_Metadata_Named_Payload, allocator)
+	metadata.search_attributes = make([dynamic]Start_Metadata_Search_Attribute, allocator)
+	metadata.allocator = allocator
+	return {}
+}
+
+start_metadata_free :: proc(metadata: ^Start_Metadata) {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return
+	}
+	allocator := metadata.allocator
+	for &entry in metadata.headers {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	for &entry in metadata.memo {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	for &entry in metadata.search_attributes {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	delete(metadata.headers)
+	delete(metadata.memo)
+	delete(metadata.search_attributes)
+	metadata^ = {}
+}
+
+start_metadata_put_named_owned :: proc(
+	entries: ^[dynamic]Start_Metadata_Named_Payload,
+	key: string,
+	payload: codec.Payload,
+	allocator: mem.Allocator,
+) -> Error {
+	owned_payload := payload
+	if len(key) == 0 {
+		codec.payload_free(&owned_payload)
+		return error_from_string(.Invalid_Argument, "Workflow metadata key must not be empty")
+	}
+	for &entry in entries^ {
+		if entry.key == key {
+			codec.payload_free(&entry.payload)
+			entry.payload = owned_payload
+			return {}
+		}
+	}
+	owned_key, key_error := strings.clone(key, allocator)
+	if key_error != nil {
+		codec.payload_free(&owned_payload)
+		return error_from_string(.Payload_Conversion, "could not allocate Workflow metadata key")
+	}
+	append(entries, Start_Metadata_Named_Payload{key = owned_key, payload = owned_payload})
+	return {}
+}
+
+start_metadata_add_named_payload :: proc(
+	metadata: ^Start_Metadata,
+	entries: ^[dynamic]Start_Metadata_Named_Payload,
+	key: string,
+	value: codec.Payload_View,
+) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil || entries == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, clone_error := codec.payload_clone(value, metadata.allocator)
+	if clone_error != .None {
+		return error_from_string(.Payload_Conversion, "could not clone Workflow metadata Payload")
+	}
+	return start_metadata_put_named_owned(entries, key, payload, metadata.allocator)
+}
+
+start_metadata_add_header_payload :: proc(
+	metadata: ^Start_Metadata,
+	key: string,
+	value: codec.Payload_View,
+) -> Error {
+	if metadata == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	return start_metadata_add_named_payload(metadata, &metadata.headers, key, value)
+}
+
+start_metadata_add_header_json :: proc(metadata: ^Start_Metadata, key: string, value: $T) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, metadata.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow header")
+	}
+	return start_metadata_put_named_owned(&metadata.headers, key, payload, metadata.allocator)
+}
+
+start_metadata_add_memo_payload :: proc(
+	metadata: ^Start_Metadata,
+	key: string,
+	value: codec.Payload_View,
+) -> Error {
+	if metadata == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	return start_metadata_add_named_payload(metadata, &metadata.memo, key, value)
+}
+
+start_metadata_add_memo_json :: proc(metadata: ^Start_Metadata, key: string, value: $T) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, metadata.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow memo")
+	}
+	return start_metadata_put_named_owned(&metadata.memo, key, payload, metadata.allocator)
+}
+
+start_metadata_put_search_owned :: proc(
+	metadata: ^Start_Metadata,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	payload: codec.Payload,
+) -> Error {
+	owned_payload := payload
+	if len(key) == 0 {
+		codec.payload_free(&owned_payload)
+		return error_from_string(.Invalid_Argument, "Search Attribute key must not be empty")
+	}
+	if codec.payload_set_search_attribute_type(&owned_payload, attribute_type) != .None {
+		codec.payload_free(&owned_payload)
+		return error_from_string(.Payload_Conversion, "could not encode Search Attribute type")
+	}
+	for &entry in metadata.search_attributes {
+		if entry.key == key {
+			codec.payload_free(&entry.payload)
+			entry.attribute_type = attribute_type
+			entry.payload = owned_payload
+			return {}
+		}
+	}
+	owned_key, key_error := strings.clone(key, metadata.allocator)
+	if key_error != nil {
+		codec.payload_free(&owned_payload)
+		return error_from_string(.Payload_Conversion, "could not allocate Search Attribute key")
+	}
+	append(
+		&metadata.search_attributes,
+		Start_Metadata_Search_Attribute{
+			key = owned_key,
+			attribute_type = attribute_type,
+			payload = owned_payload,
+		},
+	)
+	return {}
+}
+
+start_metadata_add_search_attribute_payload :: proc(
+	metadata: ^Start_Metadata,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: codec.Payload_View,
+) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, clone_error := codec.payload_clone(value, metadata.allocator)
+	if clone_error != .None {
+		return error_from_string(.Payload_Conversion, "could not clone Search Attribute Payload")
+	}
+	return start_metadata_put_search_owned(metadata, key, attribute_type, payload)
+}
+
+start_metadata_add_search_attribute_json :: proc(
+	metadata: ^Start_Metadata,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: $T,
+) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, metadata.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Search Attribute")
+	}
+	return start_metadata_put_search_owned(metadata, key, attribute_type, payload)
 }
 
 Workflow_Handle :: struct {
@@ -272,27 +495,41 @@ duration_proto :: proc(value: time.Duration) -> proto.Google_Protobuf_Duration {
 	}
 }
 
-start_workflow_payload :: proc(
-	client: ^Client,
+free_start_proto_payloads :: proc(payloads: []proto.Temporal_Api_Common_V1_Payload) {
+	for &payload in payloads {
+		delete(payload.metadata)
+		delete(payload.external_payloads)
+	}
+	delete(payloads)
+}
+
+// encode_start_workflow_request is the deterministic request-construction
+// boundary used by the Client and wire-contract tests. Returned bytes are owned
+// by the caller.
+encode_start_workflow_request :: proc(
+	namespace: string,
 	workflow_type: string,
 	input: codec.Payload_View,
 	options: Start_Workflow_Options,
-) -> (handle: Workflow_Handle, error: Error) {
-	if client == nil || client.connection == nil || client.connection.handle == nil {
-		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
 	}
 	if len(workflow_type) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow type must not be empty")
+		return nil, error_from_string(.Invalid_Argument, "Workflow type must not be empty")
 	}
 	if len(options.id) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow ID must not be empty")
+		return nil, error_from_string(.Invalid_Argument, "Workflow ID must not be empty")
 	}
 	if len(options.task_queue) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow task queue must not be empty")
+		return nil, error_from_string(.Invalid_Argument, "Workflow task queue must not be empty")
 	}
 	if options.workflow_execution_timeout < 0 || options.workflow_run_timeout < 0 ||
 	   options.workflow_task_timeout < 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow timeouts must not be negative")
+		return nil, error_from_string(.Invalid_Argument, "Workflow timeouts must not be negative")
+	}
+	if options.metadata != nil && options.metadata.allocator.procedure == nil {
+		return nil, error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
 	}
 
 	request_id := options.request_id
@@ -310,7 +547,7 @@ start_workflow_payload :: proc(
 	append(&inputs.payloads, payload)
 
 	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{
-		namespace = client.namespace,
+		namespace = namespace,
 		workflow_id = options.id,
 		workflow_type = &workflow_type_value,
 		task_queue = &task_queue,
@@ -331,7 +568,94 @@ start_workflow_payload :: proc(
 		request.workflow_task_timeout = &task_timeout
 	}
 
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(&request)
+	header := proto.Temporal_Api_Common_V1_Header{}
+	memo := proto.Temporal_Api_Common_V1_Memo{}
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	memo_payloads: []proto.Temporal_Api_Common_V1_Payload
+	search_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer delete(memo.fields)
+	defer delete(search_attributes.indexed_fields)
+	defer free_start_proto_payloads(header_payloads)
+	defer free_start_proto_payloads(memo_payloads)
+	defer free_start_proto_payloads(search_payloads)
+	if options.metadata != nil {
+		metadata := options.metadata
+		if len(metadata.headers) > 0 {
+			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.headers))
+			for &entry, index in metadata.headers {
+				header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.headers {
+				append(
+					&header.fields,
+					proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+						key = entry.key,
+						value = &header_payloads[index],
+					},
+				)
+			}
+			request.header = &header
+		}
+		if len(metadata.memo) > 0 {
+			memo_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.memo))
+			for &entry, index in metadata.memo {
+				memo_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.memo {
+				append(
+					&memo.fields,
+					proto.Temporal_Api_Common_V1_Memo_FieldsEntry{
+						key = entry.key,
+						value = &memo_payloads[index],
+					},
+				)
+			}
+			request.memo = &memo
+		}
+		if len(metadata.search_attributes) > 0 {
+			search_payloads = make(
+				[]proto.Temporal_Api_Common_V1_Payload,
+				len(metadata.search_attributes),
+			)
+			for &entry, index in metadata.search_attributes {
+				search_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.search_attributes {
+				append(
+					&search_attributes.indexed_fields,
+					proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+						key = entry.key,
+						value = &search_payloads[index],
+					},
+				)
+			}
+			request.search_attributes = &search_attributes
+		}
+	}
+
+	return proto.encode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(&request), {}
+}
+
+start_workflow_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Start_Workflow_Options,
+) -> (handle: Workflow_Handle, error: Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	request_bytes, request_error := encode_start_workflow_request(
+		client.namespace,
+		workflow_type,
+		input,
+		options,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
 	defer delete(request_bytes)
 	rpc_result := temporal_core.client_rpc_call(
 		client.connection,

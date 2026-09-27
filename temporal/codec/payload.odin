@@ -15,6 +15,32 @@ External_Payload_Details :: struct {
 	size_bytes: i64,
 }
 
+// Search Attribute types are represented by Temporal's canonical Payload
+// metadata strings. Keeping the mapping in the codec layer lets Client and
+// Workflow APIs share it without depending on one another.
+Search_Attribute_Type :: enum {
+	Bool,
+	Int,
+	Double,
+	Keyword,
+	Text,
+	Datetime,
+	Keyword_List,
+}
+
+search_attribute_type_name :: proc(value: Search_Attribute_Type) -> string {
+	switch value {
+	case .Bool:         return "Bool"
+	case .Int:          return "Int"
+	case .Double:       return "Double"
+	case .Keyword:      return "Keyword"
+	case .Text:         return "Text"
+	case .Datetime:     return "Datetime"
+	case .Keyword_List: return "KeywordList"
+	}
+	return ""
+}
+
 Payload_View :: struct {
 	metadata:          []Metadata_Entry,
 	data:              []u8,
@@ -95,6 +121,17 @@ payload_add_external :: proc(payload: ^Payload, size_bytes: i64) -> Error {
 	}
 	append(&payload.external_payloads, External_Payload_Details{size_bytes = size_bytes})
 	return .None
+}
+
+payload_set_search_attribute_type :: proc(
+	payload: ^Payload,
+	attribute_type: Search_Attribute_Type,
+) -> Error {
+	return payload_add_metadata(
+		payload,
+		"type",
+		transmute([]u8)search_attribute_type_name(attribute_type),
+	)
 }
 
 payload_clone :: proc(view: Payload_View, allocator := context.allocator) -> (payload: Payload, error: Error) {

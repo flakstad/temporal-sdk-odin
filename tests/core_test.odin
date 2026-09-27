@@ -1962,6 +1962,12 @@ workflow_info_memo_and_search_attributes_replay_identically :: proc(t: ^testing.
 	proto_input := proto.encode_payload(codec.payload_view(&input))
 	defer delete(proto_input.metadata)
 	defer delete(proto_input.external_payloads)
+	header, header_error := codec.encode_json("header-value")
+	testing.expect(t, header_error == .None)
+	defer codec.payload_free(&header)
+	proto_header := proto.encode_payload(codec.payload_view(&header))
+	defer delete(proto_header.metadata)
+	defer delete(proto_header.external_payloads)
 	old_memo, old_memo_error := codec.encode_json("before")
 	testing.expect(t, old_memo_error == .None)
 	defer codec.payload_free(&old_memo)
@@ -2055,7 +2061,15 @@ workflow_info_memo_and_search_attributes_replay_identically :: proc(t: ^testing.
 		original_execution_run_id = "original-run",
 	}
 	defer delete(initialize.arguments)
+	defer delete(initialize.headers)
 	append(&initialize.arguments, proto_input)
+	append(
+		&initialize.headers,
+		proto.Coresdk_Workflow_Activation_InitializeWorkflow_HeadersEntry{
+			key = "test-header",
+			value = &proto_header,
+		},
+	)
 	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
 		run_id = "properties-run",
 		history_length = 3,
@@ -3092,6 +3106,11 @@ workflow_properties_test_workflow :: proc(
 	   info.priority.priority_key != 7 || info.priority.fairness_key != "tenant-a" ||
 	   info.priority.fairness_weight != 1.5 {
 		return "Workflow info mismatch"
+	}
+	initial_header: string
+	header_found, header_error := workflow.header_json(ctx, "test-header", &initial_header)
+	if !header_found || header_error != .None || initial_header != "header-value" {
+		return "initial header mismatch"
 	}
 	initial_memo: string
 	memo_found, memo_error := workflow.memo_json(ctx, "old-memo", &initial_memo)
@@ -4277,6 +4296,141 @@ client_close_event_result_owns_payload_after_decode :: proc(t: ^testing.T) {
 	testing.expect_value(t, actual.name, expected.name)
 	testing.expect_value(t, actual.count, expected.count)
 	testing.expect_value(t, actual.enabled, expected.enabled)
+}
+
+@(test)
+client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
+	metadata := temporal_client.Start_Metadata{}
+	init_error := temporal_client.start_metadata_init(&metadata)
+	testing.expect(t, init_error.message == nil)
+	temporal_client.error_free(&init_error)
+	defer temporal_client.start_metadata_free(&metadata)
+
+	header, header_encode_error := codec.encode_json("client-header")
+	testing.expect(t, header_encode_error == .None)
+	header_error := temporal_client.start_metadata_add_header_payload(
+		&metadata,
+		"odin-header",
+		codec.payload_view(&header),
+	)
+	codec.payload_free(&header)
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	memo_error := temporal_client.start_metadata_add_memo_json(
+		&metadata,
+		"odin-start",
+		"before",
+	)
+	testing.expect(t, memo_error.message == nil)
+	temporal_client.error_free(&memo_error)
+	memo_replace_error := temporal_client.start_metadata_add_memo_json(
+		&metadata,
+		"odin-start",
+		"after",
+	)
+	testing.expect(t, memo_replace_error.message == nil)
+	temporal_client.error_free(&memo_replace_error)
+	search_error := temporal_client.start_metadata_add_search_attribute_json(
+		&metadata,
+		"OdinSdkKeyword",
+		.Keyword,
+		"blue",
+	)
+	testing.expect(t, search_error.message == nil)
+	temporal_client.error_free(&search_error)
+
+	input, input_error := codec.encode_json("start-input")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	request_bytes, request_error := temporal_client.encode_start_workflow_request(
+		"orders-namespace",
+		"order_workflow",
+		codec.payload_view(&input),
+		{
+			id = "order-42",
+			task_queue = "orders",
+			request_id = "request-42",
+			workflow_execution_timeout = 24 * time.Hour,
+			workflow_run_timeout = time.Hour,
+			workflow_task_timeout = 10 * time.Second,
+			metadata = &metadata,
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "orders-namespace")
+	testing.expect_value(t, request.workflow_id, "order-42")
+	testing.expect_value(t, request.workflow_type.name, "order_workflow")
+	testing.expect_value(t, request.task_queue.name, "orders")
+	testing.expect_value(t, request.request_id, "request-42")
+	testing.expect_value(t, request.workflow_execution_timeout.seconds, i64(86_400))
+	testing.expect_value(t, request.workflow_run_timeout.seconds, i64(3_600))
+	testing.expect_value(t, request.workflow_task_timeout.seconds, i64(10))
+	testing.expect(t, request.header != nil)
+	testing.expect_value(t, len(request.header.fields), 1)
+	testing.expect_value(t, request.header.fields[0].key, "odin-header")
+	owned_header, owned_header_error := proto.clone_payload(request.header.fields[0].value)
+	defer codec.payload_free(&owned_header)
+	testing.expect(t, owned_header_error == .None)
+	decoded_header: string
+	defer delete(decoded_header)
+	testing.expect(
+		t,
+		codec.decode_json(codec.payload_view(&owned_header), &decoded_header) == .None,
+	)
+	testing.expect_value(t, decoded_header, "client-header")
+	testing.expect(t, request.memo != nil)
+	testing.expect_value(t, len(request.memo.fields), 1)
+	testing.expect_value(t, request.memo.fields[0].key, "odin-start")
+	owned_memo, owned_memo_error := proto.clone_payload(request.memo.fields[0].value)
+	defer codec.payload_free(&owned_memo)
+	testing.expect(t, owned_memo_error == .None)
+	decoded_memo: string
+	defer delete(decoded_memo)
+	testing.expect(
+		t,
+		codec.decode_json(codec.payload_view(&owned_memo), &decoded_memo) == .None,
+	)
+	testing.expect_value(t, decoded_memo, "after")
+	testing.expect(t, request.search_attributes != nil)
+	testing.expect_value(t, len(request.search_attributes.indexed_fields), 1)
+	search := request.search_attributes.indexed_fields[0]
+	testing.expect_value(t, search.key, "OdinSdkKeyword")
+	owned_search, owned_search_error := proto.clone_payload(search.value)
+	defer codec.payload_free(&owned_search)
+	testing.expect(t, owned_search_error == .None)
+	decoded_search: string
+	defer delete(decoded_search)
+	testing.expect(t, codec.decode_json(codec.payload_view(&owned_search), &decoded_search) == .None)
+	testing.expect_value(t, decoded_search, "blue")
+	type_metadata, type_found := codec.metadata_get(codec.payload_view(&owned_search), "type")
+	testing.expect(t, type_found)
+	testing.expect_value(t, string(type_metadata), "Keyword")
+
+	uninitialized := temporal_client.Start_Metadata{}
+	invalid_bytes, invalid_error := temporal_client.encode_start_workflow_request(
+		"default",
+		"order_workflow",
+		codec.payload_view(&input),
+		{id = "invalid", task_queue = "orders", metadata = &uninitialized},
+	)
+	defer delete(invalid_bytes)
+	defer temporal_client.error_free(&invalid_error)
+	testing.expect(t, invalid_error.kind == .Invalid_Argument)
 }
 
 @(test)

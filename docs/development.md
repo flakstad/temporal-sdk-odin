@@ -353,6 +353,37 @@ the Client. Free handles before closing the Client. `start_workflow_payload`
 and `get_result_payload` are the codec-neutral forms; JSON helpers currently
 represent one Workflow argument and one result Payload.
 
+Initial Payload maps use a separate owned builder:
+
+```odin
+metadata := temporal_client.Start_Metadata{}
+_ = temporal_client.start_metadata_init(&metadata)
+defer temporal_client.start_metadata_free(&metadata)
+
+_ = temporal_client.start_metadata_add_header_json(&metadata, "trace-id", trace_id)
+_ = temporal_client.start_metadata_add_memo_json(&metadata, "customer", customer_id)
+_ = temporal_client.start_metadata_add_search_attribute_json(
+    &metadata,
+    "OrderStatus",
+    .Keyword,
+    "pending",
+)
+
+handle, start_error := temporal_client.start_workflow_json(
+    &client,
+    "greeting_workflow",
+    input,
+    {id = "greeting-42", task_queue = "greetings", metadata = &metadata},
+)
+```
+
+The builder records its allocator and owns cloned keys/Payloads. Payload helpers
+accept borrowed codec views, JSON helpers encode directly into builder-owned
+storage, and adding the same key again frees and replaces the previous value.
+`Start_Workflow_Options` borrows the builder only for request encoding. Search
+Attribute helpers replace/add Temporal's canonical `type` Payload metadata;
+the custom field itself must already be registered in the namespace.
+
 Start uses a UUIDv4 request ID when the caller omits one. Zero duration means
 unspecified; negative execution/run/task timeouts are rejected before RPC.
 Result retrieval issues a blocking close-event long poll with no local timeout,
@@ -609,6 +640,10 @@ read-after-write, command counts, eviction, and byte-identical fresh-stack
 replay. The focused unit test additionally checks every exposed `workflow.Info`
 field and decodes the exact `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` payloads and type metadata.
+Another 500-case property generates Client start headers, memo, Search
+Attributes, raw Payload bytes, keys, and all seven Temporal type labels. It
+frees each source Payload before request encoding, then decodes the complete
+`StartWorkflowExecutionRequest` to prove builder ownership and wire fidelity.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
@@ -801,19 +836,16 @@ temporal operator search-attribute create \
 TEMPORAL_ODIN_SCENARIO=workflow-properties \
 ./scripts/run-hello-workflow.sh
 
-temporal workflow execute \
-  --workflow-id odin-properties-manual \
-  --type odin_workflow_properties \
-  --task-queue odin-hello-workflow \
-  --input '"odin-properties-manual"' \
-  --memo 'odin-start="before"' \
-  --search-attribute 'OdinSdkKeyword="before"'
+TEMPORAL_CLIENT_SCENARIO=workflow-properties \
+TEMPORAL_CLIENT_WORKFLOW_ID=odin-properties-manual \
+./scripts/run-client-start.sh
 ```
 
 The registration command is only needed for a new dev server. The Workflow
-returns `Workflow properties updated`; its history contains two memo-property
-events (one upsert and one empty-Payload removal) and one Search Attribute
-upsert event.
+reads the Odin Client's header, memo, and Search Attribute and returns
+`Workflow properties updated`; its history contains two memo-property events
+(one upsert and one empty-Payload removal) and one Search Attribute upsert
+event.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

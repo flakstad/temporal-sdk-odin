@@ -166,6 +166,147 @@ client_close_events_preserve_generated_results :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+generated_search_attribute_type :: proc(value: int) -> codec.Search_Attribute_Type {
+	switch value {
+	case 0: return .Bool
+	case 1: return .Int
+	case 2: return .Double
+	case 3: return .Keyword
+	case 4: return .Text
+	case 5: return .Datetime
+	case 6: return .Keyword_List
+	}
+	return .Keyword
+}
+
+client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
+	header_key := pbt.draw(t, pbt.string_ascii(1, 24))
+	memo_key := pbt.draw(t, pbt.string_ascii(1, 24))
+	search_key := pbt.draw(t, pbt.string_ascii(1, 24))
+	header_value := pbt.draw(t, pbt.string_ascii(0, 48))
+	memo_value := pbt.draw(t, pbt.string_ascii(0, 48))
+	search_value := pbt.draw(t, pbt.string_ascii(0, 48))
+	type_case := pbt.draw(t, pbt.int_range(0, 6))
+	attribute_type := generated_search_attribute_type(type_case)
+	pbt.cover(t, type_case == 0, 5.0, "Bool Search Attribute metadata")
+	pbt.cover(t, type_case == 6, 5.0, "KeywordList Search Attribute metadata")
+	pbt.cover(t, len(search_value) == 0, 2.0, "empty Search Attribute Payload")
+
+	metadata := temporal_client.Start_Metadata{}
+	init_error := temporal_client.start_metadata_init(&metadata)
+	if init_error.message != nil {
+		temporal_client.error_free(&init_error)
+		return pbt.error("could not initialize generated Client start metadata")
+	}
+	temporal_client.error_free(&init_error)
+	defer temporal_client.start_metadata_free(&metadata)
+
+	header := codec.payload_create(transmute([]u8)header_value)
+	memo := codec.payload_create(transmute([]u8)memo_value)
+	search := codec.payload_create(transmute([]u8)search_value)
+	if codec.payload_add_metadata(&header, "encoding", transmute([]u8)string("binary/test")) != .None ||
+	   codec.payload_add_metadata(&memo, "encoding", transmute([]u8)string("binary/test")) != .None ||
+	   codec.payload_add_metadata(&search, "encoding", transmute([]u8)string("binary/test")) != .None {
+		codec.payload_free(&header)
+		codec.payload_free(&memo)
+		codec.payload_free(&search)
+		return pbt.error("could not prepare generated Client start Payloads")
+	}
+	header_error := temporal_client.start_metadata_add_header_payload(
+		&metadata,
+		header_key,
+		codec.payload_view(&header),
+	)
+	memo_error := temporal_client.start_metadata_add_memo_payload(
+		&metadata,
+		memo_key,
+		codec.payload_view(&memo),
+	)
+	search_error := temporal_client.start_metadata_add_search_attribute_payload(
+		&metadata,
+		search_key,
+		attribute_type,
+		codec.payload_view(&search),
+	)
+	codec.payload_free(&header)
+	codec.payload_free(&memo)
+	codec.payload_free(&search)
+	defer temporal_client.error_free(&header_error)
+	defer temporal_client.error_free(&memo_error)
+	defer temporal_client.error_free(&search_error)
+	if header_error.message != nil || memo_error.message != nil || search_error.message != nil {
+		return pbt.error("could not add generated Client start metadata")
+	}
+
+	input := codec.payload_create(transmute([]u8)string("input"))
+	defer codec.payload_free(&input)
+	request_bytes, request_error := temporal_client.encode_start_workflow_request(
+		"generated-namespace",
+		"generated-workflow",
+		codec.payload_view(&input),
+		{
+			id = "generated-workflow-id",
+			task_queue = "generated-queue",
+			request_id = "generated-request-id",
+			metadata = &metadata,
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	if request_error.message != nil {
+		return pbt.fail("generated Client start request did not encode")
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize generated Client request arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || request.header == nil || request.memo == nil ||
+	   request.search_attributes == nil || len(request.header.fields) != 1 ||
+	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 {
+		return pbt.fail("generated Client start metadata did not decode")
+	}
+	header_field := request.header.fields[0]
+	memo_field := request.memo.fields[0]
+	search_field := request.search_attributes.indexed_fields[0]
+	if header_field.value == nil || memo_field.value == nil || search_field.value == nil ||
+	   header_field.key != header_key || memo_field.key != memo_key || search_field.key != search_key ||
+	   string(header_field.value.data) != header_value || string(memo_field.value.data) != memo_value ||
+	   string(search_field.value.data) != search_value {
+		return pbt.fail("generated Client start metadata changed across protobuf encoding")
+	}
+	type_name := ""
+	for entry in search_field.value.metadata {
+		if entry.key == "type" {
+			type_name = string(entry.value)
+		}
+	}
+	if type_name != codec.search_attribute_type_name(attribute_type) {
+		return pbt.fail("generated Search Attribute type metadata changed")
+	}
+	return pbt.pass()
+}
+
+@(test)
+client_start_metadata_preserves_generated_payload_maps :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Client start metadata preserves generated Payload maps",
+		client_start_metadata_wire_property,
+		{num_tests = 500, seed = 0x5354_4152_544d_4554},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 activity_failure_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	failure_type := pbt.draw(t, pbt.string_ascii(1, 32))
 	non_retryable := pbt.draw(t, pbt.boolean())

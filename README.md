@@ -63,8 +63,10 @@ first attempt followed by timer-backed success.
 Workflow initialization metadata is now exposed through borrowed
 `workflow.Info`, including execution identity, attempt/run-chain fields,
 timeouts, start/expiration time, parent/root identity, Retry Policy, priority,
-cron schedule, and continuation cause. Initial and locally updated memo/Search
-Attribute Payloads are readable through codec-neutral and typed JSON helpers.
+cron schedule, and continuation cause. Initial headers plus initial and locally
+updated memo/Search Attribute Payloads are readable through codec-neutral and
+typed JSON helpers. The Odin Client supplies all three initial Payload maps
+through an explicitly owned start-metadata builder.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -207,11 +209,23 @@ The core API is intentionally small:
 client, err := temporal_client.connect()
 defer temporal_client.close(&client)
 
+metadata := temporal_client.Start_Metadata{}
+err = temporal_client.start_metadata_init(&metadata)
+defer temporal_client.start_metadata_free(&metadata)
+err = temporal_client.start_metadata_add_header_json(&metadata, "trace-id", trace_id)
+err = temporal_client.start_metadata_add_memo_json(&metadata, "customer", customer_id)
+err = temporal_client.start_metadata_add_search_attribute_json(
+    &metadata,
+    "OrderStatus",
+    .Keyword,
+    "pending",
+)
+
 handle, err := temporal_client.start_workflow_json(
     &client,
     "order_workflow",
     order,
-    {id = "order-42", task_queue = "orders"},
+    {id = "order-42", task_queue = "orders", metadata = &metadata},
 )
 defer temporal_client.workflow_handle_free(&handle)
 
@@ -224,6 +238,12 @@ owns its ID/run-ID strings but borrows the Client, so handles must be freed
 before `client.close`. An Update handle follows the same rule and owns the
 Workflow/run/Update IDs needed for later polling. The Payload variants expose the codec-neutral boundary;
 the JSON variants currently send and receive exactly one Payload.
+`Start_Metadata` explicitly owns cloned header, memo, and Search Attribute
+Payloads. Its `_payload` methods are codec-neutral; the JSON methods are
+convenience adapters. Options borrow the builder only until the synchronous
+start call returns, so it may be freed immediately afterward. Reusing a key
+replaces its value, and custom Search Attribute names must already exist in the
+Temporal namespace.
 
 Existing executions can be addressed without an RPC when creating the handle:
 

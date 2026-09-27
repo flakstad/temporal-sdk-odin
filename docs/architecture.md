@@ -153,6 +153,15 @@ true`. Core owns gRPC transport and retries. The handle result loop maps
 completed, failed, canceled, terminated, timed-out, and Continue-As-New close
 events, following the next run by default as the current .NET SDK does.
 
+Start requests now accept an explicitly owned `Start_Metadata` builder.
+Codec-neutral and JSON helpers clone named header, memo, and Search Attribute
+Payloads through the builder's recorded allocator; duplicate names replace the
+previous owned value. `Start_Workflow_Options` borrows the builder only while
+the blocking RPC request is encoded. Search Attribute typing shares the codec
+layer's canonical Temporal metadata mapping with the Workflow runtime. A wire
+unit test and 500 generated Payload-map cases decode the resulting
+`StartWorkflowExecutionRequest` and verify every key, byte, and type label.
+
 The same generic bridge now carries `SignalWorkflowExecution`,
 `RequestCancelWorkflowExecution`, and `TerminateWorkflowExecution`. Signals
 support zero or one generic/typed Payload and generate a UUIDv4 request ID for
@@ -726,11 +735,12 @@ completion commands:
 InitializeWorkflow
   +-- identity, Workflow/run/type/attempt and run-chain metadata
   +-- timeouts, start/expiration time, parent/root, Retry Policy, priority
+  +-- Headers<string, Payload>
   +-- Memo<string, Payload>
   `-- SearchAttributes<string, Payload>
 
 Odin Workflow code
-  +-- workflow.info / memo_* / search_attribute_*
+  +-- workflow.info / header_* / memo_* / search_attribute_*
   +-- ModifyWorkflowProperties(upserted_memo)
   `-- UpsertWorkflowSearchAttributes(search_attributes)
 ```
@@ -742,10 +752,11 @@ namespace, so `Info.root.namespace` is empty; parent namespace is preserved
 from Core's `NamespacedWorkflowExecution`. Invalid protobuf durations or
 timestamps fail initialization instead of reaching user code.
 
-Memo and Search Attribute values remain generic `codec.Payload` objects. The
-runtime clones initial maps into the run arena, so they outlive the activation
-decode arena. Raw accessors return borrowed `Payload_View`s and JSON accessors
-are adapters above that boundary. Every successful mutation records an owned
+Headers, memo, and Search Attribute values remain generic `codec.Payload`
+objects. The runtime clones all initial maps into the run arena, so they outlive
+the activation decode arena. Raw accessors return borrowed `Payload_View`s and
+JSON accessors are adapters above that boundary. Headers are read-only Workflow
+inputs. Every successful memo/Search Attribute mutation records an owned
 command value and immediately updates the local map, giving deterministic
 read-after-write behavior in the same Workflow task. Removal uses the upstream
 protobuf contract: the named entry is sent with a default/empty Payload.
@@ -762,7 +773,7 @@ Commands retain call order and are emitted before a terminal Workflow command.
 Fresh-stack replay reconstructs the initial maps and executes the same calls,
 therefore producing byte-identical completion bytes. A 500-case property varies
 keys, values, Keyword/Text selection, upsert/removal sequences, local
-read-after-write, eviction, and replay. The CLI-devserver test observes both
+read-after-write, eviction, and replay. The Odin Client/devserver test observes both
 `EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED` and
 `EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` in real Service history.
 
@@ -1494,8 +1505,10 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, and termination are live-proven, but the
-   public Client still lacks describe/history iteration, query reject conditions, headers,
-   search attributes, memo, retry/options completeness, and failure-detail conversion.
+   public Client still lacks describe/history iteration, query reject conditions,
+   retry/start-policy completeness, and failure-detail conversion. Start headers,
+   memo, and typed Search Attributes are implemented through an explicitly owned
+   metadata builder.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -1524,7 +1537,8 @@ proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
-500 Client close-event/result round trips, 500 query response round trips, and
+500 Client close-event/result round trips, 500 Client start-metadata request
+round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
 signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
@@ -1541,9 +1555,11 @@ the next-run Payload and the main timeout/retry/backoff options through a
 non-returning terminal fiber primitive. Core's patch/versioning protocol is now
 implemented and live-proven. The first Local Activity
 command/dispatch/resolution path and timer-backed `DoBackoff` retries are now
-live-proven. The next smallest runtime extensions are the remaining
-Workflow-information surface and Search Attribute/memo commands,
-while richer recursive failure inspection can proceed independently.
+live-proven. Workflow information, headers, memo, and Search Attribute commands
+are implemented, and the Odin Client supplies all three initial Payload maps
+end-to-end. The next smallest client slice is start-policy completeness (ID
+reuse/conflict, Retry Policy, priority, delay, and cron) plus typed Describe;
+richer recursive failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

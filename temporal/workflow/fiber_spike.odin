@@ -231,15 +231,7 @@ Info :: struct {
 	priority: Workflow_Priority,
 }
 
-Search_Attribute_Type :: enum {
-	Bool,
-	Int,
-	Double,
-	Keyword,
-	Text,
-	Datetime,
-	Keyword_List,
-}
+Search_Attribute_Type :: codec.Search_Attribute_Type
 
 // Activity_Options borrows its strings, slices, and retry_policy only for the
 // start/execute call. The Workflow runtime copies them into the run arena before
@@ -794,6 +786,7 @@ Fiber_Instance :: struct {
 	workflow_type:   string,
 	task_queue:      string,
 	info:            Info,
+	headers:         [dynamic]Fiber_Named_Payload,
 	memo:            [dynamic]Fiber_Named_Payload,
 	search_attributes: [dynamic]Fiber_Named_Payload,
 	property_commands: [dynamic]Fiber_Property_Command,
@@ -1436,6 +1429,24 @@ clone_named_proto_payloads :: proc(
 	return true
 }
 
+clone_named_header_payloads :: proc(
+	entries: []proto.Coresdk_Workflow_Activation_InitializeWorkflow_HeadersEntry,
+	result: ^[dynamic]Fiber_Named_Payload,
+) -> bool {
+	for entry in entries {
+		if len(entry.key) == 0 || entry.value == nil {
+			return false
+		}
+		key, key_error := strings.clone(entry.key)
+		payload, payload_error := proto.clone_payload(entry.value)
+		if key_error != nil || payload_error != .None {
+			return false
+		}
+		append(result, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return true
+}
+
 clone_named_search_payloads :: proc(
 	entries: []proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry,
 	result: ^[dynamic]Fiber_Named_Payload,
@@ -1496,6 +1507,7 @@ add_fiber_instance :: proc(
 	instance.task_queue = owned_task_queue
 	owned_input, clone_error := proto.clone_payload(&initialize.arguments[0])
 	instance.input = owned_input
+	instance.headers = make([dynamic]Fiber_Named_Payload)
 	instance.memo = make([dynamic]Fiber_Named_Payload)
 	instance.search_attributes = make([dynamic]Fiber_Named_Payload)
 	instance.property_commands = make([dynamic]Fiber_Property_Command)
@@ -1614,6 +1626,7 @@ add_fiber_instance :: proc(
 		) && metadata_strings_ok
 		info.priority.fairness_weight = initialize.priority.fairness_weight
 	}
+	headers_ok := clone_named_header_payloads(initialize.headers[:], &instance.headers)
 	memo_ok := initialize.memo == nil || clone_named_proto_payloads(initialize.memo.fields[:], &instance.memo)
 	search_ok := initialize.search_attributes == nil || clone_named_search_payloads(
 		initialize.search_attributes.indexed_fields[:],
@@ -1624,7 +1637,7 @@ add_fiber_instance :: proc(
 	   workflow_type_error != nil || task_queue_error != nil || clone_error != .None ||
 	   !metadata_strings_ok || !retry_durations_ok ||
 	   !execution_timeout_ok || !run_timeout_ok || !task_timeout_ok || !start_time_ok ||
-	   !expiration_ok || !memo_ok || !search_ok {
+	   !expiration_ok || !headers_ok || !memo_ok || !search_ok {
 		virtual.arena_destroy(&instance.arena)
 		free(instance, instance.owner_allocator)
 		return nil, error_from_string("could not preserve Workflow initialization")
@@ -2483,6 +2496,29 @@ find_named_payload :: proc(
 	return nil, -1, false
 }
 
+header_payload :: proc(ctx: ^Fiber_Context, key: string) -> (codec.Payload_View, bool) {
+	if ctx == nil || ctx.instance == nil {
+		return {}, false
+	}
+	entry, _, found := find_named_payload(&ctx.instance.headers, key)
+	if !found {
+		return {}, false
+	}
+	return codec.payload_view(&entry.payload), true
+}
+
+header_json :: proc(
+	ctx: ^Fiber_Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := header_payload(ctx, key)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
 memo_payload :: proc(ctx: ^Fiber_Context, key: string) -> (codec.Payload_View, bool) {
 	if ctx == nil || ctx.instance == nil {
 		return {}, false
@@ -2641,19 +2677,6 @@ remove_memo :: proc(ctx: ^Fiber_Context, key: string) -> bool {
 	return upsert_property_owned(ctx, .Memo, key, {}, true)
 }
 
-search_attribute_type_name :: proc(value: Search_Attribute_Type) -> string {
-	switch value {
-	case .Bool:         return "Bool"
-	case .Int:          return "Int"
-	case .Double:       return "Double"
-	case .Keyword:      return "Keyword"
-	case .Text:         return "Text"
-	case .Datetime:     return "Datetime"
-	case .Keyword_List: return "KeywordList"
-	}
-	return ""
-}
-
 upsert_search_attribute_payload :: proc(
 	ctx: ^Fiber_Context,
 	key: string,
@@ -2664,11 +2687,8 @@ upsert_search_attribute_payload :: proc(
 		return false
 	}
 	payload, clone_error := codec.payload_clone(value, ctx.instance.odin_context.allocator)
-	if clone_error != .None || codec.payload_add_metadata(
-		&payload,
-		"type",
-		transmute([]u8)search_attribute_type_name(attribute_type),
-	) != .None {
+	if clone_error != .None ||
+	   codec.payload_set_search_attribute_type(&payload, attribute_type) != .None {
 		codec.payload_free(&payload)
 		property_mutation_failure(ctx.instance, "could not preserve Workflow Search Attribute")
 		return false
@@ -2686,11 +2706,8 @@ upsert_search_attribute_json :: proc(
 		return false
 	}
 	payload, encode_error := codec.encode_json(value, ctx.instance.odin_context.allocator)
-	if encode_error != .None || codec.payload_add_metadata(
-		&payload,
-		"type",
-		transmute([]u8)search_attribute_type_name(attribute_type),
-	) != .None {
+	if encode_error != .None ||
+	   codec.payload_set_search_attribute_type(&payload, attribute_type) != .None {
 		codec.payload_free(&payload)
 		property_mutation_failure(ctx.instance, "could not encode Workflow Search Attribute")
 		return false

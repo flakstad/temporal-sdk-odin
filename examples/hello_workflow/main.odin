@@ -456,6 +456,8 @@ workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: 
 	   len(metadata.run_id) == 0 {
 		return "Workflow info mismatch"
 	}
+	initial_header: string
+	header_found, header_error := workflow.header_json(ctx, "odin-header", &initial_header)
 	initial_memo: string
 	memo_found, memo_error := workflow.memo_json(ctx, "odin-start", &initial_memo)
 	initial_search: string
@@ -464,7 +466,8 @@ workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: 
 		"OdinSdkKeyword",
 		&initial_search,
 	)
-	if !memo_found || memo_error != .None || initial_memo != "before" ||
+	if !header_found || header_error != .None || initial_header != "client-header" ||
+	   !memo_found || memo_error != .None || initial_memo != "before" ||
 	   !search_found || search_error != .None || initial_search != "before" {
 		return "Initial Workflow properties mismatch"
 	}

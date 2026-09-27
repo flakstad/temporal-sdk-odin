@@ -383,18 +383,13 @@ for _ in {1..30}; do
 done
 
 properties_workflow_id="odin-sdk-workflow-properties-$$-$(date +%s)"
-temporal workflow execute \
-  --workflow-id "$properties_workflow_id" \
-  --type odin_workflow_properties \
-  --task-queue odin-hello-workflow \
-  --input "\"$properties_workflow_id\"" \
-  --memo 'odin-start="before"' \
-  --search-attribute 'OdinSdkKeyword="before"' \
-  --command-timeout 30s \
-  --output json >"$workflow_output_file"
+TEMPORAL_CLIENT_SCENARIO=workflow-properties \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$properties_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
 properties_workflow_output="$(<"$workflow_output_file")"
 echo "$properties_workflow_output"
-grep -q '"status": "COMPLETED"' <<<"$properties_workflow_output"
+grep -q "Odin client completed workflow-properties workflow_id=$properties_workflow_id" <<<"$properties_workflow_output"
 grep -q 'Workflow properties updated' <<<"$properties_workflow_output"
 temporal workflow show \
   --workflow-id "$properties_workflow_id" \
@@ -404,6 +399,7 @@ grep -q 'EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED' "$typed_history_file"
 grep -q 'EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES' "$typed_history_file"
 grep -q 'odin-status' "$typed_history_file"
 grep -q 'OdinSdkKeyword' "$typed_history_file"
+grep -q 'odin-header' "$typed_history_file"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
