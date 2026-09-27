@@ -2390,6 +2390,17 @@ Failure_Test_Details :: struct {
 }
 
 failure_test_matches :: proc(failure: ^workflow.Activity_Failure) -> bool {
+	tree := workflow.activity_failure_tree(failure)
+	if tree == nil {
+		return false
+	}
+	activity_node := temporal_failure.find_kind(tree, .Activity)
+	application_node := temporal_failure.find_kind(tree, .Application)
+	if activity_node == nil || application_node == nil ||
+	   activity_node.activity.activity_id != "failure-activity" ||
+	   application_node.application.type != "DependencyRejected" {
+		return false
+	}
 	application := failure.application
 	details: Failure_Test_Details
 	detail_found, detail_error := workflow.activity_failure_detail_json(
@@ -2878,7 +2889,8 @@ child_signal_failure_test_workflow :: proc(
 	)
 	signal := workflow.signal_child_workflow_json(ctx, future, "approve", "never-delivered")
 	if signal.status == .Failed && signal.cause == .Workflow_Not_Found &&
-	   signal.failure_message == "Child Workflow signal failed" {
+	   signal.failure_message == "Child Workflow signal failed" &&
+	   signal.failure != nil && signal.failure.message == "Child Workflow signal failed" {
 		return "Observed Child Workflow signal failure"
 	}
 	return "Child Workflow signal failure mismatch"
@@ -2948,7 +2960,8 @@ external_cancel_failure_test_workflow :: proc(
 		"cancel missing Workflow",
 	)
 	if result.status == .Failed && result.cause == .Workflow_Not_Found &&
-	   result.failure_message == "External Workflow cancellation failed" {
+	   result.failure_message == "External Workflow cancellation failed" &&
+	   result.failure != nil && result.failure.message == "External Workflow cancellation failed" {
 		return "Observed external Workflow cancellation failure"
 	}
 	return "External Workflow cancellation failure mismatch"
@@ -3185,7 +3198,16 @@ child_failure_observer_test_workflow :: proc(
 		0,
 		&details,
 	)
+	tree := workflow.child_workflow_failure_tree(failure)
+	if tree == nil {
+		return "recursive Child Workflow failure was not preserved"
+	}
+	child_node := temporal_failure.find_kind(tree, .Child_Workflow)
+	application_node := temporal_failure.find_kind(tree, .Application)
 	if failure.message != "Child Workflow failed" || failure.source != "TemporalSDK" ||
+	   child_node == nil || application_node == nil ||
+	   child_node.child_workflow.workflow_id != "child-failure-id" ||
+	   application_node.application.type != "ChildBillingRejected" ||
 	   failure.namespace != "default" || failure.workflow_id != "child-failure-id" ||
 	   failure.run_id != "child-failure-run" || failure.workflow_type != "child_failure_test_workflow" ||
 	   failure.initiated_event_id != 5 || failure.started_event_id != 6 ||

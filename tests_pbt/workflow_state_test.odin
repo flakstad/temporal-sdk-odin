@@ -570,7 +570,8 @@ activity_failure_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 			}
 			operation := workflow.Fiber_Activity_Operation{}
 			context.allocator = virtual.arena_allocator(&decode_arena)
-			preserved := workflow.preserve_activity_failure(&operation, status.value.failure)
+			failure_bytes := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+			preserved := workflow.preserve_activity_failure(&operation, failure_bytes[:])
 			context.allocator = previous_allocator
 			preserved_detail := 0
 			detail_found, detail_error := workflow.activity_failure_detail_json(
@@ -578,7 +579,11 @@ activity_failure_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 				0,
 				&preserved_detail,
 			)
+			failure_tree := workflow.activity_failure_tree(&operation.failure)
+			application_node := temporal_failure.find_kind(failure_tree, .Application)
 			valid = valid && preserved && operation.failure.application.present &&
+				failure_tree != nil && application_node != nil &&
+				application_node.application.type == failure_type &&
 				operation.failure.application.message == "generated failure" &&
 				operation.failure.application.type == failure_type &&
 				operation.failure.application.non_retryable == non_retryable &&

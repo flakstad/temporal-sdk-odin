@@ -762,7 +762,8 @@ return result
 ```
 
 Catchable Activity failures expose both the outer Activity metadata and the
-nested Application Failure:
+nested Application Failure. The same result also exposes the complete recursive
+Temporal Failure tree:
 
 ```odin
 result := workflow.execute_activity_result(ctx, "charge", order_id)
@@ -776,11 +777,22 @@ if result.status == .Failed {
     )
     // result.failure: Activity ID/type, identity, retry state
     // app: message, type, retryability, category, details, next retry delay
+
+    tree := workflow.activity_failure_tree(&result.failure)
+    timeout := temporal_failure.find_kind(tree, .Timeout)
+    server := temporal_failure.find_kind(tree, .Server)
 }
 ```
 
-These values are borrowed from the Workflow instance and remain valid for that
-run. Unhandled failures still propagate the preserved Temporal Failure protobuf.
+`child_workflow_failure_tree` provides the same boundary for Child Workflow
+results. These pointers and the compatibility views borrow the Workflow
+instance arena, remain valid for that run, and must not be passed to
+`failure_free`. They include every current Failure variant, recursive causes,
+encoded attributes, and detail/heartbeat Payloads. Unhandled failures still
+propagate the preserved Temporal Failure protobuf byte-for-byte.
+Failed Child/external Workflow signal results and failed external cancellation
+results expose the same borrowed tree through their `failure` field, alongside
+the operation-specific failure-cause enum.
 
 Cancellation is cooperative in Workflow code. Result-returning waits report
 `.Canceled`. An Activity or timer created inside a detached scope does not

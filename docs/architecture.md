@@ -20,8 +20,9 @@ handle, long-polls its close event, follows new runs, returns a generic or typed
 Payload result, sends typed signals, requests cancellation, and terminates
 executions. The Workflow runtime now preserves signal Payloads generically and
 offers raw, typed JSON, and string await adapters.
-Catchable Activity results now expose the outer Activity failure metadata and a
-typed view of nested Application Failure fields and details.
+Catchable Activity and Child Workflow results expose both ergonomic flattened
+views and the complete recursive Temporal Failure tree, including every pinned
+variant, encoded attributes, and Payload details.
 Workflow initialization metadata, memo, and Search Attributes are also mapped
 into run-owned state. Workflow code can read them through borrowed views and
 emit deterministic memo/Search Attribute upserts or removals; unit, generated
@@ -1052,6 +1053,22 @@ same decoder now serves both result paths. No Core C-ABI change or new symbol is
 involved—the generic WorkflowService RPC and generated protobuf graph are
 sufficient.
 
+Workflow activation failures use the same decoder with a different lifetime:
+
+```text
+ResolveActivity / ResolveChildWorkflowExecution Failure (activation arena)
+  -> preserved encoded Failure bytes (Workflow instance arena)
+  -> recursive failure tree (Workflow instance arena)
+  -> borrowed Activity_Failure / Child_Workflow_Failure compatibility views
+```
+
+`activity_failure_tree` and `child_workflow_failure_tree` return the tree root.
+Workflow code must not free it: eviction destroys the containing instance arena
+and replay reconstructs a fresh tree from history. The old direct fields now
+borrow strings and Payload views from this tree rather than maintaining a
+second ownership graph. This removes duplicate conversion logic while retaining
+the existing Activity/Application and Child convenience API.
+
 The decoder limits a cause chain to 128 nodes, validates protobuf durations
 before converting to `time.Duration`, and treats malformed present union
 pointers as errors. A valid protobuf with no known union member becomes
@@ -1640,11 +1657,13 @@ Workflows are enabled.
 6. **Core version skew.** Server compatibility is broad, but Core-local
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.
-7. **Error/cancellation completeness.** The shared Client-facing failure model
+7. **Error/cancellation completeness.** The shared Client/Workflow failure model
    converts every current pinned Failure variant, recursive cause, Payload list,
-   and encoded attribute. The Workflow runtime still exposes its older flattened
-   Activity/Child views to catchable Workflow code while preserving raw bytes
-   for lossless propagation; those views should converge on the shared model.
+   and encoded attribute. The Workflow runtime retains older flattened
+   Activity/Child fields as compatibility views over that model while preserving
+   raw bytes for lossless propagation. External/Child signal and external
+   cancellation results also retain a borrowed tree when Core supplies a
+   Failure, in addition to their operation-specific cause enum.
    Activity cancellation preserves Core's
    reason but not all detail flags or user cancellation details in its result.
    The Activity API now models typed success, retryability, failure type,
@@ -1718,13 +1737,13 @@ Schedule create/describe/list/pause/unpause/trigger/delete are now implemented
 and live-proven without new C symbols. Full replace-update with optimistic
 conflict tokens and matching-time queries are also live-proven; structured and
 excluded calendars, TZif data, and backfill have exact wire/property coverage.
-Recursive Client failure inspection is now implemented and live-proven. The
+Recursive Client and Workflow failure inspection is now implemented and
+live-proven. The
 next smallest client-facing slice is query reject-condition/static
 summary/details support; backfill should gain a dedicated multi-execution live
-case without overloading the one-shot Schedule example. The next failure-model
-step is to replace the Workflow runtime's duplicated flattened Activity/Child
-conversion with adapters over `temporal/failure`, retaining ergonomic typed
-detail helpers.
+case without overloading the one-shot Schedule example. Remaining failure work
+is Activity-cancellation detail completeness and deciding whether start failures
+that only carry Core cause enums need a synthetic language-level Failure.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1803,10 +1822,10 @@ parent with a running, timer-blocked child and verifies that Odin emits the
 cancel command, receives the child resolution, and only then acknowledges the
 parent cancellation.
 
-On failure, Odin owns the outer `ChildWorkflowExecutionFailureInfo` identity
-(namespace, execution, type, event IDs, and Retry State) and walks the Failure
-cause chain to expose Application Failure details, cancellation details,
-Timeout Type, or termination. Typed JSON helpers decode copied detail Payloads.
+On failure, Odin builds the shared recursive Failure tree in the Workflow
+instance arena. The direct child identity, Application, cancellation, timeout,
+and termination fields are borrowed compatibility views over that tree. Typed
+JSON helpers decode its owned detail Payloads through borrowed views.
 For an unhandled child failure, the parent completion re-emits the original
 Temporal Failure protobuf rather than synthesizing a generic Application
 Failure. This preserves server-generated wrapper/cause semantics for callers

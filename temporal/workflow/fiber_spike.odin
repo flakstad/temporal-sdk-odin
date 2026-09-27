@@ -9,6 +9,7 @@ import "core:strings"
 import "core:time"
 import codec "../codec"
 import proto "../core/proto"
+import temporal_failure "../failure"
 import fiber_raw "fiber/raw"
 
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
@@ -359,6 +360,8 @@ Workflow_Signal_Result :: struct {
 	status:          Workflow_Signal_Status,
 	failure_message: string,
 	cause:           Workflow_Signal_Failure_Cause,
+	// failure borrows the Workflow instance arena when Core supplied one.
+	failure:         ^temporal_failure.Failure,
 }
 
 Child_Workflow_Signal_Status :: Workflow_Signal_Status
@@ -387,6 +390,8 @@ External_Workflow_Cancel_Result :: struct {
 	status:          External_Workflow_Cancel_Status,
 	failure_message: string,
 	cause:           External_Workflow_Cancel_Failure_Cause,
+	// failure borrows the Workflow instance arena when Core supplied one.
+	failure:         ^temporal_failure.Failure,
 }
 
 Child_Workflow_Start_Status :: enum {
@@ -424,6 +429,8 @@ Failure_Timeout_Type :: enum {
 }
 
 Child_Workflow_Failure :: struct {
+	// tree borrows the Workflow instance arena and must not be freed by Workflow code.
+	tree:               ^temporal_failure.Failure,
 	message:            string,
 	source:             string,
 	stack_trace:        string,
@@ -511,6 +518,8 @@ Application_Failure :: struct {
 }
 
 Activity_Failure :: struct {
+	// tree borrows the Workflow instance arena and must not be freed by Workflow code.
+	tree:          ^temporal_failure.Failure,
 	message:       string,
 	source:        string,
 	stack_trace:   string,
@@ -629,8 +638,7 @@ Fiber_Activity_Operation :: struct {
 	failure_message: string,
 	failure_proto:   []u8,
 	failure:         Activity_Failure,
-	failure_detail_payloads: [dynamic]codec.Payload,
-	failure_detail_views:    []codec.Payload_View,
+	failure_detail_views: []codec.Payload_View,
 	state:         Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
 }
@@ -671,10 +679,8 @@ Fiber_Child_Workflow_Operation :: struct {
 	cancellation_reason: string,
 	failure_proto:   []u8,
 	failure:         Child_Workflow_Failure,
-	failure_detail_payloads: [dynamic]codec.Payload,
-	failure_detail_views:    []codec.Payload_View,
-	cancellation_detail_payloads: [dynamic]codec.Payload,
-	cancellation_detail_views:    []codec.Payload_View,
+	failure_detail_views:     []codec.Payload_View,
+	cancellation_detail_views: []codec.Payload_View,
 	command_state:   Fiber_Operation_State,
 	start_state:     Child_Workflow_Start_State,
 	completion_state: Child_Workflow_Completion_State,
@@ -691,7 +697,7 @@ Fiber_External_Signal_Operation :: struct {
 	signal_name:        string,
 	input:              codec.Payload,
 	failure_message:    string,
-	failure_proto:      []u8,
+	failure:            ^temporal_failure.Failure,
 	cause:              Workflow_Signal_Failure_Cause,
 	state:              Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
@@ -704,7 +710,7 @@ Fiber_External_Cancel_Operation :: struct {
 	run_id:          string,
 	reason:          string,
 	failure_message: string,
-	failure_proto:   []u8,
+	failure:         ^temporal_failure.Failure,
 	cause:           External_Workflow_Cancel_Failure_Cause,
 	state:           Fiber_Operation_State,
 }
@@ -1265,19 +1271,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	for &operation in instance.activities {
 		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
-		for &detail in operation.failure_detail_payloads {
-			codec.payload_free(&detail)
-		}
 	}
 	for &operation in instance.child_workflows {
 		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
-		for &detail in operation.failure_detail_payloads {
-			codec.payload_free(&detail)
-		}
-		for &detail in operation.cancellation_detail_payloads {
-			codec.payload_free(&detail)
-		}
 	}
 	for &operation in instance.external_signals {
 		codec.payload_free(&operation.input)
@@ -3800,9 +3797,14 @@ workflow_signal_result_from_operation :: proc(
 			status = .Failed,
 			failure_message = operation.failure_message,
 			cause = operation.cause,
+			failure = operation.failure,
 		}
 	case .Canceled:
-		return {status = .Canceled, failure_message = operation.failure_message}
+		return {
+			status = .Canceled,
+			failure_message = operation.failure_message,
+			failure = operation.failure,
+		}
 	case .Cancel_Requested:
 		return {status = .Canceled, failure_message = operation.failure_message}
 	case .Scheduled, .Commanded:
@@ -4075,6 +4077,7 @@ request_cancel_external_workflow :: proc(
 		status = .Failed,
 		failure_message = resolved.failure_message,
 		cause = resolved.cause,
+		failure = resolved.failure,
 	}
 }
 
@@ -4277,20 +4280,13 @@ activity_retry_state_from_proto :: proc(
 	return .Unspecified
 }
 
-application_error_category_from_proto :: proc(
-	value: proto.Temporal_Api_Enums_V1_ApplicationErrorCategory,
+application_error_category_from_failure :: proc(
+	value: temporal_failure.Application_Error_Category,
 ) -> Application_Error_Category {
-	if value == .APPLICATION_ERROR_CATEGORY_BENIGN {
+	if value == .Benign {
 		return .Benign
 	}
 	return .Unspecified
-}
-
-failure_duration_from_proto :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {
-	if value == nil {
-		return 0
-	}
-	return time.Duration(value.seconds * i64(time.Second) + i64(value.nanos))
 }
 
 positive_duration_from_proto :: proc(
@@ -4309,81 +4305,95 @@ positive_duration_from_proto :: proc(
 	return duration, duration > 0
 }
 
-clone_failure_string :: proc(value: string) -> (string, bool) {
-	owned, allocation_error := strings.clone(value)
-	return owned, allocation_error == nil
+activity_retry_state_from_failure :: proc(
+	value: temporal_failure.Retry_State,
+) -> Activity_Retry_State {
+	switch value {
+	case .In_Progress:              return .In_Progress
+	case .Non_Retryable_Failure:    return .Non_Retryable_Failure
+	case .Timeout:                  return .Timed_Out
+	case .Maximum_Attempts_Reached: return .Maximum_Attempts_Reached
+	case .Retry_Policy_Not_Set:     return .Retry_Policy_Not_Set
+	case .Internal_Server_Error:    return .Internal_Server_Error
+	case .Cancel_Requested:         return .Cancel_Requested
+	case .Unspecified:              return .Unspecified
+	}
+	return .Unspecified
+}
+
+failure_timeout_type_from_failure :: proc(
+	value: temporal_failure.Timeout_Type,
+) -> Failure_Timeout_Type {
+	switch value {
+	case .Start_To_Close:    return .Start_To_Close
+	case .Schedule_To_Start: return .Schedule_To_Start
+	case .Schedule_To_Close: return .Schedule_To_Close
+	case .Heartbeat:         return .Heartbeat
+	case .Unspecified:       return .Unspecified
+	}
+	return .Unspecified
+}
+
+preserve_temporal_failure :: proc(data: []u8) -> (^temporal_failure.Failure, bool) {
+	decoded, decode_error := temporal_failure.decode(data)
+	if decode_error != .None {
+		return nil, false
+	}
+	owned, allocation_error := new(temporal_failure.Failure)
+	if allocation_error != nil {
+		temporal_failure.failure_free(&decoded)
+		return nil, false
+	}
+	owned^ = decoded
+	return owned, true
+}
+
+failure_payload_views :: proc(
+	values: []codec.Payload,
+) -> []codec.Payload_View {
+	result := make([]codec.Payload_View, len(values))
+	for &value, index in values {
+		result[index] = codec.payload_view(&value)
+	}
+	return result
 }
 
 preserve_activity_failure :: proc(
 	operation: ^Fiber_Activity_Operation,
-	value: ^proto.Temporal_Api_Failure_V1_Failure,
+	data: []u8,
 ) -> bool {
-	if operation == nil || value == nil {
+	if operation == nil || len(data) == 0 {
 		return false
 	}
-	message_ok, source_ok, stack_ok: bool
-	operation.failure.message, message_ok = clone_failure_string(value.message)
-	operation.failure.source, source_ok = clone_failure_string(value.source)
-	operation.failure.stack_trace, stack_ok = clone_failure_string(value.stack_trace)
-	if !message_ok || !source_ok || !stack_ok {
+	tree, preserved := preserve_temporal_failure(data)
+	if !preserved {
 		return false
 	}
-
-	current := value
-	for current != nil {
-		#partial switch info in current.failure_info {
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info:
-			if info.value != nil && len(operation.failure.activity_id) == 0 {
-				id_ok, type_ok, identity_ok: bool
-				operation.failure.activity_id, id_ok = clone_failure_string(info.value.activity_id)
-				if info.value.activity_type != nil {
-					operation.failure.activity_type, type_ok = clone_failure_string(info.value.activity_type.name)
-				} else {
-					type_ok = true
-				}
-				operation.failure.identity, identity_ok = clone_failure_string(info.value.identity)
-				if !id_ok || !type_ok || !identity_ok {
-					return false
-				}
-				operation.failure.retry_state = activity_retry_state_from_proto(info.value.retry_state)
-			}
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
-			if info.value != nil && !operation.failure.application.present {
-				application := &operation.failure.application
-				application.present = true
-				app_message_ok, app_type_ok: bool
-				application.message, app_message_ok = clone_failure_string(current.message)
-				application.type, app_type_ok = clone_failure_string(info.value.type)
-				if !app_message_ok || !app_type_ok {
-					return false
-				}
-				application.non_retryable = info.value.non_retryable
-				application.category = application_error_category_from_proto(info.value.category)
-				if info.value.next_retry_delay != nil {
-					application.has_next_retry_delay = true
-					application.next_retry_delay = failure_duration_from_proto(info.value.next_retry_delay)
-				}
-				operation.failure_detail_payloads = make([dynamic]codec.Payload)
-				if info.value.details != nil {
-					for &detail in info.value.details.payloads {
-						owned, clone_error := proto.clone_payload(&detail)
-						if clone_error != .None {
-							return false
-						}
-						append(&operation.failure_detail_payloads, owned)
-					}
-				}
-				operation.failure_detail_views = make(
-					[]codec.Payload_View,
-					len(operation.failure_detail_payloads),
-				)
-				for &detail, index in operation.failure_detail_payloads {
-					operation.failure_detail_views[index] = codec.payload_view(&detail)
-				}
-				application.details = operation.failure_detail_views
-			}
+	operation.failure.tree = tree
+	operation.failure.message = tree.message
+	operation.failure.source = tree.source
+	operation.failure.stack_trace = tree.stack_trace
+	activity := temporal_failure.find_kind(tree, .Activity)
+	if activity != nil {
+		operation.failure.activity_id = activity.activity.activity_id
+		operation.failure.activity_type = activity.activity.activity_type
+		operation.failure.identity = activity.activity.identity
+		operation.failure.retry_state = activity_retry_state_from_failure(activity.activity.retry_state)
+	}
+	application_failure := temporal_failure.find_kind(tree, .Application)
+	if application_failure != nil {
+		info := &application_failure.application
+		operation.failure_detail_views = failure_payload_views(info.details[:])
+		operation.failure.application = {
+			present = true,
+			message = application_failure.message,
+			type = info.type,
+			non_retryable = info.non_retryable,
+			category = application_error_category_from_failure(info.category),
+			details = operation.failure_detail_views,
+			next_retry_delay = info.next_retry_delay,
+			has_next_retry_delay = info.has_next_retry_delay,
 		}
-		current = current.cause
 	}
 	return true
 }
@@ -4399,6 +4409,16 @@ activity_failure_detail_payload :: proc(
 	return failure.application.details[index], true
 }
 
+// activity_failure_tree returns the complete recursive Temporal Failure. The
+// pointer borrows the Workflow instance arena and is valid only for the current
+// Workflow execution; callers must not pass it to failure_free.
+activity_failure_tree :: proc(failure: ^Activity_Failure) -> ^temporal_failure.Failure {
+	if failure == nil {
+		return nil
+	}
+	return failure.tree
+}
+
 activity_failure_detail_json :: proc(
 	failure: ^Activity_Failure,
 	index: int,
@@ -4411,133 +4431,58 @@ activity_failure_detail_json :: proc(
 	return true, codec.decode_json(payload, value)
 }
 
-failure_timeout_type_from_proto :: proc(
-	value: proto.Temporal_Api_Enums_V1_TimeoutType,
-) -> Failure_Timeout_Type {
-	switch value {
-	case .TIMEOUT_TYPE_START_TO_CLOSE:
-		return .Start_To_Close
-	case .TIMEOUT_TYPE_SCHEDULE_TO_START:
-		return .Schedule_To_Start
-	case .TIMEOUT_TYPE_SCHEDULE_TO_CLOSE:
-		return .Schedule_To_Close
-	case .TIMEOUT_TYPE_HEARTBEAT:
-		return .Heartbeat
-	case .TIMEOUT_TYPE_UNSPECIFIED:
-		return .Unspecified
-	}
-	return .Unspecified
-}
-
 preserve_child_workflow_failure :: proc(
 	operation: ^Fiber_Child_Workflow_Operation,
-	value: ^proto.Temporal_Api_Failure_V1_Failure,
+	data: []u8,
 ) -> bool {
-	if operation == nil || value == nil {
+	if operation == nil || len(data) == 0 {
 		return false
 	}
-	message_ok, source_ok, stack_ok: bool
-	operation.failure.message, message_ok = clone_failure_string(value.message)
-	operation.failure.source, source_ok = clone_failure_string(value.source)
-	operation.failure.stack_trace, stack_ok = clone_failure_string(value.stack_trace)
-	if !message_ok || !source_ok || !stack_ok {
+	tree, preserved := preserve_temporal_failure(data)
+	if !preserved {
 		return false
 	}
-
-	current := value
-	for current != nil {
-		#partial switch info in current.failure_info {
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info:
-			if info.value != nil && len(operation.failure.workflow_id) == 0 {
-				child := info.value
-				namespace_ok, id_ok, run_ok, type_ok: bool
-				operation.failure.namespace, namespace_ok = clone_failure_string(child.namespace)
-				if child.workflow_execution != nil {
-					operation.failure.workflow_id, id_ok = clone_failure_string(child.workflow_execution.workflow_id)
-					operation.failure.run_id, run_ok = clone_failure_string(child.workflow_execution.run_id)
-				} else {
-					id_ok = true
-					run_ok = true
-				}
-				if child.workflow_type != nil {
-					operation.failure.workflow_type, type_ok = clone_failure_string(child.workflow_type.name)
-				} else {
-					type_ok = true
-				}
-				if !namespace_ok || !id_ok || !run_ok || !type_ok {
-					return false
-				}
-				operation.failure.initiated_event_id = child.initiated_event_id
-				operation.failure.started_event_id = child.started_event_id
-				operation.failure.retry_state = activity_retry_state_from_proto(child.retry_state)
-			}
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
-			if info.value != nil && !operation.failure.application.present {
-				application := &operation.failure.application
-				application.present = true
-				app_message_ok, app_type_ok: bool
-				application.message, app_message_ok = clone_failure_string(current.message)
-				application.type, app_type_ok = clone_failure_string(info.value.type)
-				if !app_message_ok || !app_type_ok {
-					return false
-				}
-				application.non_retryable = info.value.non_retryable
-				application.category = application_error_category_from_proto(info.value.category)
-				if info.value.next_retry_delay != nil {
-					application.has_next_retry_delay = true
-					application.next_retry_delay = failure_duration_from_proto(info.value.next_retry_delay)
-				}
-				operation.failure_detail_payloads = make([dynamic]codec.Payload)
-				if info.value.details != nil {
-					for &detail in info.value.details.payloads {
-						owned, clone_error := proto.clone_payload(&detail)
-						if clone_error != .None {
-							return false
-						}
-						append(&operation.failure_detail_payloads, owned)
-					}
-				}
-				operation.failure_detail_views = make(
-					[]codec.Payload_View,
-					len(operation.failure_detail_payloads),
-				)
-				for &detail, index in operation.failure_detail_payloads {
-					operation.failure_detail_views[index] = codec.payload_view(&detail)
-				}
-				application.details = operation.failure_detail_views
-			}
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
-			if info.value != nil && !operation.failure.canceled {
-				operation.failure.canceled = true
-				operation.cancellation_detail_payloads = make([dynamic]codec.Payload)
-				if info.value.details != nil {
-					for &detail in info.value.details.payloads {
-						owned, clone_error := proto.clone_payload(&detail)
-						if clone_error != .None {
-							return false
-						}
-						append(&operation.cancellation_detail_payloads, owned)
-					}
-				}
-				operation.cancellation_detail_views = make(
-					[]codec.Payload_View,
-					len(operation.cancellation_detail_payloads),
-				)
-				for &detail, index in operation.cancellation_detail_payloads {
-					operation.cancellation_detail_views[index] = codec.payload_view(&detail)
-				}
-				operation.failure.cancellation_details = operation.cancellation_detail_views
-			}
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Timeout_Failure_Info:
-			if info.value != nil && !operation.failure.timed_out {
-				operation.failure.timed_out = true
-				operation.failure.timeout_type = failure_timeout_type_from_proto(info.value.timeout_type)
-			}
-		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Terminated_Failure_Info:
-			operation.failure.terminated = info.value != nil
+	operation.failure.tree = tree
+	operation.failure.message = tree.message
+	operation.failure.source = tree.source
+	operation.failure.stack_trace = tree.stack_trace
+	child := temporal_failure.find_kind(tree, .Child_Workflow)
+	if child != nil {
+		operation.failure.namespace = child.child_workflow.namespace
+		operation.failure.workflow_id = child.child_workflow.workflow_id
+		operation.failure.run_id = child.child_workflow.run_id
+		operation.failure.workflow_type = child.child_workflow.workflow_type
+		operation.failure.initiated_event_id = child.child_workflow.initiated_event_id
+		operation.failure.started_event_id = child.child_workflow.started_event_id
+		operation.failure.retry_state = activity_retry_state_from_failure(child.child_workflow.retry_state)
+	}
+	application_failure := temporal_failure.find_kind(tree, .Application)
+	if application_failure != nil {
+		info := &application_failure.application
+		operation.failure_detail_views = failure_payload_views(info.details[:])
+		operation.failure.application = {
+			present = true,
+			message = application_failure.message,
+			type = info.type,
+			non_retryable = info.non_retryable,
+			category = application_error_category_from_failure(info.category),
+			details = operation.failure_detail_views,
+			next_retry_delay = info.next_retry_delay,
+			has_next_retry_delay = info.has_next_retry_delay,
 		}
-		current = current.cause
 	}
+	canceled := temporal_failure.find_kind(tree, .Canceled)
+	if canceled != nil {
+		operation.failure.canceled = true
+		operation.cancellation_detail_views = failure_payload_views(canceled.canceled.details[:])
+		operation.failure.cancellation_details = operation.cancellation_detail_views
+	}
+	timeout := temporal_failure.find_kind(tree, .Timeout)
+	if timeout != nil {
+		operation.failure.timed_out = true
+		operation.failure.timeout_type = failure_timeout_type_from_failure(timeout.timeout.timeout_type)
+	}
+	operation.failure.terminated = temporal_failure.find_kind(tree, .Terminated) != nil
 	return true
 }
 
@@ -4550,6 +4495,17 @@ child_workflow_failure_detail_payload :: proc(
 		return
 	}
 	return failure.application.details[index], true
+}
+
+// child_workflow_failure_tree returns the complete recursive Temporal Failure.
+// It has the same borrowed Workflow-instance lifetime as the flattened view.
+child_workflow_failure_tree :: proc(
+	failure: ^Child_Workflow_Failure,
+) -> ^temporal_failure.Failure {
+	if failure == nil {
+		return nil
+	}
+	return failure.tree
 }
 
 child_workflow_failure_detail_json :: proc(
@@ -7105,15 +7061,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
-				failure_preserved := preserve_activity_failure(operation, status.value.failure)
+				failure_preserved := preserve_activity_failure(operation, failure_proto[:])
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
+				if len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve Activity failure")
 					return
 				}
-				operation.failure_message = failure_message
+				operation.failure_message = operation.failure.message
 				operation.failure_proto = failure_proto[:]
 				operation.state = .Failed
 				result.resolved_activity_seq = operation.command_seq
@@ -7275,15 +7230,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
-				failure_preserved := preserve_child_workflow_failure(operation, status.value.failure)
+				failure_preserved := preserve_child_workflow_failure(operation, failure_proto[:])
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
+				if len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve Child Workflow failure")
 					return
 				}
-				operation.failure_message = failure_message
+				operation.failure_message = operation.failure.message
 				operation.failure_proto = failure_proto[:]
 				operation.completion_state = .Failed
 			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Cancelled:
@@ -7293,15 +7247,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
-				failure_preserved := preserve_child_workflow_failure(operation, status.value.failure)
+				failure_preserved := preserve_child_workflow_failure(operation, failure_proto[:])
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
+				if len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve canceled Child Workflow failure")
 					return
 				}
-				operation.failure_message = failure_message
+				operation.failure_message = operation.failure.message
 				operation.failure_proto = failure_proto[:]
 				operation.completion_state = .Canceled
 			}
@@ -7348,21 +7301,17 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 			} else {
 				context.allocator = instance.odin_context.allocator
-				failure_message, allocation_error := strings.clone(variant.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(variant.value.failure)
+				failure, failure_preserved := preserve_temporal_failure(failure_proto[:])
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 {
+				if len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve external Workflow signal failure")
 					return
 				}
-				operation.failure_message = failure_message
-				operation.failure_proto = failure_proto[:]
+				operation.failure_message = failure.message
+				operation.failure = failure
 				operation.cause = workflow_signal_failure_cause_from_proto(variant.value.cause)
-				canceled_failure := false
-				#partial switch failure_info in variant.value.failure.failure_info {
-				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
-					canceled_failure = failure_info.value != nil
-				}
+				canceled_failure := temporal_failure.find_kind(failure, .Canceled) != nil
 				if was_canceled || canceled_failure {
 					operation.state = .Canceled
 					if operation.child_workflow_seq != 0 {
@@ -7400,15 +7349,15 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				operation.state = .Resolved
 			} else {
 				context.allocator = instance.odin_context.allocator
-				failure_message, allocation_error := strings.clone(variant.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(variant.value.failure)
+				failure, failure_preserved := preserve_temporal_failure(failure_proto[:])
 				context.allocator = previous_allocator
-				if allocation_error != nil || len(failure_proto) == 0 {
+				if len(failure_proto) == 0 || !failure_preserved {
 					process_error(&result, activation.run_id, "could not preserve external Workflow cancellation failure")
 					return
 				}
-				operation.failure_message = failure_message
-				operation.failure_proto = failure_proto[:]
+				operation.failure_message = failure.message
+				operation.failure = failure
 				operation.cause = external_workflow_cancel_failure_cause_from_proto(
 					variant.value.cause,
 				)

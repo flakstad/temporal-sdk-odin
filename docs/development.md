@@ -616,6 +616,15 @@ ID/type and `Maximum_Attempts_Reached` retry state, then decodes the nested
 Application Failure message, type, retryability, details, and delay. It
 completes with `"Observed structured Activity failure"`; this proves the fields
 crossed both Core and the Service rather than only the local completion encoder.
+The result also exposes the complete tree through
+`workflow.activity_failure_tree`; `workflow.child_workflow_failure_tree` does
+the same for Child results. Unlike Client-decoded failures these pointers are
+borrowed from the Workflow instance arena: inspect them synchronously and never
+call `failure_free`. The older direct Activity/Application and Child fields are
+compatibility views over this tree, not separately cloned ownership graphs.
+Signal-external-Workflow and request-cancel-external-Workflow failures expose a
+borrowed `result.failure` pointer with the same lifetime; their `cause` enum
+remains the concise operation-specific classification.
 
 The immediately following `terminal-failure` case deliberately leaves the same
 Activity failure unhandled. Odin emits `FailWorkflowExecution`, Temporal stores

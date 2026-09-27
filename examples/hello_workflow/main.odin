@@ -6,6 +6,7 @@ import "core:strings"
 import "core:time"
 import activity "../../temporal/activity"
 import temporal_core "../../temporal/core"
+import temporal_failure "../../temporal/failure"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
 
@@ -414,13 +415,19 @@ failure_details_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> 
 		&details,
 	)
 	application := result.failure.application
+	failure_tree := workflow.activity_failure_tree(&result.failure)
+	activity_node := temporal_failure.find_kind(failure_tree, .Activity)
+	application_node := temporal_failure.find_kind(failure_tree, .Application)
 	if result.failure.activity_id != "failure-details-activity" ||
 	   result.failure.activity_type != "failure_details" ||
 	   result.failure.retry_state != .Maximum_Attempts_Reached ||
 	   !application.present || application.message != "billing dependency rejected request" ||
 	   application.type != "DependencyRejected" || application.non_retryable ||
 	   !application.has_next_retry_delay || application.next_retry_delay != 250 * time.Millisecond ||
-	   !detail_found || detail_error != .None || details.dependency != "billing" || details.code != 409 {
+	   !detail_found || detail_error != .None || details.dependency != "billing" || details.code != 409 ||
+	   failure_tree == nil || activity_node == nil || application_node == nil ||
+	   activity_node.activity.activity_id != "failure-details-activity" ||
+	   application_node.application.type != "DependencyRejected" {
 		return "structured Activity failure mismatch"
 	}
 	return "Observed structured Activity failure"

@@ -6,6 +6,7 @@ import "core:strings"
 import "core:time"
 import temporal_core "../../temporal/core"
 import codec "../../temporal/codec"
+import temporal_failure "../../temporal/failure"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
 
@@ -55,13 +56,19 @@ failure_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> s
 		},
 		string,
 	)
+	failure_tree := workflow.child_workflow_failure_tree(&result.failure)
+	child_node := temporal_failure.find_kind(failure_tree, .Child_Workflow)
+	application_node := temporal_failure.find_kind(failure_tree, .Application)
 	if result.status != .Failed ||
 	   result.failure.workflow_id != "odin-failing-child" ||
 	   result.failure.workflow_type != FAILURE_CHILD_WORKFLOW_TYPE ||
 	   !result.failure.application.present ||
 	   result.failure.application.message != "child rejected input" ||
 	   result.failure.application.type != "OdinChildRejected" ||
-	   !result.failure.application.non_retryable {
+	   !result.failure.application.non_retryable || failure_tree == nil ||
+	   child_node == nil || application_node == nil ||
+	   child_node.child_workflow.workflow_id != "odin-failing-child" ||
+	   application_node.application.type != "OdinChildRejected" {
 		return "structured Child Workflow failure mismatch"
 	}
 	return "Observed structured Child Workflow failure"
