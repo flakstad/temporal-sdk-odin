@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:bytes"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
 import "core:testing"
@@ -2237,6 +2238,260 @@ workflow_patch_truth_table_for_generated_values :: proc(t: ^testing.T) {
 		"Workflow patches follow replay/notification/deprecation truth table",
 		workflow_patch_truth_table_property,
 		{num_tests = 500, seed = 0x5041_5443_485f_4f44},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+Generated_Determinism_Output :: struct {
+	time_nanoseconds: i64,
+	history_length:   u32,
+	first:            i64,
+	second:           i64,
+	fraction:         f64,
+	uuid:             string,
+}
+
+generated_determinism_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> Generated_Determinism_Output {
+	_ = input
+	activation_time, present := workflow.now(ctx)
+	result := Generated_Determinism_Output{}
+	result.history_length = workflow.history_length(ctx)
+	result.first = i64(workflow.random_u64(ctx) & 0x7fff_ffff_ffff_ffff)
+	result.second = i64(workflow.random_u64(ctx) & 0x7fff_ffff_ffff_ffff)
+	result.fraction = workflow.random_f64(ctx)
+	result.uuid = workflow.uuid_v4(ctx)
+	if present {
+		result.time_nanoseconds = time.to_unix_nanoseconds(activation_time)
+	}
+	return result
+}
+
+splitmix64_next :: proc(state: ^u64) -> u64 {
+	state^ += 0x9e3779b97f4a7c15
+	value := state^
+	value = (value ~ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ~ (value >> 27)) * 0x94d049bb133111eb
+	return value ~ (value >> 31)
+}
+
+decode_determinism_completion :: proc(
+	data: []u8,
+) -> (output: Generated_Determinism_Output, ok: bool) {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return {}, false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	if !proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion) {
+		return {}, false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return {}, false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+			if variant.value == nil || variant.value.result == nil {
+				return {}, false
+			}
+			owned, clone_error := proto.clone_payload(variant.value.result)
+			if clone_error != .None {
+				return {}, false
+			}
+			defer codec.payload_free(&owned)
+			if codec.decode_json(codec.payload_view(&owned), &output) != .None {
+				return {}, false
+			}
+			owned_uuid, allocation_error := strings.clone(output.uuid, previous_allocator)
+			if allocation_error != nil {
+				return {}, false
+			}
+			output.uuid = owned_uuid
+			return output, true
+		}
+	}
+	return {}, false
+}
+
+workflow_deterministic_primitives_property :: proc(t: ^pbt.T) -> pbt.Result {
+	initial_seed := u64(pbt.draw(t, pbt.int_range(0, 2_000_000_000)))
+	updated_seed := u64(pbt.draw(t, pbt.int_range(0, 2_000_000_000)))
+	has_update := pbt.draw(t, pbt.boolean())
+	seconds := i64(pbt.draw(t, pbt.int_range(1_000_000_000, 2_000_000_000)))
+	nanos := i32(pbt.draw(t, pbt.int_range(0, 999_999_999)))
+	history := u32(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	pbt.cover(t, has_update, 30.0, "Core seed update")
+	pbt.cover(t, !has_update, 30.0, "initial seed")
+
+	owned_queue, queue_error := strings.clone("pbt-determinism-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate determinism queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_determinism_workflow",
+		generated_determinism_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register generated determinism Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json("input")
+	if encode_error != .None {
+		return pbt.error("could not encode determinism input")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_determinism_workflow",
+		randomness_seed = initial_seed,
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	seed_update := proto.Coresdk_Workflow_Activation_UpdateRandomSeed{
+		randomness_seed = updated_seed,
+	}
+	timestamp := proto.Google_Protobuf_Timestamp{seconds = seconds, nanos = nanos}
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-determinism-run",
+		history_length = history,
+		timestamp = &timestamp,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	if has_update {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Update_Random_Seed{
+					value = &seed_update,
+				},
+			},
+		)
+	}
+	fresh := process_activation(runtime, &activation)
+	defer destroy_process_result(&fresh)
+	if fresh.error.message != nil || !fresh.completed {
+		return pbt.fail("generated deterministic Workflow did not complete")
+	}
+	output, decoded := decode_determinism_completion(fresh.completion[:])
+	defer delete(output.uuid)
+	effective_seed := has_update ? updated_seed : initial_seed
+	expected_state := effective_seed
+	expected_first := i64(splitmix64_next(&expected_state) & 0x7fff_ffff_ffff_ffff)
+	expected_second := i64(splitmix64_next(&expected_state) & 0x7fff_ffff_ffff_ffff)
+	expected_fraction := f64(splitmix64_next(&expected_state) >> 11) *
+		(1.0 / 9007199254740992.0)
+	fraction_difference := output.fraction - expected_fraction
+	if fraction_difference < 0 {
+		fraction_difference = -fraction_difference
+	}
+	if !decoded || output.time_nanoseconds != seconds * i64(time.Second) + i64(nanos) ||
+	   output.history_length != history || output.first != expected_first ||
+	   output.second != expected_second || fraction_difference > 1e-15 ||
+	   len(output.uuid) != 36 || output.uuid[14] != '4' {
+		return pbt.fail(fmt.tprintf(
+			"deterministic mismatch decoded=%v time=%d/%d history=%d/%d first=%d/%d second=%d/%d fraction=%v/%v uuid=%q",
+			decoded,
+			output.time_nanoseconds,
+			seconds * i64(time.Second) + i64(nanos),
+			output.history_length,
+			history,
+			output.first,
+			expected_first,
+			output.second,
+			expected_second,
+			output.fraction,
+			expected_fraction,
+			output.uuid,
+		))
+	}
+
+	completion_bytes := bytes.clone(fresh.completion[:])
+	defer delete(completion_bytes)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated deterministic Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	if has_update {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Update_Random_Seed{
+					value = &seed_update,
+				},
+			},
+		)
+	}
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !bytes.equal(completion_bytes, replayed.completion[:]) {
+		return pbt.fail("generated deterministic primitives changed on fresh-stack replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_deterministic_primitives_for_generated_activations :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow time and random primitives replay deterministically",
+		workflow_deterministic_primitives_property,
+		{num_tests = 500, seed = 0x5449_4d45_524e_4721},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

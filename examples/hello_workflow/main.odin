@@ -362,7 +362,15 @@ failure_details_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> 
 
 patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if workflow.patched(ctx, PATCH_ID) {
-		result, allocation_error := strings.concatenate({"Patched ", name})
+		activation_time, has_time := workflow.now(ctx)
+		_ = activation_time
+		identifier := workflow.uuid_v4(ctx)
+		random_fraction := workflow.random_f64(ctx)
+		if !has_time || workflow.history_length(ctx) == 0 || len(identifier) != 36 ||
+		   random_fraction < 0 || random_fraction >= 1 {
+			return "invalid deterministic Workflow context"
+		}
+		result, allocation_error := strings.concatenate({"Patched ", name, " ", identifier})
 		if allocation_error != nil {
 			return ""
 		}

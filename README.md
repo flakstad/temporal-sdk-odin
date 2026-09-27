@@ -45,6 +45,10 @@ Workflow runtime now implements Core's patch protocol through
 `NotifyHasPatch` jobs, memoizes each decision per run, emits at most one
 `SetPatchMarker`, and takes the legacy branch when replay encounters no marker.
 The CLI-devserver suite verifies the resulting `core_patch` history marker. The
+same activation-context layer now exposes `workflow.now`, `history_length`,
+`is_replaying`, deterministic `random_u64`/`random_f64`, and `uuid_v4` without
+consulting host time or OS entropy. Core-provided start/reset seeds are applied
+before user code resumes. The
 offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
@@ -416,6 +420,22 @@ executions have passed the migration window, replace the branch with
 call. Patch IDs are part of durable history and must not be reused for a
 different change. This is Workflow code versioning, not Worker Deployment
 Versioning; deployment routing is not exposed yet.
+
+Workflow time and random values must use Temporal-aware primitives:
+
+```odin
+current_time, available := workflow.now(ctx)
+choice := workflow.random_u64(ctx)
+ratio := workflow.random_f64(ctx)
+request_id := workflow.uuid_v4(ctx)
+```
+
+`now` is constant within an activation and returns Core's history-derived
+timestamp. The random stream is seeded by `InitializeWorkflow` and reset by a
+pre-scanned `UpdateRandomSeed`; its SplitMix64 sequence is replay compatibility
+state and is not cryptographically secure. `uuid_v4` consumes that stream and
+returns a lowercase RFC 4122 variant/version string. Named isolated random
+streams are not implemented yet.
 
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:

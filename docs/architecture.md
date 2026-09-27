@@ -1471,7 +1471,7 @@ Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
 signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
-truth-table cases, and 1,000
+truth-table cases, 500 deterministic time/random activation contexts, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
@@ -1483,8 +1483,8 @@ cancellation are also implemented and live-proven. Continue-As-New now provides
 the next-run Payload and the main timeout/retry/backoff options through a
 non-returning terminal fiber primitive. Core's patch/versioning protocol is now
 implemented and live-proven. The next smallest runtime extension is
-deterministic Workflow time/randomness, while richer recursive failure
-inspection can proceed independently.
+the remaining Workflow-information surface and isolated named random streams,
+while richer recursive failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1727,3 +1727,37 @@ CLI-devserver test executes the new branch, observes one emitted marker, and
 requires `core_patch` in server history. This API concerns deterministic code
 changes inside a Workflow. Worker Deployment Versioning, build-ID routing, and
 Core's experimental rollout callback remain separate and unimplemented.
+
+### Workflow time and randomness boundary
+
+Temporal-aware time is activation state, not a host-clock read. Core places the
+history-derived time in `WorkflowActivation.timestamp`; Odin copies it to the
+run instance before any job can resume code. `workflow.now` returns that stable
+value plus an availability flag, and every call within the activation observes
+the same instant. `workflow.history_length` and `workflow.is_replaying` expose
+the corresponding activation fields without introducing commands.
+
+Core also derives a seed from the run identity. The first seed arrives in
+`InitializeWorkflow.randomness_seed`; reset boundaries arrive as the
+preemptive `UpdateRandomSeed` job. The Rust reference runtime scans seed updates
+in `apply_activation_context` before dispatching jobs. Odin mirrors that order,
+including when `InitializeWorkflow` precedes the update job in the serialized
+activation. This keeps Signal/Update routines and the main fiber on one shared,
+deterministically ordered stream.
+
+The initial Odin API provides `random_u64`, `random_f64`, and `uuid_v4`.
+SplitMix64 was selected as a tiny, locally implemented generator so replay does
+not depend on an Odin standard-library algorithm changing. Its algorithm and
+constants are now compatibility state. `random_f64` uses the high 53 bits and
+returns `[0, 1)`; UUID generation consumes two draws and stamps RFC 4122 version
+4 and variant bits. None is cryptographically secure. Query and synchronous
+Update-validation snapshots include the random state, so drawing there is
+detected as mutation and rolled back.
+
+One unit test fixes a Core seed, timestamp, and history length, then requires an
+identical terminal completion after eviction and replay. A 500-case property
+varies all three plus optional `UpdateRandomSeed`, checks the exact SplitMix64
+oracle, and again requires byte-identical completion. The live patch example
+also reads Workflow time and produces a deterministic UUID/random value using
+the real CLI dev server. Named isolated streams, richer numeric/range helpers,
+and the remaining `InitializeWorkflow` information fields are still pending.

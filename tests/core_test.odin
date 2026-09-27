@@ -1387,6 +1387,102 @@ deprecated_workflow_patch_emits_one_deprecated_marker :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_time_random_and_uuid_replay_identically :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"deterministic_primitives_test_workflow",
+		"determinism-task-queue",
+		deterministic_primitives_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("input")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "deterministic_primitives_test_workflow",
+		randomness_seed = 42,
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	timestamp := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_000_000,
+		nanos = 123_456_789,
+	}
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "deterministic-primitives-run",
+		history_length = 17,
+		timestamp = &timestamp,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	fresh := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, fresh.error.message == nil, "deterministic primitives failed: %s", string(fresh.error.message))
+	testing.expect(t, fresh.completed)
+	fresh_bytes := bytes.clone(fresh.completion[:])
+	inspection := inspect_workflow_completion(fresh.completion[:])
+	value, decode_error := codec.decode_string(inspection.completion_result, "json/plain")
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, len(value), 36)
+	if len(value) == 36 {
+		testing.expect_value(t, value[14], u8('4'))
+		testing.expect(t, value[19] == '8' || value[19] == '9' || value[19] == 'a' || value[19] == 'b')
+	}
+	delete(value)
+	delete(inspection.completion_result)
+	delete(fresh.completion)
+	workflow.error_free(&fresh.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "deterministic primitives replay failed: %s", string(replayed.error.message))
+	testing.expect(t, replayed.is_replaying)
+	testing.expect(t, bytes.equal(fresh_bytes, replayed.completion[:]))
+	delete(fresh_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2265,6 +2361,26 @@ deprecated_patch_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: stri
 		return "deprecated"
 	}
 	return "missing"
+}
+
+deterministic_primitives_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	_ = input
+	activation_time, present := workflow.now(ctx)
+	if !present ||
+	   time.to_unix_nanoseconds(activation_time) != 1_700_000_000_123_456_789 ||
+	   workflow.history_length(ctx) != 17 {
+		return "invalid Workflow clock"
+	}
+	first := workflow.random_u64(ctx)
+	second := workflow.random_u64(ctx)
+	fraction := workflow.random_f64(ctx)
+	if first == second || fraction < 0 || fraction >= 1 {
+		return "invalid Workflow random stream"
+	}
+	return workflow.uuid_v4(ctx)
 }
 
 Child_Failure_Details :: struct {

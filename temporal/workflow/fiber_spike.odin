@@ -1,6 +1,7 @@
 package workflow
 
 import allocator_runtime "base:runtime"
+import "core:encoding/uuid"
 import "core:fmt"
 import "core:math"
 import "core:mem/virtual"
@@ -707,6 +708,11 @@ Fiber_Instance :: struct {
 	next_external_cancel_seq: u32,
 	next_timer_seq:    u32,
 	activation_is_replaying: bool,
+	activation_history_length: u32,
+	activation_time:         time.Time,
+	has_activation_time:     bool,
+	random_state:            u64,
+	random_initialized:      bool,
 	phase:           Fiber_Phase,
 	fiber:           fiber_raw.Handle,
 	arena:           virtual.Arena,
@@ -2056,6 +2062,69 @@ cancellation_reason :: proc(ctx: ^Fiber_Context) -> string {
 
 is_replaying :: proc(ctx: ^Fiber_Context) -> bool {
 	return ctx != nil && ctx.instance != nil && ctx.instance.activation_is_replaying
+}
+
+history_length :: proc(ctx: ^Fiber_Context) -> u32 {
+	if ctx == nil || ctx.instance == nil {
+		return 0
+	}
+	return ctx.instance.activation_history_length
+}
+
+// now returns Temporal's activation timestamp. It never reads the host clock.
+now :: proc(ctx: ^Fiber_Context) -> (value: time.Time, present: bool) {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.has_activation_time {
+		return {}, false
+	}
+	return ctx.instance.activation_time, true
+}
+
+// random_u64 advances a deterministic per-run stream seeded by Core. The
+// SplitMix64 algorithm and constants are part of Odin Workflow replay
+// compatibility and must not change without versioning.
+random_u64 :: proc(ctx: ^Fiber_Context) -> u64 {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.random_initialized {
+		return 0
+	}
+	instance := ctx.instance
+	instance.random_state += 0x9e3779b97f4a7c15
+	value := instance.random_state
+	value = (value ~ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ~ (value >> 27)) * 0x94d049bb133111eb
+	return value ~ (value >> 31)
+}
+
+random_f64 :: proc(ctx: ^Fiber_Context) -> f64 {
+	// Use the top 53 bits to produce a value in [0, 1).
+	return f64(random_u64(ctx) >> 11) * (1.0 / 9007199254740992.0)
+}
+
+uuid_v4 :: proc(ctx: ^Fiber_Context) -> string {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.random_initialized {
+		return ""
+	}
+	id: uuid.Identifier
+	first := random_u64(ctx)
+	second := random_u64(ctx)
+	for index in 0..<8 {
+		id[index] = u8(first >> u64((7 - index) * 8))
+		id[index + 8] = u8(second >> u64((7 - index) * 8))
+	}
+	id[uuid.VERSION_BYTE_INDEX] &= 0x0f
+	id[uuid.VERSION_BYTE_INDEX] |= 0x40
+	id[uuid.VARIANT_BYTE_INDEX] &= 0x3f
+	id[uuid.VARIANT_BYTE_INDEX] |= 0x80
+	result, allocation_error := uuid.to_string_allocated(
+		id,
+		ctx.instance.odin_context.allocator,
+	)
+	if allocation_error != nil {
+		ctx.instance.failure_message = "could not allocate deterministic Workflow UUID"
+		ctx.instance.failure_type = "OdinWorkflowRandomError"
+		ctx.instance.phase = .Failed
+		return ""
+	}
+	return result
 }
 
 find_patch_decision :: proc(
@@ -4536,6 +4605,7 @@ Workflow_Command_State :: struct {
 	external_signal_count: int,
 	external_cancel_count: int,
 	patch_count:          int,
+	random_state:         u64,
 }
 
 workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_State {
@@ -4552,6 +4622,7 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 		external_signal_count = len(instance.external_signals),
 		external_cancel_count = len(instance.external_cancels),
 		patch_count = len(instance.patches),
+		random_state = instance.random_state,
 	}
 }
 
@@ -4570,7 +4641,8 @@ workflow_command_state_changed :: proc(
 		len(instance.child_workflows) != before.child_workflow_count ||
 		len(instance.external_signals) != before.external_signal_count ||
 		len(instance.external_cancels) != before.external_cancel_count ||
-		len(instance.patches) != before.patch_count
+		len(instance.patches) != before.patch_count ||
+		instance.random_state != before.random_state
 }
 
 restore_workflow_command_state :: proc(
@@ -4583,6 +4655,7 @@ restore_workflow_command_state :: proc(
 	instance.next_child_workflow_seq = before.next_child_workflow_seq
 	instance.next_external_signal_seq = before.next_external_signal_seq
 	instance.next_external_cancel_seq = before.next_external_cancel_seq
+	instance.random_state = before.random_state
 	for len(instance.activities) > before.activity_count {
 		ordered_remove(&instance.activities, len(instance.activities) - 1)
 	}
@@ -5658,6 +5731,44 @@ apply_activation_patch_notifications :: proc(
 	return {}
 }
 
+apply_activation_metadata :: proc(
+	instance: ^Fiber_Instance,
+	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
+) -> Error {
+	if instance == nil || activation == nil {
+		return error_from_string("Workflow activation metadata has no active fiber")
+	}
+	instance.activation_is_replaying = activation.is_replaying
+	instance.activation_history_length = activation.history_length
+	instance.has_activation_time = activation.timestamp != nil
+	if activation.timestamp != nil {
+		if activation.timestamp.nanos < 0 || activation.timestamp.nanos >= 1_000_000_000 {
+			return error_from_string("Workflow activation timestamp is invalid")
+		}
+		instance.activation_time = time.unix(
+			activation.timestamp.seconds,
+			i64(activation.timestamp.nanos),
+		)
+	} else {
+		instance.activation_time = {}
+	}
+	seed_updated := false
+	for job in activation.jobs {
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Update_Random_Seed:
+			if variant.value == nil {
+				return error_from_string("Workflow random-seed update has no seed")
+			}
+			if !seed_updated {
+				instance.random_state = variant.value.randomness_seed
+				instance.random_initialized = true
+				seed_updated = true
+			}
+		}
+	}
+	return {}
+}
+
 process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result: Process_Result) {
 	if runtime == nil || runtime.invoke == nil || runtime.callback_data == nil {
 		result.error = error_from_string("Workflow fiber runtime is not initialized")
@@ -5702,7 +5813,13 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	}
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
 	if instance_found {
-		instance.activation_is_replaying = activation.is_replaying
+		metadata_error := apply_activation_metadata(instance, &activation)
+		if metadata_error.message != nil {
+			message := string(metadata_error.message)
+			error_free(&metadata_error)
+			process_error(&result, activation.run_id, message)
+			return
+		}
 		notification_error := apply_activation_patch_notifications(instance, &activation)
 		if notification_error.message != nil {
 			message := string(notification_error.message)
@@ -5729,7 +5846,15 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			instance_found = true
-			instance.activation_is_replaying = activation.is_replaying
+			instance.random_state = variant.value.randomness_seed
+			instance.random_initialized = true
+			metadata_error := apply_activation_metadata(instance, &activation)
+			if metadata_error.message != nil {
+				message := string(metadata_error.message)
+				error_free(&metadata_error)
+				process_error(&result, activation.run_id, message)
+				return
+			}
 			notification_error := apply_activation_patch_notifications(instance, &activation)
 			if notification_error.message != nil {
 				message := string(notification_error.message)
@@ -5750,6 +5875,13 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			handled = true
 			if variant.value == nil || len(variant.value.patch_id) == 0 || !instance_found {
 				process_error(&result, activation.run_id, "Workflow patch notification has no active fiber or patch ID")
+				return
+			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Update_Random_Seed:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "Workflow random-seed update has no active fiber or seed")
 				return
 			}
 

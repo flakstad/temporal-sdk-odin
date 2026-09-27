@@ -102,7 +102,10 @@ forces eviction, reconstructs a fresh fiber, and requires the decisive
 fresh-stack replay. Another 500 cases vary Continue-As-New identity,
 timeouts, Retry Policy, backoff, Payload, and exact replay. A patch property
 generates another 500 replay/notified/deprecated combinations, checks Core's
-truth table, and requires duplicate calls to emit at most one marker. PBT is a
+truth table, and requires duplicate calls to emit at most one marker. Another
+500 activation contexts vary initial/reset seeds, timestamps, and history
+lengths, then require exact random values and byte-identical fresh-stack replay.
+PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
 statechart lifecycle model. Its own package tests currently contain an upstream

@@ -10,7 +10,9 @@ initialize -> schedule hello Activity -> resolve Activity -> complete
 handled Activity failures, buffered signals, a durable signal/timer race, and
 Activity-awaiting Workflow Update routines through stackful coroutines. It also
 implements Core's `NotifyHasPatch`/`SetPatchMarker` replay protocol through
-`patched` and `deprecate_patch`. The
+`patched` and `deprecate_patch`. Workflow time, history length, replay status,
+deterministic random values, and UUID v4 values come only from activation
+metadata and Core-provided seeds. The
 current live Workflow includes:
 
 ```odin
