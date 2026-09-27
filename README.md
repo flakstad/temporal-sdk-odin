@@ -24,11 +24,14 @@ Typed Signals may now be registered as immediate handlers or independent
 stackful routines. An asynchronous Signal handler can await an Activity, mutate
 Workflow-owned state, participate in handler draining, and replay on a fresh
 stack; the CLI-devserver suite proves the state through a public Client Query.
-Child Workflows now have a first vertical path: Odin emits Core's
-`StartChildWorkflowExecution`, awaits its separate start and completion
-resolutions, decodes a typed JSON result, and requests cancellation through
-`CancelChildWorkflowExecution`. The parent/child example completes two Odin
-Workflow Executions through the CLI dev server, and the offline test requires
+Child Workflows now have a vertical start/result/failure/cancellation path:
+Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and completion
+resolutions, decodes typed JSON results and structured Child Workflow failures,
+and requests cancellation through `CancelChildWorkflowExecution`. Unhandled
+child failures preserve Core's original Temporal Failure wrapper and cause
+chain when the parent fails. The CLI-devserver suite proves successful child
+completion, a caught server-generated child failure, and parent cancellation
+that waits for child cancellation before closing. The offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
 multiple outstanding Activities, catchable Activity failure,
@@ -59,8 +62,9 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, structured Child Workflow failure decoding,
-local Activities, client cancellation of an accepted Update, multiple Activity arguments,
+nested cancellation-token trees, explicit Child Workflow handles for signaling
+or direct cancellation, local Activities, client cancellation of an accepted
+Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
 

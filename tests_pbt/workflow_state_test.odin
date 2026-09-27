@@ -1194,6 +1194,265 @@ activity_options_replay_for_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Child_Options_Input :: struct {
+	workflow_id:          string,
+	task_queue:           string,
+	execution_timeout_ms: int,
+	run_timeout_ms:       int,
+	task_timeout_ms:      int,
+	retry_initial_ms:     int,
+	retry_maximum_ms:     int,
+	retry_attempts:       int,
+	cancellation_type:    int,
+	parent_close_policy:  int,
+}
+
+generated_child_options_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Child_Options_Input,
+) -> string {
+	cancellation_type := workflow.Child_Workflow_Cancellation_Type.Wait_Cancellation_Completed
+	switch input.cancellation_type {
+	case 1:
+		cancellation_type = .Abandon
+	case 2:
+		cancellation_type = .Try_Cancel
+	case 3:
+		cancellation_type = .Wait_Cancellation_Requested
+	}
+	parent_close_policy := workflow.Parent_Close_Policy.Unspecified
+	switch input.parent_close_policy {
+	case 1:
+		parent_close_policy = .Terminate
+	case 2:
+		parent_close_policy = .Abandon
+	case 3:
+		parent_close_policy = .Request_Cancel
+	}
+	non_retryable_types := [?]string{"GeneratedChildPermanentFailure"}
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = time.Duration(input.retry_initial_ms) * time.Millisecond,
+		backoff_coefficient = 2,
+		maximum_interval = time.Duration(input.retry_maximum_ms) * time.Millisecond,
+		maximum_attempts = i32(input.retry_attempts),
+		non_retryable_error_types = non_retryable_types[:],
+	}
+	future := workflow.start_child_workflow_json(
+		ctx,
+		"generated_child_workflow",
+		input.workflow_id,
+		{
+			workflow_id = input.workflow_id,
+			task_queue = input.task_queue,
+			workflow_execution_timeout = time.Duration(input.execution_timeout_ms) * time.Millisecond,
+			workflow_run_timeout = time.Duration(input.run_timeout_ms) * time.Millisecond,
+			workflow_task_timeout = time.Duration(input.task_timeout_ms) * time.Millisecond,
+			retry_policy = &retry_policy,
+			cancellation_type = cancellation_type,
+			parent_close_policy = parent_close_policy,
+		},
+	)
+	_ = workflow.await_child_workflow_start(ctx, future)
+	return "started"
+}
+
+generated_child_options_match :: proc(
+	data: []u8,
+	expected: ^Generated_Child_Options_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Child_Workflow_Execution:
+			if variant.value == nil || variant.value.retry_policy == nil {
+				return false
+			}
+			start := variant.value
+			cancellation_type := proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED
+			switch expected.cancellation_type {
+			case 1:
+				cancellation_type = .ABANDON
+			case 2:
+				cancellation_type = .TRY_CANCEL
+			case 3:
+				cancellation_type = .WAIT_CANCELLATION_REQUESTED
+			}
+			parent_close_policy := proto.Coresdk_Child_Workflow_ParentClosePolicy.PARENT_CLOSE_POLICY_UNSPECIFIED
+			switch expected.parent_close_policy {
+			case 1:
+				parent_close_policy = .PARENT_CLOSE_POLICY_TERMINATE
+			case 2:
+				parent_close_policy = .PARENT_CLOSE_POLICY_ABANDON
+			case 3:
+				parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL
+			}
+			policy := start.retry_policy
+			return start.seq == 1 && start.workflow_id == expected.workflow_id &&
+				start.workflow_type == "generated_child_workflow" &&
+				start.task_queue == expected.task_queue && len(start.input) == 1 &&
+				pbt_proto_duration(start.workflow_execution_timeout) == time.Duration(expected.execution_timeout_ms) * time.Millisecond &&
+				pbt_proto_duration(start.workflow_run_timeout) == time.Duration(expected.run_timeout_ms) * time.Millisecond &&
+				pbt_proto_duration(start.workflow_task_timeout) == time.Duration(expected.task_timeout_ms) * time.Millisecond &&
+				pbt_proto_duration(policy.initial_interval) == time.Duration(expected.retry_initial_ms) * time.Millisecond &&
+				policy.backoff_coefficient == 2 &&
+				pbt_proto_duration(policy.maximum_interval) == time.Duration(expected.retry_maximum_ms) * time.Millisecond &&
+				policy.maximum_attempts == i32(expected.retry_attempts) &&
+				len(policy.non_retryable_error_types) == 1 &&
+				policy.non_retryable_error_types[0] == "GeneratedChildPermanentFailure" &&
+				start.cancellation_type == cancellation_type &&
+				start.parent_close_policy == parent_close_policy
+		}
+	}
+	return false
+}
+
+child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	execution_timeout_ms := pbt.draw(t, pbt.int_range(1000, 120_000))
+	run_timeout_ms := pbt.draw(t, pbt.int_range(1, execution_timeout_ms))
+	task_timeout_ms := pbt.draw(t, pbt.int_range(1, run_timeout_ms))
+	retry_initial_ms := pbt.draw(t, pbt.int_range(1, 10_000))
+	retry_maximum_ms := pbt.draw(t, pbt.int_range(retry_initial_ms, 120_000))
+	input_value := Generated_Child_Options_Input{
+		workflow_id = pbt.draw(t, pbt.string_ascii(1, 32)),
+		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
+		execution_timeout_ms = execution_timeout_ms,
+		run_timeout_ms = run_timeout_ms,
+		task_timeout_ms = task_timeout_ms,
+		retry_initial_ms = retry_initial_ms,
+		retry_maximum_ms = retry_maximum_ms,
+		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
+		cancellation_type = pbt.draw(t, pbt.int_range(0, 3)),
+		parent_close_policy = pbt.draw(t, pbt.int_range(0, 3)),
+	}
+	pbt.cover(t, input_value.cancellation_type == 0, 15.0, "wait cancellation completed")
+	pbt.cover(t, input_value.cancellation_type == 1, 15.0, "abandon child")
+	pbt.cover(t, input_value.cancellation_type == 2, 15.0, "try cancel child")
+	pbt.cover(t, input_value.cancellation_type == 3, 15.0, "wait cancellation requested")
+	pbt.cover(t, input_value.parent_close_policy == 0, 15.0, "server parent-close default")
+	pbt.cover(t, input_value.parent_close_policy == 3, 15.0, "request cancel on parent close")
+
+	owned_queue, queue_error := strings.clone("pbt-child-workflow-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate Child Workflow options queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_child_options_workflow",
+		generated_child_options_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register Child Workflow options Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Child Workflow options")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_child_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-child-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.started_child_workflow ||
+	   !generated_child_options_match(initial.completion[:], &input_value) {
+		return pbt.fail("generated Child Workflow options changed across command encoding")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated Child Workflow options Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil || !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated Child Workflow options replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+child_workflow_options_replay_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Child Workflow options survive generated command encoding and replay",
+		child_options_replay_property,
+		{num_tests = 500, seed = 0x4348_494c_445f_4f50},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

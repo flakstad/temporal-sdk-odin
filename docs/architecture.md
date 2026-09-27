@@ -1448,7 +1448,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, registered dispatch, eviction, and replay on macOS arm64 | Add Child Workflow start/result/cancel and stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/cancel, registered dispatch, eviction, and replay on macOS arm64 | Add explicit child handles/signals and stress shared-state scheduling without moving fibers between threads |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -1468,12 +1468,13 @@ Application Failure contracts, 500 typed Workflow replay cases, and 500
 Activity-option command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
-and 1,000 statechart-backed Update lifecycle traces,
+500 Child Workflow option/replay cases, and 1,000 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The Child Workflow start/result slice is now implemented. The next smallest
-extension is structured Child Workflow failure propagation plus live
-cancellation coverage, followed by signal/cancel handles for a started child.
+The Child Workflow start/result/failure/cancellation slice is now implemented.
+The next smallest extension is an owned public child handle with explicit
+cancel and signal operations, followed by start-failure coverage and richer
+recursive failure inspection.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,
@@ -1531,9 +1532,10 @@ the second. A completion delivered in the same activation as the start
 resolution is retained before either fiber resume, so activation ordering does
 not lose it.
 
-Owned Workflow ID/type/options/input, Run ID, output Payload, and failure bytes
-live in the Workflow instance arena. Activation decode values remain borrowed
-only for that callback and are cloned before the decode arena is destroyed.
+Owned Workflow ID/type/options/input, Run ID, output Payload, structured failure
+fields/details, and original encoded Failure bytes live in the Workflow instance
+arena. Activation decode values remain borrowed only for that callback and are
+cloned before the decode arena is destroyed.
 Eviction destroys the entire operation table; replay recreates it by rerunning
 deterministic Odin code. The offline acceptance test evicts immediately after
 the start command and requires a byte-identical command from a fresh stack.
@@ -1542,14 +1544,28 @@ The default Odin cancellation enum intentionally maps its zero value to Core's
 `WAIT_CANCELLATION_COMPLETED`, matching the safe Core SDK default rather than
 the protobuf enum's zero-valued `ABANDON`. `ABANDON` and `TRY_CANCEL` can resume
 the parent locally; the wait policies remain suspended until Core supplies the
-corresponding resolution. A unit test covers cancellation while waiting for the
-start resolution. Full live cancellation and structured Child Workflow Failure
-decoding remain open hardening work.
+corresponding resolution. Unit tests cover cancellation while waiting for the
+start resolution and exact reason transport. The CLI-devserver test cancels a
+parent with a running, timer-blocked child and verifies that Odin emits the
+cancel command, receives the child resolution, and only then acknowledges the
+parent cancellation.
+
+On failure, Odin owns the outer `ChildWorkflowExecutionFailureInfo` identity
+(namespace, execution, type, event IDs, and Retry State) and walks the Failure
+cause chain to expose Application Failure details, cancellation details,
+Timeout Type, or termination. Typed JSON helpers decode copied detail Payloads.
+For an unhandled child failure, the parent completion re-emits the original
+Temporal Failure protobuf rather than synthesizing a generic Application
+Failure. This preserves server-generated wrapper/cause semantics for callers
+and higher-level parent Workflows. The public structure currently summarizes
+the first recognized cause instead of exposing an arbitrary recursive typed
+Failure tree.
 
 The CLI-devserver acceptance test registers parent and child Workflow types on
 one Odin worker and task queue. Temporal starts the child as a distinct durable
-execution, both executions complete, and the parent returns the child's result.
-This confirms the intended boundary:
+execution. Success returns the child's typed result, failure produces a real
+server-authored child wrapper decoded by the parent, and cancellation traverses
+the Core command/resolution protocol. This confirms the intended boundary:
 
 ```text
 Odin parent fiber -> StartChild command -> Core -> Temporal Service

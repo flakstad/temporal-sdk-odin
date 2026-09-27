@@ -813,3 +813,96 @@ wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Child Workflow failure Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_failure_parent_id="odin-sdk-child-failure-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$child_failure_parent_id" \
+  --type odin_child_failure_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"Odin"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+child_failure_output="$(<"$workflow_output_file")"
+echo "$child_failure_output"
+grep -q '"status": "COMPLETED"' <<<"$child_failure_output"
+grep -q 'Observed structured Child Workflow failure' <<<"$child_failure_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Child Workflow cancellation Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_cancel_suffix="$$-$(date +%s)"
+child_cancel_parent_id="odin-sdk-child-cancel-$child_cancel_suffix"
+temporal workflow execute \
+  --workflow-id "$child_cancel_parent_id" \
+  --type odin_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input "\"cancel-$child_cancel_suffix\"" \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -q 'start_resolved=1' "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Child Workflow did not start before parent cancellation" >&2
+    cat "$worker_log" >&2
+    cat "$workflow_output_file" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+TEMPORAL_CLIENT_ACTION=cancel \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$child_cancel_parent_id" \
+  TEMPORAL_CLIENT_REASON="Odin Child Workflow integration cancellation" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+child_cancel_cli_status=0
+wait "$workflow_cli_pid" || child_cancel_cli_status=$?
+workflow_cli_pid=""
+child_cancel_output="$(<"$workflow_output_file")"
+echo "$child_cancel_output"
+[[ "$child_cancel_cli_status" -eq 0 || "$child_cancel_cli_status" -eq 1 ]]
+grep -q '"status": "CANCELED"' <<<"$child_cancel_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
+grep -q 'resolved=1 .*canceled_workflow=true' "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"

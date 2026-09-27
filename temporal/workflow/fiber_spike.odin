@@ -253,22 +253,52 @@ Child_Workflow_Result_Status :: enum {
 	Canceled,
 }
 
+Failure_Timeout_Type :: enum {
+	Unspecified,
+	Start_To_Close,
+	Schedule_To_Start,
+	Schedule_To_Close,
+	Heartbeat,
+}
+
+Child_Workflow_Failure :: struct {
+	message:            string,
+	source:             string,
+	stack_trace:        string,
+	namespace:          string,
+	workflow_id:        string,
+	run_id:             string,
+	workflow_type:      string,
+	initiated_event_id: i64,
+	started_event_id:   i64,
+	retry_state:        Activity_Retry_State,
+	application:        Application_Failure,
+	canceled:           bool,
+	cancellation_details: []codec.Payload_View,
+	timed_out:          bool,
+	timeout_type:       Failure_Timeout_Type,
+	terminated:         bool,
+}
+
 Payload_Child_Workflow_Result :: struct {
 	status:          Child_Workflow_Result_Status,
 	value:           codec.Payload_View,
 	failure_message: string,
+	failure:         Child_Workflow_Failure,
 }
 
 Json_Child_Workflow_Result :: struct($T: typeid) {
 	status:          Child_Workflow_Result_Status,
 	value:           T,
 	failure_message: string,
+	failure:         Child_Workflow_Failure,
 }
 
 Child_Workflow_Result :: struct {
 	status:          Child_Workflow_Result_Status,
 	value:           string,
 	failure_message: string,
+	failure:         Child_Workflow_Failure,
 }
 
 Child_Workflow_Start_State :: enum {
@@ -449,6 +479,11 @@ Fiber_Child_Workflow_Operation :: struct {
 	result:        codec.Payload,
 	failure_message: string,
 	failure_proto:   []u8,
+	failure:         Child_Workflow_Failure,
+	failure_detail_payloads: [dynamic]codec.Payload,
+	failure_detail_views:    []codec.Payload_View,
+	cancellation_detail_payloads: [dynamic]codec.Payload,
+	cancellation_detail_views:    []codec.Payload_View,
 	command_state:   Fiber_Operation_State,
 	start_state:     Child_Workflow_Start_State,
 	completion_state: Child_Workflow_Completion_State,
@@ -476,6 +511,7 @@ Fiber_Signal_Routine :: struct {
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
 	unhandled_activity_seq: u32,
+	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
 	phase:                  Fiber_Phase,
@@ -498,6 +534,7 @@ Fiber_Update_Routine :: struct {
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
 	unhandled_activity_seq: u32,
+	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
 	phase:                  Fiber_Phase,
@@ -531,6 +568,7 @@ Fiber_Instance :: struct {
 	detached_scope_depth:   int,
 	terminal_command_sent: bool,
 	unhandled_activity_seq: u32,
+	unhandled_child_workflow_seq: u32,
 	failure_message:       string,
 	failure_type:          string,
 	next_activity_seq: u32,
@@ -684,6 +722,7 @@ Fiber_Execution_State :: struct {
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
 	unhandled_activity_seq: u32,
+	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
 	phase:                  Fiber_Phase,
@@ -698,6 +737,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 		waiting_signal_name = instance.waiting_signal_name,
 		detached_scope_depth = instance.detached_scope_depth,
 		unhandled_activity_seq = instance.unhandled_activity_seq,
+		unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq,
 		failure_message = instance.failure_message,
 		failure_type = instance.failure_type,
 		phase = instance.phase,
@@ -712,6 +752,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 	instance.waiting_signal_name = state.waiting_signal_name
 	instance.detached_scope_depth = state.detached_scope_depth
 	instance.unhandled_activity_seq = state.unhandled_activity_seq
+	instance.unhandled_child_workflow_seq = state.unhandled_child_workflow_seq
 	instance.failure_message = state.failure_message
 	instance.failure_type = state.failure_type
 	instance.phase = state.phase
@@ -726,6 +767,7 @@ signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execut
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
+		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
 		failure_type = routine.failure_type,
 		phase = routine.phase,
@@ -743,6 +785,7 @@ capture_signal_routine_execution :: proc(
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
+	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
 	routine.failure_type = instance.failure_type
 	routine.phase = instance.phase
@@ -785,6 +828,13 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 				failure_type = "OdinWorkflowSignalActivityFailure"
 			}
 		}
+		if instance.unhandled_child_workflow_seq != 0 {
+			operation, found := find_child_workflow_operation(instance, instance.unhandled_child_workflow_seq)
+			if found {
+				message = operation.failure_message
+				failure_type = "OdinWorkflowSignalChildWorkflowFailure"
+			}
+		}
 		if len(message) == 0 {
 			message = "Workflow Signal routine failed"
 		}
@@ -807,6 +857,7 @@ update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execut
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
+		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
 		failure_type = routine.failure_type,
 		phase = routine.phase,
@@ -824,6 +875,7 @@ capture_update_routine_execution :: proc(
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
+	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
 	routine.failure_type = instance.failure_type
 	routine.phase = instance.phase
@@ -864,6 +916,13 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 			if found {
 				message = operation.failure_message
 				failure_type = "OdinWorkflowUpdateActivityFailure"
+			}
+		}
+		if instance.unhandled_child_workflow_seq != 0 {
+			operation, found := find_child_workflow_operation(instance, instance.unhandled_child_workflow_seq)
+			if found {
+				message = operation.failure_message
+				failure_type = "OdinWorkflowUpdateChildWorkflowFailure"
 			}
 		}
 		if len(message) == 0 {
@@ -921,6 +980,12 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	for &operation in instance.child_workflows {
 		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
+		for &detail in operation.failure_detail_payloads {
+			codec.payload_free(&detail)
+		}
+		for &detail in operation.cancellation_detail_payloads {
+			codec.payload_free(&detail)
+		}
 	}
 	for &signal in instance.signals {
 		codec.payload_free(&signal.payload)
@@ -2277,9 +2342,17 @@ payload_child_workflow_result_from_operation :: proc(
 	case .Succeeded:
 		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
 	case .Failed:
-		return {status = .Failed, failure_message = operation.failure_message}
+		return {
+			status = .Failed,
+			failure_message = operation.failure_message,
+			failure = operation.failure,
+		}
 	case .Canceled:
-		return {status = .Canceled, failure_message = operation.failure_message}
+		return {
+			status = .Canceled,
+			failure_message = operation.failure_message,
+			failure = operation.failure,
+		}
 	case .Pending:
 	}
 	return {status = .Failed, failure_message = "Child Workflow has not completed"}
@@ -2324,7 +2397,11 @@ await_child_workflow_json_result :: proc(
 ) -> Json_Child_Workflow_Result(T) {
 	result := await_child_workflow_payload_result(ctx, future)
 	if result.status != .Succeeded {
-		return {status = result.status, failure_message = result.failure_message}
+		return {
+			status = result.status,
+			failure_message = result.failure_message,
+			failure = result.failure,
+		}
 	}
 	value: T
 	if codec.decode_json(result.value, &value) != .None {
@@ -2339,7 +2416,12 @@ await_child_workflow_result :: proc(
 	future: Child_Workflow_Future,
 ) -> Child_Workflow_Result {
 	result := await_child_workflow_json_result(ctx, future, string)
-	return {status = result.status, value = result.value, failure_message = result.failure_message}
+	return {
+		status = result.status,
+		value = result.value,
+		failure_message = result.failure_message,
+		failure = result.failure,
+	}
 }
 
 execute_child_workflow_json_result :: proc(
@@ -2361,9 +2443,17 @@ execute_child_workflow :: proc(
 	workflow_type, input: string,
 	options: Child_Workflow_Options,
 ) -> string {
-	result := execute_child_workflow_json_result(ctx, workflow_type, input, options, string)
-	if result.status == .Failed {
-		mark_child_workflow_failure(ctx, result.failure_message, "OdinChildWorkflowExecutionError")
+	future := start_child_workflow_json(ctx, workflow_type, input, options)
+	result := await_child_workflow_json_result(ctx, future, string)
+	if result.status == .Failed ||
+	   (result.status == .Canceled && ctx != nil && !root_cancellation_applies(ctx.instance)) {
+		operation, found := find_child_workflow_operation(ctx.instance, future.seq)
+		if found && len(operation.failure_proto) > 0 {
+			ctx.instance.unhandled_child_workflow_seq = future.seq
+			ctx.instance.phase = .Failed
+		} else {
+			mark_child_workflow_failure(ctx, result.failure_message, "OdinChildWorkflowExecutionError")
+		}
 		return ""
 	}
 	return result.value
@@ -2509,6 +2599,171 @@ activity_failure_detail_json :: proc(
 		return false, .None
 	}
 	return true, codec.decode_json(payload, value)
+}
+
+failure_timeout_type_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_TimeoutType,
+) -> Failure_Timeout_Type {
+	switch value {
+	case .TIMEOUT_TYPE_START_TO_CLOSE:
+		return .Start_To_Close
+	case .TIMEOUT_TYPE_SCHEDULE_TO_START:
+		return .Schedule_To_Start
+	case .TIMEOUT_TYPE_SCHEDULE_TO_CLOSE:
+		return .Schedule_To_Close
+	case .TIMEOUT_TYPE_HEARTBEAT:
+		return .Heartbeat
+	case .TIMEOUT_TYPE_UNSPECIFIED:
+		return .Unspecified
+	}
+	return .Unspecified
+}
+
+preserve_child_workflow_failure :: proc(
+	operation: ^Fiber_Child_Workflow_Operation,
+	value: ^proto.Temporal_Api_Failure_V1_Failure,
+) -> bool {
+	if operation == nil || value == nil {
+		return false
+	}
+	message_ok, source_ok, stack_ok: bool
+	operation.failure.message, message_ok = clone_failure_string(value.message)
+	operation.failure.source, source_ok = clone_failure_string(value.source)
+	operation.failure.stack_trace, stack_ok = clone_failure_string(value.stack_trace)
+	if !message_ok || !source_ok || !stack_ok {
+		return false
+	}
+
+	current := value
+	for current != nil {
+		#partial switch info in current.failure_info {
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info:
+			if info.value != nil && len(operation.failure.workflow_id) == 0 {
+				child := info.value
+				namespace_ok, id_ok, run_ok, type_ok: bool
+				operation.failure.namespace, namespace_ok = clone_failure_string(child.namespace)
+				if child.workflow_execution != nil {
+					operation.failure.workflow_id, id_ok = clone_failure_string(child.workflow_execution.workflow_id)
+					operation.failure.run_id, run_ok = clone_failure_string(child.workflow_execution.run_id)
+				} else {
+					id_ok = true
+					run_ok = true
+				}
+				if child.workflow_type != nil {
+					operation.failure.workflow_type, type_ok = clone_failure_string(child.workflow_type.name)
+				} else {
+					type_ok = true
+				}
+				if !namespace_ok || !id_ok || !run_ok || !type_ok {
+					return false
+				}
+				operation.failure.initiated_event_id = child.initiated_event_id
+				operation.failure.started_event_id = child.started_event_id
+				operation.failure.retry_state = activity_retry_state_from_proto(child.retry_state)
+			}
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+			if info.value != nil && !operation.failure.application.present {
+				application := &operation.failure.application
+				application.present = true
+				app_message_ok, app_type_ok: bool
+				application.message, app_message_ok = clone_failure_string(current.message)
+				application.type, app_type_ok = clone_failure_string(info.value.type)
+				if !app_message_ok || !app_type_ok {
+					return false
+				}
+				application.non_retryable = info.value.non_retryable
+				application.category = application_error_category_from_proto(info.value.category)
+				if info.value.next_retry_delay != nil {
+					application.has_next_retry_delay = true
+					application.next_retry_delay = failure_duration_from_proto(info.value.next_retry_delay)
+				}
+				operation.failure_detail_payloads = make([dynamic]codec.Payload)
+				if info.value.details != nil {
+					for &detail in info.value.details.payloads {
+						owned, clone_error := proto.clone_payload(&detail)
+						if clone_error != .None {
+							return false
+						}
+						append(&operation.failure_detail_payloads, owned)
+					}
+				}
+				operation.failure_detail_views = make(
+					[]codec.Payload_View,
+					len(operation.failure_detail_payloads),
+				)
+				for &detail, index in operation.failure_detail_payloads {
+					operation.failure_detail_views[index] = codec.payload_view(&detail)
+				}
+				application.details = operation.failure_detail_views
+			}
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
+			if info.value != nil && !operation.failure.canceled {
+				operation.failure.canceled = true
+				operation.cancellation_detail_payloads = make([dynamic]codec.Payload)
+				if info.value.details != nil {
+					for &detail in info.value.details.payloads {
+						owned, clone_error := proto.clone_payload(&detail)
+						if clone_error != .None {
+							return false
+						}
+						append(&operation.cancellation_detail_payloads, owned)
+					}
+				}
+				operation.cancellation_detail_views = make(
+					[]codec.Payload_View,
+					len(operation.cancellation_detail_payloads),
+				)
+				for &detail, index in operation.cancellation_detail_payloads {
+					operation.cancellation_detail_views[index] = codec.payload_view(&detail)
+				}
+				operation.failure.cancellation_details = operation.cancellation_detail_views
+			}
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Timeout_Failure_Info:
+			if info.value != nil && !operation.failure.timed_out {
+				operation.failure.timed_out = true
+				operation.failure.timeout_type = failure_timeout_type_from_proto(info.value.timeout_type)
+			}
+		case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Terminated_Failure_Info:
+			operation.failure.terminated = info.value != nil
+		}
+		current = current.cause
+	}
+	return true
+}
+
+child_workflow_failure_detail_payload :: proc(
+	failure: ^Child_Workflow_Failure,
+	index: int,
+) -> (payload: codec.Payload_View, found: bool) {
+	if failure == nil || !failure.application.present || index < 0 ||
+	   index >= len(failure.application.details) {
+		return
+	}
+	return failure.application.details[index], true
+}
+
+child_workflow_failure_detail_json :: proc(
+	failure: ^Child_Workflow_Failure,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := child_workflow_failure_detail_payload(failure, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+child_workflow_cancellation_detail_json :: proc(
+	failure: ^Child_Workflow_Failure,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	if failure == nil || !failure.canceled || index < 0 ||
+	   index >= len(failure.cancellation_details) {
+		return false, .None
+	}
+	return true, codec.decode_json(failure.cancellation_details[index], value)
 }
 
 payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
@@ -4162,6 +4417,19 @@ append_fiber_failure_command :: proc(
 		if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
 			return error_from_string("could not restore unhandled Activity failure")
 		}
+	} else if instance.unhandled_child_workflow_seq != 0 {
+		operation, found := find_child_workflow_operation(
+			instance,
+			instance.unhandled_child_workflow_seq,
+		)
+		if !found ||
+		   (operation.completion_state != .Failed && operation.completion_state != .Canceled) ||
+		   len(operation.failure_proto) == 0 {
+			return error_from_string("Workflow fiber failed without a preserved Child Workflow failure")
+		}
+		if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
+			return error_from_string("could not restore unhandled Child Workflow failure")
+		}
 	} else {
 		if len(instance.failure_message) == 0 {
 			return error_from_string("Workflow fiber failed without failure details")
@@ -4488,8 +4756,13 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				operation.result, _ = proto.clone_payload(status.value.result)
+				cloned_result, clone_error := proto.clone_payload(status.value.result)
 				context.allocator = previous_allocator
+				if clone_error != .None {
+					process_error(&result, activation.run_id, "could not preserve Child Workflow result Payload")
+					return
+				}
+				operation.result = cloned_result
 				operation.completion_state = .Succeeded
 			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Failed:
 				resolution_handled = true
@@ -4498,10 +4771,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				operation.failure_message, _ = strings.clone(status.value.failure.message)
+				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
-				operation.failure_proto = failure_proto[:]
+				failure_preserved := preserve_child_workflow_failure(operation, status.value.failure)
 				context.allocator = previous_allocator
+				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
+					process_error(&result, activation.run_id, "could not preserve Child Workflow failure")
+					return
+				}
+				operation.failure_message = failure_message
+				operation.failure_proto = failure_proto[:]
 				operation.completion_state = .Failed
 			case proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Cancelled:
 				resolution_handled = true
@@ -4510,10 +4789,16 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 					return
 				}
 				context.allocator = instance.odin_context.allocator
-				operation.failure_message, _ = strings.clone(status.value.failure.message)
+				failure_message, allocation_error := strings.clone(status.value.failure.message)
 				failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
-				operation.failure_proto = failure_proto[:]
+				failure_preserved := preserve_child_workflow_failure(operation, status.value.failure)
 				context.allocator = previous_allocator
+				if allocation_error != nil || len(failure_proto) == 0 || !failure_preserved {
+					process_error(&result, activation.run_id, "could not preserve canceled Child Workflow failure")
+					return
+				}
+				operation.failure_message = failure_message
+				operation.failure_proto = failure_proto[:]
 				operation.completion_state = .Canceled
 			}
 			if !resolution_handled {

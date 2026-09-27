@@ -291,6 +291,82 @@ child_workflow_cancellation_requests_core_and_waits_for_start_resolution :: proc
 	workflow.error_free(&completed.error)
 }
 
+@(test)
+child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"child_failure_observer_test_workflow",
+		"parent-task-queue",
+		child_failure_observer_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	completed := drive_child_failure_test(
+		t,
+		&runtime,
+		"child_failure_observer_test_workflow",
+		"child-failure-observer-run",
+		"child-failure-id",
+	)
+	testing.expectf(t, completed.error.message == nil, "structured Child failure failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	payload, found := clone_workflow_completion_payload(completed.completion[:])
+	testing.expect(t, found)
+	if found {
+		value: string
+		decode_error := codec.decode_json(codec.payload_view(&payload), &value)
+		testing.expect(t, decode_error == .None)
+		testing.expect_value(t, value, "Observed structured Child Workflow failure")
+		delete(value)
+	}
+	codec.payload_free(&payload)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+unhandled_child_workflow_failure_preserves_original_temporal_wrapper :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"child_failure_unhandled_test_workflow",
+		"parent-task-queue",
+		child_failure_unhandled_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	completed := drive_child_failure_test(
+		t,
+		&runtime,
+		"child_failure_unhandled_test_workflow",
+		"child-failure-unhandled-run",
+		"child-failure-unhandled-id",
+	)
+	testing.expectf(t, completed.error.message == nil, "unhandled Child failure failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	inspection := inspect_workflow_failure_command(completed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect(t, inspection.child_workflow)
+	testing.expect_value(t, string(inspection.message), "Child Workflow failed")
+	testing.expect_value(t, string(inspection.child_workflow_id), "child-failure-unhandled-id")
+	testing.expect_value(t, string(inspection.child_workflow_type), "child_failure_test_workflow")
+	testing.expect_value(t, string(inspection.cause_message), "billing rejected child")
+	testing.expect_value(t, string(inspection.cause_type), "ChildBillingRejected")
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(inspection.child_workflow_id)
+	delete(inspection.child_workflow_type)
+	delete(inspection.cause_message)
+	delete(inspection.cause_type)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
 Heartbeat_Progress :: struct {
 	completed: int,
 }
@@ -920,6 +996,64 @@ child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) 
 	)
 }
 
+Child_Failure_Details :: struct {
+	dependency: string,
+	code:       int,
+}
+
+child_failure_observer_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	result := workflow.execute_child_workflow_json_result(
+		ctx,
+		"child_failure_test_workflow",
+		input,
+		{
+			workflow_id = "child-failure-id",
+			workflow_execution_timeout = time.Minute,
+		},
+		string,
+	)
+	if result.status != .Failed {
+		return "expected Child Workflow failure"
+	}
+	failure := &result.failure
+	details: Child_Failure_Details
+	detail_found, detail_error := workflow.child_workflow_failure_detail_json(
+		failure,
+		0,
+		&details,
+	)
+	if failure.message != "Child Workflow failed" || failure.source != "TemporalSDK" ||
+	   failure.namespace != "default" || failure.workflow_id != "child-failure-id" ||
+	   failure.run_id != "child-failure-run" || failure.workflow_type != "child_failure_test_workflow" ||
+	   failure.initiated_event_id != 5 || failure.started_event_id != 6 ||
+	   failure.retry_state != .Maximum_Attempts_Reached || !failure.application.present ||
+	   failure.application.message != "billing rejected child" ||
+	   failure.application.type != "ChildBillingRejected" ||
+	   !failure.application.non_retryable || !detail_found || detail_error != .None ||
+	   details.dependency != "billing" || details.code != 409 {
+		return "structured Child Workflow failure mismatch"
+	}
+	return "Observed structured Child Workflow failure"
+}
+
+child_failure_unhandled_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	return workflow.execute_child_workflow(
+		ctx,
+		"child_failure_test_workflow",
+		input,
+		{
+			workflow_id = "child-failure-unhandled-id",
+			workflow_execution_timeout = time.Minute,
+		},
+	)
+}
+
 process_fiber_test_activation :: proc(
 	runtime: ^workflow.Fiber_Runtime,
 	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
@@ -927,6 +1061,135 @@ process_fiber_test_activation :: proc(
 	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(activation)
 	defer delete(encoded)
 	return workflow.process_fiber_activation(runtime, encoded[:])
+}
+
+drive_child_failure_test :: proc(
+	t: ^testing.T,
+	runtime: ^workflow.Fiber_Runtime,
+	parent_workflow_type, run_id, child_workflow_id: string,
+) -> workflow.Process_Result {
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = parent_workflow_type,
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = run_id,
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "Child failure test initialization failed: %s", string(initial.error.message))
+	testing.expect(t, initial.started_child_workflow)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	start_success := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStartSuccess{
+		run_id = "child-failure-run",
+	}
+	resolve_start := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecutionStart_Status_Succeeded{
+			value = &start_success,
+		},
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution_Start{
+				value = &resolve_start,
+			},
+		},
+	)
+	started := process_fiber_test_activation(runtime, &activation)
+	testing.expectf(t, started.error.message == nil, "Child failure start resolution failed: %s", string(started.error.message))
+	delete(started.completion)
+	workflow.error_free(&started.error)
+
+	detail, detail_error := codec.encode_json(Child_Failure_Details{dependency = "billing", code = 409})
+	testing.expect(t, detail_error == .None)
+	defer codec.payload_free(&detail)
+	proto_detail := proto.encode_payload(codec.payload_view(&detail))
+	defer delete(proto_detail.metadata)
+	defer delete(proto_detail.external_payloads)
+	details := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(details.payloads)
+	append(&details.payloads, proto_detail)
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "ChildBillingRejected",
+		non_retryable = true,
+		details = &details,
+	}
+	cause := proto.Temporal_Api_Failure_V1_Failure{
+		message = "billing rejected child",
+		source = "OdinSDK",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	workflow_execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = child_workflow_id,
+		run_id = "child-failure-run",
+	}
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{
+		name = "child_failure_test_workflow",
+	}
+	child_info := proto.Temporal_Api_Failure_V1_ChildWorkflowExecutionFailureInfo{
+		namespace = "default",
+		workflow_execution = &workflow_execution,
+		workflow_type = &workflow_type,
+		initiated_event_id = 5,
+		started_event_id = 6,
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Child Workflow failed",
+		source = "TemporalSDK",
+		stack_trace = "child stack",
+		cause = &cause,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info{
+			value = &child_info,
+		},
+	}
+	child_failed := proto.Coresdk_Child_Workflow_Failure{failure = &failure}
+	child_result := proto.Coresdk_Child_Workflow_ChildWorkflowResult{
+		status = proto.Coresdk_Child_Workflow_ChildWorkflowResult_Status_Failed{
+			value = &child_failed,
+		},
+	}
+	resolve_child := proto.Coresdk_Workflow_Activation_ResolveChildWorkflowExecution{
+		seq = 1,
+		result = &child_result,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Child_Workflow_Execution{
+				value = &resolve_child,
+			},
+		},
+	)
+	return process_fiber_test_activation(runtime, &activation)
 }
 
 Workflow_Completion_Inspection :: struct {
@@ -1364,6 +1627,11 @@ Workflow_Failure_Inspection :: struct {
 	message:       []u8,
 	failure_type:  []u8,
 	non_retryable: bool,
+	child_workflow: bool,
+	child_workflow_id: []u8,
+	child_workflow_type: []u8,
+	cause_message: []u8,
+	cause_type: []u8,
 }
 
 inspect_workflow_failure_command :: proc(
@@ -1394,14 +1662,38 @@ inspect_workflow_failure_command :: proc(
 					return
 				}
 				inspection.message = bytes.clone(transmute([]u8)variant.value.failure.message)
+				inspection.found = true
 				#partial switch failure_info in variant.value.failure.failure_info {
 				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
 					if failure_info.value != nil {
-						inspection.found = true
 						inspection.failure_type = bytes.clone(
 							transmute([]u8)failure_info.value.type,
 						)
 						inspection.non_retryable = failure_info.value.non_retryable
+					}
+				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Child_Workflow_Execution_Failure_Info:
+					if failure_info.value != nil {
+						inspection.child_workflow = true
+						if failure_info.value.workflow_execution != nil {
+							inspection.child_workflow_id = bytes.clone(
+								transmute([]u8)failure_info.value.workflow_execution.workflow_id,
+							)
+						}
+						if failure_info.value.workflow_type != nil {
+							inspection.child_workflow_type = bytes.clone(
+								transmute([]u8)failure_info.value.workflow_type.name,
+							)
+						}
+					}
+				}
+				if variant.value.failure.cause != nil {
+					cause := variant.value.failure.cause
+					inspection.cause_message = bytes.clone(transmute([]u8)cause.message)
+					#partial switch cause_info in cause.failure_info {
+					case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info:
+						if cause_info.value != nil {
+							inspection.cause_type = bytes.clone(transmute([]u8)cause_info.value.type)
+						}
 					}
 				}
 				return

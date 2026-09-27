@@ -591,7 +591,11 @@ evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,
 retry, queue, ID, cancellation, and eager-execution combinations. It checks
 every encoded `ScheduleActivity` field and requires byte-identical commands
-after eviction and fresh-stack replay. The Client property generates another
+after eviction and fresh-stack replay. The Child Workflow options property
+generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
+and Parent Close Policy combinations. It checks every encoded
+`StartChildWorkflowExecution` field and requires byte-identical commands after
+eviction and fresh-stack replay. The Client property generates another
 500 typed Workflow results, wraps each in a real close-event history response,
 destroys the encoded response, and requires the owned result Payload to retain
 the generated value. The query property generates 500 success/failure
@@ -693,10 +697,11 @@ closes the Workflow as canceled only after that Activity resolves.
 
 ## Child Workflow acceptance test
 
-`examples/child_workflow` registers a parent and child Workflow on task queue
-`odin-child-workflow`. The parent assigns an explicit deterministic child ID,
-starts the child through SDK Core, waits first for start and then completion,
-and returns the child's JSON result. Run it with the CLI dev server:
+`examples/child_workflow` registers successful, failing, and cancellation-aware
+parent/child Workflows on task queue `odin-child-workflow`. The normal parent
+assigns an explicit deterministic child ID, starts the child through SDK Core,
+waits first for start and then completion, and returns the child's JSON result.
+Run it with the CLI dev server:
 
 ```bash
 temporal server start-dev
@@ -709,13 +714,24 @@ temporal workflow execute \
   --input '"Odin"'
 ```
 
-The example stops after both durable Workflow Executions complete and Core
-evicts both cached fibers. `scripts/integration-test.sh` runs this path
-automatically. The unit suite additionally evicts the parent immediately after
-its start command, replays onto a fresh stack, compares the completions byte for
-byte, then applies separate start and completion resolutions. A second test
-requires inherited cancellation to emit `CancelChildWorkflowExecution(seq=1)`
-and waits for Core's canceled start resolution before closing the parent.
+The example stops after two durable Workflow Executions reach terminal state
+and Core evicts both cached fibers. `scripts/integration-test.sh` runs three
+server-backed paths automatically:
+
+- successful typed child result delivery;
+- a failing child whose parent catches a structured Temporal child wrapper and
+  typed Application Failure detail;
+- cancellation of a waiting parent through the public Odin Client, which emits
+  `CancelChildWorkflowExecution(seq=1)` and does not close the parent until Core
+  resolves the child as canceled.
+
+The unit suite additionally evicts the parent immediately after its start
+command, replays onto a fresh stack, compares the completions byte for byte,
+then applies separate start and completion resolutions. It verifies the exact
+cancellation reason, structured failure ownership after the activation decode
+arena is gone, and lossless propagation of an unhandled original Temporal
+Failure wrapper. The 500-case Child Workflow property varies start options and
+requires exact fresh-stack replay.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:
