@@ -25,6 +25,7 @@ Worker :: struct {
 	handle:                    ^raw.Worker,
 	runtime:                   ^Runtime,
 	workflows_enabled:         bool,
+	local_activities_enabled:  bool,
 	remote_activities_enabled: bool,
 }
 
@@ -156,6 +157,7 @@ worker_create :: proc(
 	task_queue: string,
 	namespace := "default",
 	enable_workflows := false,
+	enable_local_activities := false,
 	enable_remote_activities := true,
 	max_activity_slots := 10,
 ) -> (worker: Worker, error: Error) {
@@ -187,6 +189,7 @@ worker_create :: proc(
 		},
 		task_types = raw.Worker_Task_Types{
 			enable_workflows = enable_workflows,
+			enable_local_activities = enable_local_activities,
 			enable_remote_activities = enable_remote_activities,
 		},
 		max_heartbeat_throttle_interval_ms     = 60_000,
@@ -203,6 +206,7 @@ worker_create :: proc(
 	worker.handle = result.worker
 	worker.runtime = client.runtime
 	worker.workflows_enabled = enable_workflows
+	worker.local_activities_enabled = enable_local_activities
 	worker.remote_activities_enabled = enable_remote_activities
 	return
 }
@@ -401,7 +405,7 @@ worker_close :: proc(worker: ^Worker) -> Error {
 			error.message = bytes.clone(transmute([]u8)string("workflow shutdown poll returned an unexpected activation"))
 		}
 	}
-	if worker.remote_activities_enabled {
+	if worker.local_activities_enabled || worker.remote_activities_enabled {
 		poll := worker_poll_activity(worker)
 		if poll.protobuf != nil {
 			delete(poll.protobuf)
@@ -425,6 +429,7 @@ worker_close :: proc(worker: ^Worker) -> Error {
 	worker.handle = nil
 	worker.runtime = nil
 	worker.workflows_enabled = false
+	worker.local_activities_enabled = false
 	worker.remote_activities_enabled = false
 	return error
 }

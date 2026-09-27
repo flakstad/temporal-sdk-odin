@@ -54,6 +54,10 @@ Run_Options :: struct {
 	max_activity_tasks:       int,
 	max_workflow_executions: int,
 	disable_activity_polling: bool,
+	// Local Activity polling is opt-in while its cancellation/shutdown
+	// interleavings are still being hardened. It requires both Workflow and
+	// Activity registrations on this Worker.
+	enable_local_activities:  bool,
 	on_workflow_activation:  Workflow_Activation_Observer,
 }
 
@@ -1174,7 +1178,8 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 		if processed.canceled_timer {
 			stats.timers_canceled += 1
 		}
-		stats.activity_cancellations_requested += processed.requested_activity_cancellation_count
+		stats.activity_cancellations_requested += processed.requested_activity_cancellation_count +
+			processed.requested_local_activity_cancellation_count
 	}
 }
 
@@ -1296,8 +1301,11 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if options.max_activity_tasks < 0 || options.max_workflow_executions < 0 {
 		return {}, error_from_string("worker run limits must not be negative")
 	}
-	poll_activities := len(worker.activity_registrations) > 0 && !options.disable_activity_polling
 	poll_workflows := len(worker.workflow_registrations) > 0
+	poll_remote_activities := len(worker.activity_registrations) > 0 && !options.disable_activity_polling
+	poll_local_activities := len(worker.activity_registrations) > 0 && poll_workflows &&
+		!options.disable_activity_polling && options.enable_local_activities
+	poll_activities := poll_remote_activities || poll_local_activities
 	if !poll_activities && !poll_workflows {
 		return {}, error_from_string("worker has no enabled registered task types")
 	}
@@ -1310,7 +1318,8 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		worker.task_queue,
 		worker.namespace,
 		enable_workflows = poll_workflows,
-		enable_remote_activities = poll_activities,
+		enable_local_activities = poll_local_activities,
+		enable_remote_activities = poll_remote_activities,
 		max_activity_slots = worker.max_concurrent_activities,
 	)
 	if create_error.message != nil {

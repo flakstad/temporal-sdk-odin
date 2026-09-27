@@ -1465,8 +1465,9 @@ server-directed retry, generic Workflow Payloads, and replay-safe Activity
 options are now proven live. Activity context identity, timeouts, effective
 Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
 proven. The PBT suites generate 500 Payload values, 500
-Application Failure contracts, 500 typed Workflow replay cases, and 500
-Activity-option command/replay cases, plus 500 Activity deadline combinations,
+Application Failure contracts, 500 typed Workflow replay cases, 500 remote
+Activity-option command/replay cases, and 500 Local Activity-option
+command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
@@ -1482,8 +1483,10 @@ Core-local `WorkflowAlreadyExists` start failure. External Workflow signal and
 cancellation are also implemented and live-proven. Continue-As-New now provides
 the next-run Payload and the main timeout/retry/backoff options through a
 non-returning terminal fiber primitive. Core's patch/versioning protocol is now
-implemented and live-proven. The next smallest runtime extension is
-the remaining Workflow-information surface and isolated named random streams,
+implemented and live-proven. The first Local Activity
+command/dispatch/resolution path is also live-proven with one attempt. The next
+smallest runtime extensions are timer-backed Local Activity `DoBackoff`, the
+remaining Workflow-information surface, and Search Attribute/memo commands,
 while richer recursive failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
@@ -1761,3 +1764,47 @@ oracle, and again requires byte-identical completion. The live patch example
 also reads Workflow time and produces a deterministic UUID/random value using
 the real CLI dev server. Named isolated streams, richer numeric/range helpers,
 and the remaining `InitializeWorkflow` information fields are still pending.
+
+### Local Activity boundary
+
+Local Activities do not bypass SDK Core. Odin emits the existing
+`WorkflowCommand.schedule_local_activity` variant and Core dispatches a normal
+`ActivityTask` through `temporal_core_worker_poll_activity_task`, with
+`Start.is_local=true`. The registered Odin Activity callback and completion ABI
+are therefore shared with remote Activities. Core records the result as a
+`core_local_activity` marker and later delivers
+`ResolveActivity(is_local=true)` to the Workflow runtime. No new C symbol is
+required.
+
+The worker task-type configuration is significant. The C bridge exposes four
+independent booleans: Workflows, Local Activities, remote Activities, and
+Nexus. Enabling Workflows and polling Activity tasks is insufficient unless
+`TemporalCoreWorkerTaskTypes.enable_local_activities` is also true. The first
+live attempt exposed this exact failure mode: Core waited inside Workflow Task
+completion for a language-side local poll that could never produce a task, and
+the Workflow Task timed out. The high-level Worker enables Local Activities
+only when it owns both a Workflow poller and an Activity registry and
+`Run_Options.enable_local_activities` is set. This opt-in is temporary while
+mixed remote Try-Cancel/local shutdown interleavings are hardened; enabling the
+Core task type for workers that did not use it exposed a bounded shutdown join
+stall. The Core lifecycle wrapper includes an enabled local stream in its final
+shutdown poll.
+
+The Odin runtime reuses its Activity future/result/failure machinery while
+emitting the distinct `ScheduleLocalActivity` and
+`RequestCancelLocalActivity` commands. It validates
+`ResolveActivity.is_local` against the scheduled operation so a mismatched Core
+resolution becomes an activation failure rather than corrupting a waiting
+fiber. The public options currently map Activity ID, Schedule-to-Close,
+Schedule-to-Start, Start-to-Close, Retry Policy, local retry threshold,
+cancellation type, and marker-input inclusion. Local Activities have neither a
+task queue nor a heartbeat timeout.
+
+Core may resolve a retrying Local Activity with `DoBackoff` when the retry delay
+should become a durable timer. Correct language handling must schedule that
+timer and then emit a new Local Activity command with Core's next attempt and
+original schedule time. The current bounded slice does not fake this behavior:
+it requires `maximum_attempts=1` and fails explicitly if a `DoBackoff` somehow
+arrives. A unit test covers command encoding, local resolution, eviction, and
+byte-identical replay; a 500-case PBT varies every exposed option; and the CLI
+dev-server scenario proves the real local dispatch/result/marker path.

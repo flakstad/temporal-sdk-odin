@@ -599,7 +599,11 @@ evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,
 retry, queue, ID, cancellation, and eager-execution combinations. It checks
 every encoded `ScheduleActivity` field and requires byte-identical commands
-after eviction and fresh-stack replay. The Child Workflow options property
+after eviction and fresh-stack replay. A separate 500-case Local Activity
+options property covers
+all three cancellation modes, timeouts, retry fields, local retry threshold,
+marker-input inclusion, `ScheduleLocalActivity` encoding, and exact replay. The
+Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
 and Parent Close Policy combinations, plus generated signal names and JSON
 payloads. It checks every encoded `StartChildWorkflowExecution` and
@@ -796,6 +800,33 @@ TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
 The default endpoint is `http://localhost:7233` inside the Core connection
 options. The wrapper accepts another URL, but TLS, API keys, metadata, and
 configuration profiles are not exposed yet.
+
+### Local Activity live path
+
+The main Workflow example registers the same `hello` procedure for remote and
+Local Activity dispatch. To run only the Local Activity scenario manually:
+
+```bash
+temporal server start-dev
+
+TEMPORAL_ODIN_SCENARIO=local-activity \
+./scripts/run-hello-workflow.sh
+```
+
+In a second terminal:
+
+```bash
+temporal workflow execute \
+  --workflow-id odin-local-manual \
+  --type odin_local_activity_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Local"'
+```
+
+The result is `Hello Local`. `temporal workflow show --workflow-id
+odin-local-manual --output json` contains a `core_local_activity` marker and an
+`input` detail because the example opts into marker argument recording. The
+full `./scripts/integration-test.sh` checks this path automatically.
 
 ## Troubleshooting
 

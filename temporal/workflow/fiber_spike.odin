@@ -124,6 +124,14 @@ Activity_Cancellation_Type :: enum {
 	Abandon,
 }
 
+// The zero value follows Core's required language-SDK default for Local
+// Activities: wait until cancellation has been acknowledged by the Activity.
+Local_Activity_Cancellation_Type :: enum {
+	Wait_Cancellation_Completed,
+	Try_Cancel,
+	Abandon,
+}
+
 // The zero value deliberately matches the safest Core SDK default: a canceled
 // parent waits until the child reports that cancellation completed.
 Child_Workflow_Cancellation_Type :: enum {
@@ -195,6 +203,32 @@ Owned_Activity_Options :: struct {
 	has_retry_policy:          bool,
 	cancellation_type:         Activity_Cancellation_Type,
 	disable_eager_execution:   bool,
+}
+
+// Local Activities execute in the same Worker process as the Workflow but are
+// still dispatched by Core as Activity tasks. They do not have a task queue or
+// heartbeat timeout. The first slice deliberately permits one attempt only;
+// Core's timer-backed local retry protocol is added separately.
+Local_Activity_Options :: struct {
+	activity_id:               string,
+	schedule_to_close_timeout: time.Duration,
+	schedule_to_start_timeout: time.Duration,
+	start_to_close_timeout:    time.Duration,
+	retry_policy:              ^Retry_Policy,
+	local_retry_threshold:     time.Duration,
+	cancellation_type:         Local_Activity_Cancellation_Type,
+	include_arguments_in_marker: bool,
+}
+
+Owned_Local_Activity_Options :: struct {
+	schedule_to_close_timeout: time.Duration,
+	schedule_to_start_timeout: time.Duration,
+	start_to_close_timeout:    time.Duration,
+	retry_policy:              Retry_Policy,
+	has_retry_policy:          bool,
+	local_retry_threshold:     time.Duration,
+	cancellation_type:         Local_Activity_Cancellation_Type,
+	include_arguments_in_marker: bool,
 }
 
 // Continue_As_New_Options borrows its strings, slices, and retry_policy only
@@ -523,7 +557,9 @@ Fiber_Activity_Operation :: struct {
 	seq:           u32,
 	activity_id:   string,
 	activity_type: string,
+	is_local:      bool,
 	options:       Owned_Activity_Options,
+	local_options: Owned_Local_Activity_Options,
 	input:         codec.Payload,
 	result:        codec.Payload,
 	failure_message: string,
@@ -2504,6 +2540,231 @@ start_activity_with_options :: proc(
 	return start_activity_json_with_options(ctx, activity_type, input, options)
 }
 
+local_activity_options_error :: proc(
+	activity_type: string,
+	options: Local_Activity_Options,
+) -> string {
+	if len(activity_type) == 0 {
+		return "Local Activity type must not be empty"
+	}
+	if options.schedule_to_close_timeout <= 0 && options.start_to_close_timeout <= 0 {
+		return "Local Activity requires a positive Schedule-to-Close or Start-to-Close timeout"
+	}
+	if options.schedule_to_close_timeout < 0 || options.schedule_to_start_timeout < 0 ||
+	   options.start_to_close_timeout < 0 || options.local_retry_threshold < 0 {
+		return "Local Activity timeouts must not be negative"
+	}
+	if options.schedule_to_close_timeout > 0 &&
+	   options.start_to_close_timeout > options.schedule_to_close_timeout {
+		return "Local Activity Start-to-Close timeout must not exceed Schedule-to-Close timeout"
+	}
+	if options.schedule_to_close_timeout > 0 &&
+	   options.schedule_to_start_timeout > options.schedule_to_close_timeout {
+		return "Local Activity Schedule-to-Start timeout must not exceed Schedule-to-Close timeout"
+	}
+	if options.retry_policy != nil {
+		policy := options.retry_policy
+		if policy.initial_interval < 0 || policy.maximum_interval < 0 ||
+		   policy.maximum_attempts < 0 {
+			return "Local Activity Retry Policy values must not be negative"
+		}
+		if math.is_nan(policy.backoff_coefficient) || math.is_inf(policy.backoff_coefficient) ||
+		   (policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1) {
+			return "Local Activity Retry Policy backoff coefficient must be zero or at least one"
+		}
+		if policy.maximum_interval > 0 && policy.initial_interval > 0 &&
+		   policy.maximum_interval < policy.initial_interval {
+			return "Local Activity Retry Policy maximum interval must not be shorter than its initial interval"
+		}
+		if policy.maximum_attempts != 1 {
+			return "Local Activity timer-backed retries are not implemented; maximum attempts must be one"
+		}
+	}
+	return ""
+}
+
+clone_local_activity_options :: proc(
+	instance: ^Fiber_Instance,
+	options: Local_Activity_Options,
+) -> (owned: Owned_Local_Activity_Options, ok: bool) {
+	allocator := instance.odin_context.allocator
+	owned.schedule_to_close_timeout = options.schedule_to_close_timeout
+	owned.schedule_to_start_timeout = options.schedule_to_start_timeout
+	owned.start_to_close_timeout = options.start_to_close_timeout
+	owned.local_retry_threshold = options.local_retry_threshold
+	owned.cancellation_type = options.cancellation_type
+	owned.include_arguments_in_marker = options.include_arguments_in_marker
+	owned.has_retry_policy = true
+	if options.retry_policy == nil {
+		owned.retry_policy.maximum_attempts = 1
+		return owned, true
+	}
+	owned.retry_policy = options.retry_policy^
+	owned.retry_policy.non_retryable_error_types = make(
+		[]string,
+		len(options.retry_policy.non_retryable_error_types),
+		allocator,
+	)
+	for error_type, index in options.retry_policy.non_retryable_error_types {
+		cloned, clone_error := strings.clone(error_type, allocator)
+		if clone_error != nil {
+			return {}, false
+		}
+		owned.retry_policy.non_retryable_error_types[index] = cloned
+	}
+	return owned, true
+}
+
+start_local_activity_owned :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload,
+	options: Local_Activity_Options,
+) -> Activity_Future {
+	owned_input := input
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		codec.payload_free(&owned_input)
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return {}
+	}
+	instance := ctx.instance
+	if root_cancellation_applies(instance) {
+		codec.payload_free(&owned_input)
+		instance.next_activity_seq += 1
+		append(
+			&instance.activities,
+			Fiber_Activity_Operation{
+				seq = instance.next_activity_seq,
+				is_local = true,
+				state = .Canceled,
+			},
+		)
+		return {seq = instance.next_activity_seq}
+	}
+	validation_error := local_activity_options_error(activity_type, options)
+	if len(validation_error) > 0 {
+		codec.payload_free(&owned_input)
+		mark_activity_options_failure(ctx, validation_error)
+		return {}
+	}
+	owned_activity_type, type_error := strings.clone(
+		activity_type,
+		instance.odin_context.allocator,
+	)
+	owned_options, options_ok := clone_local_activity_options(instance, options)
+	if type_error != nil || !options_ok {
+		codec.payload_free(&owned_input)
+		mark_activity_options_failure(ctx, "could not preserve Local Activity options")
+		return {}
+	}
+	instance.next_activity_seq += 1
+	activity_id := options.activity_id
+	if len(activity_id) == 0 {
+		activity_id = fmt.aprintf("local-activity-%d", instance.next_activity_seq)
+	} else {
+		cloned_id, id_error := strings.clone(activity_id, instance.odin_context.allocator)
+		if id_error != nil {
+			codec.payload_free(&owned_input)
+			mark_activity_options_failure(ctx, "could not preserve Local Activity ID")
+			return {}
+		}
+		activity_id = cloned_id
+	}
+	operation := Fiber_Activity_Operation{
+		seq = instance.next_activity_seq,
+		activity_id = activity_id,
+		activity_type = owned_activity_type,
+		is_local = true,
+		local_options = owned_options,
+		input = owned_input,
+		state = .Scheduled,
+		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+	}
+	append(&instance.activities, operation)
+	return {seq = operation.seq}
+}
+
+start_local_activity_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+	options: Local_Activity_Options,
+) -> Activity_Future {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		return {}
+	}
+	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
+	if clone_error != .None {
+		ctx.instance.phase = .Failed
+		ctx.instance.failure_message = "could not preserve Local Activity input Payload"
+		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		return {}
+	}
+	return start_local_activity_owned(ctx, activity_type, owned_input, options)
+}
+
+start_local_activity_payload :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+) -> Activity_Future {
+	return start_local_activity_payload_with_options(
+		ctx,
+		activity_type,
+		input,
+		{start_to_close_timeout = 20 * time.Second},
+	)
+}
+
+start_local_activity_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $T,
+	options: Local_Activity_Options,
+) -> Activity_Future {
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	payload, encode_error := codec.encode_json(input, ctx.instance.odin_context.allocator)
+	if encode_error != .None {
+		ctx.instance.phase = .Failed
+		ctx.instance.failure_message = "could not encode Local Activity input as json/plain"
+		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		return {}
+	}
+	return start_local_activity_owned(ctx, activity_type, payload, options)
+}
+
+start_local_activity_json :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $T,
+) -> Activity_Future {
+	return start_local_activity_json_with_options(
+		ctx,
+		activity_type,
+		input,
+		{start_to_close_timeout = 20 * time.Second},
+	)
+}
+
+start_local_activity :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+) -> Activity_Future {
+	return start_local_activity_json(ctx, activity_type, input)
+}
+
+start_local_activity_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Local_Activity_Options,
+) -> Activity_Future {
+	return start_local_activity_json_with_options(ctx, activity_type, input, options)
+}
+
 child_workflow_options_error :: proc(
 	workflow_type: string,
 	options: Child_Workflow_Options,
@@ -3935,6 +4196,129 @@ execute_activity_json_with_options :: proc(
 	return result.value
 }
 
+execute_local_activity :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+) -> string {
+	return await_activity(ctx, start_local_activity(ctx, activity_type, input))
+}
+
+execute_local_activity_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Local_Activity_Options,
+) -> string {
+	return await_activity(
+		ctx,
+		start_local_activity_with_options(ctx, activity_type, input, options),
+	)
+}
+
+execute_local_activity_result :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+) -> Activity_Result {
+	return await_activity_result(ctx, start_local_activity(ctx, activity_type, input))
+}
+
+execute_local_activity_result_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type, input: string,
+	options: Local_Activity_Options,
+) -> Activity_Result {
+	return await_activity_result(
+		ctx,
+		start_local_activity_with_options(ctx, activity_type, input, options),
+	)
+}
+
+execute_local_activity_payload :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_local_activity_payload(ctx, activity_type, input),
+	)
+}
+
+execute_local_activity_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: codec.Payload_View,
+	options: Local_Activity_Options,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_local_activity_payload_with_options(ctx, activity_type, input, options),
+	)
+}
+
+execute_local_activity_json_result :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+) -> Json_Activity_Result(Output) {
+	return await_activity_json_result(
+		ctx,
+		start_local_activity_json(ctx, activity_type, input),
+		Output,
+	)
+}
+
+execute_local_activity_json_result_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+	options: Local_Activity_Options,
+) -> Json_Activity_Result(Output) {
+	return await_activity_json_result(
+		ctx,
+		start_local_activity_json_with_options(ctx, activity_type, input, options),
+		Output,
+	)
+}
+
+execute_local_activity_json :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+) -> Output {
+	future := start_local_activity_json(ctx, activity_type, input)
+	result := await_activity_json_result(ctx, future, Output)
+	if result.status == .Failed {
+		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	if result.status == .Canceled {
+		return {}
+	}
+	return result.value
+}
+
+execute_local_activity_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	input: $Input,
+	$Output: typeid,
+	options: Local_Activity_Options,
+) -> Output {
+	future := start_local_activity_json_with_options(ctx, activity_type, input, options)
+	result := await_activity_json_result(ctx, future, Output)
+	if result.status == .Failed {
+		mark_activity_failure_unhandled(ctx, future)
+		return {}
+	}
+	if result.status == .Canceled {
+		return {}
+	}
+	return result.value
+}
+
 signal_payload_conversion_failed :: proc(instance: ^Fiber_Instance, message: string) {
 	if instance == nil {
 		return
@@ -4212,6 +4596,20 @@ activity_cancellation_type_to_proto :: proc(
 	return .TRY_CANCEL
 }
 
+local_activity_cancellation_type_to_proto :: proc(
+	cancellation_type: Local_Activity_Cancellation_Type,
+) -> proto.Coresdk_Workflow_Commands_ActivityCancellationType {
+	switch cancellation_type {
+	case .Wait_Cancellation_Completed:
+		return .WAIT_CANCELLATION_COMPLETED
+	case .Try_Cancel:
+		return .TRY_CANCEL
+	case .Abandon:
+		return .ABANDON
+	}
+	return .WAIT_CANCELLATION_COMPLETED
+}
+
 child_workflow_cancellation_type_to_proto :: proc(
 	cancellation_type: Child_Workflow_Cancellation_Type,
 ) -> proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType {
@@ -4311,6 +4709,39 @@ append_fiber_schedule_command :: proc(
 	operation: ^Fiber_Activity_Operation,
 	task_queue: string,
 ) {
+	if operation.is_local {
+		payload := new(proto.Temporal_Api_Common_V1_Payload)
+		payload^ = proto.encode_payload(codec.payload_view(&operation.input))
+		options := &operation.local_options
+		schedule := new(proto.Coresdk_Workflow_Commands_ScheduleLocalActivity)
+		schedule^ = {
+			seq = operation.seq,
+			activity_id = operation.activity_id,
+			activity_type = operation.activity_type,
+			attempt = 1,
+			schedule_to_close_timeout = duration_to_proto(options.schedule_to_close_timeout),
+			schedule_to_start_timeout = duration_to_proto(options.schedule_to_start_timeout),
+			start_to_close_timeout = duration_to_proto(options.start_to_close_timeout),
+			retry_policy = retry_policy_to_proto(&options.retry_policy),
+			local_retry_threshold = duration_to_proto(options.local_retry_threshold),
+			cancellation_type = local_activity_cancellation_type_to_proto(options.cancellation_type),
+			include_arguments_in_marker = options.include_arguments_in_marker,
+		}
+		append(&schedule.arguments, payload^)
+		append(
+			commands,
+			proto.Coresdk_Workflow_Commands_WorkflowCommand{
+				variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity{
+					value = schedule,
+				},
+			},
+		)
+		operation.state = .Commanded
+		result.scheduled_local_activity = true
+		result.scheduled_local_activity_count += 1
+		result.activity_seq = operation.seq
+		return
+	}
 	payload := new(proto.Temporal_Api_Common_V1_Payload)
 	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 	activity_task_queue := operation.options.task_queue
@@ -4415,6 +4846,23 @@ append_fiber_cancel_activity_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	operation: ^Fiber_Activity_Operation,
 ) {
+	if operation.is_local {
+		request := new(proto.Coresdk_Workflow_Commands_RequestCancelLocalActivity)
+		request.seq = operation.seq
+		append(
+			commands,
+			proto.Coresdk_Workflow_Commands_WorkflowCommand{
+				variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_Local_Activity{
+					value = request,
+				},
+			},
+		)
+		operation.state = .Canceled
+		result.requested_local_activity_cancellation = true
+		result.requested_local_activity_cancellation_count += 1
+		result.canceled_activity_seq = operation.seq
+		return
+	}
 	request := new(proto.Coresdk_Workflow_Commands_RequestCancelActivity)
 	request.seq = operation.seq
 	append(
@@ -5896,6 +6344,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, "Activity resolution does not match a pending Workflow operation")
 				return
 			}
+			if operation.is_local != variant.value.is_local {
+				process_error(&result, activation.run_id, "Activity resolution local/remote kind does not match its command")
+				return
+			}
 			if operation.state == .Canceled {
 				// Core may report the terminal resolution of a requested Activity
 				// while detached cleanup is running or before cache eviction.
@@ -5952,6 +6404,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				}
 				operation.state = .Canceled
 				result.resolved_activity_seq = operation.seq
+			case proto.Coresdk_Activity_Result_ActivityResolution_Status_Backoff:
+				resolution_handled = true
+				process_error(
+					&result,
+					activation.run_id,
+					"Local Activity requested timer-backed retry, which is not implemented",
+				)
+				return
 			}
 			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")

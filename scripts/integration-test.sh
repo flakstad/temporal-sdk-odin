@@ -206,6 +206,46 @@ worker_pid=""
 cat "$worker_log"
 grep -q "typed Workflow and Activity Payloads completed end-to-end" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=local-activity \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Local Activity Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+local_activity_workflow_id="odin-sdk-local-activity-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$local_activity_workflow_id" \
+  --type odin_local_activity_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Local"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+local_activity_output="$(<"$workflow_output_file")"
+echo "$local_activity_output"
+grep -q '"status": "COMPLETED"' <<<"$local_activity_output"
+grep -q 'Hello Local' <<<"$local_activity_output"
+temporal workflow show \
+  --workflow-id "$local_activity_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'core_local_activity' "$typed_history_file"
+grep -q '"input"' "$typed_history_file"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq 'replay=false .*local_scheduled=1 .*waiting_activity=1' "$worker_log"
+grep -q "Local Activity completed through Core in the Workflow Worker" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=failure-details \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
@@ -384,7 +424,7 @@ TEMPORAL_CLIENT_ACTION=update \
 slow_update_pid=$!
 
 for _ in {1..30}; do
-  if grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
+  if grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
@@ -445,12 +485,12 @@ grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=3" 
 grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=3" "$worker_log"
 grep -Eq "replay=(true|false) .*queries=1 query_failures=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=false .*scheduled=1 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=true .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=true .*scheduled=1 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
@@ -539,7 +579,7 @@ grep -q '"result": "Hello Approved"' <<<"$workflow_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq "replay=false .*scheduled=1 last_activity=1 .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=1 .*signal_handlers_started=0 signal_handlers_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
 grep -q "asynchronous Workflow Signal handler awaited an Activity and replayed" "$worker_log"
@@ -679,7 +719,7 @@ TEMPORAL_CLIENT_ACTION=update \
 slow_update_pid=$!
 
 for _ in {1..30}; do
-  if grep -Eq "replay=false .*scheduled=1 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
+  if grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
@@ -816,7 +856,7 @@ run_workflow_cancellation_case \
   cancel-cleanup \
   '"cancel-cleanup"' \
   'cancel-cleanup heartbeat recorded' \
-  'replay=false .*scheduled=1 last_activity=2 .*cancel=true canceled_workflow=false .*canceled_timer=false canceled_activity=true .*waiting_activity=2' \
+  'replay=false .*scheduled=1 local_scheduled=0 last_activity=2 .*cancel=true canceled_workflow=false .*canceled_timer=false canceled_activity=true .*waiting_activity=2' \
   'Workflow ran detached cleanup before acknowledging cancellation'
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \

@@ -1483,6 +1483,147 @@ workflow_time_random_and_uuid_replay_identically :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_local_activity_command_resolution_and_replay :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"local_activity_test_workflow",
+		"local-task-queue",
+		local_activity_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "local_activity_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "local-activity-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	scheduled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, scheduled.error.message == nil, "Local Activity schedule failed: %s", string(scheduled.error.message))
+	testing.expect_value(t, scheduled.scheduled_local_activity_count, 1)
+	testing.expect_value(t, scheduled.scheduled_activity_count, 0)
+	testing.expect_value(t, scheduled.waiting_activity_seq, u32(1))
+	scheduled_bytes := bytes.clone(scheduled.completion[:])
+	inspection := inspect_scheduled_local_activity(scheduled.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, inspection.seq, u32(1))
+	testing.expect_value(t, inspection.activity_id, "local-greeting")
+	testing.expect_value(t, inspection.activity_type, "hello")
+	testing.expect_value(t, inspection.attempt, u32(1))
+	testing.expect_value(t, inspection.schedule_to_close_timeout, 30 * time.Second)
+	testing.expect_value(t, inspection.schedule_to_start_timeout, 5 * time.Second)
+	testing.expect_value(t, inspection.start_to_close_timeout, 10 * time.Second)
+	testing.expect_value(t, inspection.local_retry_threshold, 2 * time.Second)
+	testing.expect_value(t, inspection.retry_maximum_attempts, i32(1))
+	testing.expect_value(t, inspection.cancellation_type, proto.Coresdk_Workflow_Commands_ActivityCancellationType.WAIT_CANCELLATION_COMPLETED)
+	testing.expect(t, inspection.include_arguments_in_marker)
+	input_value: string
+	testing.expect(t, codec.decode_json(codec.payload_view(&inspection.input), &input_value) == .None)
+	testing.expect_value(t, input_value, "Odin")
+	delete(input_value)
+	scheduled_local_activity_inspection_free(&inspection)
+	delete(scheduled.completion)
+	workflow.error_free(&scheduled.error)
+
+	result, result_error := codec.encode_json("Hello Odin")
+	testing.expect(t, result_error == .None)
+	defer codec.payload_free(&result)
+	proto_result := proto.encode_payload(codec.payload_view(&result))
+	defer delete(proto_result.metadata)
+	defer delete(proto_result.external_payloads)
+	success := proto.Coresdk_Activity_Result_Success{result = &proto_result}
+	resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &success},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &resolution,
+		is_local = true,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "Local Activity resolution failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	completion_payload, found := clone_workflow_completion_payload(completed.completion[:])
+	testing.expect(t, found)
+	if found {
+		value: string
+		testing.expect(t, codec.decode_json(codec.payload_view(&completion_payload), &value) == .None)
+		testing.expect_value(t, value, "Hello Odin")
+		delete(value)
+		codec.payload_free(&completion_payload)
+	}
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "Local Activity replay failed: %s", string(replayed.error.message))
+	testing.expect(t, bytes.equal(scheduled_bytes, replayed.completion[:]))
+	delete(scheduled_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
 child_workflow_failure_is_structured_and_catchable :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -2383,6 +2524,28 @@ deterministic_primitives_test_workflow :: proc(
 	return workflow.uuid_v4(ctx)
 }
 
+local_activity_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	return workflow.execute_local_activity_with_options(
+		ctx,
+		"hello",
+		input,
+		{
+			activity_id = "local-greeting",
+			schedule_to_close_timeout = 30 * time.Second,
+			schedule_to_start_timeout = 5 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+			local_retry_threshold = 2 * time.Second,
+			cancellation_type = .Wait_Cancellation_Completed,
+			include_arguments_in_marker = true,
+		},
+	)
+}
+
 Child_Failure_Details :: struct {
 	dependency: string,
 	code:       int,
@@ -3003,6 +3166,22 @@ Scheduled_Activity_Inspection :: struct {
 	disable_eager_execution: bool,
 }
 
+Scheduled_Local_Activity_Inspection :: struct {
+	found:                       bool,
+	seq:                         u32,
+	activity_id:                 string,
+	activity_type:               string,
+	attempt:                     u32,
+	schedule_to_close_timeout:   time.Duration,
+	schedule_to_start_timeout:   time.Duration,
+	start_to_close_timeout:      time.Duration,
+	local_retry_threshold:       time.Duration,
+	retry_maximum_attempts:      i32,
+	cancellation_type:           proto.Coresdk_Workflow_Commands_ActivityCancellationType,
+	include_arguments_in_marker: bool,
+	input:                       codec.Payload,
+}
+
 proto_duration_value :: proc(value: ^proto.Google_Protobuf_Duration) -> time.Duration {
 	if value == nil {
 		return 0
@@ -3022,6 +3201,70 @@ scheduled_activity_inspection_free :: proc(inspection: ^Scheduled_Activity_Inspe
 	}
 	delete(inspection.non_retryable_error_types)
 	inspection^ = {}
+}
+
+scheduled_local_activity_inspection_free :: proc(
+	inspection: ^Scheduled_Local_Activity_Inspection,
+) {
+	if inspection == nil {
+		return
+	}
+	delete(inspection.activity_id)
+	delete(inspection.activity_type)
+	codec.payload_free(&inspection.input)
+	inspection^ = {}
+}
+
+inspect_scheduled_local_activity :: proc(
+	data: []u8,
+) -> (inspection: Scheduled_Local_Activity_Inspection) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity:
+				if variant.value == nil {
+					return
+				}
+				schedule := variant.value
+				inspection.found = true
+				inspection.seq = schedule.seq
+				inspection.activity_id, _ = strings.clone(schedule.activity_id)
+				inspection.activity_type, _ = strings.clone(schedule.activity_type)
+				inspection.attempt = schedule.attempt
+				inspection.schedule_to_close_timeout = proto_duration_value(schedule.schedule_to_close_timeout)
+				inspection.schedule_to_start_timeout = proto_duration_value(schedule.schedule_to_start_timeout)
+				inspection.start_to_close_timeout = proto_duration_value(schedule.start_to_close_timeout)
+				inspection.local_retry_threshold = proto_duration_value(schedule.local_retry_threshold)
+				inspection.cancellation_type = schedule.cancellation_type
+				inspection.include_arguments_in_marker = schedule.include_arguments_in_marker
+				if schedule.retry_policy != nil {
+					inspection.retry_maximum_attempts = schedule.retry_policy.maximum_attempts
+				}
+				if len(schedule.arguments) == 1 {
+					inspection.input, _ = proto.clone_payload(&schedule.arguments[0])
+				}
+				return
+			}
+		}
+	}
+	return
 }
 
 inspect_scheduled_activity :: proc(

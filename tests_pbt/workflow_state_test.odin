@@ -1195,6 +1195,237 @@ activity_options_replay_for_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Local_Activity_Options_Input :: struct {
+	activity_id:                string,
+	schedule_to_close_ms:       int,
+	schedule_to_start_ms:       int,
+	start_to_close_ms:          int,
+	retry_initial_ms:           int,
+	retry_maximum_ms:           int,
+	local_retry_threshold_ms:   int,
+	cancellation_type:          int,
+	include_arguments_in_marker: bool,
+}
+
+generated_local_activity_options_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: Generated_Local_Activity_Options_Input,
+) -> string {
+	cancellation_type := workflow.Local_Activity_Cancellation_Type.Wait_Cancellation_Completed
+	switch input.cancellation_type {
+	case 1:
+		cancellation_type = .Try_Cancel
+	case 2:
+		cancellation_type = .Abandon
+	}
+	retry_policy := workflow.Retry_Policy{
+		initial_interval = time.Duration(input.retry_initial_ms) * time.Millisecond,
+		backoff_coefficient = 1.5,
+		maximum_interval = time.Duration(input.retry_maximum_ms) * time.Millisecond,
+		maximum_attempts = 1,
+	}
+	return workflow.execute_local_activity_json_with_options(
+		ctx,
+		"generated_local_activity",
+		input.activity_id,
+		string,
+		{
+			activity_id = input.activity_id,
+			schedule_to_close_timeout = time.Duration(input.schedule_to_close_ms) * time.Millisecond,
+			schedule_to_start_timeout = time.Duration(input.schedule_to_start_ms) * time.Millisecond,
+			start_to_close_timeout = time.Duration(input.start_to_close_ms) * time.Millisecond,
+			retry_policy = &retry_policy,
+			local_retry_threshold = time.Duration(input.local_retry_threshold_ms) * time.Millisecond,
+			cancellation_type = cancellation_type,
+			include_arguments_in_marker = input.include_arguments_in_marker,
+		},
+	)
+}
+
+generated_local_activity_options_match :: proc(
+	data: []u8,
+	expected: ^Generated_Local_Activity_Options_Input,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return false
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity:
+			if variant.value == nil || variant.value.retry_policy == nil ||
+			   len(variant.value.arguments) != 1 {
+				return false
+			}
+			schedule := variant.value
+			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+			switch expected.cancellation_type {
+			case 1:
+				expected_cancellation = .TRY_CANCEL
+			case 2:
+				expected_cancellation = .ABANDON
+			}
+			return schedule.seq == 1 && schedule.activity_id == expected.activity_id &&
+				schedule.activity_type == "generated_local_activity" && schedule.attempt == 1 &&
+				pbt_proto_duration(schedule.schedule_to_close_timeout) == time.Duration(expected.schedule_to_close_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.schedule_to_start_timeout) == time.Duration(expected.schedule_to_start_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.start_to_close_timeout) == time.Duration(expected.start_to_close_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.retry_policy.initial_interval) == time.Duration(expected.retry_initial_ms) * time.Millisecond &&
+				pbt_proto_duration(schedule.retry_policy.maximum_interval) == time.Duration(expected.retry_maximum_ms) * time.Millisecond &&
+				schedule.retry_policy.backoff_coefficient == 1.5 &&
+				schedule.retry_policy.maximum_attempts == 1 &&
+				pbt_proto_duration(schedule.local_retry_threshold) == time.Duration(expected.local_retry_threshold_ms) * time.Millisecond &&
+				schedule.cancellation_type == expected_cancellation &&
+				schedule.include_arguments_in_marker == expected.include_arguments_in_marker
+		}
+	}
+	return false
+}
+
+local_activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
+	schedule_to_close_ms := pbt.draw(t, pbt.int_range(100, 120_000))
+	input_value := Generated_Local_Activity_Options_Input{
+		activity_id = pbt.draw(t, pbt.string_ascii(1, 32)),
+		schedule_to_close_ms = schedule_to_close_ms,
+		schedule_to_start_ms = pbt.draw(t, pbt.int_range(1, schedule_to_close_ms)),
+		start_to_close_ms = pbt.draw(t, pbt.int_range(1, schedule_to_close_ms)),
+		retry_initial_ms = pbt.draw(t, pbt.int_range(1, 10_000)),
+		local_retry_threshold_ms = pbt.draw(t, pbt.int_range(1, 120_000)),
+		cancellation_type = pbt.draw(t, pbt.int_range(0, 2)),
+		include_arguments_in_marker = pbt.draw(t, pbt.boolean()),
+	}
+	input_value.retry_maximum_ms = pbt.draw(
+		t,
+		pbt.int_range(input_value.retry_initial_ms, 120_000),
+	)
+	pbt.cover(t, input_value.cancellation_type == 0, 20.0, "wait for cancellation")
+	pbt.cover(t, input_value.cancellation_type == 1, 20.0, "try cancel")
+	pbt.cover(t, input_value.cancellation_type == 2, 20.0, "abandon")
+	pbt.cover(t, input_value.include_arguments_in_marker, 30.0, "arguments in marker")
+
+	owned_queue, queue_error := strings.clone("pbt-local-activity-queue")
+	if queue_error != nil {
+		return pbt.error("could not allocate Local Activity Workflow queue")
+	}
+	sdk_worker := worker.Worker{
+		task_queue = owned_queue,
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_json_workflow(
+		&sdk_worker,
+		"generated_local_activity_options_workflow",
+		generated_local_activity_options_workflow,
+	)
+	if register_error.message != nil {
+		worker.error_free(&register_error)
+		return pbt.error("could not register Local Activity options Workflow")
+	}
+	worker.error_free(&register_error)
+	runtime := &sdk_worker.workflow_registrations[0].runtime
+
+	input, encode_error := codec.encode_json(input_value)
+	if encode_error != .None {
+		return pbt.error("could not encode generated Local Activity options")
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_local_activity_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-local-activity-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.scheduled_local_activity ||
+	   initial.scheduled_activity {
+		return pbt.fail("generated Local Activity options did not schedule a Local Activity")
+	}
+	if !generated_local_activity_options_match(initial.completion[:], &input_value) {
+		return pbt.fail("generated Local Activity options changed across command encoding")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated Local Activity Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_activation(runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil ||
+	   !bytes.equal(initial.completion[:], replayed.completion[:]) {
+		return pbt.fail("generated Local Activity replay changed command bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+local_activity_options_replay_for_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Local Activity options survive generated command encoding and replay",
+		local_activity_options_replay_property,
+		{num_tests = 500, seed = 0x4c4f_4341_4c5f_4143},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Generated_Child_Options_Input :: struct {
 	workflow_id:          string,
 	task_queue:           string,

@@ -12,6 +12,7 @@ import workflow "../../temporal/workflow"
 TASK_QUEUE :: "odin-hello-workflow"
 WORKFLOW_TYPE :: "odin_hello_workflow"
 TYPED_WORKFLOW_TYPE :: "odin_typed_workflow"
+LOCAL_ACTIVITY_WORKFLOW_TYPE :: "odin_local_activity_workflow"
 FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
@@ -326,6 +327,27 @@ typed_workflow :: proc(
 	)
 }
 
+local_activity_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	return workflow.execute_local_activity_with_options(
+		ctx,
+		"hello",
+		name,
+		{
+			activity_id = "local-hello",
+			schedule_to_close_timeout = 30 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+			local_retry_threshold = 2 * time.Second,
+			cancellation_type = .Wait_Cancellation_Completed,
+			include_arguments_in_marker = true,
+		},
+	)
+}
+
 failure_details_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
 	result := workflow.execute_activity_result_with_options(
@@ -389,12 +411,13 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
 		error_message,
 		processed.scheduled_activity_count,
+		processed.scheduled_local_activity_count,
 		processed.activity_seq,
 		processed.resolved_activity_seq,
 		processed.resolved_activity_failed,
@@ -516,6 +539,19 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	local_activity_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		LOCAL_ACTIVITY_WORKFLOW_TYPE,
+		local_activity_workflow,
+	)
+	if local_activity_workflow_register_error.message != nil {
+		fmt.eprintf("Local Activity Workflow registration failed: %s\n", string(local_activity_workflow_register_error.message))
+		worker.error_free(&local_activity_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	failure_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		FAILURE_DETAILS_WORKFLOW_TYPE,
@@ -555,6 +591,7 @@ main :: proc() {
 	expect_signal_handler := scenario == "signal-handler"
 	expect_query := scenario == "query" || expect_update || expect_signal_handler
 	expect_typed_payload := scenario == "typed-payload"
+	expect_local_activity := scenario == "local-activity"
 	expect_failure_details := scenario == "failure-details"
 	expect_patch := scenario == "patch"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
@@ -564,6 +601,7 @@ main :: proc() {
 			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : (expect_signal_handler ? 2 : 1)),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer || expect_patch,
+			enable_local_activities = expect_local_activity,
 			on_workflow_activation = observe_activation,
 		},
 	)
@@ -603,9 +641,9 @@ main :: proc() {
 				fmt.eprintln("Workflow patch path produced unexpected worker stats")
 				failed = true
 			}
-		} else if expect_typed_payload || expect_failure_details {
+		} else if expect_typed_payload || expect_failure_details || expect_local_activity {
 			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
-				fmt.eprintln("Typed Workflow payload path produced unexpected worker stats")
+				fmt.eprintln("Single-Activity Workflow path produced unexpected worker stats")
 				failed = true
 			}
 		} else if expect_abandon_update {
@@ -677,6 +715,8 @@ main :: proc() {
 		fmt.println("Workflow ran detached cleanup before acknowledging cancellation")
 	} else if expect_typed_payload {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
+	} else if expect_local_activity {
+		fmt.println("Local Activity completed through Core in the Workflow Worker")
 	} else if expect_failure_details {
 		fmt.println("structured Activity failure details reached Workflow code")
 	} else if expect_patch {

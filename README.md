@@ -48,7 +48,18 @@ The CLI-devserver suite verifies the resulting `core_patch` history marker. The
 same activation-context layer now exposes `workflow.now`, `history_length`,
 `is_replaying`, deterministic `random_u64`/`random_f64`, and `uuid_v4` without
 consulting host time or OS entropy. Core-provided start/reset seeds are applied
-before user code resumes. The
+before user code resumes. Local Activities now run through Core's dedicated
+local task path: Workflow code emits `ScheduleLocalActivity`, the same Odin
+Activity registry receives a callback with `activity.info(ctx).is_local`, and
+`ResolveActivity(is_local=true)` resumes the fiber. The API exposes typed JSON
+and generic Payload forms, timeout/cancellation options, marker-input control,
+and exact eviction/replay. The live suite verifies the server-side
+`core_local_activity` marker. Timer-backed Local Activity retry (`DoBackoff`)
+is intentionally rejected for now, so this first slice requires one attempt.
+Workers must also set `Run_Options.enable_local_activities`; the opt-in keeps
+the still-unhardened mixed remote-cancellation/local shutdown path out of
+workers that do not use Local Activities.
+The
 offline suite requires
 the start command to be byte-identical after eviction and fresh-stack replay.
 It also proves
@@ -80,8 +91,8 @@ and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, local Activities, client cancellation of an accepted
-Update, multiple Activity arguments,
+nested cancellation-token trees, timer-backed Local Activity retries, client
+cancellation of an accepted Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
 
