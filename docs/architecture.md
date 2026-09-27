@@ -192,8 +192,19 @@ symbols:
   unknown future fields. A response containing only `raw_history` is rejected;
   supporting encoded history blobs will require explicit codec/decompression
   handling instead of pretending that the typed event list is complete.
+- `ListWorkflowExecutions` accepts Temporal's Visibility query string, requested
+  page size, and opaque continuation token. Odin copies the limited
+  `WorkflowExecutionInfo` visibility projection into owned summaries, including
+  identity, status/timing/counters, parent/root identity, priority, memo, and
+  Search Attributes. Experimental versioning details remain available only in
+  the generated schema for now.
+- `CountWorkflowExecutions` returns the Service's approximate total plus any
+  aggregation groups. Group values are ordered according to the query's
+  `GROUP BY` fields and remain codec-neutral owned Payloads; interpreting them
+  as strings, integers, dates, or other Search Attribute types belongs above
+  this transport-level API.
 
-The ownership rule is the same for both calls: Core's callback response buffer
+The ownership rule is the same for all four calls: Core's callback response buffer
 is copied by `temporal/core`, generated decoding borrows a short-lived virtual
 arena, and the language-facing result records its own allocator. Its matching
 free procedure releases nested strings, Payload metadata/data, repeated lists,
@@ -1565,9 +1576,10 @@ Workflows are enabled.
    policy for panics. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
-   Activity-awaiting Updates, cancellation, and termination are live-proven, but the
-   public Client still lacks describe/history iteration, query reject conditions,
-   static summary/details, eager start, and failure-detail conversion. Start headers,
+   Activity-awaiting Updates, cancellation, termination, Describe/history, and
+   Visibility list/count are live-proven, but the public Client still lacks
+   query reject conditions, static summary/details, eager start, Schedule APIs,
+   and complete failure-detail conversion. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
    metadata builder. ID reuse/conflict, Retry Policy, cron, start delay, and
    Priority are implemented and wire/live tested.
@@ -1600,7 +1612,7 @@ Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 Client start request
-round trips, 500 query response round trips, and
+round trips, 500 paginated Visibility list/count round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
 signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
@@ -1621,9 +1633,11 @@ live-proven. Workflow information, headers, memo, and Search Attribute commands
 are implemented, and the Odin Client supplies all three initial Payload maps
 end-to-end. Client start-policy completeness (ID reuse/conflict, Retry Policy,
 priority, delay, and cron) is now implemented and live-proven, including
-`Use_Existing`. The next smallest client slice is typed Describe Workflow plus
-paginated history iteration; richer recursive failure inspection can proceed
-independently.
+`Use_Existing`. Typed Describe, paginated history, and Visibility list/count are
+now implemented and live-proven without new C symbols. The next smallest
+client-facing vertical slice is Schedule create/describe/list/pause/trigger/delete,
+starting with an owned action builder and one CLI-devserver create/trigger proof;
+richer recursive failure inspection can proceed independently.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler
 scheduler. Immediate and stackful registrations, independent suspension,

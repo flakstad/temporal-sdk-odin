@@ -10550,6 +10550,133 @@ client_history_page_is_owned_and_preserves_event_protobuf :: proc(t: ^testing.T)
 	testing.expect_value(t, decoded_event.event_id, i64(11))
 }
 
+@(test)
+client_visibility_list_page_is_owned_and_preserves_summary :: proc(t: ^testing.T) {
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "visible-workflow",
+		run_id = "visible-run",
+	}
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = "visible_type"}
+	parent := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "parent-workflow",
+		run_id = "parent-run",
+	}
+	root := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "root-workflow",
+		run_id = "root-run",
+	}
+	start_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_100, nanos = 123}
+	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_200}
+	duration := proto.Google_Protobuf_Duration{seconds = 99, nanos = 999}
+	priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 7,
+		fairness_key = "tenant-visible",
+		fairness_weight = 1.5,
+	}
+	memo_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"owned memo"`)}
+	search_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"blue"`)}
+	memo := proto.Temporal_Api_Common_V1_Memo{}
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	defer delete(memo.fields)
+	defer delete(search_attributes.indexed_fields)
+	append(&memo.fields, proto.Temporal_Api_Common_V1_Memo_FieldsEntry{
+		key = "note",
+		value = &memo_payload,
+	})
+	append(&search_attributes.indexed_fields, proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+		key = "Color",
+		value = &search_payload,
+	})
+	info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionInfo{
+		execution = &execution,
+		type = &workflow_type,
+		start_time = &start_time,
+		close_time = &close_time,
+		status = .WORKFLOW_EXECUTION_STATUS_COMPLETED,
+		history_length = 42,
+		parent_namespace_id = "parent-namespace",
+		parent_execution = &parent,
+		memo = &memo,
+		search_attributes = &search_attributes,
+		task_queue = "visible-queue",
+		state_transition_count = 11,
+		history_size_bytes = 8192,
+		execution_duration = &duration,
+		root_execution = &root,
+		first_run_id = "first-visible-run",
+		worker_deployment_name = "visible-deployment",
+		priority = &priority,
+		external_payload_size_bytes = 1000,
+		external_payload_count = 3,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_ListWorkflowExecutionsResponse{
+		next_page_token = transmute([]u8)string("opaque-next-page"),
+	}
+	defer delete(response.executions)
+	append(&response.executions, info)
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListWorkflowExecutionsResponse(&response)
+	page, page_error := temporal_client.decode_workflow_list_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.workflow_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expectf(t, page_error.message == nil, "Visibility list decode failed: %s", string(page_error.message))
+	testing.expect_value(t, len(page.executions), 1)
+	summary := &page.executions[0]
+	testing.expect_value(t, summary.workflow_id, "visible-workflow")
+	testing.expect_value(t, summary.run_id, "visible-run")
+	testing.expect_value(t, summary.first_run_id, "first-visible-run")
+	testing.expect_value(t, summary.workflow_type, "visible_type")
+	testing.expect_value(t, summary.task_queue, "visible-queue")
+	testing.expect_value(t, summary.parent_workflow_id, "parent-workflow")
+	testing.expect_value(t, summary.root_run_id, "root-run")
+	testing.expect_value(t, summary.status, temporal_client.Workflow_Status.Completed)
+	testing.expect(t, summary.start_time.present)
+	testing.expect(t, summary.close_time.present)
+	testing.expect_value(t, summary.history_length, i64(42))
+	testing.expect_value(t, summary.external_payload_count, i64(3))
+	testing.expect_value(t, summary.priority.fairness_key, "tenant-visible")
+	testing.expect_value(t, len(summary.memo), 1)
+	testing.expect(t, bytes.equal(summary.memo[0].payload.data, transmute([]u8)string(`"owned memo"`)))
+	testing.expect_value(t, len(summary.search_attributes), 1)
+	testing.expect(t, bytes.equal(page.next_page_token, transmute([]u8)string("opaque-next-page")))
+}
+
+@(test)
+client_visibility_count_is_owned_and_preserves_groups :: proc(t: ^testing.T) {
+	status_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Completed"`)}
+	group := proto.Temporal_Api_Workflowservice_V1_CountWorkflowExecutionsResponse_AggregationGroup{
+		count = 9,
+	}
+	defer delete(group.group_values)
+	append(&group.group_values, status_payload)
+	response := proto.Temporal_Api_Workflowservice_V1_CountWorkflowExecutionsResponse{count = 12}
+	defer delete(response.groups)
+	append(&response.groups, group)
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_CountWorkflowExecutionsResponse(&response)
+	count, count_error := temporal_client.decode_workflow_count(encoded[:])
+	delete(encoded)
+	defer temporal_client.workflow_count_free(&count)
+	defer temporal_client.error_free(&count_error)
+	testing.expectf(t, count_error.message == nil, "Visibility count decode failed: %s", string(count_error.message))
+	testing.expect_value(t, count.count, i64(12))
+	testing.expect_value(t, len(count.groups), 1)
+	testing.expect_value(t, count.groups[0].count, i64(9))
+	testing.expect_value(t, len(count.groups[0].values), 1)
+	testing.expect(t, bytes.equal(count.groups[0].values[0].data, transmute([]u8)string(`"Completed"`)))
+}
+
+@(test)
+client_visibility_rejects_an_uninitialized_client :: proc(t: ^testing.T) {
+	page, page_error := temporal_client.list_workflows(nil)
+	defer temporal_client.workflow_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expect_value(t, page_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	count, count_error := temporal_client.count_workflows(nil)
+	defer temporal_client.workflow_count_free(&count)
+	defer temporal_client.error_free(&count_error)
+	testing.expect_value(t, count_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+}
+
 raw_byte_ref_slice :: proc(value: raw.Byte_Array_Ref) -> []u8 {
 	if value.data == nil || value.size == 0 {
 		return nil

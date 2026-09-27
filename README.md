@@ -14,7 +14,11 @@ timeouts, priority, memo/Search Attributes, and pending execution summaries—an
 iterates full Workflow history with explicit pagination tokens. Each history
 event includes stable metadata plus an owned canonical protobuf representation.
 The live suite requests one-event pages against the CLI dev server and follows
-every returned token. Client connection options now expose Core's TLS/mTLS,
+every returned token. The Client also lists Workflow executions through
+Temporal Visibility and counts raw or grouped queries. List pages own their
+summaries, memo/Search Attribute Payloads, and opaque continuation token;
+grouped count values remain codec-neutral Temporal Payloads. Client connection
+options now expose Core's TLS/mTLS,
 API-key, ASCII/binary RPC metadata, retry, keepalive, HTTP CONNECT proxy, DNS
 load-balancing, compression, identity, and payload-warning controls. API-key
 connections enable TLS automatically, and metadata/API keys can be replaced on
@@ -270,6 +274,18 @@ page, err := temporal_client.fetch_history_page(
     {maximum_page_size = 100, filter = .All, skip_archival = true},
 )
 defer temporal_client.history_page_free(&page)
+
+visibility_page, err := temporal_client.list_workflows(
+    &client,
+    {page_size = 100, query = `ExecutionStatus = "Running"`},
+)
+defer temporal_client.workflow_list_page_free(&visibility_page)
+
+counts, err := temporal_client.count_workflows(
+    &client,
+    `ExecutionStatus = "Running" GROUP BY WorkflowType`,
+)
+defer temporal_client.workflow_count_free(&counts)
 ```
 
 Temporal Cloud API-key authentication uses the same Core connection:
@@ -314,9 +330,11 @@ encoding. Zero values inside them preserve Temporal Service defaults. Start
 delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
 policy combinations are rejected before the RPC.
 
-`Workflow_Description` and `History_Page` are allocator-owned snapshots; they
-do not borrow Core response buffers or protobuf decode arenas. Call their
-matching `_free` procedures. A history page's `next_page_token` is opaque and
+`Workflow_Description`, `History_Page`, `Workflow_List_Page`, and
+`Workflow_Count` are allocator-owned snapshots; they do not borrow Core
+response buffers or protobuf decode arenas. Call their matching `_free`
+procedures. List/count query strings are passed directly to Temporal Visibility;
+the SDK does not yet add a query DSL. List and history `next_page_token` values are opaque and
 must be passed unchanged to the next call. Event `protobuf` bytes are
 canonically re-encoded from the pinned schema, so unknown fields from a newer
 server are not retained. The typed history API currently rejects raw history

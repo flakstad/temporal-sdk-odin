@@ -707,7 +707,13 @@ opaque pagination tokens. It destroys the source response and requires every
 owned event plus its canonical protobuf encoding to remain readable. Focused
 unit tests perform the same arena-lifetime check for rich Describe results,
 including memo/Search Attribute Payloads and pending execution summaries. The
-query property generates 500 success/failure
+Visibility property adds 500 pages with zero to sixteen execution summaries,
+all current Workflow status values, and opaque terminal/non-terminal tokens,
+plus zero to eight grouped count results with arbitrary ASCII Payload bytes.
+It destroys each encoded response before inspecting the owned Odin value;
+focused tests additionally cover memo/Search Attribute Payloads, parent/root
+identity, priority, deployment name, timing, counters, and invalid Client use.
+The query property generates 500 success/failure
 responses, destroys the command arena after encoding, and verifies query IDs,
 typed success Payloads, and non-retryable Application Failure types after a
 fresh decode.
@@ -893,8 +899,13 @@ reads the Odin Client's header, memo, and Search Attribute and returns
 event. The same client invocation now calls `DescribeWorkflowExecution`, checks
 the completed identity/status plus updated memo/Search Attribute keys, then
 walks `GetWorkflowExecutionHistory` with a requested page size of one until the
-opaque next-page token is empty. This is the live ownership and pagination
-acceptance path for the typed read APIs.
+opaque next-page token is empty. It also executes
+`ListWorkflowExecutions` and `CountWorkflowExecutions` with an exact
+`WorkflowId` Visibility query, requiring the completed typed summary and a
+non-zero count. This is the live ownership, Visibility, and pagination
+acceptance path for the typed read APIs. Counts are approximate by Temporal's
+contract; the integration assertion therefore only requires the unique test
+execution to be visible, not an exact global total.
 
 For the default scenario, query the running execution from another terminal
 before sending the approval signal:

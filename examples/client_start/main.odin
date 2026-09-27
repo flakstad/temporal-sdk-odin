@@ -330,6 +330,52 @@ run :: proc() -> int {
 			return 1
 		}
 
+		visibility_query := fmt.aprintf("WorkflowId = %q", workflow_id)
+		defer delete(visibility_query)
+		visibility_page, visibility_error := temporal_client.list_workflows(
+			&client,
+			{page_size = 1, query = visibility_query},
+		)
+		defer temporal_client.workflow_list_page_free(&visibility_page)
+		if visibility_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties Visibility list failed (status=%d): %s\n",
+				visibility_error.status_code,
+				string(visibility_error.message),
+			)
+			temporal_client.error_free(&visibility_error)
+			return 1
+		}
+		visibility_listed := false
+		for summary in visibility_page.executions {
+			if summary.workflow_id == workflow_id &&
+			   summary.run_id == handle.run_id &&
+			   summary.workflow_type == "odin_workflow_properties" &&
+			   summary.status == .Completed {
+				visibility_listed = true
+				break
+			}
+		}
+		if !visibility_listed {
+			fmt.eprintf("Workflow-properties execution was absent from Visibility list\n")
+			return 1
+		}
+		visibility_count, count_error := temporal_client.count_workflows(&client, visibility_query)
+		defer temporal_client.workflow_count_free(&visibility_count)
+		if count_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties Visibility count failed (status=%d): %s\n",
+				count_error.status_code,
+				string(count_error.message),
+			)
+			temporal_client.error_free(&count_error)
+			return 1
+		}
+		if visibility_count.count < 1 {
+			fmt.eprintf("Workflow-properties Visibility count was %d\n", visibility_count.count)
+			return 1
+		}
+
 		next_page_token: []u8
 		defer delete(next_page_token)
 		history_event_count := 0
@@ -389,10 +435,12 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true describe_status=%v history_events=%d history_pages=%d result=%q\n",
+			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true describe_status=%v visibility_listed=%v visibility_count=%d history_events=%d history_pages=%d result=%q\n",
 			workflow_id,
 			handle.run_id,
 			description.status,
+			visibility_listed,
+			visibility_count.count,
 			history_event_count,
 			history_page_count,
 			result,
