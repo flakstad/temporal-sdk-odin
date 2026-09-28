@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import temporal_client "../../temporal/client"
+import codec "../../temporal/codec"
 
 env :: proc(name: string, buffer: []u8) -> string {
 	return os.get_env(buffer, name)
@@ -39,6 +40,46 @@ Greeting_Update_Output :: struct {
 	caller:        string,
 }
 
+add_client_context :: proc(headers: ^temporal_client.Headers) -> temporal_client.Error {
+	return temporal_client.headers_add_json(headers, "caller", "odin-client-control")
+}
+
+signal_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Signal_Workflow_Input,
+	next: temporal_client.Client_Signal_Workflow_Next,
+) -> temporal_client.Error {
+	header_error := add_client_context(input.headers)
+	if header_error.message != nil {
+		return header_error
+	}
+	return temporal_client.client_signal_workflow_next(next, input)
+}
+
+query_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Query_Workflow_Input,
+	next: temporal_client.Client_Query_Workflow_Next,
+) -> (codec.Payload, temporal_client.Error) {
+	header_error := add_client_context(input.headers)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	return temporal_client.client_query_workflow_next(next, input)
+}
+
+update_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Start_Update_Input,
+	next: temporal_client.Client_Start_Update_Next,
+) -> (temporal_client.Update_Handle, temporal_client.Error) {
+	header_error := add_client_context(input.headers)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	return temporal_client.client_start_update_next(next, input)
+}
+
 run :: proc() -> int {
 	action_buffer: [32]u8
 	id_buffer: [256]u8
@@ -52,7 +93,16 @@ run :: proc() -> int {
 		return 2
 	}
 
-	client, connect_error := temporal_client.connect()
+	interceptors := [?]temporal_client.Client_Interceptor{{
+		signal_workflow = signal_interceptor,
+		query_workflow = query_interceptor,
+		start_update = update_interceptor,
+	}}
+	client, connect_error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		interceptors = interceptors[:],
+	})
 	if connect_error.message != nil {
 		print_error("connection", &connect_error)
 		return 1
@@ -73,29 +123,11 @@ run :: proc() -> int {
 			signal_name = "approval"
 		}
 		input := env("TEMPORAL_CLIENT_SIGNAL_INPUT", input_buffer[:])
-		headers := temporal_client.Headers{}
-		headers_error := temporal_client.headers_init(&headers)
-		if headers_error.message != nil {
-			print_error("signal header initialization", &headers_error)
-			return 1
-		}
-		temporal_client.error_free(&headers_error)
-		defer temporal_client.headers_free(&headers)
-		header_error := temporal_client.headers_add_json(
-			&headers,
-			"caller",
-			"odin-client-control",
-		)
-		if header_error.message != nil {
-			print_error("signal header encoding", &header_error)
-			return 1
-		}
-		temporal_client.error_free(&header_error)
 		operation_error = temporal_client.signal_workflow_json_with_options(
 			&handle,
 			signal_name,
 			input,
-			{headers = &headers},
+			{},
 		)
 	case "cancel":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
@@ -106,30 +138,12 @@ run :: proc() -> int {
 			query_name = "greeting_status"
 		}
 		output: Greeting_Query_Output
-		headers := temporal_client.Headers{}
-		headers_error := temporal_client.headers_init(&headers)
-		if headers_error.message != nil {
-			print_error("query header initialization", &headers_error)
-			return 1
-		}
-		temporal_client.error_free(&headers_error)
-		defer temporal_client.headers_free(&headers)
-		header_error := temporal_client.headers_add_json(
-			&headers,
-			"caller",
-			"odin-client-control",
-		)
-		if header_error.message != nil {
-			print_error("query header encoding", &header_error)
-			return 1
-		}
-		temporal_client.error_free(&header_error)
 		operation_error = temporal_client.query_workflow_json_with_options(
 			&handle,
 			query_name,
 			Greeting_Query_Input{include_name = true},
 			&output,
-			{headers = &headers},
+			{},
 		)
 		if operation_error.message != nil {
 			print_error(action, &operation_error)
@@ -156,29 +170,11 @@ run :: proc() -> int {
 		if len(new_name) == 0 {
 			new_name = "Temporal"
 		}
-		headers := temporal_client.Headers{}
-		headers_error := temporal_client.headers_init(&headers)
-		if headers_error.message != nil {
-			print_error("Update header initialization", &headers_error)
-			return 1
-		}
-		temporal_client.error_free(&headers_error)
-		defer temporal_client.headers_free(&headers)
-		header_error := temporal_client.headers_add_json(
-			&headers,
-			"caller",
-			"odin-client-control",
-		)
-		if header_error.message != nil {
-			print_error("Update header encoding", &header_error)
-			return 1
-		}
-		temporal_client.error_free(&header_error)
 		update_handle, start_update_error := temporal_client.start_update_json_with_options(
 			&handle,
 			update_name,
 			Greeting_Update_Input{name = new_name},
-			{headers = &headers},
+			{},
 		)
 		if start_update_error.message != nil {
 			operation_error = start_update_error

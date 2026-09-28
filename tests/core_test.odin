@@ -22,6 +22,40 @@ Heartbeat_Capture :: struct {
 	details: string,
 }
 
+Client_Interceptor_Test_State :: struct {
+	events: [8]int,
+	count:  int,
+}
+
+Client_Interceptor_Test_Node :: struct {
+	state:         ^Client_Interceptor_Test_State,
+	id:            int,
+	short_circuit: bool,
+}
+
+client_interceptor_test_signal :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Signal_Workflow_Input,
+	next: temporal_client.Client_Signal_Workflow_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	header_error := temporal_client.headers_add_json(input.headers, "interceptor", node.id)
+	if header_error.message != nil {
+		return header_error
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "interceptor short circuit")
+	} else {
+		result = temporal_client.client_signal_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
 @(test)
 child_workflow_start_completion_and_fresh_stack_replay :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
@@ -4871,6 +4905,54 @@ client_signal_projects_request_id_and_headers :: proc(t: ^testing.T) {
 	delete(invalid_bytes)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
 	temporal_client.error_free(&invalid_error)
+}
+
+@(test)
+client_signal_interceptors_nest_and_isolate_working_headers :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	interceptors := [?]temporal_client.Client_Interceptor{
+		{user_data = &first, signal_workflow = client_interceptor_test_signal},
+		{user_data = &second, signal_workflow = client_interceptor_test_signal},
+	}
+	client := temporal_client.Client{
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	append(&client.interceptors, ..interceptors[:])
+	defer temporal_client.close(&client)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+
+	headers := temporal_client.Headers{}
+	init_error := temporal_client.headers_init(&headers)
+	testing.expect(t, init_error.message == nil)
+	temporal_client.error_free(&init_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "original")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+
+	input, encode_error := codec.encode_json("signal-input")
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&input)
+	signal_error := temporal_client.signal_workflow_payload_with_options(
+		&handle,
+		"approval",
+		codec.payload_view(&input),
+		{headers = &headers},
+	)
+	testing.expect_value(t, signal_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(signal_error.message), "interceptor short circuit")
+	temporal_client.error_free(&signal_error)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+	// Both interceptors mutated the per-call working copy. The caller-owned
+	// builder remains unchanged and can be reused safely.
+	testing.expect_value(t, len(headers.entries), 1)
+	testing.expect_value(t, headers.entries[0].key, "caller")
 }
 
 @(test)

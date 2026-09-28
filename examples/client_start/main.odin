@@ -28,6 +28,22 @@ Typed_Greeting_Output :: struct {
 	heartbeat_timeout_milliseconds: i64,
 }
 
+start_workflow_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Start_Workflow_Input,
+	next: temporal_client.Client_Start_Workflow_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	header_error := temporal_client.headers_add_json(
+		input.headers,
+		"odin-interceptor",
+		"odin-client-start",
+	)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	return temporal_client.client_start_workflow_next(next, input)
+}
+
 run :: proc() -> int {
 	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
 		key = "x-odin-sdk",
@@ -53,6 +69,9 @@ run :: proc() -> int {
 	connection_dns := temporal_client.DNS_Load_Balancing_Options{
 		resolution_interval = 30 * time.Second,
 	}
+	interceptors := [?]temporal_client.Client_Interceptor{{
+		start_workflow = start_workflow_interceptor,
+	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",
 		namespace = "default",
@@ -65,6 +84,7 @@ run :: proc() -> int {
 		grpc_compression = .Gzip,
 		payloads_warn_size = 512 * 1024,
 		memo_warn_size = 2 * 1024,
+		interceptors = interceptors[:],
 	})
 	if connect_error.message != nil {
 		fmt.eprintf("Temporal client connection failed: %s\n", string(connect_error.message))

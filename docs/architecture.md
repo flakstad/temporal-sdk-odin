@@ -1343,8 +1343,9 @@ interceptor is responsible for commands issued by handler code. .NET's
 demonstrates the same client/workflow/activity interception split. Odin
 uses that split rather than one universal hook. The Activity family is now the
 first complete chain: Worker-level interceptors wrap inbound callback execution
-and outbound heartbeat calls through explicit `next` continuations. Client and
-Workflow chains remain future work.
+and outbound heartbeat calls through explicit `next` continuations. Client
+outbound now uses the same nesting contract with separate types for Workflow
+start, Signal, Query, and Update start. Workflow chains remain future work.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1361,6 +1362,23 @@ No C ABI or protobuf change is involved. Unit coverage proves nested execution,
 short-circuiting, and heartbeat wrapping; a 500-case PBT property varies chain
 depth and rejection position; the CLI-devserver scenario sends one heartbeat
 through Core and returns the Activity result through the same interceptor set.
+
+Client interception also remains entirely above the C bridge. Each public call
+constructs a mutable semantic input and clones the caller's headers before
+entering the chain. The terminal continuation performs the existing protobuf
+encoding and generic Client RPC. Per-operation continuation types preserve
+`Workflow_Handle`, `Update_Handle`, Payload, and Error results without an opaque
+result union. Workflow-start adapts the older `Start_Metadata.headers` storage
+into the shared working map; memo, Search Attributes, static metadata, policies,
+and timeouts remain in the mutable start options. This is an allocation per
+intercepted call, chosen to make ownership and caller isolation unambiguous.
+
+The Client owns a copy of interceptor records, but callback `user_data` is
+borrowed. A 500-case property checks nested Signal chains and arbitrary
+short-circuit depth. Live start, Signal, Query, and Update paths prove header
+projection through Service/Core. Schedule and Visibility operations, result
+polling, cancellation, termination, Signal-With-Start, and connection mutation
+are not yet intercepted.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines

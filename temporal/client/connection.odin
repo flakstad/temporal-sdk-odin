@@ -25,6 +25,7 @@ Connect_Options :: struct {
 	grpc_compression:       Grpc_Compression,
 	payloads_warn_size:     u64,
 	memo_warn_size:         u64,
+	interceptors:           []Client_Interceptor,
 }
 
 update_rpc_metadata :: proc(

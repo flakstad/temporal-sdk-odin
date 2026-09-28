@@ -193,6 +193,35 @@ trace_activity :: proc(
 }
 ```
 
+Client connections accept an ordered `[]Client_Interceptor`. The current
+typesafe outbound surface wraps Workflow start, Signal, Query, and Update start;
+each operation has its own input, result, and `next` type:
+
+```odin
+propagate_signal :: proc(
+    data: rawptr,
+    input: ^temporal_client.Client_Signal_Workflow_Input,
+    next: temporal_client.Client_Signal_Workflow_Next,
+) -> temporal_client.Error {
+    err := temporal_client.headers_add_json(input.headers, "trace-id", "request-42")
+    if err.message != nil do return err
+    return temporal_client.client_signal_workflow_next(next, input)
+}
+
+interceptors := [?]temporal_client.Client_Interceptor{{
+    signal_workflow = propagate_signal,
+}}
+client, err := temporal_client.connect_with_options({
+    namespace = "default",
+    interceptors = interceptors[:],
+})
+```
+
+Interceptor records are copied at connect time, while `user_data` remains
+application-owned until `client.close`. Headers are cloned per call: interceptor
+mutations reach the RPC but never mutate the caller-owned builder. Shared
+mutable `user_data` must be safe for concurrent Client calls.
+
 ```text
 Temporal CLI dev server
           ^ gRPC

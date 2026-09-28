@@ -125,9 +125,10 @@ error_from_core :: proc(core_error: ^temporal_core.Error, kind := Error_Kind.Rpc
 }
 
 Client :: struct {
-	runtime:     ^temporal_core.Runtime,
-	connection:  ^temporal_core.Client,
-	namespace:   string,
+	runtime:      ^temporal_core.Runtime,
+	connection:   ^temporal_core.Client,
+	namespace:    string,
+	interceptors: [dynamic]Client_Interceptor,
 }
 
 connect :: proc(
@@ -190,10 +191,13 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 		return {}, error_from_core(&connect_error, .Connection)
 	}
 	connection^ = created_connection
+	interceptors := make([dynamic]Client_Interceptor, heap)
+	append(&interceptors, ..options.interceptors)
 	return {
 		runtime = runtime,
 		connection = connection,
 		namespace = owned_namespace,
+		interceptors = interceptors,
 	}, {}
 }
 
@@ -211,6 +215,7 @@ close :: proc(client: ^Client) {
 		free(client.runtime, heap)
 	}
 	delete(client.namespace, heap)
+	delete(client.interceptors)
 	client^ = {}
 }
 
@@ -833,6 +838,7 @@ encode_start_workflow_request :: proc(
 	workflow_type: string,
 	input: codec.Payload_View,
 	options: Start_Workflow_Options,
+	header_override: ^Headers = nil,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
@@ -842,6 +848,9 @@ encode_start_workflow_request :: proc(
 	}
 	if options_message := start_workflow_options_error(options); len(options_message) > 0 {
 		return nil, error_from_string(.Invalid_Argument, options_message)
+	}
+	if header_override != nil && header_override.allocator.procedure == nil {
+		return nil, error_from_string(.Invalid_Argument, "Workflow start interceptor headers are not initialized")
 	}
 
 	request_id := options.request_id
@@ -952,7 +961,7 @@ encode_start_workflow_request :: proc(
 		if metadata.has_static_summary || metadata.has_static_details {
 			request.user_metadata = &user_metadata
 		}
-		if len(metadata.headers) > 0 {
+		if header_override == nil && len(metadata.headers) > 0 {
 			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.headers))
 			for &entry, index in metadata.headers {
 				header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
@@ -1004,15 +1013,32 @@ encode_start_workflow_request :: proc(
 			request.search_attributes = &search_attributes
 		}
 	}
+	if header_override != nil && len(header_override.entries) > 0 {
+		header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(header_override.entries))
+		for &entry, index in header_override.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in header_override.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+		request.header = &header
+	}
 
 	return proto.encode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(&request), {}
 }
 
-start_workflow_payload :: proc(
+start_workflow_payload_unintercepted :: proc(
 	client: ^Client,
 	workflow_type: string,
 	input: codec.Payload_View,
 	options: Start_Workflow_Options,
+	headers: ^Headers,
 ) -> (handle: Workflow_Handle, error: Error) {
 	if client == nil || client.connection == nil || client.connection.handle == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
@@ -1022,6 +1048,7 @@ start_workflow_payload :: proc(
 		workflow_type,
 		input,
 		options,
+		headers,
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -1072,6 +1099,47 @@ start_workflow_payload :: proc(
 	handle.eager_execution_accepted = response.eager_workflow_task != nil
 	handle.started_by_request = response.started
 	return handle, {}
+}
+
+start_workflow_payload_terminal :: proc(
+	input: ^Client_Start_Workflow_Input,
+) -> (Workflow_Handle, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "start Workflow input is missing")
+	}
+	if input.headers == nil || input.headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "start Workflow interceptor headers are invalid")
+	}
+	return start_workflow_payload_unintercepted(
+		input.client,
+		input.workflow_type,
+		input.input,
+		input.options,
+		input.headers,
+	)
+}
+
+start_workflow_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Start_Workflow_Options,
+) -> (Workflow_Handle, Error) {
+	headers := Headers{}
+	headers_error := client_start_interceptor_headers_init(&headers, options.metadata)
+	if headers_error.message != nil {
+		return {}, headers_error
+	}
+	defer headers_free(&headers)
+	interceptor_input := Client_Start_Workflow_Input{
+		client = client,
+		workflow_type = workflow_type,
+		input = input,
+		options = options,
+		headers = &headers,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_start_workflow_chain(&state, &interceptor_input)
 }
 
 start_workflow_json :: proc(
@@ -1357,6 +1425,99 @@ rpc_empty_response :: proc(
 	return {}
 }
 
+signal_workflow_payload_terminal :: proc(input: ^Client_Signal_Workflow_Input) -> Error {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if input.headers == nil || input.headers.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Signal interceptor headers are invalid")
+	}
+	if len(input.signal_name) == 0 {
+		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	}
+	options := input.options
+	options.headers = input.headers
+	request_bytes: [dynamic]u8
+	request_error: Error
+	if input.has_input {
+		request_bytes, request_error = encode_signal_workflow_request(
+			input.handle.client.namespace,
+			input.handle.id,
+			input.handle.run_id,
+			input.signal_name,
+			input.input,
+			options,
+		)
+	} else {
+		execution := workflow_execution(input.handle)
+		request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+		request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
+			namespace = input.handle.client.namespace,
+			workflow_execution = &execution,
+			signal_name = input.signal_name,
+			identity = "temporal-sdk-odin@local",
+			request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
+		}
+		header := proto.Temporal_Api_Common_V1_Header{}
+		header_payloads: []proto.Temporal_Api_Common_V1_Payload
+		defer delete(header.fields)
+		defer free_start_proto_payloads(header_payloads)
+		if len(input.headers.entries) > 0 {
+			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(input.headers.entries))
+			for &entry, index in input.headers.entries {
+				header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in input.headers.entries {
+				append(
+					&header.fields,
+					proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+						key = entry.key,
+						value = &header_payloads[index],
+					},
+				)
+			}
+			request.header = &header
+		}
+		request_bytes = proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(
+			&request,
+		)
+	}
+	if request_error.message != nil {
+		return request_error
+	}
+	defer delete(request_bytes)
+	return rpc_empty_response(input.handle, "SignalWorkflowExecution", request_bytes[:])
+}
+
+signal_workflow_intercept :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	input: codec.Payload_View,
+	has_input: bool,
+	options: Signal_Workflow_Options,
+) -> Error {
+	headers := Headers{}
+	headers_error := client_interceptor_headers_init(&headers, options.headers)
+	if headers_error.message != nil {
+		return headers_error
+	}
+	defer headers_free(&headers)
+	interceptor_input := Client_Signal_Workflow_Input{
+		handle = handle,
+		signal_name = signal_name,
+		input = input,
+		has_input = has_input,
+		options = options,
+		headers = &headers,
+	}
+	client: ^Client
+	if handle != nil {
+		client = handle.client
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_signal_workflow_chain(&state, &interceptor_input)
+}
+
 signal_workflow :: proc(
 	handle: ^Workflow_Handle,
 	signal_name: string,
@@ -1374,47 +1535,7 @@ signal_workflow_with_options :: proc(
 	signal_name: string,
 	options: Signal_Workflow_Options,
 ) -> Error {
-	if !workflow_handle_valid(handle) {
-		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
-	}
-	if len(signal_name) == 0 {
-		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
-	}
-	if options.headers != nil && options.headers.allocator.procedure == nil {
-		return error_from_string(.Invalid_Argument, "Workflow signal headers are not initialized")
-	}
-	execution := workflow_execution(handle)
-	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
-		workflow_execution = &execution,
-		signal_name = signal_name,
-		identity = "temporal-sdk-odin@local",
-		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
-	}
-	header := proto.Temporal_Api_Common_V1_Header{}
-	header_payloads: []proto.Temporal_Api_Common_V1_Payload
-	defer delete(header.fields)
-	defer free_start_proto_payloads(header_payloads)
-	if options.headers != nil && len(options.headers.entries) > 0 {
-		header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(options.headers.entries))
-		for &entry, index in options.headers.entries {
-			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
-		}
-		for entry, index in options.headers.entries {
-			append(
-				&header.fields,
-				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
-					key = entry.key,
-					value = &header_payloads[index],
-				},
-			)
-		}
-		request.header = &header
-	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request)
-	defer delete(request_bytes)
-	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
+	return signal_workflow_intercept(handle, signal_name, {}, false, options)
 }
 
 // encode_signal_workflow_request is the codec-neutral wire-contract boundary
@@ -1492,22 +1613,7 @@ signal_workflow_payload_with_options :: proc(
 	input: codec.Payload_View,
 	options: Signal_Workflow_Options,
 ) -> Error {
-	if !workflow_handle_valid(handle) {
-		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
-	}
-	request_bytes, request_error := encode_signal_workflow_request(
-		handle.client.namespace,
-		handle.id,
-		handle.run_id,
-		signal_name,
-		input,
-		options,
-	)
-	if request_error.message != nil {
-		return request_error
-	}
-	defer delete(request_bytes)
-	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
+	return signal_workflow_intercept(handle, signal_name, input, true, options)
 }
 
 signal_workflow_json :: proc(
@@ -1608,7 +1714,7 @@ encode_query_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(&request), {}
 }
 
-query_workflow_payload_with_options :: proc(
+query_workflow_payload_unintercepted :: proc(
 	handle: ^Workflow_Handle,
 	query_type: string,
 	input: codec.Payload_View,
@@ -1640,6 +1746,52 @@ query_workflow_payload_with_options :: proc(
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_query_workflow_response(rpc_result.protobuf)
+}
+
+query_workflow_payload_terminal :: proc(
+	input: ^Client_Query_Workflow_Input,
+) -> (codec.Payload, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Query input is missing")
+	}
+	if input.headers == nil || input.headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Query interceptor headers are invalid")
+	}
+	options := input.options
+	options.headers = input.headers
+	return query_workflow_payload_unintercepted(
+		input.handle,
+		input.query_type,
+		input.input,
+		options,
+	)
+}
+
+query_workflow_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: codec.Payload_View,
+	options: Query_Workflow_Options,
+) -> (codec.Payload, Error) {
+	headers := Headers{}
+	headers_error := client_interceptor_headers_init(&headers, options.headers)
+	if headers_error.message != nil {
+		return {}, headers_error
+	}
+	defer headers_free(&headers)
+	interceptor_input := Client_Query_Workflow_Input{
+		handle = handle,
+		query_type = query_type,
+		input = input,
+		options = options,
+		headers = &headers,
+	}
+	client: ^Client
+	if handle != nil {
+		client = handle.client
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_query_workflow_chain(&state, &interceptor_input)
 }
 
 // decode_query_workflow_response preserves the result Payload or returns a
@@ -1919,7 +2071,7 @@ start_update_payload :: proc(
 	)
 }
 
-start_update_payload_with_options :: proc(
+start_update_payload_unintercepted :: proc(
 	handle: ^Workflow_Handle,
 	update_name: string,
 	input: codec.Payload_View,
@@ -2048,6 +2200,52 @@ start_update_payload_with_options :: proc(
 		virtual.arena_destroy(&decode_arena)
 		return result, {}
 	}
+}
+
+start_update_payload_terminal :: proc(
+	input: ^Client_Start_Update_Input,
+) -> (Update_Handle, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Update input is missing")
+	}
+	if input.headers == nil || input.headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Update interceptor headers are invalid")
+	}
+	options := input.options
+	options.headers = input.headers
+	return start_update_payload_unintercepted(
+		input.handle,
+		input.update_name,
+		input.input,
+		options,
+	)
+}
+
+start_update_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: codec.Payload_View,
+	options: Update_Workflow_Options,
+) -> (Update_Handle, Error) {
+	headers := Headers{}
+	headers_error := client_interceptor_headers_init(&headers, options.headers)
+	if headers_error.message != nil {
+		return {}, headers_error
+	}
+	defer headers_free(&headers)
+	interceptor_input := Client_Start_Update_Input{
+		handle = handle,
+		update_name = update_name,
+		input = input,
+		options = options,
+		headers = &headers,
+	}
+	client: ^Client
+	if handle != nil {
+		client = handle.client
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_start_update_chain(&state, &interceptor_input)
 }
 
 start_update_json :: proc(

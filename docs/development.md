@@ -1180,6 +1180,32 @@ A 500-case property varies chain depth and the short-circuit position. The
 `activity-interceptor` integration scenario proves execute-before/after and
 heartbeat-before/after across a real Core worker and CLI dev server.
 
+### Client outbound interceptor chain
+
+`Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
+for Workflow start, Signal, Query, and Update start. Each operation has a
+dedicated mutable input and result-bearing `next`; no result passes through an
+untyped pointer. Registration order is outermost-first and unwind order is
+reversed. Skipping `next` deliberately short-circuits the RPC, so a successful
+short circuit must return a valid operation-specific handle or Payload.
+
+Before the chain runs, the SDK clones existing headers into a per-call owned
+`Headers` value. Workflow-start headers are adapted from `Start_Metadata`; the
+other operations clone their option header builder. Interceptors mutate
+`input.headers`, and the terminal encoder uses exactly that working copy. It is
+freed after the synchronous chain returns, while the caller's builder remains
+unchanged and reusable. Interceptor inputs and `next` values must not be
+retained. The Client copies interceptor records during connect but only borrows
+their `user_data` until `close`.
+Client calls may run concurrently; mutable interceptor user data therefore needs
+application-level synchronization.
+
+The unit and 500-case PBT tests cover nested order, short-circuiting, and header
+isolation. `client_start` injects a start header solely through the interceptor;
+`client_control` does the same for Signal, Query, and Update. The full dev-server
+suite requires all four headers to arrive in Workflow code, including Update
+context after Activity suspension.
+
 ## Troubleshooting
 
 - `library not found for -ltemporalio_sdk_core_c_bridge`: run
