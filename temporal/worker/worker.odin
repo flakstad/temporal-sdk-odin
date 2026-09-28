@@ -47,6 +47,7 @@ Rejected_Workflow_Run :: struct {
 }
 
 Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
+Worker_Ready_Proc :: #type proc(user_data: rawptr) -> bool
 
 Run_Options :: struct {
 	// Zero means no bound. These limits exist for tests and examples; production
@@ -59,6 +60,10 @@ Run_Options :: struct {
 	// Activity registrations on this Worker.
 	enable_local_activities:  bool,
 	on_workflow_activation:  Workflow_Activation_Observer,
+	// Called synchronously after Core validation and worker registration, but
+	// before polling. This permits same-Connection eager Workflow starts.
+	on_ready:                Worker_Ready_Proc,
+	on_ready_data:           rawptr,
 }
 
 Run_Stats :: struct {
@@ -1384,6 +1389,9 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	}
 	worker.lifecycle = .Running
 	defer { worker.lifecycle = .Stopped }
+	if options.on_ready != nil && !options.on_ready(options.on_ready_data) {
+		return {}, error_from_string("worker ready callback failed")
+	}
 
 	if poll_activities && !poll_workflows {
 		stats.activity_tasks_completed,

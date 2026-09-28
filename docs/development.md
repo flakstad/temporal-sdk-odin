@@ -412,6 +412,7 @@ handle, start_error := temporal_client.start_workflow_json(
         start_delay = 500 * time.Millisecond,
         priority = &priority,
         metadata = &metadata,
+        enable_eager_workflow_start = true,
     },
 )
 ```
@@ -441,6 +442,13 @@ negative/non-finite.
 
 Start uses a UUIDv4 request ID when the caller omits one. Zero duration means
 unspecified; invalid options are rejected before RPC.
+When eager start is requested, the matching Workflow worker must already be
+validated on the same public Client/Core connection. Core reserves the worker
+slot, may clear the request if no slot is available, and dispatches a returned
+task before the RPC result reaches Odin. The resulting Workflow handle records
+whether eager execution was actually accepted. `worker.Run_Options.on_ready`
+is the synchronous post-validation/pre-poll hook used by the self-contained
+live example to establish this ordering without a race.
 Result retrieval issues a blocking close-event long poll with no local timeout,
 maps every terminal Workflow event, and follows retry/cron/Continue-As-New run
 IDs by default. Set `follow_runs = false` to receive
@@ -748,9 +756,12 @@ field and decodes the exact `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` payloads and type metadata.
 Another 500-case property generates Client start headers, memo, Search
 Attributes, raw Payload bytes, keys, all seven Temporal type labels, ID
-policies, Retry Policies, delays, and priorities. It
+policies, Retry Policies, delays, priorities, and eager-start intent. It
 frees each source Payload before request encoding, then decodes the complete
 `StartWorkflowExecutionRequest` to prove builder ownership and wire fidelity.
+An additional 500 cases generate query header keys, arbitrary Payload bytes and
+metadata, query types, and reject conditions; the source Payload is freed
+before request encoding.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
@@ -982,6 +993,12 @@ non-zero count. This is the live ownership, Visibility, and pagination
 acceptance path for the typed read APIs. Counts are approximate by Temporal's
 contract; the integration assertion therefore only requires the unique test
 execution to be visible, not an exact global total.
+
+The normal query/update live paths add an owned `Headers` value to each query.
+The Service copies it into Core's Query activation; the contextual Odin handler
+decodes `caller = "odin-client-control"` and returns it in the result. `Headers`
+owns cloned keys and Payloads until `headers_free`; query options only borrow it
+for the synchronous RPC.
 
 ### Schedule lifecycle live path
 

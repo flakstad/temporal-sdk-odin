@@ -100,7 +100,10 @@ typed JSON helpers. The Odin Client supplies all three initial Payload maps
 through an explicitly owned start-metadata builder. Workflow starts also expose
 ID reuse/conflict policies, Retry Policy, cron schedule, start delay, and task
 priority. The live suite proves delayed start plus `Use_Existing` by requiring
-two starts against the CLI dev server to return the same run ID.
+two starts against the CLI dev server to return the same run ID. Eager Workflow
+start is also live-proven: a validated worker on the same Core connection
+reserves a slot, Core dispatches the response task directly into that worker,
+and history records `eagerExecutionAccepted`.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -242,6 +245,13 @@ close event, and decodes the result Payload without Temporal CLI:
 ./scripts/run-client-start.sh
 ```
 
+The self-contained eager example creates a public Client and Worker on the same
+Core connection and proves inline first-task dispatch:
+
+```bash
+./scripts/run-eager-workflow.sh
+```
+
 With `examples/hello_workflow` running in the `patch` scenario, exercise the
 complete Schedule lifecycle without Temporal CLI acting as the client:
 
@@ -296,6 +306,7 @@ handle, err := temporal_client.start_workflow_json(
         start_delay = 500 * time.Millisecond,
         priority = &priority,
         metadata = &metadata,
+        enable_eager_workflow_start = true,
     },
 )
 defer temporal_client.workflow_handle_free(&handle)
@@ -406,6 +417,10 @@ Temporal namespace. Retry Policy and Priority are borrowed only during request
 encoding. Zero values inside them preserve Temporal Service defaults. Start
 delay and cron are mutually exclusive; invalid timeout, retry, priority, and ID
 policy combinations are rejected before the RPC.
+Eager start is only accepted when a validated Workflow worker for the
+namespace/task queue is registered on the same Core connection;
+`handle.eager_execution_accepted` reports whether the start response actually
+contained the inline task.
 
 `Workflow_Description`, `History_Page`, `Workflow_List_Page`, and
 `Workflow_Count`, plus Schedule descriptions/list/counts/matching-times, are allocator-owned snapshots; they do not borrow Core
@@ -430,6 +445,17 @@ err = temporal_client.query_workflow_json(
     "order_status",
     Order_Status_Query{},
     &status,
+)
+query_headers := temporal_client.Headers{}
+err = temporal_client.headers_init(&query_headers)
+defer temporal_client.headers_free(&query_headers)
+err = temporal_client.headers_add_json(&query_headers, "caller", "orders-api")
+err = temporal_client.query_workflow_json_with_options(
+    &handle,
+    "order_status",
+    Order_Status_Query{},
+    &status,
+    {headers = &query_headers},
 )
 // Closed executions can be rejected before handler delivery.
 err = temporal_client.query_workflow_json_with_options(
@@ -722,12 +748,18 @@ Status_State :: struct { phase: string, order_id: string }
 Status_Query :: struct {}
 Status_Result :: struct { phase: string, order_id: string }
 
-status_query :: proc(state: Status_State, _: Status_Query) -> Status_Result {
+status_query :: proc(
+    query: ^workflow.Query_Context,
+    state: Status_State,
+    _: Status_Query,
+) -> Status_Result {
+    caller: string
+    _, _ = workflow.query_header_json(query, "caller", &caller)
     return {phase = state.phase, order_id = state.order_id}
 }
 
 state := Status_State{phase = "waiting", order_id = input.order_id}
-if !workflow.set_query_handler_json(ctx, "order_status", &state, status_query) {
+if !workflow.set_query_handler_json_with_context(ctx, "order_status", &state, status_query) {
     return {}
 }
 ```
@@ -736,6 +768,9 @@ The runtime answers a `QueryWorkflow` activation without resuming the suspended
 fiber. Handler state is borrowed from the live Workflow stack, passed to the
 callback by value, and must remain valid while the Workflow runs. The current
 experimental boundary accepts exactly one input Payload and one result Payload.
+The contextual registration additionally receives invocation-scoped query
+identity and header accessors without exposing the command-capable
+`Fiber_Context`; header Payload views must not escape the callback.
 Unknown handlers and codec errors become failed query responses rather than
 failed Workflow Tasks.
 
@@ -939,6 +974,7 @@ temporal/failure/         owned recursive Temporal Failure model
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
+examples/eager_workflow/  same-connection eager Workflow start proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof

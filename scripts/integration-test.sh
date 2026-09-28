@@ -76,6 +76,19 @@ fi
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
+eager_workflow_id="odin-sdk-eager-$$-$(date +%s)"
+TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-eager-workflow.sh" >"$workflow_output_file"
+eager_output="$(<"$workflow_output_file")"
+echo "$eager_output"
+grep -q "Eager Workflow start accepted and completed workflow_id=$eager_workflow_id" <<<"$eager_output"
+temporal workflow show \
+  --workflow-id "$eager_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q '"eagerExecutionAccepted": true' "$typed_history_file"
+
 run_activity_case() {
   local mode="$1"
   if [[ "$mode" == "retry" ]]; then
@@ -662,6 +675,7 @@ query_output="$(<"$workflow_control_output_file")"
 echo "$query_output"
 grep -q "Odin client query=greeting_status workflow_id=$workflow_id" <<<"$query_output"
 grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$query_output"
+grep -q 'caller="odin-client-control"' <<<"$query_output"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
@@ -760,6 +774,7 @@ signal_query_output="$(<"$workflow_control_output_file")"
 echo "$signal_query_output"
 grep -q "Odin client query=greeting_status workflow_id=$signal_handler_workflow_id" <<<"$signal_query_output"
 grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$signal_query_output"
+grep -q 'caller="odin-client-control"' <<<"$signal_query_output"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \

@@ -2497,6 +2497,7 @@ Query_Test_Input :: struct {
 Query_Test_Output :: struct {
 	message: string,
 	count:   int,
+	caller:  string,
 }
 
 Query_Mutation_State :: struct {
@@ -2720,16 +2721,22 @@ fiber_detached_update_cancellation_test_workflow :: proc(
 
 fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Query_Test_State{phase = "waiting", count = len(name)}
-	registered := workflow.set_query_handler_json(
+	registered := workflow.set_query_handler_json_with_context(
 		ctx,
 		"status",
 		&state,
-		proc(state: Query_Test_State, input: Query_Test_Input) -> Query_Test_Output {
+		proc(
+			query: ^workflow.Query_Context,
+			state: Query_Test_State,
+			input: Query_Test_Input,
+		) -> Query_Test_Output {
 			message, allocation_error := strings.concatenate({input.prefix, state.phase})
 			if allocation_error != nil {
 				return {}
 			}
-			return {message = message, count = state.count}
+			caller: string
+			_, _ = workflow.query_header_json(query, "caller", &caller)
+			return {message = message, count = state.count, caller = caller}
 		},
 	)
 	if !registered {
@@ -4407,6 +4414,7 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 			start_delay = 3 * time.Second,
 			priority = &priority,
 			metadata = &metadata,
+			enable_eager_workflow_start = true,
 		},
 	)
 	defer delete(request_bytes)
@@ -4430,6 +4438,7 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.workflow_type.name, "order_workflow")
 	testing.expect_value(t, request.task_queue.name, "orders")
 	testing.expect_value(t, request.request_id, "request-42")
+	testing.expect(t, request.request_eager_execution)
 	testing.expect_value(t, request.workflow_execution_timeout.seconds, i64(86_400))
 	testing.expect_value(t, request.workflow_run_timeout.seconds, i64(3_600))
 	testing.expect_value(t, request.workflow_task_timeout.seconds, i64(10))
@@ -4544,6 +4553,14 @@ client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc
 	input, input_error := codec.encode_json("query-input")
 	testing.expect(t, input_error == .None)
 	defer codec.payload_free(&input)
+	headers := temporal_client.Headers{}
+	headers_init_error := temporal_client.headers_init(&headers)
+	testing.expect(t, headers_init_error.message == nil)
+	temporal_client.error_free(&headers_init_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "odin-client")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
 	cases := [?]struct {
 		condition: temporal_client.Query_Reject_Condition,
 		expected:  proto.Temporal_Api_Enums_V1_QueryRejectCondition,
@@ -4560,7 +4577,7 @@ client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc
 			"run-42",
 			"status",
 			codec.payload_view(&input),
-			{reject_condition = test_case.condition},
+			{reject_condition = test_case.condition, headers = &headers},
 		)
 		testing.expect(t, request_error.message == nil)
 		temporal_client.error_free(&request_error)
@@ -4582,6 +4599,21 @@ client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc
 		testing.expect_value(t, request.query.query_type, "status")
 		testing.expect(t, request.query.query_args != nil)
 		testing.expect_value(t, len(request.query.query_args.payloads), 1)
+		testing.expect(t, request.query.header != nil)
+		if request.query.header != nil {
+			testing.expect_value(t, len(request.query.header.fields), 1)
+			testing.expect_value(t, request.query.header.fields[0].key, "caller")
+			owned_header, clone_error := proto.clone_payload(request.query.header.fields[0].value)
+			testing.expect(t, clone_error == .None)
+			decoded_header: string
+			testing.expect(
+				t,
+				codec.decode_json(codec.payload_view(&owned_header), &decoded_header) == .None,
+			)
+			testing.expect_value(t, decoded_header, "odin-client")
+			delete(decoded_header)
+			codec.payload_free(&owned_header)
+		}
 		testing.expect(t, request.query_reject_condition == test_case.expected)
 		virtual.arena_destroy(&decode_arena)
 		delete(request_bytes)
@@ -9244,12 +9276,26 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 	query_input_proto := proto.encode_payload(codec.payload_view(&query_input))
 	defer delete(query_input_proto.metadata)
 	defer delete(query_input_proto.external_payloads)
+	query_header, query_header_error := codec.encode_json("unit-test-client")
+	testing.expect(t, query_header_error == .None)
+	defer codec.payload_free(&query_header)
+	query_header_proto := proto.encode_payload(codec.payload_view(&query_header))
+	defer delete(query_header_proto.metadata)
+	defer delete(query_header_proto.external_payloads)
 	query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
 		query_id = "query-after-update",
 		query_type = "status",
 	}
 	defer delete(query.arguments)
+	defer delete(query.headers)
 	append(&query.arguments, query_input_proto)
+	append(
+		&query.headers,
+		proto.Coresdk_Workflow_Activation_QueryWorkflow_HeadersEntry{
+			key = "caller",
+			value = &query_header_proto,
+		},
+	)
 	delete(activation.jobs)
 	activation.jobs = nil
 	append(
@@ -9271,7 +9317,9 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 	testing.expect(t, query_decode_error == .None)
 	testing.expect_value(t, query_output.message, "After waiting")
 	testing.expect_value(t, query_output.count, 7)
+	testing.expect_value(t, query_output.caller, "unit-test-client")
 	delete(query_output.message)
+	delete(query_output.caller)
 	codec.payload_free(&query_inspection.payload)
 	delete(query_inspection.failure_message)
 	delete(query_inspection.failure_type)

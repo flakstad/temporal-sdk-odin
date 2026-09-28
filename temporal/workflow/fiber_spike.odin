@@ -30,6 +30,11 @@ Query_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Query_Context_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	query: ^Query_Context,
+	input: codec.Payload_View,
+) -> Payload_Result
 Update_Validate_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
@@ -579,10 +584,19 @@ Cancellation_Scope :: struct {
 	active:   bool,
 }
 
+// Query_Context exists only for the synchronous query callback. Its identity,
+// strings, and header Payload views are borrowed and must not escape it.
+Query_Context :: struct {
+	id:      string,
+	type:    string,
+	headers: [dynamic]Fiber_Named_Payload,
+}
+
 Fiber_Query_Handler :: struct {
-	name:          string,
-	callback_data: rawptr,
-	invoke:        Query_Invoke_Proc,
+	name:                string,
+	callback_data:       rawptr,
+	invoke:              Query_Invoke_Proc,
+	invoke_with_context: Query_Context_Invoke_Proc,
 }
 
 Fiber_Signal_Handler :: struct {
@@ -1423,6 +1437,10 @@ clone_named_proto_payloads :: proc(
 		key, key_error := strings.clone(entry.key)
 		payload, payload_error := proto.clone_payload(entry.value)
 		if key_error != nil || payload_error != .None {
+			if key_error == nil {
+				delete(key)
+			}
+			codec.payload_free(&payload)
 			return false
 		}
 		append(result, Fiber_Named_Payload{key = key, payload = payload})
@@ -1441,6 +1459,28 @@ clone_named_header_payloads :: proc(
 		key, key_error := strings.clone(entry.key)
 		payload, payload_error := proto.clone_payload(entry.value)
 		if key_error != nil || payload_error != .None {
+			return false
+		}
+		append(result, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return true
+}
+
+clone_query_header_payloads :: proc(
+	entries: []proto.Coresdk_Workflow_Activation_QueryWorkflow_HeadersEntry,
+	result: ^[dynamic]Fiber_Named_Payload,
+) -> bool {
+	for entry in entries {
+		if len(entry.key) == 0 || entry.value == nil {
+			return false
+		}
+		key, key_error := strings.clone(entry.key)
+		payload, payload_error := proto.clone_payload(entry.value)
+		if key_error != nil || payload_error != .None {
+			if key_error == nil {
+				delete(key)
+			}
+			codec.payload_free(&payload)
 			return false
 		}
 		append(result, Fiber_Named_Payload{key = key, payload = payload})
@@ -1812,6 +1852,41 @@ set_query_handler_payload :: proc(
 	return true
 }
 
+set_query_handler_payload_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Query_Context_Invoke_Proc,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(ctx.instance, "invalid contextual Workflow query handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_query_handler(instance, name)
+	if duplicate {
+		query_registration_failed(instance, "Workflow query handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(instance, "could not preserve Workflow query handler name")
+		return false
+	}
+	append(
+		&instance.query_handlers,
+		Fiber_Query_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_with_context = callback,
+		},
+	)
+	return true
+}
+
 // set_query_handler_json registers a synchronous, read-only query view over
 // Workflow-owned state. The callback receives a top-level copy of State and no
 // Fiber_Context, so it cannot schedule Temporal commands through the normal API.
@@ -1853,6 +1928,62 @@ set_query_handler_json :: proc(
 				)
 			}
 			output := owned.callback(owned.state^, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow query result as json/plain",
+					"OdinWorkflowQueryPayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+	)
+}
+
+// set_query_handler_json_with_context adds read-only, invocation-scoped query
+// metadata without exposing the command-capable Fiber_Context.
+set_query_handler_json_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	callback: proc(query: ^Query_Context, state: State, input: $Input) -> $Output,
+) -> bool {
+	Callback :: #type proc(query: ^Query_Context, state: State, input: Input) -> Output
+	Data :: struct {
+		state:    ^State,
+		callback: Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(ctx.instance, "invalid typed contextual Workflow query handler")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(ctx.instance, "could not allocate typed contextual Workflow query handler")
+		return false
+	}
+	data.state = state
+	data.callback = callback
+	return set_query_handler_payload_with_context(
+		ctx,
+		name,
+		data,
+		proc(
+			callback_data: rawptr,
+			query: ^Query_Context,
+			input: codec.Payload_View,
+		) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow query input as json/plain",
+					"OdinWorkflowQueryPayloadConversionError",
+				)
+			}
+			output := owned.callback(query, owned.state^, value)
 			payload, encode_error := codec.encode_json(output)
 			if encode_error != .None {
 				return payload_fail(
@@ -2514,6 +2645,29 @@ header_json :: proc(
 	value: ^$T,
 ) -> (found: bool, error: codec.Error) {
 	payload, payload_found := header_payload(ctx, key)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+query_header_payload :: proc(query: ^Query_Context, key: string) -> (codec.Payload_View, bool) {
+	if query == nil {
+		return {}, false
+	}
+	entry, _, found := find_named_payload(&query.headers, key)
+	if !found {
+		return {}, false
+	}
+	return codec.payload_view(&entry.payload), true
+}
+
+query_header_json :: proc(
+	query: ^Query_Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := query_header_payload(query, key)
 	if !payload_found {
 		return false, .None
 	}
@@ -5857,7 +6011,34 @@ invoke_workflow_query :: proc(
 		)
 	}
 	defer codec.payload_free(&input)
-	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
+	query_context := Query_Context{
+		id = query.query_id,
+		type = query.query_type,
+		headers = make([dynamic]Fiber_Named_Payload),
+	}
+	defer {
+		for &entry in query_context.headers {
+			delete(entry.key)
+			codec.payload_free(&entry.payload)
+		}
+		delete(query_context.headers)
+	}
+	if !clone_query_header_payloads(query.headers[:], &query_context.headers) {
+		return payload_fail(
+			"could not preserve Workflow query headers",
+			"OdinWorkflowQueryHeaderConversionError",
+		)
+	}
+	result: Payload_Result
+	if handler.invoke_with_context != nil {
+		result = handler.invoke_with_context(
+			handler.callback_data,
+			&query_context,
+			codec.payload_view(&input),
+		)
+	} else {
+		result = handler.invoke(handler.callback_data, codec.payload_view(&input))
+	}
 	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&result.payload)
 		restore_workflow_command_state(instance, command_state)

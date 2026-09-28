@@ -272,6 +272,18 @@ retry. Odin rejects invalid duration, backoff, priority, cron/delay, and legacy
 terminate-if-running/conflict combinations before calling Core. This remains
 protobuf work above the generic Client RPC and adds no C symbol.
 
+Eager Workflow start uses that same generic C call, but not as a raw boolean
+shortcut. Core's connection tracks registered workers. For a request with
+`request_eager_execution`, Core attempts to reserve a Workflow slot for the
+same namespace/task queue, populates deployment options when applicable, and
+clears the request if no slot exists. A returned `eager_workflow_task` is then
+scheduled directly into the reserved worker before the response is returned to
+Odin. `Workflow_Handle.eager_execution_accepted` reflects presence of that
+response task. The live example starts from the worker's post-validation
+`on_ready` hook, completes through the ordinary activation loop, and verifies
+the history's `eagerExecutionAccepted` bit. No new C ABI is required, but a
+worker on a different Client connection cannot participate in eager dispatch.
+
 The same generic bridge now carries `SignalWorkflowExecution`,
 `RequestCancelWorkflowExecution`, and `TerminateWorkflowExecution`. Signals
 support zero or one generic/typed Payload and generate a UUIDv4 request ID for
@@ -1157,6 +1169,15 @@ the live Workflow stack and remain valid because handlers execute only while
 that fiber instance is cached. Eviction destroys both together; replay creates
 a fresh stack and deterministically registers a fresh handler.
 
+Client query options now borrow an explicitly owned `Headers` map. The request
+encodes it into `WorkflowQuery.header`; Core delivers the corresponding map on
+the activation job. `set_query_handler_json_with_context` receives a narrow
+`Query_Context` containing query identity and owned-for-the-invocation header
+copies, exposed to user code as borrowed Payload views/typed JSON. It still
+does not expose `Fiber_Context`, so adding propagation data does not also expose
+Temporal command primitives. The map and views die when the synchronous query
+callback returns.
+
 The live CLI-devserver run exposed an important detail: Core may mark the
 activation containing the externally requested query as `is_replaying=true`
 while reconstructing Workflow state for that query. Query accounting therefore
@@ -1170,8 +1191,7 @@ query delivered alongside a signal-producing completion.
 Core reserves `legacy_query` as `LEGACY_QUERY_ID`: a legacy query completion
 may contain no other commands. The current runtime produces the correct
 query-only completion when Core sends such an activation, but it does not yet
-reject a malformed mixed legacy activation itself. Query headers are not yet
-exposed. Client-side reject-condition selection is exposed independently of
+reject a malformed mixed legacy activation itself. Client-side reject-condition selection is exposed independently of
 Workflow delivery: Odin maps all four pinned conditions onto
 `QueryWorkflowRequest.query_reject_condition`. A `QueryRejected` response is a
 typed Client error that retains the rejecting Workflow execution status.
@@ -1715,9 +1735,9 @@ Workflows are enabled.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
    Visibility list/count are live-proven. Query reject conditions and static
-   summary/details are now wire- and live-proven, but the public Client still
-   lacks eager start and a
-   supported-server matrix for newer Schedule methods.
+   summary/details, query headers, and eager Workflow start are now wire- and
+   live-proven, but the public Client still lacks a supported-server matrix for
+   newer Schedule methods.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
@@ -1752,8 +1772,9 @@ Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 recursive Failure chains,
-500 Client start request (including static UserMetadata)
-round trips, 500 paginated Visibility list/count round trips, 500 query response round trips, and
+500 Client start request (including static UserMetadata and eager-start intent)
+round trips, 500 paginated Visibility list/count round trips, 500 query request/header round trips,
+500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
 signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
@@ -1787,8 +1808,11 @@ Activity cancellation detail completeness is now implemented: all Core flags,
 an explicit Workflow cancel primitive, correct
 `Wait_Cancellation_Completed` suspension, recursive canceled Failure
 preservation, and a typed user-detail round trip are unit-, property-, and
-live-proven. The next smallest client-completeness slice is query/start headers
-and eager Workflow start; backfill should also gain a dedicated multi-execution
+live-proven. Query headers and same-connection eager Workflow start are now
+owned, wire-tested, and live-proven; start headers were already covered by
+`Start_Metadata`. The next smallest client-completeness slice is
+Signal-With-Start (including header separation and conflict semantics), while
+backfill should also gain a dedicated multi-execution
 live case without overloading the one-shot Schedule example. Remaining failure work includes deciding whether start failures
 that only carry Core cause enums need a synthetic language-level Failure.
 

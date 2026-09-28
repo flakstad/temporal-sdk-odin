@@ -338,12 +338,14 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	priority_key := i32(pbt.draw(t, pbt.int_range(0, 5)))
 	fairness_key := pbt.draw(t, pbt.string_ascii(0, 64))
 	fairness_weight := f32(pbt.draw(t, pbt.int_range(0, 100_000))) / 100.0
+	enable_eager_start := pbt.draw(t, pbt.boolean())
 	pbt.cover(t, type_case == 0, 5.0, "Bool Search Attribute metadata")
 	pbt.cover(t, type_case == 6, 5.0, "KeywordList Search Attribute metadata")
 	pbt.cover(t, len(search_value) == 0, 2.0, "empty Search Attribute Payload")
 	pbt.cover(t, reuse_case == 4, 5.0, "deprecated terminate-if-running reuse policy")
 	pbt.cover(t, conflict_case == 3, 5.0, "terminate-existing conflict policy")
 	pbt.cover(t, len(fairness_key) == 64, 1.0, "maximum-length fairness key")
+	pbt.cover(t, enable_eager_start, 30.0, "eager Workflow start requested")
 
 	metadata := temporal_client.Start_Metadata{}
 	init_error := temporal_client.start_metadata_init(&metadata)
@@ -425,6 +427,7 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 			start_delay = time.Duration(start_delay_ms) * time.Millisecond,
 			priority = &priority,
 			metadata = &metadata,
+			enable_eager_workflow_start = enable_eager_start,
 		},
 	)
 	defer delete(request_bytes)
@@ -453,7 +456,8 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil {
 		return pbt.fail("generated Client start metadata did not decode")
 	}
-	if i32(request.workflow_id_reuse_policy) != i32(reuse_case) ||
+	if request.request_eager_execution != enable_eager_start ||
+	   i32(request.workflow_id_reuse_policy) != i32(reuse_case) ||
 	   i32(request.workflow_id_conflict_policy) != i32(conflict_case) ||
 	   pbt_proto_duration(request.workflow_start_delay) !=
 	   time.Duration(start_delay_ms) * time.Millisecond ||
@@ -758,6 +762,107 @@ query_responses_preserve_generated_payloads_and_failures :: proc(t: ^testing.T) 
 		"Workflow query responses preserve generated payloads and failures",
 		query_response_wire_property,
 		{num_tests = 500, seed = 0x5155_4552_595f_5253},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+client_query_header_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
+	header_key := pbt.draw(t, pbt.string_ascii(1, 24))
+	header_value := pbt.draw(t, pbt.string_ascii(0, 96))
+	query_type := pbt.draw(t, pbt.string_ascii(1, 32))
+	reject_case := pbt.draw(t, pbt.int_range(0, 3))
+	pbt.cover(t, len(header_value) == 0, 1.0, "empty query header Payload")
+	pbt.cover(t, reject_case == 2, 20.0, "reject query when not open")
+
+	headers := temporal_client.Headers{}
+	init_error := temporal_client.headers_init(&headers)
+	if init_error.message != nil {
+		temporal_client.error_free(&init_error)
+		return pbt.error("could not initialize generated query headers")
+	}
+	temporal_client.error_free(&init_error)
+	defer temporal_client.headers_free(&headers)
+	header := codec.payload_create(transmute([]u8)header_value)
+	if codec.payload_add_metadata(
+		&header,
+		"encoding",
+		transmute([]u8)string("binary/query-test"),
+	) != .None {
+		codec.payload_free(&header)
+		return pbt.error("could not add generated query header metadata")
+	}
+	header_error := temporal_client.headers_add_payload(
+		&headers,
+		header_key,
+		codec.payload_view(&header),
+	)
+	codec.payload_free(&header)
+	defer temporal_client.error_free(&header_error)
+	if header_error.message != nil {
+		return pbt.error("could not preserve generated query header")
+	}
+
+	input := codec.payload_create(transmute([]u8)string("query-input"))
+	defer codec.payload_free(&input)
+	request_bytes, request_error := temporal_client.encode_query_workflow_request(
+		"generated-namespace",
+		"generated-workflow-id",
+		"generated-run-id",
+		query_type,
+		codec.payload_view(&input),
+		{
+			reject_condition = temporal_client.Query_Reject_Condition(reject_case),
+			headers = &headers,
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	if request_error.message != nil {
+		return pbt.fail("generated query request did not encode")
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize generated query request arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || request.query == nil || request.query.header == nil ||
+	   len(request.query.header.fields) != 1 || request.query.header.fields[0].value == nil {
+		return pbt.fail("generated query header did not decode")
+	}
+	field := request.query.header.fields[0]
+	if request.query.query_type != query_type || field.key != header_key ||
+	   string(field.value.data) != header_value ||
+	   i32(request.query_reject_condition) != i32(reject_case) {
+		return pbt.fail("generated query options changed across protobuf encoding")
+	}
+	encoding := ""
+	for entry in field.value.metadata {
+		if entry.key == "encoding" {
+			encoding = string(entry.value)
+		}
+	}
+	if encoding != "binary/query-test" {
+		return pbt.fail("generated query header metadata changed across protobuf encoding")
+	}
+	return pbt.pass()
+}
+
+@(test)
+client_query_headers_preserve_generated_payloads :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Client query headers preserve generated Payloads",
+		client_query_header_wire_property,
+		{num_tests = 500, seed = 0x5155_4552_595f_4844},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

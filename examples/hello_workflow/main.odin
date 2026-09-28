@@ -69,6 +69,7 @@ Greeting_Query_Input :: struct {
 Greeting_Query_Output :: struct {
 	phase: string,
 	name:  string,
+	caller: string,
 }
 
 Greeting_Update_Input :: struct {
@@ -81,10 +82,12 @@ Greeting_Update_Output :: struct {
 }
 
 greeting_status_query :: proc(
+	query: ^workflow.Query_Context,
 	state: Greeting_Query_State,
 	input: Greeting_Query_Input,
 ) -> Greeting_Query_Output {
 	result := Greeting_Query_Output{phase = state.phase}
+	_, _ = workflow.query_header_json(query, "caller", &result.caller)
 	if input.include_name {
 		result.name = state.name
 	}
@@ -337,7 +340,7 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	}
 
 	query_state := Greeting_Query_State{phase = "waiting-for-approval", name = name}
-	if !workflow.set_query_handler_json(
+	if !workflow.set_query_handler_json_with_context(
 		ctx,
 		"greeting_status",
 		&query_state,

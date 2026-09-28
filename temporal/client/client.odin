@@ -234,6 +234,7 @@ Start_Workflow_Options :: struct {
 	start_delay:                time.Duration,
 	priority:                   ^Priority,
 	metadata:                   ^Start_Metadata,
+	enable_eager_workflow_start: bool,
 }
 
 // Workflow_Id_Reuse_Policy controls reuse after a previous execution with the
@@ -281,6 +282,39 @@ Search_Attribute_Type :: codec.Search_Attribute_Type
 Start_Metadata_Named_Payload :: struct {
 	key:     string,
 	payload: codec.Payload,
+}
+
+// Headers owns a deterministic insertion-ordered map of Temporal Payloads.
+// It is reusable across synchronous Client calls, but must outlive each call
+// whose options borrow it.
+Headers :: struct {
+	entries:   [dynamic]Start_Metadata_Named_Payload,
+	allocator: mem.Allocator,
+}
+
+headers_init :: proc(headers: ^Headers, allocator := context.allocator) -> Error {
+	if headers == nil || allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Temporal headers require an allocator")
+	}
+	if headers.allocator.procedure != nil {
+		return error_from_string(.Invalid_Argument, "Temporal headers are already initialized")
+	}
+	headers.entries = make([dynamic]Start_Metadata_Named_Payload, allocator)
+	headers.allocator = allocator
+	return {}
+}
+
+headers_free :: proc(headers: ^Headers) {
+	if headers == nil || headers.allocator.procedure == nil {
+		return
+	}
+	allocator := headers.allocator
+	for &entry in headers.entries {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	delete(headers.entries)
+	headers^ = {}
 }
 
 Start_Metadata_Search_Attribute :: struct {
@@ -405,6 +439,28 @@ start_metadata_put_named_owned :: proc(
 	}
 	append(entries, Start_Metadata_Named_Payload{key = owned_key, payload = owned_payload})
 	return {}
+}
+
+headers_add_payload :: proc(headers: ^Headers, key: string, value: codec.Payload_View) -> Error {
+	if headers == nil || headers.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized")
+	}
+	payload, clone_error := codec.payload_clone(value, headers.allocator)
+	if clone_error != .None {
+		return error_from_string(.Payload_Conversion, "could not clone Temporal header Payload")
+	}
+	return start_metadata_put_named_owned(&headers.entries, key, payload, headers.allocator)
+}
+
+headers_add_json :: proc(headers: ^Headers, key: string, value: $T) -> Error {
+	if headers == nil || headers.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, headers.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Temporal header")
+	}
+	return start_metadata_put_named_owned(&headers.entries, key, payload, headers.allocator)
 }
 
 start_metadata_add_named_payload :: proc(
@@ -543,6 +599,7 @@ Workflow_Handle :: struct {
 	id:                     string,
 	run_id:                 string,
 	first_execution_run_id: string,
+	eager_execution_accepted: bool,
 }
 
 // Query_Reject_Condition controls whether Temporal may deliver a Query for a
@@ -556,6 +613,7 @@ Query_Reject_Condition :: enum {
 
 Query_Workflow_Options :: struct {
 	reject_condition: Query_Reject_Condition,
+	headers:          ^Headers,
 }
 
 query_reject_condition_to_proto :: proc(
@@ -798,6 +856,7 @@ encode_start_workflow_request :: proc(
 		workflow_id_reuse_policy = workflow_id_reuse_policy_to_proto(options.id_reuse_policy),
 		workflow_id_conflict_policy = workflow_id_conflict_policy_to_proto(options.id_conflict_policy),
 		cron_schedule = options.cron_schedule,
+		request_eager_execution = options.enable_eager_workflow_start,
 	}
 	execution_timeout := duration_proto(options.workflow_execution_timeout)
 	run_timeout := duration_proto(options.workflow_run_timeout)
@@ -987,7 +1046,18 @@ start_workflow_payload :: proc(
 	if len(first_execution_run_id) == 0 {
 		first_execution_run_id = response.run_id
 	}
-	return get_workflow_handle(client, options.id, response.run_id, first_execution_run_id)
+	handle_error: Error
+	handle, handle_error = get_workflow_handle(
+		client,
+		options.id,
+		response.run_id,
+		first_execution_run_id,
+	)
+	if handle_error.message != nil {
+		return {}, handle_error
+	}
+	handle.eager_execution_accepted = response.eager_workflow_task != nil
+	return handle, {}
 }
 
 start_workflow_json :: proc(
@@ -1140,6 +1210,9 @@ encode_query_workflow_request :: proc(
 	if len(query_type) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Workflow query type must not be empty")
 	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return nil, error_from_string(.Invalid_Argument, "Workflow query headers are not initialized")
+	}
 	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
 		workflow_id = workflow_id,
 		run_id = run_id,
@@ -1153,6 +1226,29 @@ encode_query_workflow_request :: proc(
 	query := proto.Temporal_Api_Query_V1_WorkflowQuery{
 		query_type = query_type,
 		query_args = &arguments,
+	}
+	header := proto.Temporal_Api_Common_V1_Header{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer free_start_proto_payloads(header_payloads)
+	if options.headers != nil && len(options.headers.entries) > 0 {
+		header_payloads = make(
+			[]proto.Temporal_Api_Common_V1_Payload,
+			len(options.headers.entries),
+		)
+		for &entry, index in options.headers.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in options.headers.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+		query.header = &header
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{
 		namespace = namespace,

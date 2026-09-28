@@ -26,6 +26,7 @@ Greeting_Query_Input :: struct {
 Greeting_Query_Output :: struct {
 	phase: string,
 	name:  string,
+	caller: string,
 }
 
 Greeting_Update_Input :: struct {
@@ -81,11 +82,30 @@ run :: proc() -> int {
 			query_name = "greeting_status"
 		}
 		output: Greeting_Query_Output
-		operation_error = temporal_client.query_workflow_json(
+		headers := temporal_client.Headers{}
+		headers_error := temporal_client.headers_init(&headers)
+		if headers_error.message != nil {
+			print_error("query header initialization", &headers_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_error)
+		defer temporal_client.headers_free(&headers)
+		header_error := temporal_client.headers_add_json(
+			&headers,
+			"caller",
+			"odin-client-control",
+		)
+		if header_error.message != nil {
+			print_error("query header encoding", &header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		operation_error = temporal_client.query_workflow_json_with_options(
 			&handle,
 			query_name,
 			Greeting_Query_Input{include_name = true},
 			&output,
+			{headers = &headers},
 		)
 		if operation_error.message != nil {
 			print_error(action, &operation_error)
@@ -93,12 +113,14 @@ run :: proc() -> int {
 		}
 		defer delete(output.phase)
 		defer delete(output.name)
+		defer delete(output.caller)
 		fmt.printf(
-			"Odin client query=%s workflow_id=%s phase=%q name=%q\n",
+			"Odin client query=%s workflow_id=%s phase=%q name=%q caller=%q\n",
 			query_name,
 			workflow_id,
 			output.phase,
 			output.name,
+			output.caller,
 		)
 		return 0
 	case "update":
