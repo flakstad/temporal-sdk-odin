@@ -2007,7 +2007,7 @@ arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
-repeated-signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
+repeated-signal/cancel/replay cases, 500 Continue-As-New repeated-argument/option/replay cases, 500 patch
 truth-table cases, 500 deterministic time/random activation contexts, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
@@ -2236,13 +2236,13 @@ current run, create the next run in the same Workflow execution chain, and later
 deliver an ordinary `InitializeWorkflow` activation for it. There is no
 resolution job for the old run because the command is terminal.
 
-The Odin primitive is typed `-> !`. It copies/owns the new input Payload and
+The Odin primitive is typed `-> !`. It copies/owns the new ordered input Payloads and
 options, marks the active fiber run terminal, yields to the language scheduler,
 and is never resumed. The completion builder emits exactly one terminal command
 after any Update responses. Empty Workflow type or task queue values reuse the
 current registered values. The initial slice maps:
 
-- one generic input Payload;
+- zero or more ordered generic input Payloads;
 - Workflow type and task queue;
 - Workflow Run and Workflow Task timeouts;
 - Retry Policy; and
@@ -2257,8 +2257,9 @@ the main Workflow context follow the same failure path. This restriction avoids
 letting a concurrent Signal or Update handler silently terminate main while the
 handler scheduler still owns a different execution-state snapshot.
 
-Ownership mirrors other commands: the `_payload` form clones a borrowed view,
-the `_owned` form consumes its Payload, and JSON encodes directly into the
+Ownership mirrors other commands: `continue_as_new_payloads` clones a borrowed
+slice including metadata and external payload details, the singular `_payload`
+form clones one view, the `_owned` form consumes one Payload, and JSON encodes directly into the
 Workflow allocator. Options, Retry Policy strings, and headers are cloned
 before the fiber yields. The interceptor working headers also live in this
 arena because the terminal call cannot return to a defer. Eviction frees the

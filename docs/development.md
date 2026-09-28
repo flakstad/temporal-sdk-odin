@@ -100,7 +100,8 @@ forces eviction, reconstructs a fresh fiber, and requires the decisive
 `WorkflowActivationCompletion` bytes to match replay exactly. Separate
 500-case properties cover Child and external Workflow commands and exact
 fresh-stack replay. Another 500 cases vary Continue-As-New identity,
-timeouts, Retry Policy, backoff, Payload, and exact replay. A patch property
+timeouts, Retry Policy, backoff, and zero to twelve ordered Payloads with exact
+replay. A patch property
 generates another 500 replay/notified/deprecated combinations, checks Core's
 truth table, and requires duplicate calls to emit at most one marker. Another
 500 activation contexts vary initial/reset seeds, timestamps, and history
@@ -837,7 +838,7 @@ signal names, JSON payloads, and cancellation reasons. It checks exact
 `NamespacedWorkflowExecution` targets for signal and cancellation commands and
 requires both completions to be byte-identical after eviction and fresh-stack
 replay. The Continue-As-New property generates 500 replacement Workflow types,
-task queues, input Payloads, valid Run/Task timeout pairs, Retry Policies, and
+task queues, zero to twelve ordered input Payloads, valid Run/Task timeout pairs, Retry Policies, and
 backoffs. Empty identity options exercise reuse of the current registration;
 every `ContinueAsNewWorkflowExecution` must encode exactly and remain
 byte-identical after fresh-stack replay. The Client property generates another
@@ -1004,7 +1005,9 @@ server-backed paths automatically:
   as canceled; the signal carries three ordered Payloads across both workers;
 - a Workflow that emits `ContinueAsNewWorkflowExecution` with replacement
   input/timeouts, is evicted, starts a second run under the same Workflow ID,
-  and returns the second run's result to Temporal CLI; and
+  and returns the second run's result to Temporal CLI;
+- a codec-neutral Continue-As-New Workflow that carries three ordered Payloads,
+  metadata, and external payload details into its second run; and
 - a Workflow that takes its new `patched` branch, emits `SetPatchMarker`, and
   leaves a server-side `core_patch` marker visible through `temporal workflow show`;
 - a Workflow that reads its Core-supplied identity, starting memo, and starting
@@ -1026,7 +1029,9 @@ to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
 the parent closes as canceled. External-operation unit tests inspect namespace,
 Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
 and fresh-stack replay bytes. The 500-case external Workflow property likewise
-varies its signal from zero through twelve ordered Payloads. Continue-As-New unit tests additionally prove the
+varies its signal from zero through twelve ordered Payloads. The live and
+property suites carry three and zero-to-twelve Continue-As-New arguments,
+respectively. Continue-As-New unit tests additionally prove the
 non-returning terminal path, default type/queue reuse, options encoding, invalid
 option failure, second-run initialization, and exact replay. Patch unit tests
 cover fresh history, replay with and without a preemptive notification, Core's

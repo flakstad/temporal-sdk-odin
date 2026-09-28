@@ -917,7 +917,7 @@ Fiber_External_Cancel_Operation :: struct {
 }
 
 Fiber_Continue_As_New_Operation :: struct {
-	input:   codec.Payload,
+	inputs:  [dynamic]codec.Payload,
 	options: Owned_Continue_As_New_Options,
 	present: bool,
 }
@@ -1614,7 +1614,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		delete(operation.inputs)
 	}
 	if instance.continue_as_new.present {
-		codec.payload_free(&instance.continue_as_new.input)
+		for &input in instance.continue_as_new.inputs {
+			codec.payload_free(&input)
+		}
+		delete(instance.continue_as_new.inputs)
 	}
 	for &signal in instance.signals {
 		for &input in signal.inputs {
@@ -5865,15 +5868,15 @@ continue_as_new_stop_with_failure :: proc(
 	panic("failed Continue-As-New Workflow was resumed")
 }
 
-continue_as_new_owned :: proc(
+continue_as_new_payloads_owned :: proc(
 	ctx: ^Fiber_Context,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options := Continue_As_New_Options{},
 ) -> ! {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx != &ctx.instance.workflow_context ||
 	   ctx.instance.phase != .Ready {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		continue_as_new_stop_with_failure(
 			ctx,
 			"Continue-As-New requires the ready main Workflow context",
@@ -5882,13 +5885,13 @@ continue_as_new_owned :: proc(
 	}
 	options_error := continue_as_new_options_error(options)
 	if len(options_error) > 0 {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		continue_as_new_stop_with_failure(ctx, options_error, "OdinContinueAsNewOptionsError")
 	}
 	instance := ctx.instance
 	owned_options, options_cloned := clone_continue_as_new_options(instance, options)
 	if !options_cloned {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		continue_as_new_stop_with_failure(
 			ctx,
 			"could not preserve Continue-As-New options",
@@ -5896,7 +5899,7 @@ continue_as_new_owned :: proc(
 		)
 	}
 	instance.continue_as_new = {
-		input = owned_input,
+		inputs = owned_inputs,
 		options = owned_options,
 		present = true,
 	}
@@ -5907,9 +5910,19 @@ continue_as_new_owned :: proc(
 	panic("continued Workflow was resumed")
 }
 
-continue_as_new_payload :: proc(
+continue_as_new_owned :: proc(
 	ctx: ^Fiber_Context,
-	input: codec.Payload_View,
+	input: codec.Payload,
+	options := Continue_As_New_Options{},
+) -> ! {
+	inputs := make([dynamic]codec.Payload)
+	append(&inputs, input)
+	continue_as_new_payloads_owned(ctx, inputs, options)
+}
+
+continue_as_new_payloads :: proc(
+	ctx: ^Fiber_Context,
+	inputs: []codec.Payload_View,
 	options := Continue_As_New_Options{},
 ) -> ! {
 	if ctx == nil || ctx.instance == nil {
@@ -5931,12 +5944,21 @@ continue_as_new_payload :: proc(
 	intercepted_options.headers = &headers
 	interceptor_input := Outbound_Continue_As_New_Input{
 		ctx = ctx,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	outbound_continue_as_new_chain(&state, &interceptor_input)
+}
+
+continue_as_new_payload :: proc(
+	ctx: ^Fiber_Context,
+	input: codec.Payload_View,
+	options := Continue_As_New_Options{},
+) -> ! {
+	inputs := [?]codec.Payload_View{input}
+	continue_as_new_payloads(ctx, inputs[:], options)
 }
 
 continue_as_new_json :: proc(
@@ -8841,7 +8863,7 @@ append_fiber_continue_as_new_command :: proc(
 	instance: ^Fiber_Instance,
 ) -> Error {
 	if !instance.continue_as_new.present {
-		return error_from_string("Workflow requested Continue-As-New without preserved input")
+		return error_from_string("Workflow requested Continue-As-New without preserved inputs")
 	}
 	if !commands_are_nonterminal_prefix(commands) {
 		return error_from_string("fiber spike emitted Continue-As-New after another command")
@@ -8849,11 +8871,12 @@ append_fiber_continue_as_new_command :: proc(
 	append_fiber_timer_cancellations(result, commands, instance)
 	operation := &instance.continue_as_new
 	options := &operation.options
-	payload := proto.encode_payload(codec.payload_view(&operation.input))
 	request := new(proto.Coresdk_Workflow_Commands_ContinueAsNewWorkflowExecution)
 	request.workflow_type = options.workflow_type
 	request.task_queue = options.task_queue
-	append(&request.arguments, payload)
+	for &input in operation.inputs {
+		append(&request.arguments, proto.encode_payload(codec.payload_view(&input)))
+	}
 	request.workflow_run_timeout = duration_to_proto(options.workflow_run_timeout)
 	request.workflow_task_timeout = duration_to_proto(options.workflow_task_timeout)
 	if options.has_retry_policy {

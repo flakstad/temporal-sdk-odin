@@ -3539,6 +3539,7 @@ workflow_start_argument_lists_preserve_generated_payloads_and_order :: proc(t: ^
 
 Generated_Continue_As_New_Input :: struct {
 	value:               string,
+	argument_count:      int,
 	workflow_type:       string,
 	task_queue:          string,
 	run_timeout_ms:      int,
@@ -3559,9 +3560,35 @@ generated_continue_as_new_workflow :: proc(
 		maximum_interval = time.Duration(input.retry_maximum_ms) * time.Millisecond,
 		maximum_attempts = i32(input.retry_attempts),
 	}
-	workflow.continue_as_new_json(
+	arguments := make([dynamic]codec.Payload)
+	for index in 0..<input.argument_count {
+		value := fmt.aprintf("%s:%d", input.value, index)
+		argument, encode_error := codec.encode_json(value)
+		delete(value)
+		if encode_error != .None {
+			return ""
+		}
+		ordinal := fmt.aprintf("%d", index)
+		metadata_error := codec.payload_add_metadata(
+			&argument,
+			"generated-ordinal",
+			transmute([]u8)ordinal,
+		)
+		delete(ordinal)
+		if metadata_error != .None ||
+		   codec.payload_add_external(&argument, i64(index * 101)) != .None {
+			codec.payload_free(&argument)
+			return ""
+		}
+		append(&arguments, argument)
+	}
+	argument_views := make([dynamic]codec.Payload_View)
+	for &argument in arguments {
+		append(&argument_views, codec.payload_view(&argument))
+	}
+	workflow.continue_as_new_payloads(
 		ctx,
-		input.value,
+		argument_views[:],
 		{
 			workflow_type = input.workflow_type,
 			task_queue = input.task_queue,
@@ -3598,7 +3625,7 @@ generated_continue_as_new_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Continue_As_New_Workflow_Execution:
 			command := variant.value
-			if command == nil || len(command.arguments) != 1 || command.retry_policy == nil {
+			if command == nil || command.retry_policy == nil {
 				return false
 			}
 			expected_type := expected.workflow_type
@@ -3609,13 +3636,14 @@ generated_continue_as_new_match :: proc(
 			if len(expected_queue) == 0 {
 				expected_queue = "pbt-continue-as-new-queue"
 			}
-			expected_payload, encode_error := codec.encode_json(expected.value)
-			if encode_error != .None {
+			if !generated_workflow_arguments_match(
+				command.arguments[:],
+				expected.argument_count,
+				expected.value,
+			) {
 				return false
 			}
-			defer codec.payload_free(&expected_payload)
 			return command.workflow_type == expected_type && command.task_queue == expected_queue &&
-				bytes.equal(command.arguments[0].data, expected_payload.data) &&
 				pbt_proto_duration(command.workflow_run_timeout) ==
 					time.Duration(expected.run_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(command.workflow_task_timeout) ==
@@ -3640,6 +3668,7 @@ continue_as_new_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	retry_maximum_ms := pbt.draw(t, pbt.int_range(retry_initial_ms, 120_000))
 	input_value := Generated_Continue_As_New_Input{
 		value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		argument_count = pbt.draw(t, pbt.int_range(0, 12)),
 		workflow_type = pbt.draw(t, pbt.string_ascii(0, 32)),
 		task_queue = pbt.draw(t, pbt.string_ascii(0, 32)),
 		run_timeout_ms = run_timeout_ms,
@@ -3649,6 +3678,9 @@ continue_as_new_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		backoff_ms = pbt.draw(t, pbt.int_range(0, 30_000)),
 	}
+	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero Continue-As-New arguments")
+	pbt.cover(t, input_value.argument_count == 1, 3.0, "one Continue-As-New argument")
+	pbt.cover(t, input_value.argument_count >= 8, 25.0, "many Continue-As-New arguments")
 	pbt.cover(t, len(input_value.workflow_type) == 0, 0.2, "reuse Workflow type")
 	pbt.cover(t, len(input_value.task_queue) == 0, 0.2, "reuse task queue")
 

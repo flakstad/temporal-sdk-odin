@@ -24,6 +24,7 @@ DUPLICATE_PARENT_WORKFLOW_TYPE :: "odin_child_duplicate_parent_workflow"
 EXTERNAL_TARGET_WORKFLOW_TYPE :: "odin_external_target_workflow"
 EXTERNAL_CALLER_WORKFLOW_TYPE :: "odin_external_caller_workflow"
 CONTINUE_AS_NEW_WORKFLOW_TYPE :: "odin_continue_as_new_workflow"
+REPEATED_CONTINUE_AS_NEW_WORKFLOW_TYPE :: "odin_repeated_continue_as_new_workflow"
 
 workflow_start_child_interceptor :: proc(
 	_: rawptr,
@@ -412,6 +413,94 @@ continue_as_new_workflow :: proc(ctx: ^workflow.Fiber_Context, value: string) ->
 	return result
 }
 
+repeated_continue_as_new_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	inputs: []codec.Payload_View,
+) -> workflow.Payload_Result {
+	if len(inputs) == 1 {
+		value: string
+		if codec.decode_json(inputs[0], &value) != .None || value != "first-run" {
+			delete(value)
+			return workflow.payload_fail(
+				"repeated Continue-As-New initial input mismatch",
+				"OdinContinueAsNewPayloadConversionError",
+			)
+		}
+		delete(value)
+		name, name_error := codec.encode_json("continued-run")
+		if name_error != .None {
+			return workflow.payload_fail("could not encode repeated Continue-As-New name")
+		}
+		count, count_error := codec.encode_json(42)
+		if count_error != .None {
+			return workflow.payload_fail("could not encode repeated Continue-As-New count")
+		}
+		enabled, enabled_error := codec.encode_json(true)
+		if enabled_error != .None {
+			return workflow.payload_fail("could not encode repeated Continue-As-New flag")
+		}
+		if codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedContinueAsNew"),
+		) != .None || codec.payload_add_external(&name, 9216) != .None {
+			return workflow.payload_fail("could not decorate repeated Continue-As-New input")
+		}
+		next_inputs := [?]codec.Payload_View{
+			codec.payload_view(&name),
+			codec.payload_view(&count),
+			codec.payload_view(&enabled),
+		}
+		workflow.continue_as_new_payloads(
+			ctx,
+			next_inputs[:],
+			{
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+	}
+	if len(inputs) != 3 || len(inputs[0].external_payloads) != 1 ||
+	   inputs[0].external_payloads[0].size_bytes != 9216 {
+		return workflow.payload_fail(
+			"repeated Continue-As-New arguments mismatch",
+			"OdinContinueAsNewArgumentCountError",
+		)
+	}
+	message_type, metadata_found := codec.metadata_get(inputs[0], "messageType")
+	interceptor_header: string
+	header_found, header_error := workflow.header_json(
+		ctx,
+		"odin-workflow-continue-as-new",
+		&interceptor_header,
+	)
+	defer delete(interceptor_header)
+	if !metadata_found || string(message_type) != "odin.RepeatedContinueAsNew" ||
+	   !header_found || header_error != .None || interceptor_header != "intercepted" {
+		return workflow.payload_fail(
+			"repeated Continue-As-New metadata mismatch",
+			"OdinContinueAsNewMetadataError",
+		)
+	}
+	name: string
+	count: int
+	enabled: bool
+	if codec.decode_json(inputs[0], &name) != .None ||
+	   codec.decode_json(inputs[1], &count) != .None ||
+	   codec.decode_json(inputs[2], &enabled) != .None {
+		delete(name)
+		return workflow.payload_fail("could not decode repeated Continue-As-New arguments")
+	}
+	defer delete(name)
+	message := fmt.aprintf("Continue-As-New received %s:%d:%v", name, count, enabled)
+	defer delete(message)
+	payload, encode_error := codec.encode_json(message)
+	if encode_error != .None {
+		return workflow.payload_fail("could not encode repeated Continue-As-New result")
+	}
+	return workflow.payload_complete(payload)
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	fmt.printf(
 		"child activation history=%d replay=%v started=%d start_resolved=%d resolved=%d child_signaled=%d child_signal_resolved=%d external_signaled=%d external_signal_resolved=%d external_cancel_requested=%v external_cancel_resolved=%d cancel_requested=%v canceled_child=%d canceled_workflow=%v continued_as_new=%v completed=%v evicted=%v\n",
@@ -735,6 +824,19 @@ main :: proc() {
 	if continue_as_new_error.message != nil {
 		fmt.eprintf("Continue-As-New registration failed: %s\n", string(continue_as_new_error.message))
 		worker.error_free(&continue_as_new_error)
+		os.exit(1)
+	}
+	repeated_continue_as_new_error := worker.register_payloads_workflow(
+		&sdk_worker,
+		REPEATED_CONTINUE_AS_NEW_WORKFLOW_TYPE,
+		repeated_continue_as_new_workflow,
+	)
+	if repeated_continue_as_new_error.message != nil {
+		fmt.eprintf(
+			"Repeated Continue-As-New registration failed: %s\n",
+			string(repeated_continue_as_new_error.message),
+		)
+		worker.error_free(&repeated_continue_as_new_error)
 		os.exit(1)
 	}
 

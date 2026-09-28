@@ -927,8 +927,10 @@ if state.events_processed >= 10_000 {
 ```
 
 Empty Workflow type and task queue options reuse the current registration.
-The current slice also supports Retry Policy, first-task backoff, and typed
-Payload headers. Continue-As-New-specific memo, Search Attribute, and
+`continue_as_new_payloads` preserves Core's ordered repeated argument field;
+the singular Payload and JSON forms remain one-argument adapters. The current
+slice also supports Retry Policy, first-task backoff, and typed Payload headers.
+Continue-As-New-specific memo, Search Attribute, and
 versioning overrides are not exposed yet.
 The primitive may only be called from the main Workflow context; misuse fails
 the Workflow with an SDK Application Failure rather than returning past the

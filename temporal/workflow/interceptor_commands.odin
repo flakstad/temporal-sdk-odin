@@ -144,7 +144,7 @@ Outbound_Cancel_External_Workflow_Interceptor_Proc :: #type proc(
 
 Outbound_Continue_As_New_Input :: struct {
 	ctx:     ^Fiber_Context,
-	input:   codec.Payload_View,
+	inputs:  []codec.Payload_View,
 	options: Continue_As_New_Options,
 	headers: ^Headers,
 }
@@ -456,13 +456,13 @@ outbound_continue_as_new_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(input.input, state.instance.odin_context.allocator)
-	if clone_error != .None {
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
 		continue_as_new_stop_with_failure(
 			input.ctx,
-			"could not preserve intercepted Continue-As-New Payload",
+			"could not preserve intercepted Continue-As-New Payloads",
 			"OdinContinueAsNewPayloadError",
 		)
 	}
-	continue_as_new_owned(input.ctx, owned_input, options)
+	continue_as_new_payloads_owned(input.ctx, owned_inputs, options)
 }
