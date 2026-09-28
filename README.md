@@ -921,6 +921,14 @@ Attribute types map to Temporal's exact `Bool`, `Int`, `Double`, `Keyword`,
 custom Search Attribute names with the Temporal Service and keep the declared
 type consistent with the encoded value.
 
+Initialization also preserves Core's previous-run state. `workflow.Info`
+contains the cron schedule-to-schedule interval, a borrowed recursive
+`failure.Failure` when this run continued after a failure, and every generic
+last-completion-result Payload. `workflow.continued_failure`,
+`last_completion_result_payload`, and `last_completion_result_json` provide
+checked accessors. Their values are owned by the Workflow run arena and must not
+escape the run.
+
 Typed query handlers are registered from inside Workflow code so replay builds
 the same handler set and callback state:
 

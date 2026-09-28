@@ -886,6 +886,7 @@ completion commands:
 InitializeWorkflow
   +-- identity, Workflow/run/type/attempt and run-chain metadata
   +-- timeouts, start/expiration time, parent/root, Retry Policy, priority
+  +-- continued Failure, last completion Payloads, cron scheduling interval
   +-- Headers<string, Payload>
   +-- Memo<string, Payload>
   `-- SearchAttributes<string, Payload>
@@ -902,6 +903,13 @@ the Worker to evict that run. The root execution protobuf does not carry a
 namespace, so `Info.root.namespace` is empty; parent namespace is preserved
 from Core's `NamespacedWorkflowExecution`. Invalid protobuf durations or
 timestamps fail initialization instead of reaching user code.
+
+The prior-run fields follow the same ownership rule. Odin clones
+`continued_failure` into the shared recursive Failure model, clones every
+`last_completion_result` Payload, and validates
+`cron_schedule_to_schedule_interval` before user code starts. Checked accessors
+return borrowed pointers/views into the run arena. Forced eviction and replay
+rebuild the same values and retain byte-identical Workflow commands.
 
 Headers, memo, and Search Attribute values remain generic `codec.Payload`
 objects. The runtime clones all initial maps into the run arena, so they outlive
@@ -2290,8 +2298,10 @@ identical terminal completion after eviction and replay. A 500-case property
 varies all three plus optional `UpdateRandomSeed`, checks the exact SplitMix64
 oracle, and again requires byte-identical completion. The live patch example
 also reads Workflow time and produces a deterministic UUID/random value using
-the real CLI dev server. Named isolated streams, richer numeric/range helpers,
-and the remaining `InitializeWorkflow` information fields are still pending.
+the real CLI dev server. Named isolated streams and richer numeric/range helpers
+are still pending. All information fields in the pinned `InitializeWorkflow`
+schema are now preserved; its user argument surface remains intentionally
+single-Payload pending a separate API design.
 
 ### Local Activity boundary
 

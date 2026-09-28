@@ -794,7 +794,8 @@ Workflow-properties property generates 500 memo/Search Attribute keys and
 values, Keyword/Text types, and independent removals. Each case verifies local
 read-after-write, command counts, eviction, and byte-identical fresh-stack
 replay. The focused unit test additionally checks every exposed `workflow.Info`
-field and decodes the exact `ModifyWorkflowProperties` and
+field—including the recursive continued Failure, repeated last-completion
+Payloads, and cron scheduling interval—and decodes the exact `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` payloads and type metadata.
 Another 500-case property generates Client start headers, memo, Search
 Attributes, raw Payload bytes, keys, all seven Temporal type labels, ID

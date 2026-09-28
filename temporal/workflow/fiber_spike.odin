@@ -249,6 +249,11 @@ Info :: struct {
 	continued_from_run_id:     string,
 	continued_initiator:       Continue_Initiator,
 	cron_schedule:             string,
+	cron_schedule_to_schedule_interval:     time.Duration,
+	has_cron_schedule_to_schedule_interval: bool,
+	continued_failure:     ^temporal_failure.Failure,
+	has_continued_failure: bool,
+	last_completion_results: []codec.Payload_View,
 	execution_timeout:     time.Duration,
 	has_execution_timeout: bool,
 	run_timeout:           time.Duration,
@@ -918,6 +923,9 @@ Fiber_Instance :: struct {
 	memo:            [dynamic]Fiber_Named_Payload,
 	search_attributes: [dynamic]Fiber_Named_Payload,
 	property_commands: [dynamic]Fiber_Property_Command,
+	continued_failure: temporal_failure.Failure,
+	last_completion_results: [dynamic]codec.Payload,
+	last_completion_result_views: []codec.Payload_View,
 	input:           codec.Payload,
 	output:          codec.Payload,
 	callback_data:   rawptr,
@@ -1440,6 +1448,11 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	instance.fiber = nil
 	codec.payload_free(&instance.input)
 	codec.payload_free(&instance.output)
+	temporal_failure.failure_free(&instance.continued_failure)
+	for &payload in instance.last_completion_results {
+		codec.payload_free(&payload)
+	}
+	delete(instance.last_completion_results)
 	for &operation in instance.activities {
 		for &input in operation.inputs {
 			codec.payload_free(&input)
@@ -1762,6 +1775,7 @@ add_fiber_instance :: proc(
 	instance.memo = make([dynamic]Fiber_Named_Payload)
 	instance.search_attributes = make([dynamic]Fiber_Named_Payload)
 	instance.property_commands = make([dynamic]Fiber_Property_Command)
+	instance.last_completion_results = make([dynamic]codec.Payload)
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
 	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.external_signals = make([dynamic]Fiber_External_Signal_Operation)
@@ -1801,6 +1815,46 @@ add_fiber_instance :: proc(
 	) && metadata_strings_ok
 	info.attempt = initialize.attempt
 	info.continued_initiator = workflow_continue_initiator_from_proto(initialize.continued_initiator)
+	cron_interval, has_cron_interval, cron_interval_ok := workflow_info_duration(
+		initialize.cron_schedule_to_schedule_interval,
+	)
+	info.cron_schedule_to_schedule_interval = cron_interval
+	info.has_cron_schedule_to_schedule_interval = has_cron_interval
+	continued_failure_ok := true
+	if initialize.continued_failure != nil {
+		continued_failure, failure_error := temporal_failure.clone_failure(
+			initialize.continued_failure,
+			instance.odin_context.allocator,
+			0,
+		)
+		continued_failure_ok = failure_error == .None
+		if continued_failure_ok {
+			instance.continued_failure = continued_failure
+			info.continued_failure = &instance.continued_failure
+			info.has_continued_failure = true
+		}
+	}
+	last_completion_results_ok := true
+	if initialize.last_completion_result != nil {
+		for &source in initialize.last_completion_result.payloads {
+			payload, payload_error := proto.clone_payload(&source)
+			if payload_error != .None {
+				last_completion_results_ok = false
+				break
+			}
+			append(&instance.last_completion_results, payload)
+		}
+	}
+	if last_completion_results_ok {
+		instance.last_completion_result_views = make(
+			[]codec.Payload_View,
+			len(instance.last_completion_results),
+		)
+		for &payload, index in instance.last_completion_results {
+			instance.last_completion_result_views[index] = codec.payload_view(&payload)
+		}
+		info.last_completion_results = instance.last_completion_result_views
+	}
 	execution_timeout, has_execution_timeout, execution_timeout_ok := workflow_info_duration(
 		initialize.workflow_execution_timeout,
 	)
@@ -1886,7 +1940,8 @@ add_fiber_instance :: proc(
 	context.allocator = previous_allocator
 	if namespace_error != nil || run_id_error != nil || workflow_id_error != nil ||
 	   workflow_type_error != nil || task_queue_error != nil || clone_error != .None ||
-	   !metadata_strings_ok || !retry_durations_ok ||
+	   !metadata_strings_ok || !retry_durations_ok || !cron_interval_ok ||
+	   !continued_failure_ok || !last_completion_results_ok ||
 	   !execution_timeout_ok || !run_timeout_ok || !task_timeout_ok || !start_time_ok ||
 	   !expiration_ok || !headers_ok || !memo_ok || !search_ok {
 		virtual.arena_destroy(&instance.arena)
@@ -3149,6 +3204,39 @@ info :: proc(ctx: ^Fiber_Context) -> (value: Info, present: bool) {
 		return {}, false
 	}
 	return ctx.instance.info, true
+}
+
+continued_failure :: proc(
+	ctx: ^Fiber_Context,
+) -> (^temporal_failure.Failure, bool) {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.info.has_continued_failure ||
+	   ctx.instance.info.continued_failure == nil {
+		return nil, false
+	}
+	return ctx.instance.info.continued_failure, true
+}
+
+last_completion_result_payload :: proc(
+	ctx: ^Fiber_Context,
+	index: int,
+) -> (codec.Payload_View, bool) {
+	if ctx == nil || ctx.instance == nil || index < 0 ||
+	   index >= len(ctx.instance.info.last_completion_results) {
+		return {}, false
+	}
+	return ctx.instance.info.last_completion_results[index], true
+}
+
+last_completion_result_json :: proc(
+	ctx: ^Fiber_Context,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := last_completion_result_payload(ctx, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
 }
 
 find_named_payload :: proc(

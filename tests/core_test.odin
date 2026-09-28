@@ -2232,6 +2232,42 @@ workflow_info_memo_and_search_attributes_replay_identically :: proc(t: ^testing.
 		fairness_key = "tenant-a",
 		fairness_weight = 1.5,
 	}
+	cron_schedule_interval := proto.Google_Protobuf_Duration{seconds = 90}
+	continued_detail, continued_detail_error := codec.encode_json("previous-detail")
+	testing.expect_value(t, continued_detail_error, codec.Error.None)
+	defer codec.payload_free(&continued_detail)
+	proto_continued_detail := proto.encode_payload(codec.payload_view(&continued_detail))
+	defer delete(proto_continued_detail.metadata)
+	defer delete(proto_continued_detail.external_payloads)
+	continued_details := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(continued_details.payloads)
+	append(&continued_details.payloads, proto_continued_detail)
+	continued_application := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "PreviousRunFailure",
+		non_retryable = true,
+		details = &continued_details,
+	}
+	continued_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "previous run failed",
+		source = "TemporalSDK",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &continued_application,
+		},
+	}
+	last_message, last_message_error := codec.encode_json("previous-result")
+	last_count, last_count_error := codec.encode_json(12)
+	testing.expect(t, last_message_error == .None && last_count_error == .None)
+	defer codec.payload_free(&last_message)
+	defer codec.payload_free(&last_count)
+	proto_last_message := proto.encode_payload(codec.payload_view(&last_message))
+	proto_last_count := proto.encode_payload(codec.payload_view(&last_count))
+	defer delete(proto_last_message.metadata)
+	defer delete(proto_last_message.external_payloads)
+	defer delete(proto_last_count.metadata)
+	defer delete(proto_last_count.external_payloads)
+	last_completion_result := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(last_completion_result.payloads)
+	append(&last_completion_result.payloads, proto_last_message, proto_last_count)
 	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
 		workflow_type = "workflow_properties_test_workflow",
 		workflow_id = "properties-workflow-id",
@@ -2242,10 +2278,13 @@ workflow_info_memo_and_search_attributes_replay_identically :: proc(t: ^testing.
 		workflow_task_timeout = &task_timeout,
 		continued_from_execution_run_id = "previous-run",
 		continued_initiator = .CONTINUE_AS_NEW_INITIATOR_RETRY,
+		continued_failure = &continued_failure,
+		last_completion_result = &last_completion_result,
 		first_execution_run_id = "first-run",
 		retry_policy = &retry_policy,
 		attempt = 3,
 		cron_schedule = "0 * * * *",
+		cron_schedule_to_schedule_interval = &cron_schedule_interval,
 		workflow_execution_expiration_time = &expiration_time,
 		memo = &memo,
 		search_attributes = &search_attributes,
@@ -3778,9 +3817,46 @@ workflow_properties_test_workflow :: proc(
 	   len(info.retry_policy.non_retryable_error_types) != 1 ||
 	   info.retry_policy.non_retryable_error_types[0] != "Permanent" ||
 	   info.priority.priority_key != 7 || info.priority.fairness_key != "tenant-a" ||
-	   info.priority.fairness_weight != 1.5 {
+	   info.priority.fairness_weight != 1.5 ||
+	   !info.has_cron_schedule_to_schedule_interval ||
+	   info.cron_schedule_to_schedule_interval != 90 * time.Second {
 		return "Workflow info mismatch"
 	}
+	continued, continued_found := workflow.continued_failure(ctx)
+	if !continued_found || continued != info.continued_failure ||
+	   continued.kind != .Application || continued.message != "previous run failed" ||
+	   continued.application.type != "PreviousRunFailure" ||
+	   len(continued.application.details) != 1 {
+		return "continued failure mismatch"
+	}
+	continued_detail: string
+	if codec.decode_json(
+		codec.payload_view(&continued.application.details[0]),
+		&continued_detail,
+	) != .None || continued_detail != "previous-detail" {
+		return "continued failure detail mismatch"
+	}
+	defer delete(continued_detail)
+	last_message: string
+	last_count: int
+	last_message_found, last_message_error := workflow.last_completion_result_json(
+		ctx,
+		0,
+		&last_message,
+	)
+	last_count_found, last_count_error := workflow.last_completion_result_json(
+		ctx,
+		1,
+		&last_count,
+	)
+	_, out_of_range := workflow.last_completion_result_payload(ctx, 2)
+	if len(info.last_completion_results) != 2 || !last_message_found ||
+	   last_message_error != .None || last_message != "previous-result" ||
+	   !last_count_found || last_count_error != .None || last_count != 12 || out_of_range {
+		delete(last_message)
+		return "last completion results mismatch"
+	}
+	defer delete(last_message)
 	initial_header: string
 	header_found, header_error := workflow.header_json(ctx, "test-header", &initial_header)
 	if !header_found || header_error != .None || initial_header != "header-value" {
