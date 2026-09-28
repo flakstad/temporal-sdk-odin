@@ -313,7 +313,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		input := workflow.Outbound_Start_Activity_Input{
 			ctx = &ctx,
 			activity_type = "property-activity",
-			input = codec.Payload_View{},
+			inputs = []codec.Payload_View{{}},
 			headers = &working_headers,
 		}
 		_ = workflow.outbound_start_activity_chain(&chain, &input)

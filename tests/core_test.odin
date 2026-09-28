@@ -2773,12 +2773,15 @@ activity_interceptor_test_heartbeat :: proc(
 activity_interceptor_test_terminal :: proc(
 	callback_data: rawptr,
 	_: ^activity.Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> activity.Payload_Result {
 	state := cast(^Activity_Interceptor_Test_State)callback_data
 	activity_interceptor_test_record(state, 99)
 	state.terminal_calls += 1
-	payload, clone_error := codec.payload_clone(input)
+	if len(inputs) != 1 {
+		return activity.payload_fail("test terminal expected one input")
+	}
+	payload, clone_error := codec.payload_clone(inputs[0])
 	if clone_error != .None {
 		return activity.payload_fail("test terminal clone failed")
 	}
@@ -2822,6 +2825,60 @@ Typed_Workflow_Input :: struct {
 Typed_Workflow_Output :: struct {
 	message:     string,
 	name_length: int,
+}
+
+Multiple_Activity_Output :: struct {
+	name:    string,
+	count:   int,
+	enabled: bool,
+}
+
+payloads_activity_test :: proc(
+	_: ^activity.Context,
+	inputs: []codec.Payload_View,
+) -> activity.Payload_Result {
+	if len(inputs) != 3 {
+		return activity.payload_fail("expected three Activity arguments")
+	}
+	output := Multiple_Activity_Output{}
+	if codec.decode_json(inputs[0], &output.name) != .None ||
+	   codec.decode_json(inputs[1], &output.count) != .None ||
+	   codec.decode_json(inputs[2], &output.enabled) != .None {
+		delete(output.name)
+		return activity.payload_fail("could not decode Activity arguments")
+	}
+	defer delete(output.name)
+	payload, encode_error := codec.encode_json(output)
+	if encode_error != .None {
+		return activity.payload_fail("could not encode multi-argument result")
+	}
+	return activity.payload_complete(payload)
+}
+
+multiple_activity_arguments_workflow_test :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	name_payload, name_error := codec.encode_json(name)
+	if name_error != .None do return "could not encode name"
+	defer codec.payload_free(&name_payload)
+	count_payload, count_error := codec.encode_json(7)
+	if count_error != .None do return "could not encode count"
+	defer codec.payload_free(&count_payload)
+	enabled_payload, enabled_error := codec.encode_json(true)
+	if enabled_error != .None do return "could not encode flag"
+	defer codec.payload_free(&enabled_payload)
+	inputs := [3]codec.Payload_View{
+		codec.payload_view(&name_payload),
+		codec.payload_view(&count_payload),
+		codec.payload_view(&enabled_payload),
+	}
+	result := workflow.execute_activity_payloads(ctx, "multiple_arguments", inputs[:])
+	output: string
+	if codec.decode_json(result, &output) != .None {
+		return "could not decode multi-argument result"
+	}
+	return output
 }
 
 typed_payload_workflow_test :: proc(
@@ -4397,6 +4454,50 @@ clone_scheduled_activity_payload :: proc(
 					found = clone_error == .None
 					return
 				}
+			}
+		}
+	}
+	return
+}
+
+clone_scheduled_activity_payloads :: proc(
+	data: []u8,
+) -> (payloads: [dynamic]codec.Payload, found: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+				if variant.value == nil {
+					return
+				}
+				payloads = make([dynamic]codec.Payload)
+				for &argument in variant.value.arguments {
+					owned, clone_error := proto.clone_payload(&argument)
+					if clone_error != .None {
+						for &payload in payloads do codec.payload_free(&payload)
+						delete(payloads)
+						return nil, false
+					}
+					append(&payloads, owned)
+				}
+				return payloads, true
 			}
 		}
 	}
@@ -6782,7 +6883,7 @@ activity_interceptors_nest_short_circuit_and_wrap_heartbeats :: proc(t: ^testing
 	}
 	input := worker.Activity_Execute_Input{
 		ctx = &execution.ctx,
-		input = codec.payload_view(&payload),
+		inputs = []codec.Payload_View{codec.payload_view(&payload)},
 	}
 	chain := worker.Activity_Execute_Chain_State{execution = &execution}
 	result := worker.activity_execute_chain_invoke(&chain, &input)
@@ -7072,10 +7173,11 @@ worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T
 	defer virtual.arena_destroy(&callback_arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&callback_arena)
+	input_views := [1]codec.Payload_View{codec.payload_view(&input_payload)}
 	result := registration.invoke(
 		registration.callback_data,
 		&ctx,
-		codec.payload_view(&input_payload),
+		input_views[:],
 	)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
@@ -7094,10 +7196,15 @@ worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T
 		key = "encoding",
 		value = transmute([]u8)string("binary/plain"),
 	}}
+	unsupported_view := codec.Payload_View{
+		metadata = unsupported_metadata[:],
+		data = transmute([]u8)string("raw"),
+	}
+	unsupported_views := [1]codec.Payload_View{unsupported_view}
 	failed := registration.invoke(
 		registration.callback_data,
 		&ctx,
-		codec.Payload_View{metadata = unsupported_metadata[:], data = transmute([]u8)string("raw")},
+		unsupported_views[:],
 	)
 	defer codec.payload_free(&failed.payload)
 	defer activity.application_failure_free(&failed.failure)
@@ -7105,6 +7212,70 @@ worker_json_activity_registration_adapts_typed_odin_values :: proc(t: ^testing.T
 	testing.expect(t, len(failed.failure.message) > 0)
 	testing.expect_value(t, failed.failure.type, "OdinPayloadConversionError")
 	testing.expect(t, failed.failure.non_retryable)
+
+	two_inputs := [2]codec.Payload_View{
+		codec.payload_view(&input_payload),
+		codec.payload_view(&input_payload),
+	}
+	wrong_arity := registration.invoke(registration.callback_data, &ctx, two_inputs[:])
+	defer codec.payload_free(&wrong_arity.payload)
+	defer activity.application_failure_free(&wrong_arity.failure)
+	testing.expect_value(t, wrong_arity.status, activity.Result_Status.Failed)
+	testing.expect_value(t, wrong_arity.failure.type, "OdinActivityArgumentCountError")
+	testing.expect(t, wrong_arity.failure.non_retryable)
+}
+
+@(test)
+worker_payloads_activity_registration_preserves_every_argument :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+
+	register_error := worker.register_payloads_activity(
+		&sdk_worker,
+		"multiple_arguments",
+		payloads_activity_test,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	if len(sdk_worker.activity_registrations) != 1 {
+		return
+	}
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(7)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	inputs := [3]codec.Payload_View{
+		codec.payload_view(&name),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	registration := &sdk_worker.activity_registrations[0]
+	result := registration.invoke(
+		registration.callback_data,
+		&activity.Context{},
+		inputs[:],
+	)
+	defer codec.payload_free(&result.payload)
+	defer activity.application_failure_free(&result.failure)
+	testing.expect_value(t, result.status, activity.Result_Status.Completed)
+	output: Multiple_Activity_Output
+	decode_error := codec.decode_json(codec.payload_view(&result.payload), &output)
+	testing.expect_value(t, decode_error, codec.Error.None)
+	testing.expect_value(t, output.name, "Odin")
+	testing.expect_value(t, output.count, 7)
+	testing.expect(t, output.enabled)
+	delete(output.name)
 }
 
 @(test)
@@ -7141,10 +7312,11 @@ worker_json_activity_result_preserves_application_failure_fields :: proc(t: ^tes
 	defer virtual.arena_destroy(&callback_arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&callback_arena)
+	input_views := [1]codec.Payload_View{codec.payload_view(&input_payload)}
 	result := registration.invoke(
 		registration.callback_data,
 		&activity.Context{},
-		codec.payload_view(&input_payload),
+		input_views[:],
 	)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
@@ -7162,6 +7334,107 @@ worker_json_activity_result_preserves_application_failure_fields :: proc(t: ^tes
 	testing.expect_value(t, details.dependency, "test")
 	testing.expect_value(t, details.attempt, u32(1))
 	delete(details.dependency)
+}
+
+@(test)
+workflow_multiple_activity_arguments_survive_command_encoding_and_replay :: proc(
+	t: ^testing.T,
+) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"multiple_activity_arguments_workflow_test",
+		"multiple-arguments-queue",
+		multiple_activity_arguments_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "multiple_activity_arguments_workflow_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "multiple-activity-arguments-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "multi-argument Workflow failed: %s", string(initial.error.message))
+	testing.expect(t, initial.scheduled_activity)
+	arguments, found := clone_scheduled_activity_payloads(initial.completion[:])
+	testing.expect(t, found)
+	testing.expect_value(t, len(arguments), 3)
+	if len(arguments) == 3 {
+		name: string
+		count: int
+		enabled: bool
+		testing.expect_value(t, codec.decode_json(codec.payload_view(&arguments[0]), &name), codec.Error.None)
+		testing.expect_value(t, codec.decode_json(codec.payload_view(&arguments[1]), &count), codec.Error.None)
+		testing.expect_value(t, codec.decode_json(codec.payload_view(&arguments[2]), &enabled), codec.Error.None)
+		testing.expect_value(t, name, "Odin")
+		testing.expect_value(t, count, 7)
+		testing.expect(t, enabled)
+		delete(name)
+	}
+	for &argument in arguments do codec.payload_free(&argument)
+	delete(arguments)
+	initial_bytes := bytes.clone(initial.completion[:])
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	testing.expect(t, evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "multi-argument replay failed: %s", string(replayed.error.message))
+	testing.expect(t, replayed.is_replaying)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
 }
 
 @(test)
@@ -7957,6 +8230,14 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 	}
 	defer delete(start.input)
 	append(&start.input, payload)
+	append(
+		&start.input,
+		proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string("7")},
+	)
+	append(
+		&start.input,
+		proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string("true")},
+	)
 	raw_task := proto.Coresdk_Activity_Task_ActivityTask{
 		task_token = transmute([]u8)string("token"),
 		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Start{value = &start},
@@ -7984,8 +8265,14 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, task.activity_id, "activity-id")
 	testing.expect_value(t, task.activity_type, "hello")
 	testing.expect_value(t, task.attempt, u32(2))
+	testing.expect_value(t, len(task.inputs), 3)
 	testing.expect_value(t, task.input.encoding, "json/plain")
 	testing.expect_value(t, string(task.input.data), `"Odin"`)
+	if len(task.inputs) == 3 {
+		testing.expect_value(t, string(task.inputs[0].data), `"Odin"`)
+		testing.expect_value(t, string(task.inputs[1].data), "7")
+		testing.expect_value(t, string(task.inputs[2].data), "true")
+	}
 	testing.expect_value(t, len(task.input.metadata), 2)
 	testing.expect_value(t, len(task.input.external_payloads), 1)
 	if len(task.input.external_payloads) == 1 {

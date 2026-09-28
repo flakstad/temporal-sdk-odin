@@ -9,7 +9,7 @@ import codec "../codec"
 Outbound_Start_Activity_Input :: struct {
 	ctx:           ^Fiber_Context,
 	activity_type: string,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 	options:       Activity_Options,
 	headers:       ^Headers,
 }
@@ -33,7 +33,7 @@ Outbound_Start_Activity_Interceptor_Proc :: #type proc(
 Outbound_Start_Local_Activity_Input :: struct {
 	ctx:           ^Fiber_Context,
 	activity_type: string,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 	options:       Local_Activity_Options,
 	headers:       ^Headers,
 }
@@ -147,15 +147,12 @@ outbound_start_activity_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(
-		input.input,
-		state.instance.odin_context.allocator,
-	)
-	if clone_error != .None {
-		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Activity input Payload")
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
+		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Activity input Payloads")
 		return {}
 	}
-	return start_activity_owned(input.ctx, input.activity_type, owned_input, options)
+	return start_activity_owned(input.ctx, input.activity_type, owned_inputs, options)
 }
 
 outbound_start_local_activity_chain :: proc(
@@ -186,15 +183,12 @@ outbound_start_local_activity_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(
-		input.input,
-		state.instance.odin_context.allocator,
-	)
-	if clone_error != .None {
-		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Local Activity input Payload")
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
+		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Local Activity input Payloads")
 		return {}
 	}
-	return start_local_activity_owned(input.ctx, input.activity_type, owned_input, options)
+	return start_local_activity_owned(input.ctx, input.activity_type, owned_inputs, options)
 }
 
 outbound_headers_init :: proc(

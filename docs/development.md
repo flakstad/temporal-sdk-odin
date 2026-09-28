@@ -258,7 +258,7 @@ worker.register_json_workflow(&w, "typed_workflow", typed_workflow)
 worker.register_payload_workflow(&w, "payload_workflow", payload_workflow)
 ```
 
-The runtime stores Workflow input, scheduled Activity input, resolved Activity
+The runtime stores Workflow input, scheduled Activity inputs, resolved Activity
 output, and Workflow completion as allocator-owned `codec.Payload` values in
 the Workflow instance arena. `register_json_workflow` generates a typed adapter
 for `proc(Fiber_Context, Input) -> Output`; `register_workflow` is the existing
@@ -274,6 +274,16 @@ call site because an Activity name string cannot communicate an Odin return
 type to the compiler. JSON conversion failures become non-retryable
 `OdinWorkflowPayloadConversionError` Workflow failures. Signal payloads remain
 on the string compatibility API for now.
+
+For more than one codec-neutral argument, use
+`start_activity_payloads`/`execute_activity_payloads` or the corresponding Local
+Activity functions. The slice is borrowed only for the scheduling call; the
+Workflow runtime clones every Payload into the run arena before it can suspend.
+Register the callback with `worker.register_payloads_activity`; its input slice
+and views are borrowed until the callback returns. `register_activity`,
+`register_json_activity`, `register_json_activity_result`, and
+`register_payload_activity` are deliberately single-argument adapters and fail
+other arities with `OdinActivityArgumentCountError`.
 
 Every Activity start/execute family has a `_with_options` form. The options map
 to Core's `ScheduleActivity` fields:
@@ -1179,6 +1189,11 @@ A unit test covers nested execute order, short-circuiting, and heartbeat order.
 A 500-case property varies chain depth and the short-circuit position. The
 `activity-interceptor` integration scenario proves execute-before/after and
 heartbeat-before/after across a real Core worker and CLI dev server.
+The `multiple-activity-arguments` scenario separately sends three JSON Payloads
+through Workflow command encoding, SDK Core, Temporal Server, Activity polling,
+and the codec-neutral Odin callback. Unit replay checks byte-identical commands,
+and a 500-case property covers 0–12 ordered arguments for remote and Local
+Activities while preserving metadata and external-payload details.
 
 ### Client outbound interceptor chain
 

@@ -3119,6 +3119,154 @@ external_workflow_operations_replay_for_generated_values :: proc(t: ^testing.T) 
 	pbt.require_pass(t, result)
 }
 
+generated_activity_argument_matches :: proc(
+	argument: ^proto.Temporal_Api_Common_V1_Payload,
+	expected: ^codec.Payload,
+	index: int,
+) -> bool {
+	if argument == nil || expected == nil || !bytes.equal(argument.data, expected.data) ||
+	   len(argument.external_payloads) != 1 ||
+	   argument.external_payloads[0].size_bytes != i64(index * 101) {
+		return false
+	}
+	expected_ordinal := fmt.aprintf("%d", index)
+	defer delete(expected_ordinal)
+	for metadata in argument.metadata {
+		if metadata.key == "generated-ordinal" {
+			return string(metadata.value) == expected_ordinal
+		}
+	}
+	return false
+}
+
+activity_argument_command_property :: proc(t: ^pbt.T) -> pbt.Result {
+	argument_count := pbt.draw(t, pbt.int_range(0, 12))
+	is_local := pbt.draw(t, pbt.boolean())
+	prefix := pbt.draw(t, pbt.string_ascii(0, 24))
+	pbt.cover(t, argument_count == 0, 3.0, "zero arguments")
+	pbt.cover(t, argument_count == 1, 3.0, "one argument")
+	pbt.cover(t, argument_count >= 8, 25.0, "many arguments")
+	pbt.cover(t, is_local, 30.0, "Local Activity")
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return pbt.error("could not initialize Activity argument arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	operation := workflow.Fiber_Activity_Operation{
+		command_seq = 17,
+		activity_id = "generated-activity-id",
+		activity_type = "generated-activity",
+		is_local = is_local,
+		attempt = 1,
+		options = {
+			start_to_close_timeout = time.Second,
+		},
+		local_options = {
+			start_to_close_timeout = time.Second,
+		},
+		inputs = make([dynamic]codec.Payload),
+	}
+	for index in 0..<argument_count {
+		value := fmt.aprintf("%s:%d", prefix, index)
+		payload, encode_error := codec.encode_json(value)
+		if encode_error != .None {
+			return pbt.error("could not encode generated Activity argument")
+		}
+		ordinal := fmt.aprintf("%d", index)
+		if codec.payload_add_metadata(
+			&payload,
+			"generated-ordinal",
+			transmute([]u8)ordinal,
+		) != .None || codec.payload_add_external(&payload, i64(index * 101)) != .None {
+			return pbt.error("could not decorate generated Activity argument")
+		}
+		append(&operation.inputs, payload)
+	}
+
+	first_result := workflow.Process_Result{}
+	first_commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	workflow.append_fiber_schedule_command(
+		&first_result,
+		&first_commands,
+		&operation,
+		"generated-default-queue",
+	)
+	if len(first_commands) != 1 {
+		return pbt.fail("Activity arguments did not produce exactly one command")
+	}
+
+	arguments_valid := false
+	#partial switch variant in first_commands[0].variant {
+	case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
+		if !is_local && variant.value != nil &&
+		   len(variant.value.arguments) == argument_count {
+			arguments_valid = true
+			for &argument, index in variant.value.arguments {
+				if !generated_activity_argument_matches(
+					&argument,
+					&operation.inputs[index],
+					index,
+				) {
+					arguments_valid = false
+					break
+				}
+			}
+		}
+	case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity:
+		if is_local && variant.value != nil &&
+		   len(variant.value.arguments) == argument_count {
+			arguments_valid = true
+			for &argument, index in variant.value.arguments {
+				if !generated_activity_argument_matches(
+					&argument,
+					&operation.inputs[index],
+					index,
+				) {
+					arguments_valid = false
+					break
+				}
+			}
+		}
+	}
+	if !arguments_valid {
+		return pbt.fail("Activity argument order or payload details changed in command encoding")
+	}
+
+	first_bytes := proto.encode_Coresdk_Workflow_Commands_WorkflowCommand(&first_commands[0])
+	second_result := workflow.Process_Result{}
+	second_commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	workflow.append_fiber_schedule_command(
+		&second_result,
+		&second_commands,
+		&operation,
+		"generated-default-queue",
+	)
+	if len(second_commands) != 1 {
+		return pbt.fail("repeated Activity scheduling did not produce a command")
+	}
+	second_bytes := proto.encode_Coresdk_Workflow_Commands_WorkflowCommand(&second_commands[0])
+	if !bytes.equal(first_bytes[:], second_bytes[:]) {
+		return pbt.fail("repeated Activity argument command encoding changed bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_argument_lists_preserve_generated_payloads_and_order :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity argument lists preserve payloads, order, and deterministic command bytes",
+		activity_argument_command_property,
+		{num_tests = 500, seed = 0x4152_4755_4d45_4e54},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Generated_Continue_As_New_Input :: struct {
 	value:               string,
 	workflow_type:       string,

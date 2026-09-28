@@ -203,6 +203,38 @@ grep -q "Workflow Activity interceptor exited after command" "$worker_log"
 grep -q "Workflow execute interceptor entered before Workflow" "$worker_log"
 grep -q "Workflow execute interceptor exited after Workflow" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=multiple-activity-arguments \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Multi-argument Activity Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+multiple_arguments_workflow_id="odin-sdk-multiple-arguments-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$multiple_arguments_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"multiple-activity-arguments"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+multiple_arguments_output="$(<"$workflow_output_file")"
+echo "$multiple_arguments_output"
+grep -q '"result": "Odin:42:true"' <<<"$multiple_arguments_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "multiple Activity arguments completed end-to-end through Core" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=signal-headers \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

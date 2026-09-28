@@ -468,14 +468,24 @@ The implemented language boundary distinguishes borrowed and owned values:
   `proc(Context, Input) -> activity.Result(Output)` to success or a structured
   Temporal Application Failure;
 - `worker.register_payload_activity` exposes the lower-level payload boundary
-  without coupling custom codecs to Core protobuf types.
+  without coupling custom codecs to Core protobuf types;
+- `worker.register_payloads_activity` exposes all repeated Activity arguments
+  as an invocation-scoped borrowed slice, while the Worker owns cloned
+  Payloads until callback completion.
 
 Metadata is represented as owned entries rather than only an `encoding` string;
 lookup follows protobuf map last-value-wins semantics and SDK construction
 replaces duplicate keys. This preserves codec-specific keys such as
 `messageType`, and the bridge also copies the schema's external-payload size
-details. The current Activity API still accepts exactly one argument Payload;
-repeated arguments remain future work.
+details. Core's repeated `Start.input`, `ScheduleActivity.arguments`, and
+`ScheduleLocalActivity.arguments` fields remain repeated across the Odin
+boundary. Workflow instances own cloned argument Payloads in their run arena;
+the Worker clones polled arguments to heap storage before releasing the Core
+poll buffer. Codec-neutral `*_activity_payloads*` APIs expose the full list.
+Existing string and typed JSON adapters accept exactly one Payload and return a
+non-retryable `OdinActivityArgumentCountError` for zero or multiple arguments.
+The singular decoded `Activity_Task.input` field is retained only as a borrowed
+alias of `inputs[0]` for source compatibility.
 
 ### Odin protobuf survey and decision
 

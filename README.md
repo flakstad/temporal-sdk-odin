@@ -179,7 +179,7 @@ end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. It does **not** provide general
 nested cancellation-token trees, client
-cancellation of an accepted Update, multiple Activity arguments,
+cancellation of an accepted Update,
 in-process panic containment, or a stable public API.
 Do not use it in production.
 
@@ -699,6 +699,15 @@ adapter encodes one `json/plain` Temporal Payload; the lower-level
 `register_payload_activity` callback receives a borrowed `codec.Payload_View`
 and can return any allocator-owned `codec.Payload`. Existing string Activities
 remain source-compatible through `register_activity`.
+
+The codec-neutral boundary also supports Temporal's repeated Activity argument
+field. Use `register_payloads_activity` for a callback-scoped borrowed
+`[]codec.Payload_View`, and schedule it with `start_activity_payloads` or
+`execute_activity_payloads` (plus their `_with_options` forms). Remote and Local
+Activity commands preserve argument order, metadata, and external-payload
+details. The typed JSON and legacy string adapters intentionally remain
+single-argument APIs; receiving any other arity fails the Activity with
+`OdinActivityArgumentCountError` instead of silently discarding arguments.
 
 Callbacks that need application failures use the result adapter:
 

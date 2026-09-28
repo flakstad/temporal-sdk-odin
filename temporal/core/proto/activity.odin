@@ -54,6 +54,8 @@ Activity_Task :: struct {
 	activity_id:   string,
 	activity_type: string,
 	attempt:       u32,
+	inputs:        []Payload_View,
+	// input remains a borrowed alias of inputs[0] for source compatibility.
 	input:         Payload_View,
 	headers:       []Named_Payload_View,
 	heartbeat_details:              []Payload_View,
@@ -244,7 +246,12 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 			task.headers = headers
 		}
 		if len(variant.value.input) > 0 {
-			task.input = payload_view(&variant.value.input[0])
+			inputs := make([]Payload_View, len(variant.value.input))
+			for &payload, index in variant.value.input {
+				inputs[index] = payload_view(&payload)
+			}
+			task.inputs = inputs
+			task.input = inputs[0]
 		}
 		if len(variant.value.heartbeat_details) > 0 {
 			details := make([]Payload_View, len(variant.value.heartbeat_details))

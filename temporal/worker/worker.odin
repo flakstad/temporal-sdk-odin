@@ -20,10 +20,14 @@ Payload_Activity_Proc :: #type proc(
 	ctx: ^activity.Context,
 	input: codec.Payload_View,
 ) -> activity.Payload_Result
+Payloads_Activity_Proc :: #type proc(
+	ctx: ^activity.Context,
+	inputs: []codec.Payload_View,
+) -> activity.Payload_Result
 Activity_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	ctx: ^activity.Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> activity.Payload_Result
 
 // Activity interceptors are registered on a Worker and form a real nested
@@ -33,7 +37,7 @@ Activity_Invoke_Proc :: #type proc(
 // are call-scoped and must not be retained.
 Activity_Execute_Input :: struct {
 	ctx:   ^activity.Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 }
 
 Activity_Execute_Next_Proc :: #type proc(
@@ -410,9 +414,44 @@ register_payload_activity :: proc(
 		worker,
 		name,
 		owned_callback,
-		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+		proc(data: rawptr, ctx: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
+			if len(inputs) != 1 {
+				return activity.payload_fail(
+					"Activity expected exactly one input Payload",
+					failure_type = "OdinActivityArgumentCountError",
+				)
+			}
 			callback := cast(^Payload_Activity_Proc)data
-			return callback^(ctx, input)
+			return callback^(ctx, inputs[0])
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_payloads_activity :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: Payloads_Activity_Proc,
+) -> Error {
+	if callback == nil {
+		return error_from_string("activity name and callback are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Payloads_Activity_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate activity callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_activity_invoker(
+		worker,
+		name,
+		owned_callback,
+		proc(data: rawptr, ctx: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
+			callback := cast(^Payloads_Activity_Proc)data
+			return callback^(ctx, inputs)
 		},
 	)
 	if registration_error.message != nil {
@@ -437,9 +476,15 @@ register_json_activity :: proc(
 		worker,
 		name,
 		owned_callback,
-		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+		proc(data: rawptr, ctx: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
+			if len(inputs) != 1 {
+				return activity.payload_fail(
+					"Activity expected exactly one input Payload",
+					failure_type = "OdinActivityArgumentCountError",
+				)
+			}
 			value: Input
-			decode_error := codec.decode_json(input, &value)
+			decode_error := codec.decode_json(inputs[0], &value)
 			if decode_error != .None {
 				return activity.payload_fail(
 					"activity input is not valid json/plain for its Odin type",
@@ -480,9 +525,15 @@ register_json_activity_result :: proc(
 		worker,
 		name,
 		owned_callback,
-		proc(data: rawptr, ctx: ^activity.Context, input: codec.Payload_View) -> activity.Payload_Result {
+		proc(data: rawptr, ctx: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
+			if len(inputs) != 1 {
+				return activity.payload_fail(
+					"Activity expected exactly one input Payload",
+					failure_type = "OdinActivityArgumentCountError",
+				)
+			}
 			value: Input
-			decode_error := codec.decode_json(input, &value)
+			decode_error := codec.decode_json(inputs[0], &value)
 			if decode_error != .None {
 				return activity.payload_fail(
 					"activity input is not valid json/plain for its Odin type",
@@ -730,7 +781,8 @@ Activity_Execution :: struct {
 	callback_data: rawptr,
 	invoke:        Activity_Invoke_Proc,
 	task_token:    []u8,
-	input:         codec.Payload,
+	inputs:        [dynamic]codec.Payload,
+	input_views:   []codec.Payload_View,
 	info_owner:    Activity_Info_Owner,
 	ctx:           activity.Context,
 	error:         Error,
@@ -1014,7 +1066,7 @@ activity_execute_chain_invoke :: proc(
 	return state.execution.invoke(
 		state.execution.callback_data,
 		input.ctx,
-		input.input,
+		input.inputs,
 	)
 }
 
@@ -1082,7 +1134,7 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	context.allocator = virtual.arena_allocator(&arena)
 	input := Activity_Execute_Input{
 		ctx = &execution.ctx,
-		input = codec.payload_view(&execution.input),
+		inputs = execution.input_views,
 	}
 	chain_state := Activity_Execute_Chain_State{execution = execution}
 	result := activity_execute_chain_invoke(&chain_state, &input)
@@ -1149,7 +1201,11 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 		return
 	}
 	delete(execution.task_token)
-	codec.payload_free(&execution.input)
+	for &input in execution.inputs {
+		codec.payload_free(&input)
+	}
+	delete(execution.inputs)
+	delete(execution.input_views)
 	activity_info_owner_destroy(&execution.info_owner)
 	error_free(&execution.error)
 	free(execution)
@@ -1170,26 +1226,25 @@ activity_execution_start :: proc(
 		return nil, error_from_core(&core_error)
 	}
 
-	input := codec.payload_create(task.input.data, allocator_runtime.heap_allocator())
-	for metadata in task.input.metadata {
-		metadata_error := codec.payload_add_metadata(&input, metadata.key, metadata.value)
-		if metadata_error != .None {
-			codec.payload_free(&input)
-			return nil, error_from_string("could not allocate Activity input payload")
-		}
-	}
-	for external in task.input.external_payloads {
-		if codec.payload_add_external(&input, external.size_bytes) != .None {
-			codec.payload_free(&input)
-			return nil, error_from_string("could not allocate Activity external payload details")
-		}
-	}
 	execution = new(Activity_Execution)
 	execution.worker = worker
 	execution.callback_data = registration.callback_data
 	execution.invoke = registration.invoke
 	execution.task_token = bytes.clone(task.task_token)
-	execution.input = input
+	heap := allocator_runtime.heap_allocator()
+	execution.inputs = make([dynamic]codec.Payload, heap)
+	for input in task.inputs {
+		owned, clone_error := proto.clone_payload_view(input, heap)
+		if clone_error != .None {
+			activity_execution_destroy(execution)
+			return nil, error_from_string("could not allocate Activity input Payload")
+		}
+		append(&execution.inputs, owned)
+	}
+	execution.input_views = make([]codec.Payload_View, len(execution.inputs), heap)
+	for &input, index in execution.inputs {
+		execution.input_views[index] = codec.payload_view(&input)
+	}
 	info_error := activity_info_owner_init(
 		&execution.info_owner,
 		worker,

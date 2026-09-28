@@ -744,7 +744,7 @@ Fiber_Activity_Operation :: struct {
 	original_schedule_nanos:    i32,
 	options:       Owned_Activity_Options,
 	local_options: Owned_Local_Activity_Options,
-	input:         codec.Payload,
+	inputs:        [dynamic]codec.Payload,
 	result:        codec.Payload,
 	failure_message: string,
 	failure_proto:   []u8,
@@ -1441,7 +1441,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 	codec.payload_free(&instance.input)
 	codec.payload_free(&instance.output)
 	for &operation in instance.activities {
-		codec.payload_free(&operation.input)
+		for &input in operation.inputs {
+			codec.payload_free(&input)
+		}
+		delete(operation.inputs)
 		codec.payload_free(&operation.result)
 	}
 	for &operation in instance.child_workflows {
@@ -3739,15 +3742,46 @@ clone_activity_options :: proc(
 	return owned, true
 }
 
+activity_inputs_free :: proc(inputs: ^[dynamic]codec.Payload) {
+	if inputs == nil {
+		return
+	}
+	for &input in inputs^ {
+		codec.payload_free(&input)
+	}
+	delete(inputs^)
+	inputs^ = nil
+}
+
+clone_activity_inputs :: proc(
+	instance: ^Fiber_Instance,
+	inputs: []codec.Payload_View,
+) -> (owned: [dynamic]codec.Payload, ok: bool) {
+	if instance == nil {
+		return nil, false
+	}
+	allocator := instance.odin_context.allocator
+	owned = make([dynamic]codec.Payload, allocator)
+	for input in inputs {
+		payload, clone_error := codec.payload_clone(input, allocator)
+		if clone_error != .None {
+			activity_inputs_free(&owned)
+			return nil, false
+		}
+		append(&owned, payload)
+	}
+	return owned, true
+}
+
 start_activity_owned :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options: Activity_Options,
 ) -> Activity_Future {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
@@ -3755,7 +3789,7 @@ start_activity_owned :: proc(
 	}
 	instance := ctx.instance
 	if root_cancellation_applies(instance) {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
 			&instance.activities,
@@ -3769,7 +3803,7 @@ start_activity_owned :: proc(
 	}
 	validation_error := activity_options_error(activity_type, options)
 	if len(validation_error) > 0 {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_activity_options_failure(ctx, validation_error)
 		return {}
 	}
@@ -3778,13 +3812,13 @@ start_activity_owned :: proc(
 		instance.odin_context.allocator,
 	)
 	if type_error != nil {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_activity_options_failure(ctx, "could not preserve Activity type")
 		return {}
 	}
 	owned_options, options_ok := clone_activity_options(instance, options)
 	if !options_ok {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_activity_options_failure(ctx, "could not preserve Activity options")
 		return {}
 	}
@@ -3798,7 +3832,7 @@ start_activity_owned :: proc(
 			instance.odin_context.allocator,
 		)
 		if id_error != nil {
-			codec.payload_free(&owned_input)
+			activity_inputs_free(&owned_inputs)
 			mark_activity_options_failure(ctx, "could not preserve Activity ID")
 			return {}
 		}
@@ -3810,7 +3844,7 @@ start_activity_owned :: proc(
 		activity_id = activity_id,
 		activity_type = owned_activity_type,
 		options = owned_options,
-		input = owned_input,
+		inputs = owned_inputs,
 		state = .Scheduled,
 		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
@@ -3820,17 +3854,26 @@ start_activity_owned :: proc(
 
 // start_activity_payload records a deterministic Activity command without
 // suspending. The handle contains only a sequence number because the operation
-// table can move. The borrowed input is copied into the Workflow instance arena.
+// table can move. The borrowed inputs are copied into the Workflow instance arena.
 start_activity_payload :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
 	input: codec.Payload_View,
 ) -> Activity_Future {
+	inputs := [1]codec.Payload_View{input}
+	return start_activity_payloads(ctx, activity_type, inputs[:])
+}
+
+start_activity_payloads :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+) -> Activity_Future {
 	retry_policy := Retry_Policy{maximum_attempts = 1}
-	return start_activity_payload_with_options(
+	return start_activity_payloads_with_options(
 		ctx,
 		activity_type,
-		input,
+		inputs,
 		{
 			start_to_close_timeout = 20 * time.Second,
 			retry_policy = &retry_policy,
@@ -3843,6 +3886,16 @@ start_activity_payload_with_options :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
 	input: codec.Payload_View,
+	options: Activity_Options,
+) -> Activity_Future {
+	inputs := [1]codec.Payload_View{input}
+	return start_activity_payloads_with_options(ctx, activity_type, inputs[:], options)
+}
+
+start_activity_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
 	options: Activity_Options,
 ) -> Activity_Future {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
@@ -3864,7 +3917,7 @@ start_activity_payload_with_options :: proc(
 	interceptor_input := Outbound_Start_Activity_Input{
 		ctx = ctx,
 		activity_type = activity_type,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
@@ -4038,12 +4091,12 @@ clone_local_activity_options :: proc(
 start_local_activity_owned :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options: Local_Activity_Options,
 ) -> Activity_Future {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
@@ -4051,7 +4104,7 @@ start_local_activity_owned :: proc(
 	}
 	instance := ctx.instance
 	if root_cancellation_applies(instance) {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
 			&instance.activities,
@@ -4067,7 +4120,7 @@ start_local_activity_owned :: proc(
 	}
 	validation_error := local_activity_options_error(activity_type, options)
 	if len(validation_error) > 0 {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_activity_options_failure(ctx, validation_error)
 		return {}
 	}
@@ -4077,7 +4130,7 @@ start_local_activity_owned :: proc(
 	)
 	owned_options, options_ok := clone_local_activity_options(instance, options)
 	if type_error != nil || !options_ok {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_activity_options_failure(ctx, "could not preserve Local Activity options")
 		return {}
 	}
@@ -4088,7 +4141,7 @@ start_local_activity_owned :: proc(
 	} else {
 		cloned_id, id_error := strings.clone(activity_id, instance.odin_context.allocator)
 		if id_error != nil {
-			codec.payload_free(&owned_input)
+			activity_inputs_free(&owned_inputs)
 			mark_activity_options_failure(ctx, "could not preserve Local Activity ID")
 			return {}
 		}
@@ -4102,7 +4155,7 @@ start_local_activity_owned :: proc(
 		is_local = true,
 		attempt = 1,
 		local_options = owned_options,
-		input = owned_input,
+		inputs = owned_inputs,
 		state = .Scheduled,
 		detached_from_root_cancellation = instance.detached_scope_depth > 0,
 	}
@@ -4114,6 +4167,16 @@ start_local_activity_payload_with_options :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
 	input: codec.Payload_View,
+	options: Local_Activity_Options,
+) -> Activity_Future {
+	inputs := [1]codec.Payload_View{input}
+	return start_local_activity_payloads_with_options(ctx, activity_type, inputs[:], options)
+}
+
+start_local_activity_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
 	options: Local_Activity_Options,
 ) -> Activity_Future {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
@@ -4132,7 +4195,7 @@ start_local_activity_payload_with_options :: proc(
 	interceptor_input := Outbound_Start_Local_Activity_Input{
 		ctx = ctx,
 		activity_type = activity_type,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
@@ -4145,10 +4208,19 @@ start_local_activity_payload :: proc(
 	activity_type: string,
 	input: codec.Payload_View,
 ) -> Activity_Future {
-	return start_local_activity_payload_with_options(
+	inputs := [1]codec.Payload_View{input}
+	return start_local_activity_payloads(ctx, activity_type, inputs[:])
+}
+
+start_local_activity_payloads :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+) -> Activity_Future {
+	return start_local_activity_payloads_with_options(
 		ctx,
 		activity_type,
-		input,
+		inputs,
 		{start_to_close_timeout = 20 * time.Second},
 	)
 }
@@ -5751,6 +5823,17 @@ execute_activity_payload :: proc(
 	)
 }
 
+execute_activity_payloads :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_activity_payloads(ctx, activity_type, inputs),
+	)
+}
+
 execute_activity_payload_with_options :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
@@ -5760,6 +5843,18 @@ execute_activity_payload_with_options :: proc(
 	return await_activity_payload(
 		ctx,
 		start_activity_payload_with_options(ctx, activity_type, input, options),
+	)
+}
+
+execute_activity_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+	options: Activity_Options,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_activity_payloads_with_options(ctx, activity_type, inputs, options),
 	)
 }
 
@@ -5874,6 +5969,17 @@ execute_local_activity_payload :: proc(
 	)
 }
 
+execute_local_activity_payloads :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_local_activity_payloads(ctx, activity_type, inputs),
+	)
+}
+
 execute_local_activity_payload_with_options :: proc(
 	ctx: ^Fiber_Context,
 	activity_type: string,
@@ -5883,6 +5989,18 @@ execute_local_activity_payload_with_options :: proc(
 	return await_activity_payload(
 		ctx,
 		start_local_activity_payload_with_options(ctx, activity_type, input, options),
+	)
+}
+
+execute_local_activity_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	activity_type: string,
+	inputs: []codec.Payload_View,
+	options: Local_Activity_Options,
+) -> codec.Payload_View {
+	return await_activity_payload(
+		ctx,
+		start_local_activity_payloads_with_options(ctx, activity_type, inputs, options),
 	)
 }
 
@@ -6413,8 +6531,6 @@ append_fiber_schedule_command :: proc(
 	task_queue: string,
 ) {
 	if operation.is_local {
-		payload := new(proto.Temporal_Api_Common_V1_Payload)
-		payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 		options := &operation.local_options
 		schedule := new(proto.Coresdk_Workflow_Commands_ScheduleLocalActivity)
 		original_schedule_time: ^proto.Google_Protobuf_Timestamp
@@ -6448,7 +6564,9 @@ append_fiber_schedule_command :: proc(
 				},
 			)
 		}
-		append(&schedule.arguments, payload^)
+		for &input in operation.inputs {
+			append(&schedule.arguments, proto.encode_payload(codec.payload_view(&input)))
+		}
 		append(
 			commands,
 			proto.Coresdk_Workflow_Commands_WorkflowCommand{
@@ -6463,8 +6581,6 @@ append_fiber_schedule_command :: proc(
 		result.activity_seq = operation.command_seq
 		return
 	}
-	payload := new(proto.Temporal_Api_Common_V1_Payload)
-	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 	activity_task_queue := operation.options.task_queue
 	if len(activity_task_queue) == 0 {
 		activity_task_queue = task_queue
@@ -6498,7 +6614,9 @@ append_fiber_schedule_command :: proc(
 			},
 		)
 	}
-	append(&schedule.arguments, payload^)
+	for &input in operation.inputs {
+		append(&schedule.arguments, proto.encode_payload(codec.payload_view(&input)))
+	}
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{

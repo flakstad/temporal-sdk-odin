@@ -49,12 +49,15 @@ activity_interceptor_property_execute :: proc(
 activity_interceptor_property_terminal :: proc(
 	callback_data: rawptr,
 	_: ^activity.Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> activity.Payload_Result {
 	state := cast(^Activity_Interceptor_Property_State)callback_data
 	activity_interceptor_property_record(state, 1000)
 	state.terminal_calls += 1
-	payload, clone_error := codec.payload_clone(input)
+	if len(inputs) != 1 {
+		return activity.payload_fail("generated terminal expected one input")
+	}
+	payload, clone_error := codec.payload_clone(inputs[0])
 	if clone_error != .None {
 		return activity.payload_fail("generated terminal clone failed")
 	}
@@ -114,7 +117,7 @@ activity_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	input := worker.Activity_Execute_Input{
 		ctx = &execution.ctx,
-		input = codec.payload_view(&payload),
+		inputs = []codec.Payload_View{codec.payload_view(&payload)},
 	}
 	chain := worker.Activity_Execute_Chain_State{execution = &execution}
 	result := worker.activity_execute_chain_invoke(&chain, &input)
