@@ -709,6 +709,16 @@ details. The typed JSON and legacy string adapters intentionally remain
 single-argument APIs; receiving any other arity fails the Activity with
 `OdinActivityArgumentCountError` instead of silently discarding arguments.
 
+Workflow starts preserve the same repeated Payload contract. Codec-neutral
+callers use `temporal_client.start_workflow_payloads`, and workers register
+`register_payloads_workflow` callbacks that receive the ordered borrowed
+`[]codec.Payload_View`. The Client interceptor sees that same slice. The
+single-Payload, typed JSON, and string Workflow adapters remain convenient
+one-argument APIs and deterministically fail with
+`OdinWorkflowArgumentCountError` on any other arity. Unit replay, a 500-case
+property over 0–12 arguments, and a CLI-devserver scenario cover the full
+Client → Core → Server → Workflow path.
+
 Callbacks that need application failures use the result adapter:
 
 ```odin
@@ -800,8 +810,10 @@ suspend. At least one of Start-to-Close or Schedule-to-Close must be positive.
 The compatibility helpers retain their experimental 20-second
 Start-to-Close/one-attempt behavior.
 
-`register_payload_workflow` is the lower-level form. String Workflows remain a
-compatibility adapter over `json/plain`. Workflow signal buffering preserves a
+`register_payload_workflow` is the single-argument lower-level form;
+`register_payloads_workflow` exposes Temporal's repeated Workflow argument
+field. String Workflows remain a compatibility adapter over `json/plain`.
+Workflow signal buffering preserves a
 generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
 typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
 the `json/plain` string compatibility adapter.

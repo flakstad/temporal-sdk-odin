@@ -2566,8 +2566,12 @@ workflow_outbound_test_local_activity :: proc(
 workflow_outbound_test_invoker :: proc(
 	callback_data: rawptr,
 	ctx: ^workflow.Fiber_Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> workflow.Payload_Result {
+	if len(inputs) != 1 {
+		return workflow.payload_fail("outbound interceptor test requires one argument")
+	}
+	input := inputs[0]
 	state := cast(^Workflow_Outbound_Interceptor_Test_State)callback_data
 	headers := workflow.Headers{}
 	if !workflow.headers_init(&headers) {
@@ -2983,6 +2987,43 @@ payload_passthrough_workflow_test :: proc(
 		)
 	}
 	return workflow.payload_complete(owned)
+}
+
+Repeated_Workflow_Output :: struct {
+	name:                string,
+	count:               int,
+	enabled:             bool,
+	first_encoding:      string,
+	first_external_size: i64,
+}
+
+repeated_payload_workflow_test :: proc(
+	_: ^workflow.Fiber_Context,
+	inputs: []codec.Payload_View,
+) -> workflow.Payload_Result {
+	if len(inputs) != 3 {
+		return workflow.payload_fail(
+			"repeated Workflow test requires three arguments",
+			"TestWorkflowArgumentCountError",
+		)
+	}
+	output := Repeated_Workflow_Output{}
+	if codec.decode_json(inputs[0], &output.name) != .None ||
+	   codec.decode_json(inputs[1], &output.count) != .None ||
+	   codec.decode_json(inputs[2], &output.enabled) != .None {
+		delete(output.name)
+		return workflow.payload_fail("could not decode repeated Workflow arguments")
+	}
+	defer delete(output.name)
+	output.first_encoding = codec.encoding(inputs[0])
+	if len(inputs[0].external_payloads) > 0 {
+		output.first_external_size = inputs[0].external_payloads[0].size_bytes
+	}
+	payload, encode_error := codec.encode_json(output)
+	if encode_error != .None {
+		return workflow.payload_fail("could not encode repeated Workflow result")
+	}
+	return workflow.payload_complete(payload)
 }
 
 fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -5393,6 +5434,71 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_start_request_preserves_repeated_workflow_arguments :: proc(t: ^testing.T) {
+	first, first_error := codec.encode_json("Odin")
+	second, second_error := codec.encode_json(42)
+	third, third_error := codec.encode_json(true)
+	testing.expect(t, first_error == .None && second_error == .None && third_error == .None)
+	defer codec.payload_free(&first)
+	defer codec.payload_free(&second)
+	defer codec.payload_free(&third)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&first,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedWorkflowInput"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&first, 4096) == .None)
+	inputs := [3]codec.Payload_View{
+		codec.payload_view(&first),
+		codec.payload_view(&second),
+		codec.payload_view(&third),
+	}
+	request_bytes, request_error := temporal_client.encode_start_workflow_request_payloads(
+		"default",
+		"repeated_workflow",
+		inputs[:],
+		{id = "repeated-workflow-id", task_queue = "repeated-workflow-queue", request_id = "repeated-request"},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect(t, request.input != nil)
+	if request.input == nil do return
+	testing.expect_value(t, len(request.input.payloads), 3)
+	if len(request.input.payloads) != 3 do return
+	testing.expect_value(t, string(request.input.payloads[0].data), `"Odin"`)
+	testing.expect_value(t, string(request.input.payloads[1].data), "42")
+	testing.expect_value(t, string(request.input.payloads[2].data), "true")
+	message_type := ""
+	for metadata in request.input.payloads[0].metadata {
+		if metadata.key == "messageType" {
+			message_type = string(metadata.value)
+		}
+	}
+	testing.expect_value(t, message_type, "odin.RepeatedWorkflowInput")
+	testing.expect_value(t, len(request.input.payloads[0].external_payloads), 1)
+	if len(request.input.payloads[0].external_payloads) == 1 {
+		testing.expect_value(t, request.input.payloads[0].external_payloads[0].size_bytes, i64(4096))
+	}
+}
+
+@(test)
 client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^testing.T) {
 	metadata := temporal_client.Start_Metadata{}
 	metadata_error := temporal_client.start_metadata_init(&metadata)
@@ -7733,6 +7839,166 @@ typed_workflow_rejects_incompatible_input_as_application_failure :: proc(t: ^tes
 	testing.expect(t, inspection.found)
 	testing.expect_value(t, string(inspection.message), "could not decode Workflow input as json/plain")
 	testing.expect_value(t, string(inspection.failure_type), "OdinWorkflowPayloadConversionError")
+	testing.expect(t, inspection.non_retryable)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_repeated_arguments_preserve_order_details_and_replay_bytes :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_payloads(
+		&runtime,
+		"repeated_payload_workflow",
+		"test-queue",
+		repeated_payload_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(t, codec.payload_add_external(&name, 2048) == .None)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_payload_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_name, proto_count, proto_enabled)
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-payload-workflow-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	fresh := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, fresh.error.message == nil, "repeated Workflow activation failed: %s", string(fresh.error.message))
+	testing.expect(t, fresh.completed)
+	fresh_bytes := bytes.clone(fresh.completion[:])
+	completion, completion_found := clone_workflow_completion_payload(fresh.completion[:])
+	testing.expect(t, completion_found)
+	if completion_found {
+		actual := Repeated_Workflow_Output{}
+		decode_error := codec.decode_json(codec.payload_view(&completion), &actual)
+		testing.expect(t, decode_error == .None)
+		testing.expect_value(t, actual.name, "Odin")
+		testing.expect_value(t, actual.count, 42)
+		testing.expect(t, actual.enabled)
+		testing.expect_value(t, actual.first_encoding, "json/plain")
+		testing.expect_value(t, actual.first_external_size, i64(2048))
+		delete(actual.name)
+		delete(actual.first_encoding)
+	}
+	codec.payload_free(&completion)
+	delete(fresh.completion)
+	workflow.error_free(&fresh.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, bytes.equal(fresh_bytes, replayed.completion[:]))
+	delete(fresh_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
+single_argument_workflow_adapter_rejects_repeated_arguments :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_payload(
+		&runtime,
+		"single_payload_workflow",
+		"test-queue",
+		payload_passthrough_workflow_test,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	first, first_error := codec.encode_json("first")
+	second, second_error := codec.encode_json("second")
+	testing.expect(t, first_error == .None && second_error == .None)
+	defer codec.payload_free(&first)
+	defer codec.payload_free(&second)
+	proto_first := proto.encode_payload(codec.payload_view(&first))
+	proto_second := proto.encode_payload(codec.payload_view(&second))
+	defer delete(proto_first.metadata)
+	defer delete(proto_first.external_payloads)
+	defer delete(proto_second.metadata)
+	defer delete(proto_second.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "single_payload_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_first, proto_second)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "single-payload-repeated-input-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.failure_type), "OdinWorkflowArgumentCountError")
 	testing.expect(t, inspection.non_retryable)
 	delete(inspection.message)
 	delete(inspection.failure_type)

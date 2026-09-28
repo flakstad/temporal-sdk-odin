@@ -353,7 +353,10 @@ workflow_execute_interceptor :: proc(
 	next: workflow.Inbound_Execute_Workflow_Next,
 ) -> workflow.Payload_Result {
 	name: string
-	decode_error := codec.decode_json(input.input, &name)
+	decode_error := codec.Error.Unsupported_Encoding
+	if len(input.inputs) == 1 {
+		decode_error = codec.decode_json(input.inputs[0], &name)
+	}
 	defer delete(name)
 	is_probe := decode_error == .None && name == "activity-interceptor"
 	if is_probe {
@@ -364,6 +367,41 @@ workflow_execute_interceptor :: proc(
 		fmt.println("Workflow execute interceptor exited after Workflow")
 	}
 	return result
+}
+
+repeated_arguments_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	inputs: []codec.Payload_View,
+) -> workflow.Payload_Result {
+	if len(inputs) != 3 {
+		return workflow.payload_fail(
+			"repeated_arguments_workflow expected exactly three Payloads",
+			"OdinWorkflowArgumentCountError",
+		)
+	}
+	name: string
+	count: int
+	enabled: bool
+	if codec.decode_json(inputs[0], &name) != .None ||
+	   codec.decode_json(inputs[1], &count) != .None ||
+	   codec.decode_json(inputs[2], &enabled) != .None {
+		delete(name)
+		return workflow.payload_fail(
+			"repeated_arguments_workflow could not decode its Payloads",
+			"OdinWorkflowPayloadConversionError",
+		)
+	}
+	defer delete(name)
+	message := fmt.aprintf("%s:%d:%v", name, count, enabled)
+	defer delete(message)
+	payload, encode_error := codec.encode_json(message)
+	if encode_error != .None {
+		return workflow.payload_fail(
+			"repeated_arguments_workflow could not encode its result",
+			"OdinWorkflowPayloadConversionError",
+		)
+	}
+	return workflow.payload_complete(payload)
 }
 
 workflow_query_interceptor :: proc(
@@ -1222,6 +1260,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	repeated_workflow_register_error := worker.register_payloads_workflow(
+		&activity_worker,
+		"odin_repeated_arguments_workflow",
+		repeated_arguments_workflow,
+	)
+	if repeated_workflow_register_error.message != nil {
+		fmt.eprintf(
+			"Repeated-argument Workflow registration failed: %s\n",
+			string(repeated_workflow_register_error.message),
+		)
+		worker.error_free(&repeated_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	local_activity_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		LOCAL_ACTIVITY_WORKFLOW_TYPE,
@@ -1343,14 +1397,15 @@ main :: proc() {
 	expect_activity_headers := scenario == "activity-headers"
 	expect_activity_interceptor := scenario == "activity-interceptor"
 	expect_multiple_activity_arguments := scenario == "multiple-activity-arguments"
+	expect_multiple_workflow_arguments := scenario == "multiple-workflow-arguments"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1385,7 +1440,7 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_properties || expect_signal_with_start {
+		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
@@ -1487,6 +1542,8 @@ main :: proc() {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_multiple_activity_arguments {
 		fmt.println("multiple Activity arguments completed end-to-end through Core")
+	} else if expect_multiple_workflow_arguments {
+		fmt.println("multiple Workflow arguments completed end-to-end through Core")
 	} else if expect_local_activity {
 		fmt.println("Local Activity completed through Core in the Workflow Worker")
 	} else if expect_local_activity_retry {

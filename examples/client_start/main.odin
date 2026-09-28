@@ -34,6 +34,15 @@ start_workflow_interceptor :: proc(
 	input: ^temporal_client.Client_Start_Workflow_Input,
 	next: temporal_client.Client_Start_Workflow_Next,
 ) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	if input.workflow_type == "odin_repeated_arguments_workflow" {
+		if len(input.inputs) != 3 {
+			return {}, temporal_client.error_from_string(
+				.Invalid_Argument,
+				"Client interceptor did not receive three Workflow arguments",
+			)
+		}
+		fmt.println("Client start interceptor observed three Workflow arguments")
+	}
 	header_error := temporal_client.headers_add_json(
 		input.headers,
 		"odin-interceptor",
@@ -164,6 +173,63 @@ run :: proc() -> int {
 	}
 	scenario_buffer: [64]u8
 	scenario := os.get_env(scenario_buffer[:], "TEMPORAL_CLIENT_SCENARIO")
+	if scenario == "multiple-workflow-arguments" {
+		name, name_error := codec.encode_json("Odin")
+		count, count_error := codec.encode_json(42)
+		enabled, enabled_error := codec.encode_json(true)
+		if name_error != .None || count_error != .None || enabled_error != .None {
+			fmt.eprintln("Could not encode repeated Workflow arguments")
+			codec.payload_free(&name)
+			codec.payload_free(&count)
+			codec.payload_free(&enabled)
+			return 1
+		}
+		defer codec.payload_free(&name)
+		defer codec.payload_free(&count)
+		defer codec.payload_free(&enabled)
+		inputs := [3]codec.Payload_View{
+			codec.payload_view(&name),
+			codec.payload_view(&count),
+			codec.payload_view(&enabled),
+		}
+		handle, start_error := temporal_client.start_workflow_payloads(
+			&client,
+			"odin_repeated_arguments_workflow",
+			inputs[:],
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf("Repeated-argument Workflow start failed: %s\n", string(start_error.message))
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf("Repeated-argument Workflow result failed: %s\n", string(result_error.message))
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "Odin:42:true" {
+			fmt.eprintf("Repeated-argument Workflow returned unexpected result: %q\n", result)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed repeated-argument workflow_id=%s run_id=%s result=%q\n",
+			workflow_id,
+			handle.run_id,
+			result,
+		)
+		return 0
+	}
 	if scenario == "signal-with-start" {
 		headers := temporal_client.Headers{}
 		headers_init_error := temporal_client.headers_init(&headers)

@@ -830,13 +830,13 @@ free_start_proto_payloads :: proc(payloads: []proto.Temporal_Api_Common_V1_Paylo
 	delete(payloads)
 }
 
-// encode_start_workflow_request is the deterministic request-construction
-// boundary used by the Client and wire-contract tests. Returned bytes are owned
-// by the caller.
-encode_start_workflow_request :: proc(
+// encode_start_workflow_request_payloads is the deterministic repeated-input
+// request boundary used by the Client and wire-contract tests. Returned bytes
+// are owned by the caller.
+encode_start_workflow_request_payloads :: proc(
 	namespace: string,
 	workflow_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Start_Workflow_Options,
 	header_override: ^Headers = nil,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
@@ -860,19 +860,21 @@ encode_start_workflow_request :: proc(
 	}
 	workflow_type_value := proto.Temporal_Api_Common_V1_WorkflowType{name = workflow_type}
 	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = options.task_queue}
-	payload := proto.encode_payload(input)
-	defer delete(payload.metadata)
-	defer delete(payload.external_payloads)
-	inputs := proto.Temporal_Api_Common_V1_Payloads{}
-	defer delete(inputs.payloads)
-	append(&inputs.payloads, payload)
+	encoded_inputs := make([]proto.Temporal_Api_Common_V1_Payload, len(inputs))
+	defer free_start_proto_payloads(encoded_inputs)
+	input_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(input_payloads.payloads)
+	for input, index in inputs {
+		encoded_inputs[index] = proto.encode_payload(input)
+		append(&input_payloads.payloads, encoded_inputs[index])
+	}
 
 	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{
 		namespace = namespace,
 		workflow_id = options.id,
 		workflow_type = &workflow_type_value,
 		task_queue = &task_queue,
-		input = &inputs,
+		input = &input_payloads,
 		identity = "temporal-sdk-odin@local",
 		request_id = request_id,
 		workflow_id_reuse_policy = workflow_id_reuse_policy_to_proto(options.id_reuse_policy),
@@ -1033,20 +1035,40 @@ encode_start_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(&request), {}
 }
 
-start_workflow_payload_unintercepted :: proc(
-	client: ^Client,
+// encode_start_workflow_request preserves the original single-argument API.
+// Temporal's wire contract is repeated, so new codec-neutral callers should
+// use encode_start_workflow_request_payloads.
+encode_start_workflow_request :: proc(
+	namespace: string,
 	workflow_type: string,
 	input: codec.Payload_View,
+	options: Start_Workflow_Options,
+	header_override: ^Headers = nil,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	inputs := [?]codec.Payload_View{input}
+	return encode_start_workflow_request_payloads(
+		namespace,
+		workflow_type,
+		inputs[:],
+		options,
+		header_override,
+	)
+}
+
+start_workflow_payloads_unintercepted :: proc(
+	client: ^Client,
+	workflow_type: string,
+	inputs: []codec.Payload_View,
 	options: Start_Workflow_Options,
 	headers: ^Headers,
 ) -> (handle: Workflow_Handle, error: Error) {
 	if client == nil || client.connection == nil || client.connection.handle == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
 	}
-	request_bytes, request_error := encode_start_workflow_request(
+	request_bytes, request_error := encode_start_workflow_request_payloads(
 		client.namespace,
 		workflow_type,
-		input,
+		inputs,
 		options,
 		headers,
 	)
@@ -1110,19 +1132,19 @@ start_workflow_payload_terminal :: proc(
 	if input.headers == nil || input.headers.allocator.procedure == nil {
 		return {}, error_from_string(.Invalid_Argument, "start Workflow interceptor headers are invalid")
 	}
-	return start_workflow_payload_unintercepted(
+	return start_workflow_payloads_unintercepted(
 		input.client,
 		input.workflow_type,
-		input.input,
+		input.inputs,
 		input.options,
 		input.headers,
 	)
 }
 
-start_workflow_payload :: proc(
+start_workflow_payloads :: proc(
 	client: ^Client,
 	workflow_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Start_Workflow_Options,
 ) -> (Workflow_Handle, Error) {
 	headers := Headers{}
@@ -1134,12 +1156,22 @@ start_workflow_payload :: proc(
 	interceptor_input := Client_Start_Workflow_Input{
 		client = client,
 		workflow_type = workflow_type,
-		input = input,
+		inputs = inputs,
 		options = options,
 		headers = &headers,
 	}
 	state := Client_Interceptor_State{client = client}
 	return client_start_workflow_chain(&state, &interceptor_input)
+}
+
+start_workflow_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Start_Workflow_Options,
+) -> (Workflow_Handle, Error) {
+	inputs := [?]codec.Payload_View{input}
+	return start_workflow_payloads(client, workflow_type, inputs[:], options)
 }
 
 start_workflow_json :: proc(

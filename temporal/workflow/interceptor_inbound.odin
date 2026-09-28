@@ -9,7 +9,7 @@ import codec "../codec"
 Inbound_Execute_Workflow_Input :: struct {
 	ctx:           ^Fiber_Context,
 	workflow_type: string,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 }
 
 Inbound_Execute_Workflow_Next_Proc :: #type proc(
@@ -226,7 +226,7 @@ inbound_execute_workflow_chain :: proc(
 	return state.instance.invoke(
 		state.instance.callback_data,
 		input.ctx,
-		input.input,
+		input.inputs,
 	)
 }
 

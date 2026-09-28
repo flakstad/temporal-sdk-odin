@@ -3267,6 +3267,95 @@ activity_argument_lists_preserve_generated_payloads_and_order :: proc(t: ^testin
 	pbt.require_pass(t, result)
 }
 
+workflow_start_argument_property :: proc(t: ^pbt.T) -> pbt.Result {
+	argument_count := pbt.draw(t, pbt.int_range(0, 12))
+	prefix := pbt.draw(t, pbt.string_ascii(0, 24))
+	pbt.cover(t, argument_count == 0, 3.0, "zero arguments")
+	pbt.cover(t, argument_count == 1, 3.0, "one argument")
+	pbt.cover(t, argument_count >= 8, 25.0, "many arguments")
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return pbt.error("could not initialize Workflow start argument arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	payloads := make([]codec.Payload, argument_count)
+	views := make([]codec.Payload_View, argument_count)
+	for index in 0..<argument_count {
+		value := fmt.aprintf("%s:%d", prefix, index)
+		payload, encode_error := codec.encode_json(value)
+		if encode_error != .None {
+			return pbt.error("could not encode generated Workflow start argument")
+		}
+		ordinal := fmt.aprintf("%d", index)
+		if codec.payload_add_metadata(
+			&payload,
+			"generated-ordinal",
+			transmute([]u8)ordinal,
+		) != .None || codec.payload_add_external(&payload, i64(index * 101)) != .None {
+			return pbt.error("could not decorate generated Workflow start argument")
+		}
+		payloads[index] = payload
+		views[index] = codec.payload_view(&payloads[index])
+	}
+	options := temporal_client.Start_Workflow_Options{
+		id = "generated-workflow-id",
+		task_queue = "generated-workflow-queue",
+		request_id = "generated-workflow-request",
+	}
+	first_bytes, first_error := temporal_client.encode_start_workflow_request_payloads(
+		"default",
+		"generated_workflow",
+		views,
+		options,
+	)
+	if first_error.message != nil {
+		temporal_client.error_free(&first_error)
+		return pbt.fail("generated Workflow start arguments did not encode")
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	if !proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		first_bytes[:],
+		&request,
+	) || request.input == nil || len(request.input.payloads) != argument_count {
+		return pbt.fail("generated Workflow start request changed argument count")
+	}
+	for &argument, index in request.input.payloads {
+		if !generated_activity_argument_matches(&argument, &payloads[index], index) {
+			return pbt.fail("Workflow start argument order or payload details changed")
+		}
+	}
+	second_bytes, second_error := temporal_client.encode_start_workflow_request_payloads(
+		"default",
+		"generated_workflow",
+		views,
+		options,
+	)
+	if second_error.message != nil {
+		temporal_client.error_free(&second_error)
+		return pbt.fail("repeated Workflow start arguments did not encode")
+	}
+	if !bytes.equal(first_bytes[:], second_bytes[:]) {
+		return pbt.fail("repeated Workflow start argument encoding changed bytes")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_start_argument_lists_preserve_generated_payloads_and_order :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow start argument lists preserve payloads, order, and deterministic bytes",
+		workflow_start_argument_property,
+		{num_tests = 500, seed = 0x5746_5f41_5247_554d},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Generated_Continue_As_New_Input :: struct {
 	value:               string,
 	workflow_type:       string,

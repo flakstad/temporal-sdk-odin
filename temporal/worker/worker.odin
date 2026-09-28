@@ -681,6 +681,60 @@ register_payload_workflow :: proc(
 	return {}
 }
 
+// register_payloads_workflow exposes the codec-neutral repeated-argument
+// boundary used by Temporal. The borrowed slice and all views are valid only
+// for the callback invocation; the returned Payload_Result remains owned by
+// the Workflow runtime.
+register_payloads_workflow :: proc(
+	worker: ^Worker,
+	name: string,
+	callback: workflow.Payloads_Proc,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("workflows cannot be registered after worker.run starts")
+	}
+	if len(name) == 0 || callback == nil {
+		return error_from_string("workflow name and callback are required")
+	}
+	for registration in worker.workflow_registrations {
+		if registration.name == name {
+			return error_from_string("workflow is already registered")
+		}
+	}
+	owned_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		return error_from_string("could not allocate workflow name")
+	}
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_payloads(
+		&runtime,
+		name,
+		worker.task_queue,
+		callback,
+		namespace = workflow_runtime_namespace(worker),
+	)
+	if init_error.message != nil {
+		delete(owned_name)
+		result := error_from_string(string(init_error.message))
+		workflow.error_free(&init_error)
+		return result
+	}
+	configuration_error := configure_workflow_runtime(worker, &runtime)
+	if configuration_error.message != nil {
+		delete(owned_name)
+		workflow.fiber_runtime_close(&runtime)
+		return configuration_error
+	}
+	append(
+		&worker.workflow_registrations,
+		Workflow_Registration{name = owned_name, runtime = runtime},
+	)
+	return {}
+}
+
 register_json_workflow :: proc(
 	worker: ^Worker,
 	name: string,
@@ -719,9 +773,15 @@ register_json_workflow :: proc(
 		name,
 		worker.task_queue,
 		owned_callback,
-		proc(data: rawptr, ctx: ^workflow.Fiber_Context, input: codec.Payload_View) -> workflow.Payload_Result {
+		proc(data: rawptr, ctx: ^workflow.Fiber_Context, inputs: []codec.Payload_View) -> workflow.Payload_Result {
+			if len(inputs) != 1 {
+				return workflow.payload_fail(
+					"typed Workflow requires exactly one argument",
+					"OdinWorkflowArgumentCountError",
+				)
+			}
 			value: Input
-			if codec.decode_json(input, &value) != .None {
+			if codec.decode_json(inputs[0], &value) != .None {
 				return workflow.payload_fail(
 					"could not decode Workflow input as json/plain",
 					"OdinWorkflowPayloadConversionError",

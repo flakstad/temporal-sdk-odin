@@ -855,13 +855,16 @@ typed_workflow :: proc(ctx: ^workflow.Fiber_Context, input: Greeting_Input) -> G
 }
 ```
 
-`Fiber_Instance` owns complete `codec.Payload` values for Workflow input and
-output. Each Activity operation likewise owns its argument and resolved result.
-The raw `register_payload_workflow` boundary receives a borrowed Payload view
-and returns an owned `workflow.Payload_Result`; `register_json_workflow`
-specializes a typed trampoline, while `register_workflow` retains source
-compatibility for string procedures. Metadata and external-payload details are
-copied rather than reconstructed, so custom codecs can use the same runtime.
+`Fiber_Instance` owns every `InitializeWorkflow.arguments` `codec.Payload`, an
+ordered borrowed-view slice over those owned values, and the Workflow output.
+Each Activity operation likewise owns its arguments and resolved result. The
+raw `register_payloads_workflow` boundary receives the complete borrowed slice
+and returns an owned `workflow.Payload_Result`; `register_payload_workflow`,
+`register_json_workflow`, and `register_workflow` are explicit one-argument
+adapters. They fail deterministically with `OdinWorkflowArgumentCountError`
+rather than dropping extra history input. Metadata and external-payload details
+are copied rather than reconstructed, so custom codecs can use the same
+runtime.
 
 The offline typed test forces eviction after scheduling the Activity and
 requires the fresh fiber to emit byte-identical command bytes. A live Temporal
@@ -875,6 +878,15 @@ shutdown. A raw Payload test separately carries custom `encoding`,
 `messageType`, opaque bytes, and external-payload size details through Workflow
 input -> Activity command -> Activity resolution -> Workflow completion. Typed
 signals use the same Payload boundary.
+
+The public Client mirrors that boundary with
+`encode_start_workflow_request_payloads` and `start_workflow_payloads`.
+`Client_Start_Workflow_Input.inputs` lets outbound interceptors inspect or
+replace the repeated views before the terminal Core RPC. The original singular
+functions construct a one-element slice and remain source-compatible.
+Signal-With-Start still exposes one Workflow input and one Signal input in its
+current high-level API; widening those independently is a separate API decision
+even though its underlying start request uses protobuf `Payloads`.
 
 ### Workflow information, memo, and Search Attributes
 

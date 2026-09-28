@@ -89,6 +89,38 @@ temporal workflow show \
   --output json >"$typed_history_file"
 grep -q '"eagerExecutionAccepted": true' "$typed_history_file"
 
+TEMPORAL_ODIN_SCENARIO=multiple-workflow-arguments \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Repeated-argument Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+repeated_workflow_id="odin-sdk-repeated-workflow-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=multiple-workflow-arguments \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$repeated_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+repeated_workflow_output="$(<"$workflow_output_file")"
+echo "$repeated_workflow_output"
+grep -q "Odin client completed repeated-argument workflow_id=$repeated_workflow_id" <<<"$repeated_workflow_output"
+grep -q 'result="Odin:42:true"' <<<"$repeated_workflow_output"
+grep -q 'Client start interceptor observed three Workflow arguments' <<<"$repeated_workflow_output"
+grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$repeated_workflow_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'multiple Workflow arguments completed end-to-end through Core' "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=signal-with-start \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

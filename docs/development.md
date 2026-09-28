@@ -256,15 +256,19 @@ Workflows have the corresponding registration levels:
 worker.register_workflow(&w, "string_workflow", string_workflow)
 worker.register_json_workflow(&w, "typed_workflow", typed_workflow)
 worker.register_payload_workflow(&w, "payload_workflow", payload_workflow)
+worker.register_payloads_workflow(&w, "payloads_workflow", payloads_workflow)
 ```
 
-The runtime stores Workflow input, scheduled Activity inputs, resolved Activity
+The runtime stores Workflow inputs, scheduled Activity inputs, resolved Activity
 output, and Workflow completion as allocator-owned `codec.Payload` values in
 the Workflow instance arena. `register_json_workflow` generates a typed adapter
 for `proc(Fiber_Context, Input) -> Output`; `register_workflow` is the existing
-string compatibility adapter. `register_payload_workflow` receives a borrowed
-view and returns an owned `workflow.Payload_Result`. Callback storage belongs to
-the `Fiber_Runtime` and is released by `fiber_runtime_close`.
+string compatibility adapter. `register_payload_workflow` receives one borrowed
+view, while `register_payloads_workflow` receives the complete ordered borrowed
+slice from `InitializeWorkflow.arguments`; both return an owned
+`workflow.Payload_Result`. The one-argument adapters reject zero or multiple
+arguments as a non-retryable `OdinWorkflowArgumentCountError`. Callback storage
+belongs to the `Fiber_Runtime` and is released by `fiber_runtime_close`.
 
 Workflow code can use `start_activity_payload`/
 `await_activity_payload_result` at the codec boundary, or
@@ -377,9 +381,11 @@ result_error := temporal_client.get_result_json(&handle, &result)
 
 `connect` heap-owns a Core runtime, Core connection, and namespace. The handle
 owns its Workflow ID, result run ID, and first execution run ID, while borrowing
-the Client. Free handles before closing the Client. `start_workflow_payload`
-and `get_result_payload` are the codec-neutral forms; JSON helpers currently
-represent one Workflow argument and one result Payload.
+the Client. Free handles before closing the Client. `start_workflow_payloads`
+is the repeated codec-neutral start form; `start_workflow_payload` and
+`start_workflow_json` are one-argument adapters. `get_result_payload` remains
+codec-neutral because a Workflow completion contains at most one result
+Payload.
 
 The combined start/signal path reuses the same start projection but has a
 dedicated option wrapper because Temporal exposes only one header map and it is
@@ -1195,6 +1201,12 @@ through Workflow command encoding, SDK Core, Temporal Server, Activity polling,
 and the codec-neutral Odin callback. Unit replay checks byte-identical commands,
 and a 500-case property covers 0–12 ordered arguments for remote and Local
 Activities while preserving metadata and external-payload details.
+The `multiple-workflow-arguments` scenario starts a Workflow through the Odin
+Client with three JSON Payloads, carries them through SDK Core and the Temporal
+CLI dev server, and returns `Odin:42:true` from a codec-neutral Odin Workflow.
+An offline eviction/replay test preserves order, metadata, and external-payload
+details, while a separate 500-case property covers deterministic Client request
+encoding for 0–12 arguments.
 
 ### Client outbound interceptor chain
 

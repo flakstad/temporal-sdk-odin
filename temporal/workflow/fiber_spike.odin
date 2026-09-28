@@ -22,10 +22,11 @@ Fiber_Context :: struct {
 
 Fiber_Proc :: proc(ctx: ^Fiber_Context, input: string) -> string
 Payload_Proc :: #type proc(ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result
+Payloads_Proc :: #type proc(ctx: ^Fiber_Context, inputs: []codec.Payload_View) -> Payload_Result
 Workflow_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	ctx: ^Fiber_Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> Payload_Result
 Workflow_Callback_Destroy_Proc :: #type proc(callback_data: rawptr)
 Query_Invoke_Proc :: #type proc(
@@ -926,7 +927,8 @@ Fiber_Instance :: struct {
 	continued_failure: temporal_failure.Failure,
 	last_completion_results: [dynamic]codec.Payload,
 	last_completion_result_views: []codec.Payload_View,
-	input:           codec.Payload,
+	inputs:          [dynamic]codec.Payload,
+	input_views:     []codec.Payload_View,
 	output:          codec.Payload,
 	callback_data:   rawptr,
 	invoke:          Workflow_Invoke_Proc,
@@ -1092,9 +1094,15 @@ fiber_runtime_init :: proc(
 		workflow_type,
 		task_queue,
 		owned_callback,
-		proc(data: rawptr, ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result {
+		proc(data: rawptr, ctx: ^Fiber_Context, inputs: []codec.Payload_View) -> Payload_Result {
+			if len(inputs) != 1 {
+				return payload_fail(
+					"string Workflow requires exactly one argument",
+					"OdinWorkflowArgumentCountError",
+				)
+			}
 			value: string
-			if codec.decode_json(input, &value) != .None {
+			if codec.decode_json(inputs[0], &value) != .None {
 				return payload_fail(
 					"could not decode Workflow input as json/plain string",
 					"OdinWorkflowPayloadConversionError",
@@ -1142,12 +1150,53 @@ fiber_runtime_init_payload :: proc(
 		workflow_type,
 		task_queue,
 		owned_callback,
-		proc(data: rawptr, ctx: ^Fiber_Context, input: codec.Payload_View) -> Payload_Result {
+		proc(data: rawptr, ctx: ^Fiber_Context, inputs: []codec.Payload_View) -> Payload_Result {
+			if len(inputs) != 1 {
+				return payload_fail(
+					"Payload Workflow requires exactly one argument",
+					"OdinWorkflowArgumentCountError",
+				)
+			}
 			callback := cast(^Payload_Proc)data
-			return callback^(ctx, input)
+			return callback^(ctx, inputs[0])
 		},
 		proc(data: rawptr) {
 			free(cast(^Payload_Proc)data, allocator_runtime.heap_allocator())
+		},
+		namespace,
+	)
+	if init_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return init_error
+}
+
+fiber_runtime_init_payloads :: proc(
+	runtime: ^Fiber_Runtime,
+	workflow_type, task_queue: string,
+	workflow: Payloads_Proc,
+	namespace := "default",
+) -> Error {
+	if workflow == nil {
+		return error_from_string("workflow type, task queue, and workflow procedure are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Payloads_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Workflow callback")
+	}
+	owned_callback^ = workflow
+	init_error := fiber_runtime_init_invoker(
+		runtime,
+		workflow_type,
+		task_queue,
+		owned_callback,
+		proc(data: rawptr, ctx: ^Fiber_Context, inputs: []codec.Payload_View) -> Payload_Result {
+			callback := cast(^Payloads_Proc)data
+			return callback^(ctx, inputs)
+		},
+		proc(data: rawptr) {
+			free(cast(^Payloads_Proc)data, allocator_runtime.heap_allocator())
 		},
 		namespace,
 	)
@@ -1446,7 +1495,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		return fiber_result_error("could not destroy Workflow fiber", fiber_result)
 	}
 	instance.fiber = nil
-	codec.payload_free(&instance.input)
+	for &input in instance.inputs {
+		codec.payload_free(&input)
+	}
+	delete(instance.inputs)
 	codec.payload_free(&instance.output)
 	temporal_failure.failure_free(&instance.continued_failure)
 	for &payload in instance.last_completion_results {
@@ -1538,7 +1590,7 @@ fiber_entry :: proc "c" (user_data: rawptr) {
 	execute_input := Inbound_Execute_Workflow_Input{
 		ctx = &instance.workflow_context,
 		workflow_type = instance.workflow_type,
-		input = codec.payload_view(&instance.input),
+		inputs = instance.input_views,
 	}
 	execute_state := Inbound_Execute_Workflow_State{instance = instance}
 	workflow_result := inbound_execute_workflow_chain(&execute_state, &execute_input)
@@ -1742,8 +1794,8 @@ add_fiber_instance :: proc(
 	run_id: string,
 	initialize: ^proto.Coresdk_Workflow_Activation_InitializeWorkflow,
 ) -> (^Fiber_Instance, Error) {
-	if initialize == nil || len(initialize.arguments) != 1 {
-		return nil, error_from_string("workflow initialization has no input")
+	if initialize == nil {
+		return nil, error_from_string("workflow initialization is missing")
 	}
 
 	instance := new(Fiber_Instance)
@@ -1769,8 +1821,20 @@ add_fiber_instance :: proc(
 	instance.workflow_type = owned_workflow_type
 	owned_task_queue, task_queue_error := strings.clone(runtime.task_queue)
 	instance.task_queue = owned_task_queue
-	owned_input, clone_error := proto.clone_payload(&initialize.arguments[0])
-	instance.input = owned_input
+	instance.inputs = make([dynamic]codec.Payload)
+	inputs_ok := true
+	for &source in initialize.arguments {
+		owned_input, clone_error := proto.clone_payload(&source)
+		if clone_error != .None {
+			inputs_ok = false
+			break
+		}
+		append(&instance.inputs, owned_input)
+	}
+	instance.input_views = make([]codec.Payload_View, len(instance.inputs))
+	for &input, index in instance.inputs {
+		instance.input_views[index] = codec.payload_view(&input)
+	}
 	instance.headers = make([dynamic]Fiber_Named_Payload)
 	instance.memo = make([dynamic]Fiber_Named_Payload)
 	instance.search_attributes = make([dynamic]Fiber_Named_Payload)
@@ -1939,7 +2003,7 @@ add_fiber_instance :: proc(
 	)
 	context.allocator = previous_allocator
 	if namespace_error != nil || run_id_error != nil || workflow_id_error != nil ||
-	   workflow_type_error != nil || task_queue_error != nil || clone_error != .None ||
+	   workflow_type_error != nil || task_queue_error != nil || !inputs_ok ||
 	   !metadata_strings_ok || !retry_durations_ok || !cron_interval_ok ||
 	   !continued_failure_ok || !last_completion_results_ok ||
 	   !execution_timeout_ok || !run_timeout_ok || !task_timeout_ok || !start_time_ok ||
@@ -8509,7 +8573,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		#partial switch variant in job.variant {
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow:
 			handled = true
-			if variant.value == nil || variant.value.workflow_type != runtime.workflow_type || instance_found || len(variant.value.arguments) != 1 {
+			if variant.value == nil || variant.value.workflow_type != runtime.workflow_type || instance_found {
 				process_error(&result, activation.run_id, "invalid Workflow fiber initialization")
 				return
 			}
