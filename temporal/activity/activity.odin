@@ -15,6 +15,46 @@ Cancel_Reason :: enum u32 {
 	Reset,
 }
 
+// Cancellation_Details surfaces every reason Core observed. More than one
+// flag may be true even though cancellation_reason returns one primary reason.
+Cancellation_Details :: struct {
+	is_not_found:       bool,
+	is_cancelled:       bool,
+	is_paused:          bool,
+	is_timed_out:       bool,
+	is_worker_shutdown: bool,
+	is_reset:           bool,
+}
+
+CANCELLATION_NOT_FOUND       :: u32(1 << 0)
+CANCELLATION_CANCELLED       :: u32(1 << 1)
+CANCELLATION_PAUSED          :: u32(1 << 2)
+CANCELLATION_TIMED_OUT       :: u32(1 << 3)
+CANCELLATION_WORKER_SHUTDOWN :: u32(1 << 4)
+CANCELLATION_RESET           :: u32(1 << 5)
+
+cancellation_details_bits :: proc(details: Cancellation_Details) -> u32 {
+	bits: u32
+	if details.is_not_found       do bits |= CANCELLATION_NOT_FOUND
+	if details.is_cancelled       do bits |= CANCELLATION_CANCELLED
+	if details.is_paused          do bits |= CANCELLATION_PAUSED
+	if details.is_timed_out       do bits |= CANCELLATION_TIMED_OUT
+	if details.is_worker_shutdown do bits |= CANCELLATION_WORKER_SHUTDOWN
+	if details.is_reset           do bits |= CANCELLATION_RESET
+	return bits
+}
+
+cancellation_details_from_bits :: proc(bits: u32) -> Cancellation_Details {
+	return {
+		is_not_found = bits & CANCELLATION_NOT_FOUND != 0,
+		is_cancelled = bits & CANCELLATION_CANCELLED != 0,
+		is_paused = bits & CANCELLATION_PAUSED != 0,
+		is_timed_out = bits & CANCELLATION_TIMED_OUT != 0,
+		is_worker_shutdown = bits & CANCELLATION_WORKER_SHUTDOWN != 0,
+		is_reset = bits & CANCELLATION_RESET != 0,
+	}
+}
+
 Heartbeat_Status :: enum {
 	Recorded,
 	Cancellation_Requested,
@@ -28,6 +68,7 @@ Heartbeat_Recorder :: #type proc(user_data: rawptr, details: codec.Payload_View)
 Result_Status :: enum {
 	Completed,
 	Failed,
+	Canceled,
 }
 
 Application_Failure :: struct {
@@ -39,10 +80,45 @@ Application_Failure :: struct {
 	next_retry_delay: time.Duration,
 }
 
+Cancellation :: struct {
+	message:     string,
+	details:     codec.Payload,
+	has_details: bool,
+}
+
 Result :: struct(T: typeid) {
-	status:  Result_Status,
-	value:   T,
-	failure: Application_Failure,
+	status:       Result_Status,
+	value:        T,
+	failure:      Application_Failure,
+	cancellation: Cancellation,
+}
+
+result_canceled :: proc($T: typeid, message := "Activity canceled") -> Result(T) {
+	return {status = .Canceled, cancellation = {message = message}}
+}
+
+result_canceled_json :: proc(
+	$T: typeid,
+	details: $Details,
+	message := "Activity canceled",
+) -> Result(T) {
+	payload, encode_error := codec.encode_json(details)
+	if encode_error != .None {
+		return result_failure(
+			T,
+			"could not encode Activity cancellation details as json/plain",
+			failure_type = "OdinPayloadConversionError",
+			non_retryable = true,
+		)
+	}
+	return {
+		status = .Canceled,
+		cancellation = {
+			message = message,
+			details = payload,
+			has_details = true,
+		},
+	}
 }
 
 result_success :: proc(value: $T) -> Result(T) {
@@ -105,10 +181,45 @@ application_failure_free :: proc(failure: ^Application_Failure) {
 	failure^ = {}
 }
 
+cancellation_free :: proc(cancellation: ^Cancellation) {
+	if cancellation == nil {
+		return
+	}
+	codec.payload_free(&cancellation.details)
+	cancellation^ = {}
+}
+
 Payload_Result :: struct {
-	status:  Result_Status,
-	payload: codec.Payload,
-	failure: Application_Failure,
+	status:       Result_Status,
+	payload:      codec.Payload,
+	failure:      Application_Failure,
+	cancellation: Cancellation,
+}
+
+payload_cancel :: proc(
+	message := "Activity canceled",
+	details := codec.Payload{},
+	has_details := false,
+) -> Payload_Result {
+	return {
+		status = .Canceled,
+		cancellation = {
+			message = message,
+			details = details,
+			has_details = has_details,
+		},
+	}
+}
+
+payload_cancel_json :: proc(details: $T, message := "Activity canceled") -> Payload_Result {
+	payload, encode_error := codec.encode_json(details)
+	if encode_error != .None {
+		return payload_fail(
+			"could not encode Activity cancellation details as json/plain",
+			failure_type = "OdinPayloadConversionError",
+		)
+	}
+	return payload_cancel(message, payload, true)
 }
 
 Retry_Policy :: struct {
@@ -188,6 +299,7 @@ Context :: struct {
 	info_value: Info,
 	cancel_requested: bool,
 	cancel_reason:    Cancel_Reason,
+	cancel_details:   u32,
 	heartbeat_user_data: rawptr,
 	heartbeat_recorder:  Heartbeat_Recorder,
 }
@@ -222,11 +334,16 @@ context_init_info :: proc(
 	}
 }
 
-context_request_cancellation :: proc(ctx: ^Context, reason: Cancel_Reason) {
+context_request_cancellation :: proc(
+	ctx: ^Context,
+	reason: Cancel_Reason,
+	details: Cancellation_Details = {},
+) {
 	if ctx == nil {
 		return
 	}
 	sync.atomic_store_explicit(&ctx.cancel_reason, reason, .Relaxed)
+	sync.atomic_store_explicit(&ctx.cancel_details, cancellation_details_bits(details), .Relaxed)
 	sync.atomic_store_explicit(&ctx.cancel_requested, true, .Release)
 }
 
@@ -239,6 +356,14 @@ cancellation_reason :: proc(ctx: ^Context) -> Cancel_Reason {
 		return .None
 	}
 	return sync.atomic_load_explicit(&ctx.cancel_reason, .Relaxed)
+}
+
+cancellation_details :: proc(ctx: ^Context) -> (details: Cancellation_Details, present: bool) {
+	if !is_cancellation_requested(ctx) {
+		return {}, false
+	}
+	bits := sync.atomic_load_explicit(&ctx.cancel_details, .Relaxed)
+	return cancellation_details_from_bits(bits), true
 }
 
 activity_id :: proc(ctx: ^Context) -> string {

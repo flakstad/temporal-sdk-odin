@@ -47,6 +47,16 @@ Failure_Details :: struct {
 	code:       int,
 }
 
+Activity_Cancellation_Details :: struct {
+	name:               string,
+	is_not_found:       bool,
+	is_cancelled:       bool,
+	is_paused:          bool,
+	is_timed_out:       bool,
+	is_worker_shutdown: bool,
+	is_reset:           bool,
+}
+
 Greeting_Query_State :: struct {
 	phase: string,
 	name:  string,
@@ -177,6 +187,40 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	return greeting
 }
 
+cancel_with_details :: proc(
+	ctx: ^activity.Context,
+	name: string,
+) -> activity.Result(string) {
+	for !activity.is_cancellation_requested(ctx) {
+		if activity.heartbeat(ctx, "waiting for detailed cancellation") == .Cancellation_Requested {
+			break
+		}
+		time.sleep(50 * time.Millisecond)
+	}
+	details, present := activity.cancellation_details(ctx)
+	if !present {
+		return activity.result_failure(
+			string,
+			"Activity cancellation details were absent",
+			failure_type = "OdinActivityCancellationContractError",
+			non_retryable = true,
+		)
+	}
+	return activity.result_canceled_json(
+		string,
+		Activity_Cancellation_Details{
+			name = name,
+			is_not_found = details.is_not_found,
+			is_cancelled = details.is_cancelled,
+			is_paused = details.is_paused,
+			is_timed_out = details.is_timed_out,
+			is_worker_shutdown = details.is_worker_shutdown,
+			is_reset = details.is_reset,
+		},
+		message = "Odin Activity acknowledged cancellation",
+	)
+}
+
 typed_greeting :: proc(ctx: ^activity.Context, input: Typed_Greeting_Input) -> Typed_Greeting_Output {
 	message, allocation_error := strings.concatenate({input.salutation, ", ", input.name, "!"})
 	if allocation_error != nil {
@@ -235,6 +279,41 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "activity-cancel-details" {
+		retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+		pending := workflow.start_activity_json_with_options(
+			ctx,
+			"cancel_with_details",
+			name,
+			{
+				activity_id = "activity-cancel-details",
+				start_to_close_timeout = 10 * time.Second,
+				heartbeat_timeout = time.Second,
+				retry_policy = &retry_policy,
+				cancellation_type = .Wait_Cancellation_Completed,
+			},
+		)
+		workflow.sleep(ctx, 250 * time.Millisecond)
+		if !workflow.cancel_activity(ctx, pending) {
+			return "could not request Activity cancellation"
+		}
+		result := workflow.await_activity_json_result(ctx, pending, string)
+		if result.status != .Canceled || !result.failure.canceled {
+			return "Activity did not return a cancellation failure"
+		}
+		details: Activity_Cancellation_Details
+		found, decode_error := workflow.activity_cancellation_detail_json(
+			&result.failure,
+			0,
+			&details,
+		)
+		if !found || decode_error != .None || details.name != name || !details.is_cancelled ||
+		   details.is_not_found || details.is_paused || details.is_timed_out ||
+		   details.is_worker_shutdown || details.is_reset {
+			return "Activity cancellation details mismatch"
+		}
+		return "Observed Activity cancellation details"
+	}
 	if name == "cancel-activity" {
 		return workflow.execute_activity(ctx, "hello", name)
 	}
@@ -641,6 +720,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	register_cancel_details_error := worker.register_json_activity_result(
+		&activity_worker,
+		"cancel_with_details",
+		cancel_with_details,
+	)
+	if register_cancel_details_error.message != nil {
+		fmt.eprintf(
+			"Cancellation-details Activity registration failed: %s\n",
+			string(register_cancel_details_error.message),
+		)
+		worker.error_free(&register_cancel_details_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	register_local_retry_error := worker.register_json_activity_result(
 		&activity_worker,
 		"local_retry",
@@ -781,7 +876,9 @@ main :: proc() {
 	expect_terminal_failure := scenario == "terminal-failure"
 	expect_patch := scenario == "patch"
 	expect_properties := scenario == "workflow-properties"
-	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup
+	expect_activity_cancel_details := scenario == "activity-cancel-details"
+	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
+		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
@@ -869,6 +966,14 @@ main :: proc() {
 				fmt.eprintln("Asynchronous Workflow Signal handler stats did not match")
 				failed = true
 			}
+		} else if expect_activity_cancel_details {
+			if run_stats.activity_tasks_completed != 1 ||
+			   run_stats.activity_cancellations_received != 1 ||
+			   run_stats.activity_cancellations_requested != 1 ||
+			   run_stats.workflow_executions_completed != 1 {
+				fmt.eprintln("Activity cancellation-details stats did not match")
+				failed = true
+			}
 		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
@@ -916,6 +1021,8 @@ main :: proc() {
 		fmt.println("structured Activity failure details reached Workflow code")
 	} else if expect_terminal_failure {
 		fmt.println("unhandled Activity failure reached the Client as a recursive Temporal Failure")
+	} else if expect_activity_cancel_details {
+		fmt.println("Activity cancellation flags and user details completed end-to-end")
 	} else if expect_patch {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
 	} else if expect_properties {

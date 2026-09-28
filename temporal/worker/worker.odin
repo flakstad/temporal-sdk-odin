@@ -311,6 +311,12 @@ register_json_activity_result :: proc(
 					failure = result.failure,
 				}
 			}
+			if result.status == .Canceled {
+				return {
+					status = .Canceled,
+					cancellation = result.cancellation,
+				}
+			}
 			payload, encode_error := codec.encode_json(result.value)
 			if encode_error != .None {
 				return activity.payload_fail(
@@ -712,6 +718,17 @@ activity_cancel_reason :: proc(reason: proto.Coresdk_Activity_Task_ActivityCance
 	return .Cancelled
 }
 
+activity_cancel_details :: proc(details: proto.Activity_Cancel_Details) -> activity.Cancellation_Details {
+	return {
+		is_not_found = details.is_not_found,
+		is_cancelled = details.is_cancelled,
+		is_paused = details.is_paused,
+		is_timed_out = details.is_timed_out,
+		is_worker_shutdown = details.is_worker_shutdown,
+		is_reset = details.is_reset,
+	}
+}
+
 activity_heartbeat_recorder :: proc(
 	user_data: rawptr,
 	details: codec.Payload_View,
@@ -751,10 +768,20 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
 	defer activity.application_failure_free(&result.failure)
+	defer activity.cancellation_free(&result.cancellation)
 
 	completion: [dynamic]u8
-	if activity.is_cancellation_requested(&execution.ctx) {
-		completion = proto.encode_activity_cancellation(execution.task_token)
+	if result.status == .Canceled || activity.is_cancellation_requested(&execution.ctx) {
+		message := result.cancellation.message
+		if len(message) == 0 {
+			message = "Activity canceled"
+		}
+		completion = proto.encode_activity_cancellation(
+			execution.task_token,
+			message,
+			codec.payload_view(&result.cancellation.details),
+			result.status == .Canceled && result.cancellation.has_details,
+		)
 	} else if result.status == .Failed {
 		failure_type := result.failure.type
 		if len(failure_type) == 0 {
@@ -1135,6 +1162,7 @@ run_activity_loop :: proc(
 				activity.context_request_cancellation(
 					&execution.ctx,
 					activity_cancel_reason(task.cancel_reason),
+					activity_cancel_details(task.cancel_details),
 				)
 				cancellations += 1
 			}

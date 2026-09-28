@@ -1552,6 +1552,28 @@ Activity poll as a separate cancel task. The live suite verifies this exact
 sequence and preserves Core's reason, including the valid `NotFound` race after
 the Workflow has already closed.
 
+The cancellation boundary is now lossless for the pinned Core schema in both
+directions. A Core `ActivityTask.Cancel` is routed by task token and atomically
+publishes its primary `ActivityCancelReason` plus all six independent
+`ActivityCancellationDetails` flags to the callback context. A typed callback
+can return `.Canceled` with a message and one codec-isolated Payload; the worker
+copies it into `CanceledFailureInfo.details` before freeing the callback-owned
+result. Core subsequently resolves a Workflow Activity with a recursive
+Failure tree. The Workflow runtime owns that decoded tree in its run arena and
+exposes cancellation-detail Payloads as borrowed views for the lifetime of the
+result/runtime.
+
+`workflow.cancel_activity` records the intent in deterministic Workflow state
+and emits at most one `RequestCancelActivity` command. `TryCancel` changes the
+language Future to canceled immediately, while
+`WaitCancellationCompleted` remains in `CancelRequested` until Core supplies
+`ResolveActivity`; this distinction is required for callback-authored
+cancellation details to be observable. `Abandon` never emits the command.
+Root-Workflow cancellation still follows the existing scope policy and may
+resume the root wait without waiting for a remote callback, so callers needing
+the acknowledgement/details contract must use explicit cancellation with
+`Wait_Cancellation_Completed`.
+
 Expected Activity failures are values, not panics. Temporal's
 [Application Failure contract](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/application-failures.mdx)
 defines these wire fields, and its
@@ -1681,9 +1703,11 @@ Workflows are enabled.
    raw bytes for lossless propagation. External/Child signal and external
    cancellation results also retain a borrowed tree when Core supplies a
    Failure, in addition to their operation-specific cause enum.
-   Activity cancellation preserves Core's
-   reason but not all detail flags or user cancellation details in its result.
-   The Activity API now models typed success, retryability, failure type,
+   Activity cancellation now preserves Core's primary reason, all six detail
+   flags, and callback-authored cancellation Payloads through a
+   `Wait_Cancellation_Completed` Workflow result. The remaining cancellation
+   gap is a general nested token/scope tree rather than information loss at the
+   Activity boundary. The Activity API now models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
@@ -1759,9 +1783,13 @@ Recursive Client and Workflow failure inspection is now implemented and
 live-proven. Query reject conditions plus static summary/details are now
 implemented and live-proven against the CLI dev server, including the typed
 status on a rejected closed-execution query and persisted Describe metadata.
-The next smallest cross-cutting slice is Activity-cancellation detail
-completeness; backfill should gain a dedicated multi-execution live case without
-overloading the one-shot Schedule example. Remaining failure work also includes deciding whether start failures
+Activity cancellation detail completeness is now implemented: all Core flags,
+an explicit Workflow cancel primitive, correct
+`Wait_Cancellation_Completed` suspension, recursive canceled Failure
+preservation, and a typed user-detail round trip are unit-, property-, and
+live-proven. The next smallest client-completeness slice is query/start headers
+and eager Workflow start; backfill should also gain a dedicated multi-execution
+live case without overloading the one-shot Schedule example. Remaining failure work includes deciding whether start failures
 that only carry Core cause enums need a synthetic language-level Failure.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler

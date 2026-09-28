@@ -165,9 +165,27 @@ pool finishes queued/running callbacks before its execution records are freed.
 `worker.close` must only be called after `run` returns.
 
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
-and `activity.cancellation_reason` expose the state Core delivered; returning
-from the callback after a request makes the worker send a cancellation result
-with `CanceledFailureInfo`. `activity.heartbeat(ctx, details)` remains the
+and `activity.cancellation_reason` expose the primary state Core delivered.
+`activity.cancellation_details` returns the associated snapshot of Core's six
+independent detail flags: not found, cancelled, paused, timed out, worker
+shutdown, and reset. More than one flag may be true. Returning from a plain
+callback after a request makes the worker send a cancellation result with an
+empty `CanceledFailureInfo`. A result-returning callback may instead use
+`activity.result_canceled` or `activity.result_canceled_json` to control the
+message and attach one user Payload. The worker copies that Payload into the
+completion before releasing the callback-owned result.
+
+At Workflow level, `workflow.cancel_activity` deterministically emits at most
+one cancel command for a started Activity. `Try_Cancel` may resume immediately;
+`Wait_Cancellation_Completed` remains suspended until Core delivers
+`ResolveActivity`, at which point
+`workflow.activity_cancellation_detail_payload` and
+`workflow.activity_cancellation_detail_json` expose callback-supplied details
+as views borrowed from the Workflow result. `Abandon` emits no cancellation
+command. Only `Wait_Cancellation_Completed` promises the Activity callback had
+an opportunity to supply cancellation details.
+
+`activity.heartbeat(ctx, details)` remains the
 string convenience API; `activity.heartbeat_json` accepts any JSON-compatible
 Odin value and `activity.heartbeat_payload` accepts a borrowed payload. All
 three send one Temporal Payload through

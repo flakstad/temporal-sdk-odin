@@ -3802,6 +3802,14 @@ activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
 	target := pbt.draw(t, pbt.int_range(0, count - 1))
 	reason_value := pbt.draw(t, pbt.int_range(1, 6))
 	heartbeats_before := pbt.draw(t, pbt.int_range(0, 8))
+	details := activity.Cancellation_Details{
+		is_not_found = pbt.draw(t, pbt.boolean()),
+		is_cancelled = pbt.draw(t, pbt.boolean()),
+		is_paused = pbt.draw(t, pbt.boolean()),
+		is_timed_out = pbt.draw(t, pbt.boolean()),
+		is_worker_shutdown = pbt.draw(t, pbt.boolean()),
+		is_reset = pbt.draw(t, pbt.boolean()),
+	}
 	pbt.cover(t, target == 0, 10.0, "first task token")
 	pbt.cover(t, target == count - 1, 10.0, "last task token")
 	pbt.cover(t, count >= 8, 15.0, "large in-flight set")
@@ -3833,13 +3841,17 @@ activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.fail("task token routed to the wrong Activity execution")
 	}
 	reason := activity.Cancel_Reason(reason_value)
-	activity.context_request_cancellation(&found.ctx, reason)
+	activity.context_request_cancellation(&found.ctx, reason, details)
 
 	for &execution, index in executions[:count] {
 		if index == target {
 			if !activity.is_cancellation_requested(&execution.ctx) ||
 			   activity.cancellation_reason(&execution.ctx) != reason {
 				return pbt.fail("target Activity lost its cancellation state")
+			}
+			actual_details, present := activity.cancellation_details(&execution.ctx)
+			if !present || actual_details != details {
+				return pbt.fail("target Activity lost generated cancellation detail flags")
 			}
 		} else if activity.is_cancellation_requested(&execution.ctx) {
 			return pbt.fail("cancellation leaked to another task token")

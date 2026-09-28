@@ -129,7 +129,12 @@ correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
-cancellation. `activity.info(ctx)` now exposes the Core-delivered execution
+cancellation. The context preserves Core's cancellation reason and all six
+detail flags (`not_found`, `cancelled`, `paused`, `timed_out`,
+`worker_shutdown`, and `reset`). Typed callbacks may return a canceled result
+with a user Payload; a Workflow using `Wait_Cancellation_Completed` can request
+the cancellation explicitly and decode that Payload from the resulting
+`CanceledFailureInfo`. `activity.info(ctx)` now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, and previous
 heartbeat details as callback-scoped borrowed values; a retry integration test
 recovers typed heartbeat progress on attempt 2. Unknown Workflow types fail the retryable Workflow Task without
@@ -884,6 +889,11 @@ still starts/waits on these older test executions and reads their history. The
 Activity case waits for an Odin heartbeat, observes Core's cancel task in the
 in-flight context, and replies with a cancellation completion. A separate fan-out case proves two Odin
 Activity callbacks overlap rather than merely being queued concurrently. The
+suite also explicitly cancels an Activity with
+`Wait_Cancellation_Completed`, verifies that Odin does not resume the Workflow
+before Core resolves cancellation, and round-trips the callback's typed JSON
+cancellation details back to the Workflow. The callback observes the exact six
+Core cancellation flags, with only `is_cancelled` set for this server path. The
 suite also starts an unregistered Workflow type, verifies a retryable
 `WorkflowTaskFailed` event and Core eviction, then proves that the same Odin
 worker can complete a registered Workflow afterward. Its Activity cases include

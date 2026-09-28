@@ -386,8 +386,24 @@ encode_activity_failure :: proc(
 	return encode_Coresdk_ActivityTaskCompletion(&completion)
 }
 
-encode_activity_cancellation :: proc(task_token: []u8, message := "Activity canceled") -> [dynamic]u8 {
+encode_activity_cancellation :: proc(
+	task_token: []u8,
+	message := "Activity canceled",
+	details := codec.Payload_View{},
+	has_details := false,
+) -> [dynamic]u8 {
+	details_payload := encode_payload(details)
+	defer delete(details_payload.metadata)
+	defer delete(details_payload.external_payloads)
+	detail_payloads := Temporal_Api_Common_V1_Payloads{}
+	defer delete(detail_payloads.payloads)
+	if has_details {
+		append(&detail_payloads.payloads, details_payload)
+	}
 	canceled_info := Temporal_Api_Failure_V1_CanceledFailureInfo{}
+	if has_details {
+		canceled_info.details = &detail_payloads
+	}
 	failure := Temporal_Api_Failure_V1_Failure{
 		message = message,
 		source = "OdinSDK",

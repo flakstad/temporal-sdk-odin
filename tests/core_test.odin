@@ -6752,6 +6752,46 @@ activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, cancelled)
+
+	cancel_payload, cancel_payload_error := codec.encode_json(
+		Activity_Failure_Details{dependency = "inventory", attempt = 4},
+	)
+	testing.expect(t, cancel_payload_error == .None)
+	defer codec.payload_free(&cancel_payload)
+	detailed_completion := proto.encode_activity_cancellation(
+		transmute([]u8)string("cancel-token"),
+		"Activity acknowledged cancellation",
+		codec.payload_view(&cancel_payload),
+		true,
+	)
+	defer delete(detailed_completion)
+	detailed_decoded := proto.Coresdk_ActivityTaskCompletion{}
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	detailed_ok := proto.decode_Coresdk_ActivityTaskCompletion(
+		detailed_completion[:],
+		&detailed_decoded,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, detailed_ok)
+	details_preserved := false
+	if detailed_ok && detailed_decoded.result != nil {
+		#partial switch status in detailed_decoded.result.status {
+		case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Cancelled:
+			if status.value != nil && status.value.failure != nil {
+				failure := status.value.failure
+				testing.expect_value(t, failure.message, "Activity acknowledged cancellation")
+				#partial switch failure_info in failure.failure_info {
+				case proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info:
+					details_preserved = failure_info.value != nil &&
+						failure_info.value.details != nil &&
+						len(failure_info.value.details.payloads) == 1 &&
+						string(failure_info.value.details.payloads[0].data) ==
+						`{"dependency":"inventory","attempt":4}`
+				}
+			}
+		}
+	}
+	testing.expect(t, details_preserved)
 }
 
 @(test)
@@ -6839,9 +6879,26 @@ activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^test
 	testing.expect_value(t, capture.calls, 1)
 	testing.expect_value(t, capture.details, "halfway")
 
-	activity.context_request_cancellation(&ctx, .Worker_Shutdown)
+	activity.context_request_cancellation(
+		&ctx,
+		.Worker_Shutdown,
+		{
+			is_not_found = true,
+			is_cancelled = true,
+			is_worker_shutdown = true,
+			is_reset = true,
+		},
+	)
 	testing.expect(t, activity.is_cancellation_requested(&ctx))
 	testing.expect(t, activity.cancellation_reason(&ctx) == .Worker_Shutdown)
+	cancel_details, cancel_details_present := activity.cancellation_details(&ctx)
+	testing.expect(t, cancel_details_present)
+	testing.expect(t, cancel_details.is_not_found)
+	testing.expect(t, cancel_details.is_cancelled)
+	testing.expect(t, !cancel_details.is_paused)
+	testing.expect(t, !cancel_details.is_timed_out)
+	testing.expect(t, cancel_details.is_worker_shutdown)
+	testing.expect(t, cancel_details.is_reset)
 	testing.expect(t, activity.heartbeat(&ctx, "too late") == .Cancellation_Requested)
 	testing.expect_value(t, capture.calls, 1)
 
@@ -6860,6 +6917,77 @@ activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^test
 	)
 	testing.expect_value(t, progress_capture.calls, 1)
 	testing.expect_value(t, progress_capture.completed, 42)
+}
+
+@(test)
+workflow_activity_wait_cancellation_preserves_user_details :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	instance := workflow.Fiber_Instance{phase = .Ready}
+	instance.activities = make([dynamic]workflow.Fiber_Activity_Operation)
+	append(
+		&instance.activities,
+		workflow.Fiber_Activity_Operation{
+			seq = 1,
+			command_seq = 7,
+			options = {cancellation_type = .Wait_Cancellation_Completed},
+			state = .Commanded,
+		},
+	)
+	ctx := workflow.Fiber_Context{instance = &instance}
+	testing.expect(t, workflow.cancel_activity(&ctx, {seq = 1}))
+	testing.expect(t, instance.activities[0].state == .Cancel_Requested)
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	processed := workflow.Process_Result{}
+	workflow.append_fiber_activity_cancellations(&processed, &commands, &instance)
+	testing.expect_value(t, len(commands), 1)
+	testing.expect(t, instance.activities[0].cancellation_command_emitted)
+	testing.expect(t, instance.activities[0].state == .Cancel_Requested)
+	workflow.append_fiber_activity_cancellations(&processed, &commands, &instance)
+	testing.expect_value(t, len(commands), 1)
+
+	detail, detail_error := codec.encode_json(
+		Activity_Failure_Details{dependency = "payments", attempt = 9},
+	)
+	testing.expect(t, detail_error == .None)
+	defer codec.payload_free(&detail)
+	proto_detail := proto.encode_payload(codec.payload_view(&detail))
+	defer delete(proto_detail.metadata)
+	defer delete(proto_detail.external_payloads)
+	details := proto.Temporal_Api_Common_V1_Payloads{}
+	append(&details.payloads, proto_detail)
+	canceled_info := proto.Temporal_Api_Failure_V1_CanceledFailureInfo{details = &details}
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Activity acknowledged cancellation",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{
+			value = &canceled_info,
+		},
+	}
+	failure_bytes := proto.encode_Temporal_Api_Failure_V1_Failure(&failure)
+	testing.expect(
+		t,
+		workflow.preserve_activity_failure(&instance.activities[0], failure_bytes[:]),
+	)
+	instance.activities[0].failure_message = instance.activities[0].failure.message
+	instance.activities[0].state = .Canceled
+	result := workflow.payload_activity_result_from_operation(&instance.activities[0])
+	testing.expect(t, result.status == .Canceled)
+	testing.expect(t, result.failure.canceled)
+	decoded_detail: Activity_Failure_Details
+	found, decode_error := workflow.activity_cancellation_detail_json(
+		&result.failure,
+		0,
+		&decoded_detail,
+	)
+	testing.expect(t, found)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, decoded_detail.dependency, "payments")
+	testing.expect_value(t, decoded_detail.attempt, u32(9))
 }
 
 @(test)

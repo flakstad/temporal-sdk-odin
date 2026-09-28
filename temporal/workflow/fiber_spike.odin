@@ -528,6 +528,8 @@ Activity_Failure :: struct {
 	identity:      string,
 	retry_state:   Activity_Retry_State,
 	application:   Application_Failure,
+	canceled:      bool,
+	cancellation_details: []codec.Payload_View,
 }
 
 Activity_Result :: struct {
@@ -639,7 +641,9 @@ Fiber_Activity_Operation :: struct {
 	failure_proto:   []u8,
 	failure:         Activity_Failure,
 	failure_detail_views: []codec.Payload_View,
+	cancellation_detail_views: []codec.Payload_View,
 	state:         Fiber_Operation_State,
+	cancellation_command_emitted: bool,
 	detached_from_root_cancellation: bool,
 }
 
@@ -3151,6 +3155,40 @@ start_activity_with_options :: proc(
 	return start_activity_json_with_options(ctx, activity_type, input, options)
 }
 
+// cancel_activity requests deterministic cancellation of a started Activity.
+// Awaiting a Wait_Cancellation_Completed Activity remains suspended until Core
+// returns the Activity worker's cancellation failure and optional details.
+cancel_activity :: proc(ctx: ^Fiber_Context, future: Activity_Future) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
+		return false
+	}
+	operation, found := find_activity_operation(ctx.instance, future.seq)
+	if !found {
+		return false
+	}
+	switch operation.state {
+	case .Scheduled:
+		operation.state = .Canceled
+		return true
+	case .Commanded:
+		abandon := operation.options.cancellation_type == .Abandon
+		if operation.is_local {
+			abandon = operation.local_options.cancellation_type == .Abandon
+		}
+		if abandon {
+			operation.state = .Canceled
+		} else {
+			operation.state = .Cancel_Requested
+		}
+		return true
+	case .Cancel_Requested:
+		return true
+	case .Resolved, .Failed, .Canceled:
+		return false
+	}
+	return false
+}
+
 local_activity_options_error :: proc(
 	activity_type: string,
 	options: Local_Activity_Options,
@@ -4395,6 +4433,12 @@ preserve_activity_failure :: proc(
 			has_next_retry_delay = info.has_next_retry_delay,
 		}
 	}
+	canceled := temporal_failure.find_kind(tree, .Canceled)
+	if canceled != nil {
+		operation.failure.canceled = true
+		operation.cancellation_detail_views = failure_payload_views(canceled.canceled.details[:])
+		operation.failure.cancellation_details = operation.cancellation_detail_views
+	}
 	return true
 }
 
@@ -4425,6 +4469,29 @@ activity_failure_detail_json :: proc(
 	value: ^$T,
 ) -> (found: bool, error: codec.Error) {
 	payload, payload_found := activity_failure_detail_payload(failure, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+activity_cancellation_detail_payload :: proc(
+	failure: ^Activity_Failure,
+	index: int,
+) -> (payload: codec.Payload_View, found: bool) {
+	if failure == nil || !failure.canceled || index < 0 ||
+	   index >= len(failure.cancellation_details) {
+		return
+	}
+	return failure.cancellation_details[index], true
+}
+
+activity_cancellation_detail_json :: proc(
+	failure: ^Activity_Failure,
+	index: int,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := activity_cancellation_detail_payload(failure, index)
 	if !payload_found {
 		return false, .None
 	}
@@ -4532,6 +4599,16 @@ child_workflow_cancellation_detail_json :: proc(
 	return true, codec.decode_json(failure.cancellation_details[index], value)
 }
 
+activity_waits_for_cancellation_completion :: proc(operation: ^Fiber_Activity_Operation) -> bool {
+	if operation == nil {
+		return false
+	}
+	if operation.is_local {
+		return operation.local_options.cancellation_type == .Wait_Cancellation_Completed
+	}
+	return operation.options.cancellation_type == .Wait_Cancellation_Completed
+}
+
 payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
 	if operation.state == .Resolved {
 		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
@@ -4544,7 +4621,11 @@ payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operat
 		}
 	}
 	if operation.state == .Cancel_Requested || operation.state == .Canceled {
-		return {status = .Canceled}
+		return {
+			status = .Canceled,
+			failure_message = operation.failure_message,
+			failure = operation.failure,
+		}
 	}
 	return {status = .Failed, failure_message = "Activity has not resolved"}
 }
@@ -4568,8 +4649,10 @@ await_activity_payload_result :: proc(
 		instance.phase = .Failed
 		return {status = .Failed, failure_message = "Activity operation was not found"}
 	}
+	cancellation_is_terminal := operation.state == .Cancel_Requested &&
+		(!activity_waits_for_cancellation_completion(operation) || root_cancellation_applies(instance))
 	if operation.state == .Resolved || operation.state == .Failed ||
-	   operation.state == .Cancel_Requested || operation.state == .Canceled {
+	   cancellation_is_terminal || operation.state == .Canceled {
 		return payload_activity_result_from_operation(operation)
 	}
 	instance.waiting_activity_seq = future.seq
@@ -4580,8 +4663,10 @@ await_activity_payload_result :: proc(
 		return {status = .Failed, failure_message = "could not resume Activity await"}
 	}
 	operation, found = find_activity_operation(instance, future.seq)
+	cancellation_is_terminal = found && operation.state == .Cancel_Requested &&
+		(!activity_waits_for_cancellation_completion(operation) || root_cancellation_applies(instance))
 	if !found || (operation.state != .Resolved && operation.state != .Failed &&
-	   operation.state != .Cancel_Requested && operation.state != .Canceled) {
+	   !cancellation_is_terminal && operation.state != .Canceled) {
 		instance.phase = .Failed
 		return {status = .Failed, failure_message = "Activity resumed without a resolution"}
 	}
@@ -5440,6 +5525,9 @@ append_fiber_cancel_activity_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	operation: ^Fiber_Activity_Operation,
 ) {
+	if operation.cancellation_command_emitted {
+		return
+	}
 	if operation.is_local {
 		request := new(proto.Coresdk_Workflow_Commands_RequestCancelLocalActivity)
 		request.seq = operation.command_seq
@@ -5451,7 +5539,10 @@ append_fiber_cancel_activity_command :: proc(
 				},
 			},
 		)
-		operation.state = .Canceled
+		operation.cancellation_command_emitted = true
+		if operation.local_options.cancellation_type != .Wait_Cancellation_Completed {
+			operation.state = .Canceled
+		}
 		result.requested_local_activity_cancellation = true
 		result.requested_local_activity_cancellation_count += 1
 		result.canceled_activity_seq = operation.command_seq
@@ -5467,7 +5558,10 @@ append_fiber_cancel_activity_command :: proc(
 			},
 		},
 	)
-	operation.state = .Canceled
+	operation.cancellation_command_emitted = true
+	if operation.options.cancellation_type != .Wait_Cancellation_Completed {
+		operation.state = .Canceled
+	}
 	result.requested_activity_cancellation = true
 	result.requested_activity_cancellation_count += 1
 	result.canceled_activity_seq = operation.command_seq
@@ -5480,7 +5574,7 @@ append_fiber_activity_cancellations :: proc(
 ) {
 	for index in 0..<len(instance.activities) {
 		operation := &instance.activities[index]
-		if operation.state == .Cancel_Requested {
+		if operation.state == .Cancel_Requested && !operation.cancellation_command_emitted {
 			append_fiber_cancel_activity_command(result, commands, operation)
 		}
 	}
@@ -7078,6 +7172,18 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				if status.value == nil {
 					process_error(&result, activation.run_id, "canceled Activity has no result")
 					return
+				}
+				if status.value.failure != nil {
+					context.allocator = instance.odin_context.allocator
+					failure_proto := proto.encode_Temporal_Api_Failure_V1_Failure(status.value.failure)
+					failure_preserved := preserve_activity_failure(operation, failure_proto[:])
+					context.allocator = previous_allocator
+					if len(failure_proto) == 0 || !failure_preserved {
+						process_error(&result, activation.run_id, "could not preserve Activity cancellation failure")
+						return
+					}
+					operation.failure_message = operation.failure.message
+					operation.failure_proto = failure_proto[:]
 				}
 				operation.state = .Canceled
 				result.resolved_activity_seq = operation.command_seq
