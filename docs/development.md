@@ -1213,15 +1213,21 @@ Register `workflow.Outbound_Interceptor` values with
 registered before a Workflow are copied when its runtime is created;
 interceptors registered afterward are copied into every existing runtime.
 Registration after `worker.run` starts is rejected. The current typed hooks are
-`start_activity` and `start_local_activity`, each with its own input, future,
-and explicit `next` continuation.
+`start_activity`, `start_local_activity`, `start_child_workflow`,
+`signal_child_workflow`, `signal_external_workflow`,
+`cancel_external_workflow`, and `continue_as_new`. Each has a semantic input,
+its natural result type, and an explicit `next` continuation. Continue-As-New
+and its continuation are `-> !`, preserving the terminal control-flow contract.
 
-The SDK clones the caller's Activity headers into a Workflow-run-arena working
+The SDK clones the caller's command headers into a Workflow-run-arena working
 map before invoking the chain. Every interceptor sees the same mutable working
 map, the terminal continuation persists it into the operation, and the original
-builder remains unchanged. The record itself is copied; `user_data` remains
-borrowed until `worker.close`. Inputs, header pointers, and `next` values are
-valid only during that scheduling call.
+builder remains unchanged. External cancellation has no header field, but its
+identity and reason remain mutable semantic input. The record itself is copied;
+`user_data` remains borrowed until `worker.close`. Inputs, header pointers, and
+`next` values are valid only during that call. Continue-As-New's temporary
+working map is reclaimed with the terminal run arena because the call cannot
+return to execute a defer.
 
 These callbacks run on the Workflow fiber and execute again during history
 replay. They must be deterministic: use no network/filesystem access, wall
@@ -1230,11 +1236,12 @@ Use Activities or Temporal-aware Workflow primitives for those operations.
 Logging is possible but will normally appear again on replay.
 
 The unit suite verifies nested entry/unwind order, caller-header isolation,
-remote and Local Activity command headers, and byte-identical completions after
-fresh-stack replay. A 500-case PBT property varies chain depth and
-short-circuit position. The `activity-interceptor` CLI-devserver scenario also
-injects a Workflow outbound header and reads it from the real Activity context
-after it crosses SDK Core.
+command headers, Continue-As-New header merging, and byte-identical completions
+after fresh-stack replay. A 500-case PBT property varies operation, chain depth,
+and short-circuit position. CLI-devserver scenarios read interceptor-injected
+headers from real Activity, Child Workflow, Signal, and next-run Workflow
+contexts after they cross SDK Core; external cancellation also proves semantic
+reason replacement reaches the terminal command path.
 
 ## Troubleshooting
 

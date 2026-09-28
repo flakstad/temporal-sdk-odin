@@ -55,9 +55,24 @@ Outbound_Start_Local_Activity_Interceptor_Proc :: #type proc(
 ) -> Activity_Future
 
 Outbound_Interceptor :: struct {
-	user_data:            rawptr,
-	start_activity:       Outbound_Start_Activity_Interceptor_Proc,
-	start_local_activity: Outbound_Start_Local_Activity_Interceptor_Proc,
+	user_data:                rawptr,
+	start_activity:           Outbound_Start_Activity_Interceptor_Proc,
+	start_local_activity:     Outbound_Start_Local_Activity_Interceptor_Proc,
+	start_child_workflow:     Outbound_Start_Child_Workflow_Interceptor_Proc,
+	signal_child_workflow:    Outbound_Signal_Child_Workflow_Interceptor_Proc,
+	signal_external_workflow: Outbound_Signal_External_Workflow_Interceptor_Proc,
+	cancel_external_workflow: Outbound_Cancel_External_Workflow_Interceptor_Proc,
+	continue_as_new:          Outbound_Continue_As_New_Interceptor_Proc,
+}
+
+outbound_interceptor_has_operation :: proc(interceptor: Outbound_Interceptor) -> bool {
+	return interceptor.start_activity != nil ||
+	       interceptor.start_local_activity != nil ||
+	       interceptor.start_child_workflow != nil ||
+	       interceptor.signal_child_workflow != nil ||
+	       interceptor.signal_external_workflow != nil ||
+	       interceptor.cancel_external_workflow != nil ||
+	       interceptor.continue_as_new != nil
 }
 
 workflow_interceptor_failure :: proc(ctx: ^Fiber_Context, message: string) {
@@ -202,4 +217,3 @@ outbound_headers_init :: proc(
 	}
 	return true
 }
-

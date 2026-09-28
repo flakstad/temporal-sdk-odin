@@ -825,6 +825,15 @@ external_workflow_signal_and_cancel_are_replay_safe :: proc(t: ^testing.T) {
 	testing.expect(t, init_error.message == nil)
 	workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{
+			signal_external_workflow = workflow_external_signal_test_interceptor,
+			cancel_external_workflow = workflow_external_cancel_test_interceptor,
+		},
+	)
+	testing.expect(t, interceptor_error.message == nil)
+	workflow.error_free(&interceptor_error)
 
 	input, input_error := codec.encode_json("target-workflow")
 	testing.expect(t, input_error == .None)
@@ -862,7 +871,7 @@ external_workflow_signal_and_cancel_are_replay_safe :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(signal_command.external_workflow_signal_namespace), "billing")
 	testing.expect_value(t, string(signal_command.external_workflow_signal_id), "target-workflow")
 	testing.expect_value(t, string(signal_command.external_workflow_signal_run_id), "target-run")
-	testing.expect_value(t, string(signal_command.child_workflow_signal_name), "approve")
+	testing.expect_value(t, string(signal_command.child_workflow_signal_name), "intercepted-approve")
 	testing.expect_value(t, string(signal_command.child_workflow_signal_input), `"approved-by-caller"`)
 	delete(signal_command.child_workflow_signal_name)
 	delete(signal_command.child_workflow_signal_input)
@@ -930,7 +939,7 @@ external_workflow_signal_and_cancel_are_replay_safe :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(cancel_command.external_workflow_cancel_namespace), "billing")
 	testing.expect_value(t, string(cancel_command.external_workflow_cancel_id), "target-workflow")
 	testing.expect_value(t, string(cancel_command.external_workflow_cancel_run_id), "target-run")
-	testing.expect_value(t, string(cancel_command.external_workflow_cancel_reason), "caller requested cancellation")
+	testing.expect_value(t, string(cancel_command.external_workflow_cancel_reason), "intercepted cancellation reason")
 	delete(cancel_command.external_workflow_cancel_namespace)
 	delete(cancel_command.external_workflow_cancel_id)
 	delete(cancel_command.external_workflow_cancel_run_id)
@@ -1047,6 +1056,12 @@ continue_as_new_is_terminal_and_replay_safe :: proc(t: ^testing.T) {
 	testing.expect(t, init_error.message == nil)
 	workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{continue_as_new = workflow_continue_as_new_test_interceptor},
+	)
+	testing.expect(t, interceptor_error.message == nil)
+	workflow.error_free(&interceptor_error)
 
 	input, input_error := codec.encode_json("first")
 	testing.expect(t, input_error == .None)
@@ -1088,9 +1103,14 @@ continue_as_new_is_terminal_and_replay_safe :: proc(t: ^testing.T) {
 	testing.expect_value(t, inspection.continue_backoff, 3 * time.Second)
 	testing.expect_value(t, inspection.continue_retry_attempts, i32(7))
 	testing.expect_value(t, inspection.continue_retry_initial, 2 * time.Second)
+	testing.expect_value(t, inspection.continue_header_count, 2)
+	testing.expect_value(t, string(inspection.continue_header_key), "workflow-interceptor")
+	testing.expect_value(t, string(inspection.continue_header_data), `"continue-as-new"`)
 	delete(inspection.continue_workflow_type)
 	delete(inspection.continue_task_queue)
 	delete(inspection.continue_input)
+	delete(inspection.continue_header_key)
+	delete(inspection.continue_header_data)
 	delete(initial.completion)
 	workflow.error_free(&initial.error)
 
@@ -2410,6 +2430,39 @@ workflow_outbound_test_invoker :: proc(
 
 workflow_outbound_test_destroy :: proc(_: rawptr) {}
 
+workflow_external_signal_test_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Signal_External_Workflow_Input,
+	next: workflow.Outbound_Signal_External_Workflow_Next,
+) -> workflow.External_Workflow_Signal_Result {
+	input.signal_name = "intercepted-approve"
+	return workflow.outbound_signal_external_workflow_next(next, input)
+}
+
+workflow_external_cancel_test_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Cancel_External_Workflow_Input,
+	next: workflow.Outbound_Cancel_External_Workflow_Next,
+) -> workflow.External_Workflow_Cancel_Result {
+	input.reason = "intercepted cancellation reason"
+	return workflow.outbound_cancel_external_workflow_next(next, input)
+}
+
+workflow_continue_as_new_test_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Continue_As_New_Input,
+	next: workflow.Outbound_Continue_As_New_Next,
+) -> ! {
+	if !workflow.headers_add_json(
+		input.headers,
+		"workflow-interceptor",
+		"continue-as-new",
+	) {
+		panic("could not add Continue-As-New test interceptor header")
+	}
+	workflow.outbound_continue_as_new_next(next, input)
+}
+
 activity_interceptor_test_record :: proc(state: ^Activity_Interceptor_Test_State, event: int) {
 	if state == nil || state.event_count >= len(state.events) {
 		return
@@ -3240,6 +3293,13 @@ continue_as_new_test_workflow :: proc(
 	input: string,
 ) -> string {
 	if input == "first" {
+		headers := workflow.Headers{}
+		if !workflow.headers_init(&headers) {
+			return "could not initialize Continue-As-New headers"
+		}
+		if !workflow.headers_add_json(&headers, "caller", "original") {
+			return "could not add Continue-As-New caller header"
+		}
 		retry_policy := workflow.Retry_Policy{
 			initial_interval = 2 * time.Second,
 			backoff_coefficient = 2,
@@ -3254,6 +3314,7 @@ continue_as_new_test_workflow :: proc(
 				workflow_task_timeout = 12 * time.Second,
 				retry_policy = &retry_policy,
 				backoff_start_interval = 3 * time.Second,
+				headers = &headers,
 			},
 		)
 	}
@@ -3680,6 +3741,9 @@ Workflow_Completion_Inspection :: struct {
 	continue_backoff: time.Duration,
 	continue_retry_attempts: i32,
 	continue_retry_initial: time.Duration,
+	continue_header_count: int,
+	continue_header_key: []u8,
+	continue_header_data: []u8,
 	canceled_external_signal_seq: u32,
 	canceled_timer_seq:     u32,
 	started_timer_seq:      u32,
@@ -3823,6 +3887,15 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 						inspection.continue_retry_initial = proto_duration_value(
 							variant.value.retry_policy.initial_interval,
 						)
+					}
+					inspection.continue_header_count = len(variant.value.headers)
+					for header in variant.value.headers {
+						if header.key != "workflow-interceptor" || header.value == nil do continue
+						inspection.continue_header_key = bytes.clone(
+							transmute([]u8)header.key,
+						)
+						inspection.continue_header_data = bytes.clone(header.value.data)
+						break
 					}
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Timer:

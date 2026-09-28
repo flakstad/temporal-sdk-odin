@@ -60,6 +60,9 @@ The shared owned `Headers` builder can also be attached to remote/Local
 Activity options, Child Workflow options, and child/external Signal options.
 Each operation clones it into the Workflow run arena before suspension so the
 caller may free the builder after the scheduling call returns.
+Continue-As-New options accept the same builder; its terminal call never
+returns, and the run arena releases its working copy when Core evicts the old
+run.
 `temporal/worker` now provides experimental name-based Workflow registration
 and dispatch, but neither the fiber API nor its one-string codec is stable or a
 complete Workflow runtime. Do not build production Workflows against them.

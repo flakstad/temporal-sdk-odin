@@ -286,7 +286,7 @@ add_workflow_interceptor :: proc(
 	if worker.lifecycle != .Configuring {
 		return error_from_string("Workflow interceptors cannot be registered after worker.run starts")
 	}
-	if interceptor.start_activity == nil && interceptor.start_local_activity == nil {
+	if !workflow.outbound_interceptor_has_operation(interceptor) {
 		return error_from_string("Workflow outbound interceptor must implement an operation")
 	}
 	for &registration in worker.workflow_registrations {

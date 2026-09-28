@@ -23,7 +23,74 @@ EXTERNAL_TARGET_WORKFLOW_TYPE :: "odin_external_target_workflow"
 EXTERNAL_CALLER_WORKFLOW_TYPE :: "odin_external_caller_workflow"
 CONTINUE_AS_NEW_WORKFLOW_TYPE :: "odin_continue_as_new_workflow"
 
+workflow_start_child_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Start_Child_Workflow_Input,
+	next: workflow.Outbound_Start_Child_Workflow_Next,
+) -> workflow.Child_Workflow_Future {
+	if !workflow.headers_add_json(input.headers, "odin-workflow-start-child", "intercepted") {
+		return {}
+	}
+	fmt.println("Workflow start-Child interceptor entered")
+	return workflow.outbound_start_child_workflow_next(next, input)
+}
+
+workflow_signal_child_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Signal_Child_Workflow_Input,
+	next: workflow.Outbound_Signal_Child_Workflow_Next,
+) -> workflow.Child_Workflow_Signal_Result {
+	if !workflow.headers_add_json(input.headers, "odin-workflow-signal-child", "intercepted") {
+		return {status = .Failed, failure_message = "could not add Child Workflow Signal interceptor header"}
+	}
+	fmt.println("Workflow signal-Child interceptor entered")
+	return workflow.outbound_signal_child_workflow_next(next, input)
+}
+
+workflow_signal_external_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Signal_External_Workflow_Input,
+	next: workflow.Outbound_Signal_External_Workflow_Next,
+) -> workflow.External_Workflow_Signal_Result {
+	if !workflow.headers_add_json(input.headers, "odin-workflow-signal-external", "intercepted") {
+		return {status = .Failed, failure_message = "could not add external Workflow Signal interceptor header"}
+	}
+	fmt.println("Workflow signal-external interceptor entered")
+	return workflow.outbound_signal_external_workflow_next(next, input)
+}
+
+workflow_cancel_external_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Cancel_External_Workflow_Input,
+	next: workflow.Outbound_Cancel_External_Workflow_Next,
+) -> workflow.External_Workflow_Cancel_Result {
+	fmt.println("Workflow cancel-external interceptor entered")
+	input.reason = "cancellation passed through Odin Workflow interceptor"
+	return workflow.outbound_cancel_external_workflow_next(next, input)
+}
+
+workflow_continue_as_new_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Continue_As_New_Input,
+	next: workflow.Outbound_Continue_As_New_Next,
+) -> ! {
+	if !workflow.headers_add_json(input.headers, "odin-workflow-continue-as-new", "intercepted") {
+		panic("could not add Continue-As-New interceptor header")
+	}
+	fmt.println("Workflow Continue-As-New interceptor entered")
+	workflow.outbound_continue_as_new_next(next, input)
+}
+
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	interceptor_header: string
+	header_found, header_error := workflow.header_json(
+		ctx,
+		"odin-workflow-start-child",
+		&interceptor_header,
+	)
+	if !header_found || header_error != .None || interceptor_header != "intercepted" {
+		return "Child Workflow interceptor header mismatch"
+	}
 	if strings.has_prefix(name, "cancel-") {
 		workflow.sleep(ctx, time.Hour)
 		return "child cancellation was not delivered"
@@ -75,8 +142,24 @@ failure_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> s
 }
 
 signaled_child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	approval := workflow.await_signal(ctx, "approve")
-	message, allocation_error := strings.concatenate({name, " received ", approval})
+	start_header: string
+	start_found, start_error := workflow.header_json(
+		ctx,
+		"odin-workflow-start-child",
+		&start_header,
+	)
+	approval := workflow.await_signal_json_with_context(ctx, "approve", string)
+	signal_header: string
+	signal_found, signal_error := workflow.signal_header_json(
+		&approval.metadata,
+		"odin-workflow-signal-child",
+		&signal_header,
+	)
+	if !start_found || start_error != .None || start_header != "intercepted" ||
+	   !signal_found || signal_error != .None || signal_header != "intercepted" {
+		return "Child Workflow interceptor header mismatch"
+	}
+	message, allocation_error := strings.concatenate({name, " received ", approval.value})
 	if allocation_error != nil {
 		return ""
 	}
@@ -156,8 +239,15 @@ duplicate_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 
 external_target_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
-	approval := workflow.await_signal(ctx, "external-approve")
-	if approval != "approval-from-external-caller" {
+	approval := workflow.await_signal_json_with_context(ctx, "external-approve", string)
+	signal_header: string
+	header_found, header_error := workflow.signal_header_json(
+		&approval.metadata,
+		"odin-workflow-signal-external",
+		&signal_header,
+	)
+	if approval.value != "approval-from-external-caller" || !header_found ||
+	   header_error != .None || signal_header != "intercepted" {
 		return "External Workflow signal payload mismatch"
 	}
 	workflow.sleep(ctx, time.Hour)
@@ -199,6 +289,15 @@ continue_as_new_workflow :: proc(ctx: ^workflow.Fiber_Context, value: string) ->
 				workflow_task_timeout = 10 * time.Second,
 			},
 		)
+	}
+	interceptor_header: string
+	header_found, header_error := workflow.header_json(
+		ctx,
+		"odin-workflow-continue-as-new",
+		&interceptor_header,
+	)
+	if !header_found || header_error != .None || interceptor_header != "intercepted" {
+		return "Continue-As-New interceptor header mismatch"
 	}
 	result, allocation_error := strings.concatenate({"Continue-As-New completed on ", value})
 	if allocation_error != nil {
@@ -274,6 +373,25 @@ main :: proc() {
 	defer {
 		close_error := worker.close(&sdk_worker)
 		worker.error_free(&close_error)
+	}
+
+	workflow_interceptor_error := worker.add_workflow_interceptor(
+		&sdk_worker,
+		{
+			start_child_workflow = workflow_start_child_interceptor,
+			signal_child_workflow = workflow_signal_child_interceptor,
+			signal_external_workflow = workflow_signal_external_interceptor,
+			cancel_external_workflow = workflow_cancel_external_interceptor,
+			continue_as_new = workflow_continue_as_new_interceptor,
+		},
+	)
+	if workflow_interceptor_error.message != nil {
+		fmt.eprintf(
+			"Workflow interceptor registration failed: %s\n",
+			string(workflow_interceptor_error.message),
+		)
+		worker.error_free(&workflow_interceptor_error)
+		os.exit(1)
 	}
 
 	parent_error := worker.register_workflow(

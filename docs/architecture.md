@@ -1346,9 +1346,9 @@ first complete chain: Worker-level interceptors wrap inbound callback execution
 and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
 start, Signal, Query, and Update start. Workflow outbound now applies that same
-contract to remote and Local Activity scheduling; Child Workflows, external
-Signals/cancellation, Continue-As-New, timers, and Workflow inbound handlers
-remain future interceptor surfaces.
+contract to remote and Local Activity scheduling, Child Workflow start/Signal,
+external Workflow Signal/cancellation, and Continue-As-New. Timers, child
+cancellation, and Workflow inbound handlers remain future interceptor surfaces.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1386,23 +1386,30 @@ are not yet intercepted.
 Workflow outbound interception lives inside the deterministic fiber boundary.
 The Worker copies configured `workflow.Outbound_Interceptor` records into every
 Workflow runtime, whether the interceptor or Workflow was registered first.
-Once polling begins the arrays are immutable. Each remote or Local Activity
-start clones caller headers into a run-arena working map, invokes typed nested
-continuations outermost-first, and makes the terminal continuation clone the
-possibly changed semantic input into the operation table. The existing command
-encoder then serializes it into `ScheduleActivity` or `ScheduleLocalActivity`.
-The caller-owned builder is never mutated, and call-scoped inputs/continuations
+Once polling begins the arrays are immutable. Each intercepted command clones
+caller headers, when supported by the Core command, into a run-arena working
+map, invokes typed nested continuations outermost-first, and makes the terminal
+continuation clone the possibly changed semantic input into the operation
+table. The existing command encoder then serializes the operation. External
+cancellation exposes its reason instead of a header map. Continue-As-New
+preserves its non-returning `-> !` contract through every continuation. The
+caller-owned builder is never mutated, and call-scoped inputs/continuations
 cannot safely be retained.
 
 The chain intentionally executes again during replay. Its code must therefore
 obey the same determinism rules as Workflow code; logging may duplicate and
 ordinary I/O, wall-clock reads, and process randomness are unsafe. Header and
 option mutations become part of the command bytes and must be reproduced on
-fresh-stack replay. Offline tests require byte-identical remote and Local
-Activity completions after eviction, while the CLI-devserver scenario proves a
-Workflow interceptor header crosses Core and is visible in the Activity
-context. This feature adds no C symbol or protobuf type: it is a language-layer
-semantic hook immediately before the already implemented command construction.
+fresh-stack replay. Offline tests require byte-identical command completions
+after eviction. CLI-devserver scenarios prove interceptor headers cross Core
+into Activity, Child Workflow, Signal, and continued-run contexts. This feature
+adds no C symbol or protobuf type: it is a language-layer semantic hook
+immediately before the already implemented command construction. Its shape
+follows the corresponding outbound operations in the current
+[Python](https://github.com/temporalio/sdk-python/blob/main/temporalio/worker/_interceptor.py)
+and
+[.NET](https://github.com/temporalio/sdk-dotnet/blob/main/src/Temporalio/Worker/Interceptors/WorkflowOutboundInterceptor.cs)
+SDK interceptor APIs.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines
@@ -2103,11 +2110,12 @@ current registered values. The initial slice maps:
 - Workflow type and task queue;
 - Workflow Run and Workflow Task timeouts;
 - Retry Policy; and
-- first-task backoff.
+- first-task backoff; and
+- generic Payload headers, including interceptor mutations.
 
-Core's memo, headers, search attributes, versioning intent, and initial
-versioning behavior fields remain intentionally unexposed until their public
-Odin models exist. Negative/contradictory durations and invalid Retry Policies
+Core's memo, search attributes, versioning intent, and initial versioning
+behavior fields remain intentionally unexposed until their public Odin models
+exist. Negative/contradictory durations and invalid Retry Policies
 fail the Workflow with a non-retryable SDK Application Failure. Calls outside
 the main Workflow context follow the same failure path. This restriction avoids
 letting a concurrent Signal or Update handler silently terminate main while the
@@ -2115,9 +2123,11 @@ handler scheduler still owns a different execution-state snapshot.
 
 Ownership mirrors other commands: the `_payload` form clones a borrowed view,
 the `_owned` form consumes its Payload, and JSON encodes directly into the
-Workflow allocator. Options and Retry Policy strings are cloned before the
-fiber yields. Eviction frees the suspended terminal fiber and its arena; replay
-reruns user code and must reconstruct identical command bytes. Unit and
+Workflow allocator. Options, Retry Policy strings, and headers are cloned
+before the fiber yields. The interceptor working headers also live in this
+arena because the terminal call cannot return to a defer. Eviction frees the
+suspended terminal fiber and its arena; replay reruns user code and must
+reconstruct identical command bytes. Unit and
 500-case property tests enforce that invariant. The live dev-server case proves
 the Service creates run two and that the same Odin worker completes it under
 the original Workflow ID.

@@ -353,6 +353,7 @@ Continue_As_New_Options :: struct {
 	workflow_task_timeout: time.Duration,
 	retry_policy:         ^Retry_Policy,
 	backoff_start_interval: time.Duration,
+	headers:              ^Headers,
 }
 
 Owned_Continue_As_New_Options :: struct {
@@ -363,6 +364,7 @@ Owned_Continue_As_New_Options :: struct {
 	retry_policy:         Retry_Policy,
 	has_retry_policy:     bool,
 	backoff_start_interval: time.Duration,
+	headers:              [dynamic]Fiber_Named_Payload,
 }
 
 Fiber_Phase :: enum {
@@ -1027,7 +1029,7 @@ fiber_runtime_add_outbound_interceptor :: proc(
 	if len(runtime.instances) != 0 {
 		return error_from_string("Workflow interceptors cannot be registered after execution starts")
 	}
-	if interceptor.start_activity == nil && interceptor.start_local_activity == nil {
+	if !outbound_interceptor_has_operation(interceptor) {
 		return error_from_string("Workflow outbound interceptor must implement an operation")
 	}
 	append(&runtime.outbound_interceptors, interceptor)
@@ -4202,12 +4204,23 @@ start_child_workflow_payload :: proc(
 	if ctx == nil || ctx.instance == nil {
 		return {}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
-		mark_child_workflow_failure(ctx, "could not preserve Child Workflow input Payload", "OdinWorkflowPayloadConversionError")
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
+		mark_child_workflow_failure(ctx, "could not initialize Child Workflow interceptor headers", "OdinWorkflowInterceptorError")
 		return {}
 	}
-	return start_child_workflow_owned(ctx, workflow_type, owned_input, options)
+	defer headers_free(&headers)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Start_Child_Workflow_Input{
+		ctx = ctx,
+		workflow_type = workflow_type,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_start_child_workflow_chain(&state, &interceptor_input)
 }
 
 start_child_workflow_json :: proc(
@@ -4224,7 +4237,13 @@ start_child_workflow_json :: proc(
 		mark_child_workflow_failure(ctx, "could not encode Child Workflow input as json/plain", "OdinWorkflowPayloadConversionError")
 		return {}
 	}
-	return start_child_workflow_owned(ctx, workflow_type, payload, options)
+	defer codec.payload_free(&payload)
+	return start_child_workflow_payload(
+		ctx,
+		workflow_type,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 child_workflow_start_result_from_operation :: proc(
@@ -4618,11 +4637,23 @@ signal_child_workflow_payload_with_options :: proc(
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid Child Workflow signal context"}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
-		return {status = .Failed, failure_message = "could not preserve Child Workflow signal Payload"}
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
+		return {status = .Failed, failure_message = "could not initialize Child Workflow Signal interceptor headers"}
 	}
-	return signal_child_workflow_owned(ctx, future, signal_name, owned_input, options)
+	defer headers_free(&headers)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Signal_Child_Workflow_Input{
+		ctx = ctx,
+		future = future,
+		signal_name = signal_name,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_signal_child_workflow_chain(&state, &interceptor_input)
 }
 
 signal_child_workflow_json :: proc(
@@ -4648,7 +4679,14 @@ signal_child_workflow_json_with_options :: proc(
 	if encode_error != .None {
 		return {status = .Failed, failure_message = "could not encode Child Workflow signal as json/plain"}
 	}
-	return signal_child_workflow_owned(ctx, future, signal_name, payload, options)
+	defer codec.payload_free(&payload)
+	return signal_child_workflow_payload_with_options(
+		ctx,
+		future,
+		signal_name,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 signal_external_workflow_owned :: proc(
@@ -4722,11 +4760,23 @@ signal_external_workflow_payload_with_options :: proc(
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid external Workflow signal context"}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
-		return {status = .Failed, failure_message = "could not preserve external Workflow signal Payload"}
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
+		return {status = .Failed, failure_message = "could not initialize external Workflow Signal interceptor headers"}
 	}
-	return signal_external_workflow_owned(ctx, execution, signal_name, owned_input, options)
+	defer headers_free(&headers)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Signal_External_Workflow_Input{
+		ctx = ctx,
+		execution = execution,
+		signal_name = signal_name,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_signal_external_workflow_chain(&state, &interceptor_input)
 }
 
 signal_external_workflow_json :: proc(
@@ -4752,7 +4802,14 @@ signal_external_workflow_json_with_options :: proc(
 	if encode_error != .None {
 		return {status = .Failed, failure_message = "could not encode external Workflow signal as json/plain"}
 	}
-	return signal_external_workflow_owned(ctx, execution, signal_name, payload, options)
+	defer codec.payload_free(&payload)
+	return signal_external_workflow_payload_with_options(
+		ctx,
+		execution,
+		signal_name,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 external_workflow_cancel_failure_cause_from_proto :: proc(
@@ -4769,7 +4826,7 @@ external_workflow_cancel_failure_cause_from_proto :: proc(
 	return .Unspecified
 }
 
-request_cancel_external_workflow :: proc(
+request_cancel_external_workflow_terminal :: proc(
 	ctx: ^Fiber_Context,
 	execution: External_Workflow_Execution,
 	reason := "external Workflow cancellation requested",
@@ -4839,6 +4896,23 @@ request_cancel_external_workflow :: proc(
 	}
 }
 
+request_cancel_external_workflow :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	reason := "external Workflow cancellation requested",
+) -> External_Workflow_Cancel_Result {
+	if ctx == nil || ctx.instance == nil {
+		return {status = .Failed, failure_message = "invalid external Workflow cancellation context"}
+	}
+	input := Outbound_Cancel_External_Workflow_Input{
+		ctx = ctx,
+		execution = execution,
+		reason = reason,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_cancel_external_workflow_chain(&state, &input)
+}
+
 continue_as_new_options_error :: proc(options: Continue_As_New_Options) -> string {
 	if options.workflow_run_timeout < 0 || options.workflow_task_timeout < 0 ||
 	   options.backoff_start_interval < 0 {
@@ -4862,6 +4936,9 @@ continue_as_new_options_error :: proc(options: Continue_As_New_Options) -> strin
 		   policy.maximum_interval < policy.initial_interval {
 			return "Continue-As-New Retry Policy maximum interval must not be shorter than its initial interval"
 		}
+	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return "Continue-As-New headers are not initialized"
 	}
 	return ""
 }
@@ -4887,6 +4964,9 @@ clone_continue_as_new_options :: proc(
 	owned.workflow_run_timeout = options.workflow_run_timeout
 	owned.workflow_task_timeout = options.workflow_task_timeout
 	owned.backoff_start_interval = options.backoff_start_interval
+	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
+		return {}, false
+	}
 	if options.retry_policy != nil {
 		owned.has_retry_policy = true
 		owned.retry_policy = options.retry_policy^
@@ -4980,15 +5060,24 @@ continue_as_new_payload :: proc(
 			"OdinContinueAsNewContextError",
 		)
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
 		continue_as_new_stop_with_failure(
 			ctx,
-			"could not preserve Continue-As-New Payload",
-			"OdinContinueAsNewPayloadError",
+			"could not initialize Continue-As-New interceptor headers",
+			"OdinWorkflowInterceptorError",
 		)
 	}
-	continue_as_new_owned(ctx, owned_input, options)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Continue_As_New_Input{
+		ctx = ctx,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	outbound_continue_as_new_chain(&state, &interceptor_input)
 }
 
 continue_as_new_json :: proc(
@@ -5011,7 +5100,7 @@ continue_as_new_json :: proc(
 			"OdinContinueAsNewPayloadError",
 		)
 	}
-	continue_as_new_owned(ctx, payload, options)
+	continue_as_new_payload(ctx, codec.payload_view(&payload), options)
 }
 
 activity_retry_state_from_proto :: proc(
@@ -7690,6 +7779,17 @@ append_fiber_continue_as_new_command :: proc(
 		request.retry_policy = retry_policy_to_proto(&options.retry_policy)
 	}
 	request.backoff_start_interval = duration_to_proto(options.backoff_start_interval)
+	for &entry in options.headers {
+		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		header_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&request.headers,
+			proto.Coresdk_Workflow_Commands_ContinueAsNewWorkflowExecution_HeadersEntry{
+				key = entry.key,
+				value = header_payload,
+			},
+		)
+	}
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{

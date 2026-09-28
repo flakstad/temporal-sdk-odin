@@ -158,9 +158,11 @@ Activity interceptors that wrap both callback execution and heartbeat calls
 with real `next` continuations. The first registered interceptor is outermost;
 it may inspect or replace inputs/results or deliberately skip `next`. Interceptor
 user data is borrowed until `worker.close`. Workers can also register deterministic
-Workflow outbound interceptors for remote and Local Activity scheduling. These
-run inside the Workflow fiber on normal execution and replay, receive isolated
-per-call headers, and emit through the existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
+Workflow outbound interceptors for remote and Local Activity scheduling, Child
+Workflow start/Signal, external Workflow Signal/cancellation, and
+Continue-As-New. These run inside the Workflow fiber on normal execution and
+replay, receive isolated per-call headers where the command supports them, and
+emit through the existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
@@ -804,9 +806,9 @@ if state.events_processed >= 10_000 {
 ```
 
 Empty Workflow type and task queue options reuse the current registration.
-The current slice also supports Retry Policy and first-task backoff.
-Continue-As-New-specific memo, header, Search Attribute, and versioning
-overrides are not exposed yet.
+The current slice also supports Retry Policy, first-task backoff, and typed
+Payload headers. Continue-As-New-specific memo, Search Attribute, and
+versioning overrides are not exposed yet.
 The primitive may only be called from the main Workflow context; misuse fails
 the Workflow with an SDK Application Failure rather than returning past the
 terminal command.
