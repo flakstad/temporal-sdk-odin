@@ -82,7 +82,7 @@ Client_Signal_Workflow_Interceptor_Proc :: #type proc(
 Client_Query_Workflow_Input :: struct {
 	handle:     ^Workflow_Handle,
 	query_type: string,
-	input:      activity_codec.Payload_View,
+	inputs:     []activity_codec.Payload_View,
 	options:    Query_Workflow_Options,
 	headers:    ^Headers,
 }

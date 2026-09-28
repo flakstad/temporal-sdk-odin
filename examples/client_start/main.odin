@@ -92,6 +92,23 @@ signal_workflow_interceptor :: proc(
 	return temporal_client.client_signal_workflow_next(next, input)
 }
 
+query_workflow_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Query_Workflow_Input,
+	next: temporal_client.Client_Query_Workflow_Next,
+) -> (codec.Payload, temporal_client.Error) {
+	if input.query_type == "repeated_status" {
+		if len(input.inputs) != 3 {
+			return {}, temporal_client.error_from_string(
+				.Invalid_Argument,
+				"Client interceptor did not receive three Query arguments",
+			)
+		}
+		fmt.println("Client Query interceptor observed three Query arguments")
+	}
+	return temporal_client.client_query_workflow_next(next, input)
+}
+
 get_result_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Get_Result_Input,
@@ -134,6 +151,7 @@ run :: proc() -> int {
 		start_workflow = start_workflow_interceptor,
 		signal_with_start = signal_with_start_interceptor,
 		signal_workflow = signal_workflow_interceptor,
+		query_workflow = query_workflow_interceptor,
 		get_result = get_result_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -320,6 +338,112 @@ run :: proc() -> int {
 			workflow_id,
 			handle.run_id,
 			result,
+		)
+		return 0
+	}
+	if scenario == "multiple-query-arguments" {
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_repeated_query_workflow",
+			"start",
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf("Repeated-Query Workflow start failed: %s\n", string(start_error.message))
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		name, name_error := codec.encode_json("Odin")
+		count, count_error := codec.encode_json(42)
+		enabled, enabled_error := codec.encode_json(true)
+		if name_error != .None || count_error != .None || enabled_error != .None {
+			fmt.eprintln("Could not encode repeated Query arguments")
+			codec.payload_free(&name)
+			codec.payload_free(&count)
+			codec.payload_free(&enabled)
+			return 1
+		}
+		defer codec.payload_free(&name)
+		defer codec.payload_free(&count)
+		defer codec.payload_free(&enabled)
+		if codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedQuery"),
+		) != .None || codec.payload_add_external(&name, 4096) != .None {
+			fmt.eprintln("Could not decorate repeated Query argument")
+			return 1
+		}
+		inputs := [3]codec.Payload_View{
+			codec.payload_view(&name),
+			codec.payload_view(&count),
+			codec.payload_view(&enabled),
+		}
+		headers := temporal_client.Headers{}
+		headers_error := temporal_client.headers_init(&headers)
+		if headers_error.message != nil {
+			fmt.eprintf("Query headers initialization failed: %s\n", string(headers_error.message))
+			temporal_client.error_free(&headers_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_error)
+		defer temporal_client.headers_free(&headers)
+		header_error := temporal_client.headers_add_json(&headers, "caller", "repeated-client")
+		if header_error.message != nil {
+			fmt.eprintf("Query header encoding failed: %s\n", string(header_error.message))
+			temporal_client.error_free(&header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		query_result, query_error := temporal_client.query_workflow_payloads_with_options(
+			&handle,
+			"repeated_status",
+			inputs[:],
+			{headers = &headers},
+		)
+		defer codec.payload_free(&query_result)
+		if query_error.message != nil {
+			fmt.eprintf("Repeated Query failed: %s\n", string(query_error.message))
+			temporal_client.error_free(&query_error)
+			return 1
+		}
+		query_output: string
+		defer delete(query_output)
+		if codec.decode_json(codec.payload_view(&query_result), &query_output) != .None ||
+		   query_output != "Odin:42:true/repeated-client" {
+			fmt.eprintf("Repeated Query returned unexpected result: %q\n", query_output)
+			return 1
+		}
+		signal_error := temporal_client.signal_workflow_json(&handle, "finish", "query finished")
+		if signal_error.message != nil {
+			fmt.eprintf("Repeated-Query finish Signal failed: %s\n", string(signal_error.message))
+			temporal_client.error_free(&signal_error)
+			return 1
+		}
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf("Repeated-Query Workflow result failed: %s\n", string(result_error.message))
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "query finished" {
+			fmt.eprintf("Repeated-Query Workflow returned unexpected result: %q\n", result)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed repeated-Query workflow_id=%s run_id=%s query=%q\n",
+			workflow_id,
+			handle.run_id,
+			query_output,
 		)
 		return 0
 	}

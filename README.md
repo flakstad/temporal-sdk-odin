@@ -637,6 +637,17 @@ err = temporal_client.query_workflow_json_with_options(
     &status,
     {headers = &query_headers},
 )
+query_args := [?]codec.Payload_View{
+    codec.payload_view(&order),
+    codec.payload_view(&filters),
+}
+raw_status, err := temporal_client.query_workflow_payloads_with_options(
+    &handle,
+    "order_status_raw",
+    query_args[:],
+    {headers = &query_headers},
+)
+defer codec.payload_free(&raw_status)
 // Closed executions can be rejected before handler delivery.
 err = temporal_client.query_workflow_json_with_options(
     &handle,
@@ -982,8 +993,11 @@ if !workflow.set_query_handler_json_with_context(ctx, "order_status", &state, st
 
 The runtime answers a `QueryWorkflow` activation without resuming the suspended
 fiber. Handler state is borrowed from the live Workflow stack, passed to the
-callback by value, and must remain valid while the Workflow runs. The current
-experimental boundary accepts exactly one input Payload and one result Payload.
+callback by value, and must remain valid while the Workflow runs. Codec-neutral
+handlers registered with `set_query_handler_payloads[_with_context]` receive
+Temporal's complete ordered argument slice. The Payload/JSON helpers remain
+one-argument adapters and reject another arity with
+`OdinWorkflowQueryArgumentCountError`. Query results remain exactly one Payload.
 The contextual registration additionally receives invocation-scoped query
 identity and header accessors without exposing the command-capable
 `Fiber_Context`; header Payload views must not escape the callback.

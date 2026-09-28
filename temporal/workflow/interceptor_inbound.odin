@@ -31,7 +31,7 @@ Inbound_Execute_Workflow_Interceptor_Proc :: #type proc(
 Inbound_Handle_Query_Input :: struct {
 	workflow_type: string,
 	query:         ^Query_Context,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 }
 
 Inbound_Handle_Query_Next_Proc :: #type proc(
@@ -262,14 +262,30 @@ inbound_handle_query_chain :: proc(
 			{data = &next_state, invoke = inbound_handle_query_chain},
 		)
 	}
+	if state.handler.invoke_payloads_with_context != nil {
+		return state.handler.invoke_payloads_with_context(
+			state.handler.callback_data,
+			input.query,
+			input.inputs,
+		)
+	}
+	if state.handler.invoke_payloads != nil {
+		return state.handler.invoke_payloads(state.handler.callback_data, input.inputs)
+	}
+	if len(input.inputs) != 1 {
+		return payload_fail(
+			"single-Payload Workflow Query handler requires exactly one argument",
+			"OdinWorkflowQueryArgumentCountError",
+		)
+	}
 	if state.handler.invoke_with_context != nil {
 		return state.handler.invoke_with_context(
 			state.handler.callback_data,
 			input.query,
-			input.input,
+			input.inputs[0],
 		)
 	}
-	return state.handler.invoke(state.handler.callback_data, input.input)
+	return state.handler.invoke(state.handler.callback_data, input.inputs[0])
 }
 
 Inbound_Handle_Signal_State :: struct {

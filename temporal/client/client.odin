@@ -1737,11 +1737,11 @@ signal_workflow_json_with_options :: proc(
 	)
 }
 
-// encode_query_workflow_request is exposed for wire-contract testing. Returned
-// bytes are owned by the caller.
-encode_query_workflow_request :: proc(
+// encode_query_workflow_request_payloads is the codec-neutral repeated-input
+// Query boundary. Returned bytes are owned by the caller.
+encode_query_workflow_request_payloads :: proc(
 	namespace, workflow_id, run_id, query_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Query_Workflow_Options = {},
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 {
@@ -1760,15 +1760,19 @@ encode_query_workflow_request :: proc(
 		workflow_id = workflow_id,
 		run_id = run_id,
 	}
-	encoded_input := proto.encode_payload(input)
-	defer delete(encoded_input.metadata)
-	defer delete(encoded_input.external_payloads)
+	encoded_inputs := make([]proto.Temporal_Api_Common_V1_Payload, len(inputs))
+	defer free_start_proto_payloads(encoded_inputs)
 	arguments := proto.Temporal_Api_Common_V1_Payloads{}
 	defer delete(arguments.payloads)
-	append(&arguments.payloads, encoded_input)
+	for input, index in inputs {
+		encoded_inputs[index] = proto.encode_payload(input)
+		append(&arguments.payloads, encoded_inputs[index])
+	}
 	query := proto.Temporal_Api_Query_V1_WorkflowQuery{
 		query_type = query_type,
-		query_args = &arguments,
+	}
+	if len(inputs) > 0 {
+		query.query_args = &arguments
 	}
 	header := proto.Temporal_Api_Common_V1_Header{}
 	header_payloads: []proto.Temporal_Api_Common_V1_Payload
@@ -1802,21 +1806,37 @@ encode_query_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(&request), {}
 }
 
-query_workflow_payload_unintercepted :: proc(
+encode_query_workflow_request :: proc(
+	namespace, workflow_id, run_id, query_type: string,
+	input: codec.Payload_View,
+	options: Query_Workflow_Options = {},
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	inputs := [?]codec.Payload_View{input}
+	return encode_query_workflow_request_payloads(
+		namespace,
+		workflow_id,
+		run_id,
+		query_type,
+		inputs[:],
+		options,
+	)
+}
+
+query_workflow_payloads_unintercepted :: proc(
 	handle: ^Workflow_Handle,
 	query_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Query_Workflow_Options,
 ) -> (payload: codec.Payload, error: Error) {
 	if !workflow_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
-	request_bytes, request_error := encode_query_workflow_request(
+	request_bytes, request_error := encode_query_workflow_request_payloads(
 		handle.client.namespace,
 		handle.id,
 		handle.run_id,
 		query_type,
-		input,
+		inputs,
 		options,
 	)
 	if request_error.message != nil {
@@ -1847,18 +1867,18 @@ query_workflow_payload_terminal :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	return query_workflow_payload_unintercepted(
+	return query_workflow_payloads_unintercepted(
 		input.handle,
 		input.query_type,
-		input.input,
+		input.inputs,
 		options,
 	)
 }
 
-query_workflow_payload_with_options :: proc(
+query_workflow_payloads_with_options :: proc(
 	handle: ^Workflow_Handle,
 	query_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Query_Workflow_Options,
 ) -> (codec.Payload, Error) {
 	headers := Headers{}
@@ -1870,7 +1890,7 @@ query_workflow_payload_with_options :: proc(
 	interceptor_input := Client_Query_Workflow_Input{
 		handle = handle,
 		query_type = query_type,
-		input = input,
+		inputs = inputs,
 		options = options,
 		headers = &headers,
 	}
@@ -1880,6 +1900,16 @@ query_workflow_payload_with_options :: proc(
 	}
 	state := Client_Interceptor_State{client = client}
 	return client_query_workflow_chain(&state, &interceptor_input)
+}
+
+query_workflow_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: codec.Payload_View,
+	options: Query_Workflow_Options,
+) -> (codec.Payload, Error) {
+	inputs := [?]codec.Payload_View{input}
+	return query_workflow_payloads_with_options(handle, query_type, inputs[:], options)
 }
 
 // decode_query_workflow_response preserves the result Payload or returns a
@@ -1926,6 +1956,14 @@ query_workflow_payload :: proc(
 	input: codec.Payload_View,
 ) -> (payload: codec.Payload, error: Error) {
 	return query_workflow_payload_with_options(handle, query_type, input, {})
+}
+
+query_workflow_payloads :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	inputs: []codec.Payload_View,
+) -> (payload: codec.Payload, error: Error) {
+	return query_workflow_payloads_with_options(handle, query_type, inputs, {})
 }
 
 query_workflow_json :: proc(

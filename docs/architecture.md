@@ -1208,11 +1208,13 @@ runtime defense, not a general memory-purity proof: a handler can still mutate
 state reachable through pointers embedded inside its copied value. The API and
 determinism documentation therefore continue to define handlers as read-only.
 
-Current query serialization is deliberately narrow: exactly one argument
-Payload and one result Payload. The public `query_workflow_payload` method is
-codec-neutral, while `query_workflow_json` and `set_query_handler_json` use the
-isolated `json/plain` codec layer. Unknown handlers, argument-count mismatches,
-and codec errors are returned as failed query results; they do not fail the
+Query serialization now preserves the protocol's repeated argument field and
+single result Payload. The public `query_workflow_payloads` method and
+`set_query_handler_payloads` registration are codec-neutral; contextual variants
+add headers and query identity. Singular Payload/JSON methods remain explicit
+one-argument adapters and fail with `OdinWorkflowQueryArgumentCountError` for
+another arity rather than discarding data. Unknown handlers, argument-count
+mismatches, and codec errors are returned as failed query results; they do not fail the
 Workflow Task or terminate the worker. Query state pointers are borrowed from
 the live Workflow stack and remain valid because handlers execute only while
 that fiber instance is cached. Eviction destroys both together; replay creates
@@ -1235,7 +1237,10 @@ ephemeral deliveries and are counted once when Odin answers them, even on such
 an activation. The test then observes Core eviction, reconstructs a new fiber,
 and continues normally after the subsequent signal. Offline tests require
 byte-identical query completions across forced eviction/replay and cover a
-query delivered alongside a signal-producing completion.
+query delivered alongside a signal-producing completion. A separate live case
+sends three Payloads through the Odin Client, Core, and Service into the
+codec-neutral handler; a 500-case property varies 0–12 arguments while checking
+order, metadata, external details, headers, and deterministic request bytes.
 
 Core reserves `legacy_query` as `LEGACY_QUERY_ID`: a legacy query completion
 may contain no other commands. The current runtime produces the correct
@@ -1986,7 +1991,8 @@ command/replay cases, plus 500 Activity deadline combinations,
 500 Client start request (including static UserMetadata and eager-start intent)
 round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
 Signal request/header round trips over 0–12 arguments, 500 paginated Visibility
-list/count round trips, 500 query request/header round trips, 500 Update
+list/count round trips, 500 repeated Query request/header round trips over 0–12
+arguments, 500 Update
 request/header round trips,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,

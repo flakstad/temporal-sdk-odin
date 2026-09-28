@@ -559,10 +559,11 @@ closed_query_error := temporal_client.query_workflow_json_with_options(
 )
 ```
 
-`query_workflow_payload` returns an owned Payload that the caller frees with
-`codec.payload_free`; the JSON helper owns that intermediate value and decodes
-it into the caller's output pointer. The request currently sends exactly one
-argument Payload. A server `QueryRejected` response maps to
+`query_workflow_payloads[_with_options]` sends the complete ordered argument
+slice and returns an owned Payload that the caller frees with
+`codec.payload_free`; the singular Payload and JSON helpers are one-argument
+adapters. Metadata and external-payload details are retained for every
+argument. A server `QueryRejected` response maps to
 `.Workflow_Query_Rejected` and sets `has_workflow_status` plus the typed
 `workflow_status` that caused rejection. The available conditions are
 `Unspecified`, `None`, `Not_Open`, and `Not_Completed_Cleanly`. Handler failures
@@ -808,9 +809,10 @@ Attributes, raw Payload bytes, keys, all seven Temporal type labels, ID
 policies, Retry Policies, delays, priorities, and eager-start intent. It
 frees each source Payload before request encoding, then decodes the complete
 `StartWorkflowExecutionRequest` to prove builder ownership and wire fidelity.
-An additional 500 cases generate query header keys, arbitrary Payload bytes and
-metadata, query types, and reject conditions; the source Payload is freed
-before request encoding.
+An additional 500 cases generate zero to twelve ordered Query arguments with
+arbitrary Payload bytes, per-argument metadata and external payload details,
+plus query headers, query types, and reject conditions. Every source Payload is
+freed before request encoding, and repeated encoding must remain byte-identical.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
@@ -1322,7 +1324,7 @@ result or failure. The call-scoped input and continuation remain valid on the
 suspended fiber stack, but must never be retained elsewhere.
 
 `handle_query` wraps the synchronous registered Query handler. It receives the
-borrowed `Query_Context`, Workflow type, and Payload view. The existing
+borrowed `Query_Context`, Workflow type, and complete Payload-view slice. The existing
 command-state snapshot still encloses the whole interceptor chain, so an
 interceptor or handler that tries to schedule Workflow commands produces
 `OdinWorkflowQueryMutationError` and has those mutations rolled back.

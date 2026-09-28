@@ -153,6 +153,38 @@ worker_pid=""
 cat "$worker_log"
 grep -q 'multiple Signal arguments completed end-to-end through Core' "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=multiple-query-arguments \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Repeated-Query Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+repeated_query_workflow_id="odin-sdk-repeated-query-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=multiple-query-arguments \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$repeated_query_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+repeated_query_output="$(<"$workflow_output_file")"
+echo "$repeated_query_output"
+grep -q "Odin client completed repeated-Query workflow_id=$repeated_query_workflow_id" <<<"$repeated_query_output"
+grep -q 'query="Odin:42:true/repeated-client"' <<<"$repeated_query_output"
+grep -q 'Client Query interceptor observed three Query arguments' <<<"$repeated_query_output"
+grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$repeated_query_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'multiple Query arguments completed end-to-end through Core' "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=signal-with-start \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

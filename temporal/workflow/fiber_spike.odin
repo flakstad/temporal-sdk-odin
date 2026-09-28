@@ -38,6 +38,15 @@ Query_Context_Invoke_Proc :: #type proc(
 	query: ^Query_Context,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Query_Payloads_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
+Query_Context_Payloads_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	query: ^Query_Context,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
 Update_Validate_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
@@ -720,10 +729,12 @@ Update_Context :: struct {
 }
 
 Fiber_Query_Handler :: struct {
-	name:                string,
-	callback_data:       rawptr,
-	invoke:              Query_Invoke_Proc,
-	invoke_with_context: Query_Context_Invoke_Proc,
+	name:                         string,
+	callback_data:                rawptr,
+	invoke:                       Query_Invoke_Proc,
+	invoke_with_context:          Query_Context_Invoke_Proc,
+	invoke_payloads:              Query_Payloads_Invoke_Proc,
+	invoke_payloads_with_context: Query_Context_Payloads_Invoke_Proc,
 }
 
 Fiber_Signal_Handler :: struct {
@@ -2223,6 +2234,43 @@ set_query_handler_payload :: proc(
 	return true
 }
 
+// set_query_handler_payloads exposes Temporal's complete ordered Query
+// argument list to a synchronous, read-only callback.
+set_query_handler_payloads :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Query_Payloads_Invoke_Proc,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(ctx.instance, "invalid repeated-input Workflow query handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_query_handler(instance, name)
+	if duplicate {
+		query_registration_failed(instance, "Workflow query handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(instance, "could not preserve Workflow query handler name")
+		return false
+	}
+	append(
+		&instance.query_handlers,
+		Fiber_Query_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_payloads = callback,
+		},
+	)
+	return true
+}
+
 set_query_handler_payload_with_context :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
@@ -2253,6 +2301,44 @@ set_query_handler_payload_with_context :: proc(
 			name = owned_name,
 			callback_data = callback_data,
 			invoke_with_context = callback,
+		},
+	)
+	return true
+}
+
+set_query_handler_payloads_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Query_Context_Payloads_Invoke_Proc,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			query_registration_failed(
+				ctx.instance,
+				"invalid contextual repeated-input Workflow query handler",
+			)
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_query_handler(instance, name)
+	if duplicate {
+		query_registration_failed(instance, "Workflow query handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		query_registration_failed(instance, "could not preserve Workflow query handler name")
+		return false
+	}
+	append(
+		&instance.query_handlers,
+		Fiber_Query_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_payloads_with_context = callback,
 		},
 	)
 	return true
@@ -7381,26 +7467,34 @@ invoke_workflow_query :: proc(
 	if instance == nil || query == nil || len(query.query_id) == 0 || len(query.query_type) == 0 {
 		return payload_fail("Workflow query is malformed", "OdinWorkflowQueryError")
 	}
-	if len(query.arguments) != 1 {
-		return payload_fail(
-			"Workflow query requires exactly one argument",
-			"OdinWorkflowQueryArgumentError",
-		)
-	}
 	handler, found := find_query_handler(instance, query.query_type)
 	if !found {
 		message := fmt.aprintf("Workflow query handler %s is not registered", query.query_type)
 		return payload_fail(message, "OdinWorkflowQueryNotFound")
 	}
 	command_state := workflow_command_state(instance)
-	input, clone_error := proto.clone_payload(&query.arguments[0])
-	if clone_error != .None {
-		return payload_fail(
-			"could not preserve Workflow query input",
-			"OdinWorkflowQueryPayloadConversionError",
-		)
+	inputs := make([dynamic]codec.Payload)
+	defer {
+		for &input in inputs {
+			codec.payload_free(&input)
+		}
+		delete(inputs)
 	}
-	defer codec.payload_free(&input)
+	for &source in query.arguments {
+		input, clone_error := proto.clone_payload(&source)
+		if clone_error != .None {
+			return payload_fail(
+				"could not preserve Workflow query inputs",
+				"OdinWorkflowQueryPayloadConversionError",
+			)
+		}
+		append(&inputs, input)
+	}
+	input_views := make([]codec.Payload_View, len(inputs))
+	defer delete(input_views)
+	for &input, index in inputs {
+		input_views[index] = codec.payload_view(&input)
+	}
 	query_context := Query_Context{
 		id = query.query_id,
 		type = query.query_type,
@@ -7422,7 +7516,7 @@ invoke_workflow_query :: proc(
 	interceptor_input := Inbound_Handle_Query_Input{
 		workflow_type = instance.workflow_type,
 		query = &query_context,
-		input = codec.payload_view(&input),
+		inputs = input_views,
 	}
 	interceptor_state := Inbound_Handle_Query_State{
 		instance = instance,

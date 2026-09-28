@@ -3588,6 +3588,58 @@ fiber_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 	return approval
 }
 
+Repeated_Query_State :: struct {
+	registered: bool,
+}
+
+fiber_repeated_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Repeated_Query_State{}
+	state.registered = workflow.set_query_handler_payloads_with_context(
+		ctx,
+		"repeated_status",
+		&state,
+		proc(
+			_: rawptr,
+			query: ^workflow.Query_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Payload_Result {
+			if len(inputs) != 3 || query.id != "repeated-query-id" ||
+			   query.type != "repeated_status" || len(inputs[0].external_payloads) != 1 ||
+			   inputs[0].external_payloads[0].size_bytes != 4096 {
+				return workflow.payload_fail("repeated Query shape mismatch", "RepeatedQueryMismatch")
+			}
+			message_type, metadata_found := codec.metadata_get(inputs[0], "messageType")
+			caller: string
+			caller_found, caller_error := workflow.query_header_json(query, "caller", &caller)
+			defer delete(caller)
+			name: string
+			count: int
+			enabled: bool
+			if !metadata_found || string(message_type) != "odin.RepeatedQuery" ||
+			   !caller_found || caller_error != .None || caller != "repeated-client" ||
+			   codec.decode_json(inputs[0], &name) != .None ||
+			   codec.decode_json(inputs[1], &count) != .None ||
+			   codec.decode_json(inputs[2], &enabled) != .None {
+				delete(name)
+				return workflow.payload_fail("repeated Query decoding failed", "RepeatedQueryMismatch")
+			}
+			defer delete(name)
+			if name != "Odin" || count != 42 || !enabled {
+				return workflow.payload_fail("repeated Query values changed", "RepeatedQueryMismatch")
+			}
+			payload, encode_error := codec.encode_json("repeated Query received")
+			if encode_error != .None {
+				return workflow.payload_fail("repeated Query output encoding failed")
+			}
+			return workflow.payload_complete(payload)
+		},
+	)
+	if !state.registered {
+		return "repeated Query registration failed"
+	}
+	return workflow.await_signal(ctx, "finish")
+}
+
 fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	approval := workflow.await_signal(ctx, "approval")
@@ -6259,6 +6311,75 @@ client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc
 	testing.expect(t, rejection_error.kind == .Workflow_Query_Rejected)
 	testing.expect(t, rejection_error.has_workflow_status)
 	testing.expect(t, rejection_error.workflow_status == .Failed)
+}
+
+@(test)
+client_query_request_preserves_repeated_arguments :: proc(t: ^testing.T) {
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedQuery"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&name, 4096) == .None)
+	inputs := [3]codec.Payload_View{
+		codec.payload_view(&name),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	request_bytes, request_error := temporal_client.encode_query_workflow_request_payloads(
+		"default",
+		"workflow-id",
+		"run-id",
+		"repeated_status",
+		inputs[:],
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded && request.query != nil && request.query.query_args != nil)
+	if request.query == nil || request.query.query_args == nil do return
+	testing.expect_value(t, len(request.query.query_args.payloads), 3)
+	if len(request.query.query_args.payloads) != 3 do return
+	testing.expect_value(t, string(request.query.query_args.payloads[0].data), `"Odin"`)
+	testing.expect_value(t, string(request.query.query_args.payloads[1].data), "42")
+	testing.expect_value(t, string(request.query.query_args.payloads[2].data), "true")
+	message_type := ""
+	for metadata in request.query.query_args.payloads[0].metadata {
+		if metadata.key == "messageType" {
+			message_type = string(metadata.value)
+		}
+	}
+	testing.expect_value(t, message_type, "odin.RepeatedQuery")
+	testing.expect_value(t, len(request.query.query_args.payloads[0].external_payloads), 1)
+	if len(request.query.query_args.payloads[0].external_payloads) == 1 {
+		testing.expect_value(
+			t,
+			request.query.query_args.payloads[0].external_payloads[0].size_bytes,
+			i64(4096),
+		)
+	}
 }
 
 @(test)
@@ -12351,6 +12472,174 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 }
 
 @(test)
+workflow_repeated_query_arguments_preserve_order_details_and_replay_bytes :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"repeated_query_workflow",
+		"test-queue",
+		fiber_repeated_query_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_query_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-query-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedQuery"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&name, 4096) == .None)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	header, header_error := codec.encode_json("repeated-client")
+	testing.expect(t, header_error == .None)
+	defer codec.payload_free(&header)
+	proto_header := proto.encode_payload(codec.payload_view(&header))
+	defer delete(proto_header.metadata)
+	defer delete(proto_header.external_payloads)
+	query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "repeated-query-id",
+		query_type = "repeated_status",
+	}
+	defer delete(query.arguments)
+	defer delete(query.headers)
+	append(&query.arguments, proto_name, proto_count, proto_enabled)
+	append(
+		&query.headers,
+		proto.Coresdk_Workflow_Activation_QueryWorkflow_HeadersEntry{
+			key = "caller",
+			value = &proto_header,
+		},
+	)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	queried := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, queried.error.message == nil, "repeated Query failed: %s", string(queried.error.message))
+	testing.expect(t, queried.waiting_signal && !queried.completed)
+	testing.expect_value(t, queried.queries_answered, 1)
+	query_inspection := inspect_query_response(queried.completion[:], "repeated-query-id")
+	testing.expect(t, query_inspection.found && !query_inspection.failed)
+	query_output: string
+	testing.expect(
+		t,
+		codec.decode_json(codec.payload_view(&query_inspection.payload), &query_output) == .None,
+	)
+	testing.expect_value(t, query_output, "repeated Query received")
+	delete(query_output)
+	codec.payload_free(&query_inspection.payload)
+	delete(query_inspection.failure_message)
+	delete(query_inspection.failure_type)
+	query_completion := queried.completion
+	workflow.error_free(&queried.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, bytes.equal(query_completion[:], replayed.completion[:]))
+	delete(query_completion)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
 workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -12514,6 +12803,41 @@ workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^test
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, bytes.equal(query_completion[:], processed.completion[:]))
 	delete(query_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	wrong_arity_query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "query-wrong-arity",
+		query_type = "status",
+	}
+	defer delete(wrong_arity_query.arguments)
+	append(&wrong_arity_query.arguments, query_input_proto, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &wrong_arity_query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.queries_failed, 1)
+	wrong_arity_inspection := inspect_query_response(
+		processed.completion[:],
+		"query-wrong-arity",
+	)
+	testing.expect(t, wrong_arity_inspection.found && wrong_arity_inspection.failed)
+	testing.expect_value(
+		t,
+		string(wrong_arity_inspection.failure_type),
+		"OdinWorkflowQueryArgumentCountError",
+	)
+	codec.payload_free(&wrong_arity_inspection.payload)
+	delete(wrong_arity_inspection.failure_message)
+	delete(wrong_arity_inspection.failure_type)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 

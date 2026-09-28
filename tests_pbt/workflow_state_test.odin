@@ -772,8 +772,12 @@ client_query_header_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	header_value := pbt.draw(t, pbt.string_ascii(0, 96))
 	query_type := pbt.draw(t, pbt.string_ascii(1, 32))
 	reject_case := pbt.draw(t, pbt.int_range(0, 3))
+	argument_count := pbt.draw(t, pbt.int_range(0, 12))
 	pbt.cover(t, len(header_value) == 0, 1.0, "empty query header Payload")
 	pbt.cover(t, reject_case == 2, 20.0, "reject query when not open")
+	pbt.cover(t, argument_count == 0, 2.0, "zero Query arguments")
+	pbt.cover(t, argument_count == 1, 2.0, "one Query argument")
+	pbt.cover(t, argument_count >= 8, 20.0, "many Query arguments")
 
 	headers := temporal_client.Headers{}
 	init_error := temporal_client.headers_init(&headers)
@@ -803,14 +807,34 @@ client_query_header_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.error("could not preserve generated query header")
 	}
 
-	input := codec.payload_create(transmute([]u8)string("query-input"))
-	defer codec.payload_free(&input)
-	request_bytes, request_error := temporal_client.encode_query_workflow_request(
+	input_values: [12]string
+	inputs: [12]codec.Payload
+	input_views: [12]codec.Payload_View
+	external_sizes: [12]i64
+	defer {
+		for index in 0..<argument_count {
+			codec.payload_free(&inputs[index])
+		}
+	}
+	for index in 0..<argument_count {
+		input_values[index] = pbt.draw(t, pbt.string_ascii(0, 96))
+		external_sizes[index] = i64(pbt.draw(t, pbt.int_range(0, 1_000_000)))
+		inputs[index] = codec.payload_create(transmute([]u8)input_values[index])
+		if codec.payload_add_metadata(
+			&inputs[index],
+			"argument",
+			transmute([]u8)input_values[index],
+		) != .None || codec.payload_add_external(&inputs[index], external_sizes[index]) != .None {
+			return pbt.error("could not decorate generated Query argument")
+		}
+		input_views[index] = codec.payload_view(&inputs[index])
+	}
+	request_bytes, request_error := temporal_client.encode_query_workflow_request_payloads(
 		"generated-namespace",
 		"generated-workflow-id",
 		"generated-run-id",
 		query_type,
-		codec.payload_view(&input),
+		input_views[:argument_count],
 		{
 			reject_condition = temporal_client.Query_Reject_Condition(reject_case),
 			headers = &headers,
@@ -835,8 +859,13 @@ client_query_header_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 		&request,
 	)
 	context.allocator = previous_allocator
+	actual_argument_count := 0
+	if request.query != nil && request.query.query_args != nil {
+		actual_argument_count = len(request.query.query_args.payloads)
+	}
 	if !decoded || request.query == nil || request.query.header == nil ||
-	   len(request.query.header.fields) != 1 || request.query.header.fields[0].value == nil {
+	   actual_argument_count != argument_count || len(request.query.header.fields) != 1 ||
+	   request.query.header.fields[0].value == nil {
 		return pbt.fail("generated query header did not decode")
 	}
 	field := request.query.header.fields[0]
@@ -854,13 +883,47 @@ client_query_header_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if encoding != "binary/query-test" {
 		return pbt.fail("generated query header metadata changed across protobuf encoding")
 	}
+	for index in 0..<argument_count {
+		argument := &request.query.query_args.payloads[index]
+		if !bytes.equal(argument.data, transmute([]u8)input_values[index]) ||
+		   len(argument.external_payloads) != 1 ||
+		   argument.external_payloads[0].size_bytes != external_sizes[index] {
+			return pbt.fail("generated Query argument order or external details changed")
+		}
+		metadata_value: []u8
+		for entry in argument.metadata {
+			if entry.key == "argument" {
+				metadata_value = entry.value
+				break
+			}
+		}
+		if !bytes.equal(metadata_value, transmute([]u8)input_values[index]) {
+			return pbt.fail("generated Query argument metadata changed")
+		}
+	}
+	reencoded, reencode_error := temporal_client.encode_query_workflow_request_payloads(
+		"generated-namespace",
+		"generated-workflow-id",
+		"generated-run-id",
+		query_type,
+		input_views[:argument_count],
+		{
+			reject_condition = temporal_client.Query_Reject_Condition(reject_case),
+			headers = &headers,
+		},
+	)
+	defer delete(reencoded)
+	defer temporal_client.error_free(&reencode_error)
+	if reencode_error.message != nil || !bytes.equal(request_bytes[:], reencoded[:]) {
+		return pbt.fail("generated Query request bytes were not deterministic")
+	}
 	return pbt.pass()
 }
 
 @(test)
 client_query_headers_preserve_generated_payloads :: proc(t: ^testing.T) {
 	result := pbt.check(
-		"Client query headers preserve generated Payloads",
+		"Client Queries preserve ordered arguments, details, and headers",
 		client_query_header_wire_property,
 		{num_tests = 500, seed = 0x5155_4552_595f_4844},
 	)
