@@ -1148,8 +1148,13 @@ Payload maps. A builder owns cloned keys and Payloads until `headers_free`; a
 Client RPC or Workflow operation only borrows the builder during the call.
 Workflow operations clone it into the run arena before they can suspend.
 
-Ordinary Client Signals use `signal_workflow_json_with_options` (or the
-Payload variant) with `Signal_Workflow_Options.headers`. Client Updates use
+Ordinary Client Signals use `signal_workflow_json_with_options`, the singular
+Payload variant, or `signal_workflow_payloads[_with_options]` with
+`Signal_Workflow_Options.headers`. The repeated form preserves all ordered
+Payloads, metadata, and external-payload details. Workflow code receives them
+through `await_signal_payloads[_with_context]` or
+`set_signal_handler_payloads`; singular adapters reject zero or multiple
+arguments with `OdinWorkflowSignalArgumentCountError`. Client Updates use
 `start_update_json_with_options`/`start_update_payload_with_options` with
 `Update_Workflow_Options.headers`. Workflow Activity,
 Local Activity, Child Workflow, and child/external Signal options expose the
@@ -1207,6 +1212,11 @@ CLI dev server, and returns `Odin:42:true` from a codec-neutral Odin Workflow.
 An offline eviction/replay test preserves order, metadata, and external-payload
 details, while a separate 500-case property covers deterministic Client request
 encoding for 0–12 arguments.
+The `multiple-signal-arguments` scenario carries three Signal Payloads from the
+Odin Client interceptor through Core and the CLI dev server into a suspended
+Odin Workflow. Its unit test evicts and replays the run byte-for-byte, and the
+500-case Signal property varies 0–12 arguments while retaining ordering,
+metadata, external details, headers, and deterministic request bytes.
 
 ### Client outbound interceptor chain
 

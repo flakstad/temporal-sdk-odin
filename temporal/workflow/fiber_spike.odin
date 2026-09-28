@@ -87,6 +87,26 @@ Signal_Context_Routine_Invoke_Proc :: #type proc(
 	signal: ^Signal_Context,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Signal_Payloads_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
+Signal_Context_Payloads_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	signal: ^Signal_Context,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
+Signal_Payloads_Routine_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
+Signal_Context_Payloads_Routine_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	signal: ^Signal_Context,
+	inputs: []codec.Payload_View,
+) -> Payload_Result
 
 Payload_Result_Status :: enum {
 	Completed,
@@ -641,6 +661,12 @@ Payload_Signal_Wait_Result :: struct {
 	metadata: Signal_Context,
 }
 
+Payloads_Signal_Wait_Result :: struct {
+	status:   Signal_Wait_Status,
+	values:   []codec.Payload_View,
+	metadata: Signal_Context,
+}
+
 // Signal_Context is borrowed from the Workflow instance. Its strings, header
 // Payload views, and the context itself must not escape Workflow execution.
 Signal_Context :: struct {
@@ -652,6 +678,11 @@ Signal_Context :: struct {
 
 Payload_Signal :: struct {
 	value:    codec.Payload_View,
+	metadata: Signal_Context,
+}
+
+Payloads_Signal :: struct {
+	values:   []codec.Payload_View,
 	metadata: Signal_Context,
 }
 
@@ -702,6 +733,10 @@ Fiber_Signal_Handler :: struct {
 	invoke_with_context:         Signal_Context_Invoke_Proc,
 	invoke_routine:              Signal_Routine_Invoke_Proc,
 	invoke_routine_with_context: Signal_Context_Routine_Invoke_Proc,
+	invoke_payloads:              Signal_Payloads_Invoke_Proc,
+	invoke_payloads_with_context: Signal_Context_Payloads_Invoke_Proc,
+	invoke_payloads_routine:      Signal_Payloads_Routine_Invoke_Proc,
+	invoke_payloads_routine_with_context: Signal_Context_Payloads_Routine_Invoke_Proc,
 	unfinished_policy:           Handler_Unfinished_Policy,
 }
 
@@ -854,18 +889,22 @@ Fiber_Signal :: struct {
 	identity:             string,
 	headers:              [dynamic]Fiber_Named_Payload,
 	originating_event_id: i64,
-	payload:              codec.Payload,
+	inputs:               [dynamic]codec.Payload,
+	input_views:          []codec.Payload_View,
 	consumed:             bool,
 }
 
 Fiber_Signal_Routine :: struct {
 	instance:             ^Fiber_Instance,
 	name:                 string,
-	input:                codec.Payload,
+	inputs:               [dynamic]codec.Payload,
+	input_views:          []codec.Payload_View,
 	signal_context:       Signal_Context,
 	callback_data:        rawptr,
 	invoke:               Signal_Routine_Invoke_Proc,
 	invoke_with_context:  Signal_Context_Routine_Invoke_Proc,
+	invoke_payloads:      Signal_Payloads_Routine_Invoke_Proc,
+	invoke_payloads_with_context: Signal_Context_Payloads_Routine_Invoke_Proc,
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
@@ -1327,7 +1366,7 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 		ctx = &routine.ctx,
 		workflow_type = instance.workflow_type,
 		signal = &routine.signal_context,
-		input = codec.payload_view(&routine.input),
+		inputs = routine.input_views,
 	}
 	interceptor_state := Inbound_Handle_Signal_State{
 		instance = instance,
@@ -1523,7 +1562,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		codec.payload_free(&instance.continue_as_new.input)
 	}
 	for &signal in instance.signals {
-		codec.payload_free(&signal.payload)
+		for &input in signal.inputs {
+			codec.payload_free(&input)
+		}
+		delete(signal.inputs)
 		for &entry in signal.headers {
 			codec.payload_free(&entry.payload)
 		}
@@ -2389,6 +2431,47 @@ set_signal_handler_payload :: proc(
 	return true
 }
 
+// set_signal_handler_payloads exposes Temporal's repeated Signal argument
+// boundary. Exactly one of callback and routine_callback must be provided.
+set_signal_handler_payloads :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Signal_Payloads_Invoke_Proc,
+	routine_callback: Signal_Payloads_Routine_Invoke_Proc = nil,
+	options := Signal_Handler_Options{},
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || (callback == nil) == (routine_callback == nil) {
+		if ctx != nil {
+			signal_registration_failed(ctx.instance, "invalid repeated-input Workflow Signal handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_signal_handler(instance, name)
+	if duplicate {
+		signal_registration_failed(instance, "Workflow Signal handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		signal_registration_failed(instance, "could not preserve Workflow Signal handler name")
+		return false
+	}
+	append(
+		&instance.signal_handlers,
+		Fiber_Signal_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_payloads = callback,
+			invoke_payloads_routine = routine_callback,
+			unfinished_policy = options.unfinished_policy,
+		},
+	)
+	return true
+}
+
 set_signal_routine_payload_with_context :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
@@ -2426,6 +2509,43 @@ set_signal_routine_payload_with_context :: proc(
 	return true
 }
 
+set_signal_routine_payloads_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Signal_Context_Payloads_Routine_Invoke_Proc,
+	options := Signal_Handler_Options{},
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			signal_registration_failed(ctx.instance, "invalid contextual repeated-input Workflow Signal routine")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_signal_handler(instance, name)
+	if duplicate {
+		signal_registration_failed(instance, "Workflow Signal handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		signal_registration_failed(instance, "could not preserve Workflow Signal handler name")
+		return false
+	}
+	append(
+		&instance.signal_handlers,
+		Fiber_Signal_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_payloads_routine_with_context = callback,
+			unfinished_policy = options.unfinished_policy,
+		},
+	)
+	return true
+}
+
 set_signal_handler_payload_with_context :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
@@ -2457,6 +2577,43 @@ set_signal_handler_payload_with_context :: proc(
 			name = owned_name,
 			callback_data = callback_data,
 			invoke_with_context = callback,
+			unfinished_policy = options.unfinished_policy,
+		},
+	)
+	return true
+}
+
+set_signal_handler_payloads_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Signal_Context_Payloads_Invoke_Proc,
+	options := Signal_Handler_Options{},
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			signal_registration_failed(ctx.instance, "invalid contextual repeated-input Workflow Signal handler")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_signal_handler(instance, name)
+	if duplicate {
+		signal_registration_failed(instance, "Workflow Signal handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		signal_registration_failed(instance, "could not preserve Workflow Signal handler name")
+		return false
+	}
+	append(
+		&instance.signal_handlers,
+		Fiber_Signal_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_payloads_with_context = callback,
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
@@ -6229,6 +6386,15 @@ signal_payload_conversion_failed :: proc(instance: ^Fiber_Instance, message: str
 	instance.failure_type = "OdinWorkflowPayloadConversionError"
 }
 
+signal_argument_count_failed :: proc(instance: ^Fiber_Instance, message: string) {
+	if instance == nil {
+		return
+	}
+	instance.phase = .Failed
+	instance.failure_message = message
+	instance.failure_type = "OdinWorkflowSignalArgumentCountError"
+}
+
 fiber_signal_context :: proc(signal: ^Fiber_Signal) -> Signal_Context {
 	if signal == nil {
 		return {}
@@ -6241,10 +6407,10 @@ fiber_signal_context :: proc(signal: ^Fiber_Signal) -> Signal_Context {
 	}
 }
 
-// await_signal_payload_with_context consumes the oldest buffered signal with
-// the requested name, or suspends until Core delivers one. Returned Payload and
-// metadata views are owned by the Workflow instance.
-await_signal_payload_with_context :: proc(ctx: ^Fiber_Context, name: string) -> Payload_Signal {
+// await_signal_payloads_with_context consumes the oldest buffered signal with
+// the requested name, or suspends until Core delivers one. Returned Payload
+// and metadata views are owned by the Workflow instance.
+await_signal_payloads_with_context :: proc(ctx: ^Fiber_Context, name: string) -> Payloads_Signal {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
@@ -6259,7 +6425,7 @@ await_signal_payload_with_context :: proc(ctx: ^Fiber_Context, name: string) -> 
 	if found {
 		signal.consumed = true
 		return {
-			value = codec.payload_view(&signal.payload),
+			values = signal.input_views,
 			metadata = fiber_signal_context(signal),
 		}
 	}
@@ -6284,9 +6450,32 @@ await_signal_payload_with_context :: proc(ctx: ^Fiber_Context, name: string) -> 
 	}
 	signal.consumed = true
 	return {
-		value = codec.payload_view(&signal.payload),
+		values = signal.input_views,
 		metadata = fiber_signal_context(signal),
 	}
+}
+
+// await_signal_payload_with_context is the one-argument compatibility adapter.
+await_signal_payload_with_context :: proc(ctx: ^Fiber_Context, name: string) -> Payload_Signal {
+	result := await_signal_payloads_with_context(ctx, name)
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
+		return {metadata = result.metadata}
+	}
+	if root_cancellation_applies(ctx.instance) {
+		return {metadata = result.metadata}
+	}
+	if len(result.values) != 1 {
+		signal_argument_count_failed(
+			ctx.instance,
+			"single-Payload Workflow Signal await requires exactly one argument",
+		)
+		return {metadata = result.metadata}
+	}
+	return {value = result.values[0], metadata = result.metadata}
+}
+
+await_signal_payloads :: proc(ctx: ^Fiber_Context, name: string) -> []codec.Payload_View {
+	return await_signal_payloads_with_context(ctx, name).values
 }
 
 // await_signal_payload is the compatibility adapter that discards invocation
@@ -6352,11 +6541,11 @@ await_signal_json_with_context :: proc(
 // timer. Core orders signal jobs before timer jobs in the same activation, so a
 // buffered matching signal wins that tie without cancelling an already-fired
 // timer.
-await_signal_payload_or_timeout :: proc(
+await_signal_payloads_or_timeout :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
 	duration: time.Duration,
-) -> Payload_Signal_Wait_Result {
+) -> Payloads_Signal_Wait_Result {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || len(name) == 0 || duration <= 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
@@ -6372,7 +6561,7 @@ await_signal_payload_or_timeout :: proc(
 		signal.consumed = true
 		return {
 			status = .Received,
-			value = codec.payload_view(&signal.payload),
+			values = signal.input_views,
 			metadata = fiber_signal_context(signal),
 		}
 	}
@@ -6409,7 +6598,7 @@ await_signal_payload_or_timeout :: proc(
 		}
 		return {
 			status = .Received,
-			value = codec.payload_view(&signal.payload),
+			values = signal.input_views,
 			metadata = fiber_signal_context(signal),
 		}
 	}
@@ -6418,6 +6607,27 @@ await_signal_payload_or_timeout :: proc(
 	}
 	instance.phase = .Failed
 	return {status = .Timed_Out}
+}
+
+await_signal_payload_or_timeout :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	duration: time.Duration,
+) -> Payload_Signal_Wait_Result {
+	result := await_signal_payloads_or_timeout(ctx, name, duration)
+	if result.status != .Received {
+		return {status = result.status, metadata = result.metadata}
+	}
+	if ctx == nil || ctx.instance == nil || len(result.values) != 1 {
+		if ctx != nil {
+			signal_argument_count_failed(
+				ctx.instance,
+				"single-Payload Workflow Signal await requires exactly one argument",
+			)
+		}
+		return {status = .Received, metadata = result.metadata}
+	}
+	return {status = .Received, value = result.values[0], metadata = result.metadata}
 }
 
 await_signal_or_timeout :: proc(
@@ -7326,10 +7536,11 @@ start_signal_routine :: proc(
 	handler: ^Fiber_Signal_Handler,
 	name: string,
 	signal_context: ^Signal_Context,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 ) -> (^Fiber_Signal_Routine, Error) {
 	if instance == nil || handler == nil ||
-	   (handler.invoke_routine == nil) == (handler.invoke_routine_with_context == nil) ||
+	   (handler.invoke_routine != nil || handler.invoke_routine_with_context != nil) ==
+	   (handler.invoke_payloads_routine != nil || handler.invoke_payloads_routine_with_context != nil) ||
 	   signal_context == nil || len(name) == 0 {
 		return nil, error_from_string("invalid Workflow Signal routine")
 	}
@@ -7339,18 +7550,32 @@ start_signal_routine :: proc(
 		return nil, error_from_string("could not allocate Workflow Signal routine")
 	}
 	owned_name, name_error := strings.clone(name, allocator)
-	owned_input, input_error := codec.payload_clone(input, allocator)
+	routine.inputs = make([dynamic]codec.Payload, allocator)
+	inputs_ok := true
+	for input in inputs {
+		owned_input, input_error := codec.payload_clone(input, allocator)
+		if input_error != .None {
+			inputs_ok = false
+			break
+		}
+		append(&routine.inputs, owned_input)
+	}
+	routine.input_views = make([]codec.Payload_View, len(routine.inputs), allocator)
+	for &input, index in routine.inputs {
+		routine.input_views[index] = codec.payload_view(&input)
+	}
 	owned_context, context_ok := clone_signal_context_for_routine(instance, signal_context)
-	if name_error != nil || input_error != .None || !context_ok {
+	if name_error != nil || !inputs_ok || !context_ok {
 		return nil, error_from_string("could not preserve Workflow Signal routine input")
 	}
 	routine.instance = instance
 	routine.name = owned_name
-	routine.input = owned_input
 	routine.signal_context = owned_context
 	routine.callback_data = handler.callback_data
 	routine.invoke = handler.invoke_routine
 	routine.invoke_with_context = handler.invoke_routine_with_context
+	routine.invoke_payloads = handler.invoke_payloads_routine
+	routine.invoke_payloads_with_context = handler.invoke_payloads_routine_with_context
 	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
 	routine.phase = .Ready
@@ -7483,11 +7708,12 @@ invoke_workflow_signal :: proc(
 	signal: ^proto.Coresdk_Workflow_Activation_SignalWorkflow,
 	result: ^Process_Result,
 ) -> Error {
-	if instance == nil || signal == nil || len(signal.signal_name) == 0 || len(signal.input) != 1 {
-		return error_from_string("Workflow signal must have a name and one payload")
+	if instance == nil || signal == nil || len(signal.signal_name) == 0 {
+		return error_from_string("Workflow signal must have a name")
 	}
 	preserved := Fiber_Signal{
 		headers = make([dynamic]Fiber_Named_Payload),
+		inputs = make([dynamic]codec.Payload),
 		originating_event_id = signal.originating_event_id,
 	}
 	buffered := false
@@ -7499,17 +7725,32 @@ invoke_workflow_signal :: proc(
 			codec.payload_free(&entry.payload)
 		}
 		delete(preserved.headers)
-		codec.payload_free(&preserved.payload)
+		for &input in preserved.inputs {
+			codec.payload_free(&input)
+		}
+		delete(preserved.inputs)
+		delete(preserved.input_views)
 	}
 	preserved.name, _ = strings.clone(signal.signal_name)
 	preserved.identity, _ = strings.clone(signal.identity)
-	cloned_payload, clone_error := proto.clone_payload(&signal.input[0])
-	preserved.payload = cloned_payload
+	inputs_ok := true
+	for &source in signal.input {
+		cloned_payload, clone_error := proto.clone_payload(&source)
+		if clone_error != .None {
+			inputs_ok = false
+			break
+		}
+		append(&preserved.inputs, cloned_payload)
+	}
+	preserved.input_views = make([]codec.Payload_View, len(preserved.inputs))
+	for &input, index in preserved.inputs {
+		preserved.input_views[index] = codec.payload_view(&input)
+	}
 	if len(preserved.name) == 0 ||
 	   (len(signal.identity) > 0 && len(preserved.identity) == 0) ||
-	   clone_error != .None ||
+	   !inputs_ok ||
 	   !clone_signal_header_payloads(signal.headers[:], &preserved.headers) {
-		return error_from_string("could not preserve Workflow signal Payload or metadata")
+		return error_from_string("could not preserve Workflow signal Payloads or metadata")
 	}
 	handler, found := find_signal_handler(instance, signal.signal_name)
 	if !found {
@@ -7517,16 +7758,16 @@ invoke_workflow_signal :: proc(
 		buffered = true
 		return {}
 	}
-	input_view := codec.payload_view(&preserved.payload)
 	signal_context := fiber_signal_context(&preserved)
 	result.signal_handlers_started += 1
-	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil {
+	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil ||
+	   handler.invoke_payloads_routine != nil || handler.invoke_payloads_routine_with_context != nil {
 		routine, routine_error := start_signal_routine(
 			instance,
 			handler,
 			signal.signal_name,
 			&signal_context,
-			input_view,
+			preserved.input_views,
 		)
 		if routine_error.message != nil {
 			return routine_error
@@ -7537,7 +7778,7 @@ invoke_workflow_signal :: proc(
 	interceptor_input := Inbound_Handle_Signal_Input{
 		workflow_type = instance.workflow_type,
 		signal = &signal_context,
-		input = input_view,
+		inputs = preserved.input_views,
 	}
 	interceptor_state := Inbound_Handle_Signal_State{
 		instance = instance,

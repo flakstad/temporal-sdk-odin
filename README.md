@@ -119,6 +119,11 @@ Activity headers remain borrowed from `activity.Context`. Unit/property tests
 cover wire encoding, ownership after Core decode arenas are destroyed, and
 byte-identical replay; the CLI-devserver suite proves both Client Signal to
 Workflow and Workflow command through Core to an Odin Activity.
+Ordinary Signals also preserve Temporal's repeated Payload field end-to-end.
+Use `signal_workflow_payloads` on the Client and
+`await_signal_payloads[_with_context]` or `set_signal_handler_payloads` in a
+Workflow. The singular Payload/JSON/string helpers remain explicit one-argument
+adapters and reject another arity with `OdinWorkflowSignalArgumentCountError`.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -605,6 +610,15 @@ err = temporal_client.signal_workflow_json_with_options(
     approval,
     {headers = &signal_headers},
 )
+signal_args := [?]codec.Payload_View{
+    codec.payload_view(&order),
+    codec.payload_view(&approval),
+}
+err = temporal_client.signal_workflow_payloads(
+    &handle,
+    "approve_order",
+    signal_args[:],
+)
 status: Order_Status
 err = temporal_client.query_workflow_json(
     &handle,
@@ -814,9 +828,10 @@ Start-to-Close/one-attempt behavior.
 `register_payloads_workflow` exposes Temporal's repeated Workflow argument
 field. String Workflows remain a compatibility adapter over `json/plain`.
 Workflow signal buffering preserves a
-generic Payload; `await_signal_payload` and `await_signal_json` expose raw and
-typed forms, with equivalent signal-or-timeout variants. `await_signal` remains
-the `json/plain` string compatibility adapter.
+complete ordered Payload slice. `await_signal_payloads` exposes the repeated
+codec-neutral boundary; `await_signal_payload` and `await_signal_json` are
+one-argument raw and typed forms, with equivalent signal-or-timeout variants.
+`await_signal` remains the `json/plain` string compatibility adapter.
 
 Outbound operations on another Workflow use an explicit execution identity and
 wait for Core's durable acknowledgement:

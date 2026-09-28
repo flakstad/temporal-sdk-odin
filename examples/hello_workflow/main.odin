@@ -21,6 +21,7 @@ TERMINAL_FAILURE_WORKFLOW_TYPE :: "odin_terminal_failure_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
 WORKFLOW_PROPERTIES_TYPE :: "odin_workflow_properties"
 SIGNAL_WITH_START_WORKFLOW_TYPE :: "odin_signal_with_start_workflow"
+REPEATED_SIGNAL_WORKFLOW_TYPE :: "odin_repeated_signal_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
 
 Typed_Greeting_Input :: struct {
@@ -402,6 +403,29 @@ repeated_arguments_workflow :: proc(
 		)
 	}
 	return workflow.payload_complete(payload)
+}
+
+repeated_signal_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	received := workflow.await_signal_payloads_with_context(ctx, "repeated")
+	if len(received.values) != 3 || len(received.values[0].external_payloads) != 1 ||
+	   received.values[0].external_payloads[0].size_bytes != 3072 {
+		return "repeated Signal shape mismatch"
+	}
+	message_type, metadata_found := codec.metadata_get(received.values[0], "messageType")
+	if !metadata_found || string(message_type) != "odin.RepeatedSignal" {
+		return "repeated Signal metadata mismatch"
+	}
+	name: string
+	count: int
+	enabled: bool
+	if codec.decode_json(received.values[0], &name) != .None ||
+	   codec.decode_json(received.values[1], &count) != .None ||
+	   codec.decode_json(received.values[2], &enabled) != .None {
+		delete(name)
+		return "repeated Signal decoding failed"
+	}
+	defer delete(name)
+	return fmt.aprintf("%s:%d:%v", name, count, enabled)
 }
 
 workflow_query_interceptor :: proc(
@@ -1276,6 +1300,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	repeated_signal_register_error := worker.register_workflow(
+		&activity_worker,
+		REPEATED_SIGNAL_WORKFLOW_TYPE,
+		repeated_signal_workflow,
+	)
+	if repeated_signal_register_error.message != nil {
+		fmt.eprintf(
+			"Repeated-Signal Workflow registration failed: %s\n",
+			string(repeated_signal_register_error.message),
+		)
+		worker.error_free(&repeated_signal_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	local_activity_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		LOCAL_ACTIVITY_WORKFLOW_TYPE,
@@ -1398,14 +1438,15 @@ main :: proc() {
 	expect_activity_interceptor := scenario == "activity-interceptor"
 	expect_multiple_activity_arguments := scenario == "multiple-activity-arguments"
 	expect_multiple_workflow_arguments := scenario == "multiple-workflow-arguments"
+	expect_multiple_signal_arguments := scenario == "multiple-signal-arguments"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1440,10 +1481,12 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments {
+		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
+			} else if expect_multiple_signal_arguments {
+				expected_signals = 1
 			}
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != expected_signals ||
 			   run_stats.timers_canceled != 0 {
@@ -1544,6 +1587,8 @@ main :: proc() {
 		fmt.println("multiple Activity arguments completed end-to-end through Core")
 	} else if expect_multiple_workflow_arguments {
 		fmt.println("multiple Workflow arguments completed end-to-end through Core")
+	} else if expect_multiple_signal_arguments {
+		fmt.println("multiple Signal arguments completed end-to-end through Core")
 	} else if expect_local_activity {
 		fmt.println("Local Activity completed through Core in the Workflow Worker")
 	} else if expect_local_activity_retry {

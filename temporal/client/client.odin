@@ -1520,51 +1520,14 @@ signal_workflow_payload_terminal :: proc(input: ^Client_Signal_Workflow_Input) -
 	}
 	options := input.options
 	options.headers = input.headers
-	request_bytes: [dynamic]u8
-	request_error: Error
-	if input.has_input {
-		request_bytes, request_error = encode_signal_workflow_request(
-			input.handle.client.namespace,
-			input.handle.id,
-			input.handle.run_id,
-			input.signal_name,
-			input.input,
-			options,
-		)
-	} else {
-		execution := workflow_execution(input.handle)
-		request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-		request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
-			namespace = input.handle.client.namespace,
-			workflow_execution = &execution,
-			signal_name = input.signal_name,
-			identity = "temporal-sdk-odin@local",
-			request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
-		}
-		header := proto.Temporal_Api_Common_V1_Header{}
-		header_payloads: []proto.Temporal_Api_Common_V1_Payload
-		defer delete(header.fields)
-		defer free_start_proto_payloads(header_payloads)
-		if len(input.headers.entries) > 0 {
-			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(input.headers.entries))
-			for &entry, index in input.headers.entries {
-				header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
-			}
-			for entry, index in input.headers.entries {
-				append(
-					&header.fields,
-					proto.Temporal_Api_Common_V1_Header_FieldsEntry{
-						key = entry.key,
-						value = &header_payloads[index],
-					},
-				)
-			}
-			request.header = &header
-		}
-		request_bytes = proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(
-			&request,
-		)
-	}
+	request_bytes, request_error := encode_signal_workflow_request_payloads(
+		input.handle.client.namespace,
+		input.handle.id,
+		input.handle.run_id,
+		input.signal_name,
+		input.inputs,
+		options,
+	)
 	if request_error.message != nil {
 		return request_error
 	}
@@ -1575,8 +1538,7 @@ signal_workflow_payload_terminal :: proc(input: ^Client_Signal_Workflow_Input) -
 signal_workflow_intercept :: proc(
 	handle: ^Workflow_Handle,
 	signal_name: string,
-	input: codec.Payload_View,
-	has_input: bool,
+	inputs: []codec.Payload_View,
 	options: Signal_Workflow_Options,
 ) -> Error {
 	headers := Headers{}
@@ -1588,8 +1550,7 @@ signal_workflow_intercept :: proc(
 	interceptor_input := Client_Signal_Workflow_Input{
 		handle = handle,
 		signal_name = signal_name,
-		input = input,
-		has_input = has_input,
+		inputs = inputs,
 		options = options,
 		headers = &headers,
 	}
@@ -1618,14 +1579,14 @@ signal_workflow_with_options :: proc(
 	signal_name: string,
 	options: Signal_Workflow_Options,
 ) -> Error {
-	return signal_workflow_intercept(handle, signal_name, {}, false, options)
+	return signal_workflow_intercept(handle, signal_name, nil, options)
 }
 
-// encode_signal_workflow_request is the codec-neutral wire-contract boundary
-// for a one-Payload Signal. Returned bytes are owned by the caller.
-encode_signal_workflow_request :: proc(
+// encode_signal_workflow_request_payloads is the codec-neutral repeated-input
+// Signal boundary. Returned bytes are owned by the caller.
+encode_signal_workflow_request_payloads :: proc(
 	namespace, workflow_id, run_id, signal_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Signal_Workflow_Options = {},
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 || len(workflow_id) == 0 || len(signal_name) == 0 {
@@ -1638,20 +1599,24 @@ encode_signal_workflow_request :: proc(
 		workflow_id = workflow_id,
 		run_id = run_id,
 	}
-	encoded_input := proto.encode_payload(input)
-	defer delete(encoded_input.metadata)
-	defer delete(encoded_input.external_payloads)
-	inputs := proto.Temporal_Api_Common_V1_Payloads{}
-	defer delete(inputs.payloads)
-	append(&inputs.payloads, encoded_input)
+	encoded_inputs := make([]proto.Temporal_Api_Common_V1_Payload, len(inputs))
+	defer free_start_proto_payloads(encoded_inputs)
+	input_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(input_payloads.payloads)
+	for input, index in inputs {
+		encoded_inputs[index] = proto.encode_payload(input)
+		append(&input_payloads.payloads, encoded_inputs[index])
+	}
 	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
 	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
 		namespace = namespace,
 		workflow_execution = &execution,
 		signal_name = signal_name,
-		input = &inputs,
 		identity = "temporal-sdk-odin@local",
 		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
+	}
+	if len(inputs) > 0 {
+		request.input = &input_payloads
 	}
 	header := proto.Temporal_Api_Common_V1_Header{}
 	header_payloads: []proto.Temporal_Api_Common_V1_Payload
@@ -1676,6 +1641,45 @@ encode_signal_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request), {}
 }
 
+encode_signal_workflow_request :: proc(
+	namespace, workflow_id, run_id, signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Workflow_Options = {},
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	inputs := [?]codec.Payload_View{input}
+	return encode_signal_workflow_request_payloads(
+		namespace,
+		workflow_id,
+		run_id,
+		signal_name,
+		inputs[:],
+		options,
+	)
+}
+
+signal_workflow_payloads :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	inputs: []codec.Payload_View,
+	explicit_request_id := "",
+) -> Error {
+	return signal_workflow_payloads_with_options(
+		handle,
+		signal_name,
+		inputs,
+		{request_id = explicit_request_id},
+	)
+}
+
+signal_workflow_payloads_with_options :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	inputs: []codec.Payload_View,
+	options: Signal_Workflow_Options,
+) -> Error {
+	return signal_workflow_intercept(handle, signal_name, inputs, options)
+}
+
 signal_workflow_payload :: proc(
 	handle: ^Workflow_Handle,
 	signal_name: string,
@@ -1696,7 +1700,8 @@ signal_workflow_payload_with_options :: proc(
 	input: codec.Payload_View,
 	options: Signal_Workflow_Options,
 ) -> Error {
-	return signal_workflow_intercept(handle, signal_name, input, true, options)
+	inputs := [?]codec.Payload_View{input}
+	return signal_workflow_payloads_with_options(handle, signal_name, inputs[:], options)
 }
 
 signal_workflow_json :: proc(

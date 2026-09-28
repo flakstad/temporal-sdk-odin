@@ -58,8 +58,7 @@ Client_Signal_With_Start_Interceptor_Proc :: #type proc(
 Client_Signal_Workflow_Input :: struct {
 	handle:      ^Workflow_Handle,
 	signal_name: string,
-	input:       activity_codec.Payload_View,
-	has_input:   bool,
+	inputs:      []activity_codec.Payload_View,
 	options:     Signal_Workflow_Options,
 	headers:     ^Headers,
 }

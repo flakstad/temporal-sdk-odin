@@ -138,15 +138,37 @@ signal_with_start_requests_preserve_generated_contract :: proc(t: ^testing.T) {
 }
 
 signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
-	input_value := pbt.draw(t, pbt.string_ascii(0, 96))
+	argument_count := pbt.draw(t, pbt.int_range(0, 12))
 	header_value := pbt.draw(t, pbt.string_ascii(0, 64))
 	run_id := pbt.draw(t, pbt.string_ascii(0, 48))
-	pbt.cover(t, len(input_value) == 0, 0.2, "empty Signal input")
+	pbt.cover(t, argument_count == 0, 2.0, "zero Signal arguments")
+	pbt.cover(t, argument_count == 1, 2.0, "one Signal argument")
+	pbt.cover(t, argument_count >= 8, 20.0, "many Signal arguments")
 	pbt.cover(t, len(header_value) == 0, 0.5, "empty Signal header value")
 	pbt.cover(t, len(run_id) == 0, 0.5, "current-run Signal target")
 
-	input := codec.payload_create(transmute([]u8)input_value)
-	defer codec.payload_free(&input)
+	input_values: [12]string
+	inputs: [12]codec.Payload
+	input_views: [12]codec.Payload_View
+	external_sizes: [12]i64
+	defer {
+		for index in 0..<argument_count {
+			codec.payload_free(&inputs[index])
+		}
+	}
+	for index in 0..<argument_count {
+		input_values[index] = pbt.draw(t, pbt.string_ascii(0, 96))
+		external_sizes[index] = i64(pbt.draw(t, pbt.int_range(0, 1_000_000)))
+		inputs[index] = codec.payload_create(transmute([]u8)input_values[index])
+		if codec.payload_add_metadata(
+			&inputs[index],
+			"argument",
+			transmute([]u8)input_values[index],
+		) != .None || codec.payload_add_external(&inputs[index], external_sizes[index]) != .None {
+			return pbt.error("could not decorate generated Signal argument")
+		}
+		input_views[index] = codec.payload_view(&inputs[index])
+	}
 	headers := temporal_client.Headers{}
 	init_error := temporal_client.headers_init(&headers)
 	defer temporal_client.error_free(&init_error)
@@ -160,12 +182,12 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.error("could not encode generated Signal header")
 	}
 
-	encoded, encode_error := temporal_client.encode_signal_workflow_request(
+	encoded, encode_error := temporal_client.encode_signal_workflow_request_payloads(
 		"property-namespace",
 		"property-workflow-id",
 		run_id,
 		"property-signal",
-		codec.payload_view(&input),
+		input_views[:argument_count],
 		{request_id = "property-request-id", headers = &headers},
 	)
 	defer delete(encoded)
@@ -187,8 +209,12 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		&request,
 	)
 	context.allocator = previous_allocator
-	if !decoded || request.workflow_execution == nil || request.input == nil ||
-	   len(request.input.payloads) != 1 || request.header == nil ||
+	actual_argument_count := 0
+	if request.input != nil {
+		actual_argument_count = len(request.input.payloads)
+	}
+	if !decoded || request.workflow_execution == nil ||
+	   actual_argument_count != argument_count || request.header == nil ||
 	   len(request.header.fields) != 1 || request.header.fields[0].value == nil {
 		return pbt.fail("generated Signal request did not decode")
 	}
@@ -197,9 +223,26 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.workflow_execution.run_id != run_id ||
 	   request.signal_name != "property-signal" ||
 	   request.request_id != "property-request-id" ||
-	   request.header.fields[0].key != "property-header" ||
-	   !bytes.equal(request.input.payloads[0].data, transmute([]u8)input_value) {
+	   request.header.fields[0].key != "property-header" {
 		return pbt.fail("generated Signal scalar fields changed during round trip")
+	}
+	for index in 0..<argument_count {
+		argument := &request.input.payloads[index]
+		if !bytes.equal(argument.data, transmute([]u8)input_values[index]) ||
+		   len(argument.external_payloads) != 1 ||
+		   argument.external_payloads[0].size_bytes != external_sizes[index] {
+			return pbt.fail("generated Signal argument order or external details changed")
+		}
+		metadata_value: []u8
+		for entry in argument.metadata {
+			if entry.key == "argument" {
+				metadata_value = entry.value
+				break
+			}
+		}
+		if !bytes.equal(metadata_value, transmute([]u8)input_values[index]) {
+			return pbt.fail("generated Signal argument metadata changed")
+		}
 	}
 	owned_header, clone_error := proto.clone_payload(request.header.fields[0].value)
 	defer codec.payload_free(&owned_header)
@@ -212,13 +255,26 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   decoded_header != header_value {
 		return pbt.fail("generated Signal header changed during round trip")
 	}
+	reencoded, reencode_error := temporal_client.encode_signal_workflow_request_payloads(
+		"property-namespace",
+		"property-workflow-id",
+		run_id,
+		"property-signal",
+		input_views[:argument_count],
+		{request_id = "property-request-id", headers = &headers},
+	)
+	defer delete(reencoded)
+	defer temporal_client.error_free(&reencode_error)
+	if reencode_error.message != nil || !bytes.equal(encoded[:], reencoded[:]) {
+		return pbt.fail("generated Signal request bytes were not deterministic")
+	}
 	return pbt.pass()
 }
 
 @(test)
 signal_requests_preserve_generated_headers :: proc(t: ^testing.T) {
 	result := pbt.check(
-		"Signal requests preserve request identity, payload, and headers",
+		"Signal requests preserve ordered arguments, details, and headers",
 		signal_request_property,
 		{num_tests = 500, seed = 0x5349_474e_414c_4844},
 	)

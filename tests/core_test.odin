@@ -3203,6 +3203,110 @@ Signal_Routine_State :: struct {
 	name: string,
 }
 
+fiber_repeated_signal_await_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	received := workflow.await_signal_payloads_with_context(ctx, "repeated")
+	if len(received.values) != 3 || received.metadata.identity != "repeated-client" ||
+	   received.metadata.originating_event_id != 73 {
+		return "repeated Signal metadata mismatch"
+	}
+	name: string
+	count: int
+	enabled: bool
+	if codec.decode_json(received.values[0], &name) != .None ||
+	   codec.decode_json(received.values[1], &count) != .None ||
+	   codec.decode_json(received.values[2], &enabled) != .None {
+		delete(name)
+		return "repeated Signal decode failed"
+	}
+	defer delete(name)
+	if name != "Odin" || count != 42 || !enabled ||
+	   len(received.values[0].external_payloads) != 1 ||
+	   received.values[0].external_payloads[0].size_bytes != 3072 {
+		return "repeated Signal values mismatch"
+	}
+	return "repeated Signal received"
+}
+
+Repeated_Signal_Handler_State :: struct {
+	valid: bool,
+}
+
+fiber_repeated_signal_handler_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	state := Repeated_Signal_Handler_State{}
+	registered := workflow.set_signal_handler_payloads(
+		ctx,
+		"repeated_handler",
+		&state,
+		proc(data: rawptr, inputs: []codec.Payload_View) -> workflow.Payload_Result {
+			state := cast(^Repeated_Signal_Handler_State)data
+			name: string
+			count: int
+			enabled: bool
+			state.valid = len(inputs) == 3 &&
+			              codec.decode_json(inputs[0], &name) == .None &&
+			              codec.decode_json(inputs[1], &count) == .None &&
+			              codec.decode_json(inputs[2], &enabled) == .None &&
+			              name == "Odin" && count == 42 && enabled
+			delete(name)
+			return workflow.payload_complete({})
+		},
+	)
+	if !registered {
+		return "repeated Signal handler registration failed"
+	}
+	_ = workflow.await_signal(ctx, "finish")
+	if !state.valid {
+		return "repeated Signal handler mismatch"
+	}
+	return "repeated Signal handler received"
+}
+
+fiber_repeated_signal_routine_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	state := Repeated_Signal_Handler_State{}
+	registered := workflow.set_signal_handler_payloads(
+		ctx,
+		"repeated_routine",
+		&state,
+		nil,
+		proc(
+			data: rawptr,
+			routine_ctx: ^workflow.Fiber_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Payload_Result {
+			state := cast(^Repeated_Signal_Handler_State)data
+			name: string
+			count: int
+			enabled: bool
+			decoded := len(inputs) == 3 &&
+			           codec.decode_json(inputs[0], &name) == .None &&
+			           codec.decode_json(inputs[1], &count) == .None &&
+			           codec.decode_json(inputs[2], &enabled) == .None
+			workflow.sleep(routine_ctx, time.Second)
+			state.valid = decoded && name == "Odin" && count == 42 && enabled
+			delete(name)
+			return workflow.payload_complete({})
+		},
+	)
+	if !registered {
+		return "repeated Signal routine registration failed"
+	}
+	_ = workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	if !state.valid {
+		return "repeated Signal routine mismatch"
+	}
+	return "repeated Signal routine received"
+}
+
 fiber_signal_handler_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Signal_Routine_State{name = name}
 	registered := workflow.set_signal_handler_json(
@@ -5806,6 +5910,73 @@ client_signal_projects_request_id_and_headers :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_signal_request_preserves_repeated_arguments :: proc(t: ^testing.T) {
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedSignal"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&name, 3072) == .None)
+	inputs := [3]codec.Payload_View{
+		codec.payload_view(&name),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	request_bytes, request_error := temporal_client.encode_signal_workflow_request_payloads(
+		"default",
+		"workflow-id",
+		"run-id",
+		"repeated",
+		inputs[:],
+		{request_id = "repeated-signal-request"},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect(t, request.input != nil)
+	if request.input == nil do return
+	testing.expect_value(t, len(request.input.payloads), 3)
+	if len(request.input.payloads) != 3 do return
+	testing.expect_value(t, string(request.input.payloads[0].data), `"Odin"`)
+	testing.expect_value(t, string(request.input.payloads[1].data), "42")
+	testing.expect_value(t, string(request.input.payloads[2].data), "true")
+	message_type := ""
+	for metadata in request.input.payloads[0].metadata {
+		if metadata.key == "messageType" {
+			message_type = string(metadata.value)
+		}
+	}
+	testing.expect_value(t, message_type, "odin.RepeatedSignal")
+	testing.expect_value(t, len(request.input.payloads[0].external_payloads), 1)
+	if len(request.input.payloads[0].external_payloads) == 1 {
+		testing.expect_value(t, request.input.payloads[0].external_payloads[0].size_bytes, i64(3072))
+	}
+}
+
+@(test)
 client_signal_interceptors_nest_and_isolate_working_headers :: proc(t: ^testing.T) {
 	state := Client_Interceptor_Test_State{}
 	first := Client_Interceptor_Test_Node{state = &state, id = 1}
@@ -7999,6 +8170,457 @@ single_argument_workflow_adapter_rejects_repeated_arguments :: proc(t: ^testing.
 	inspection := inspect_workflow_failure_command(processed.completion[:])
 	testing.expect(t, inspection.found)
 	testing.expect_value(t, string(inspection.failure_type), "OdinWorkflowArgumentCountError")
+	testing.expect(t, inspection.non_retryable)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_repeated_signal_arguments_preserve_order_details_and_replay_bytes :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"repeated_signal_await_workflow",
+		"test-queue",
+		fiber_repeated_signal_await_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_signal_await_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-signal-await-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "repeated Signal initialization failed: %s", string(initial.error.message))
+	testing.expect(t, initial.waiting_signal)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(t, codec.payload_add_external(&name, 3072) == .None)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "repeated",
+		identity = "repeated-client",
+		originating_event_id = 73,
+	}
+	defer delete(signal.input)
+	append(&signal.input, proto_name, proto_count, proto_enabled)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "repeated Signal failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	inspection := inspect_workflow_completion(completed.completion[:])
+	testing.expect(t, inspection.completed)
+	testing.expect_value(t, string(inspection.completion_result), `"repeated Signal received"`)
+	delete(inspection.completion_result)
+	completion_bytes := completed.completion
+	workflow.error_free(&completed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, replayed.completed)
+	testing.expect(t, bytes.equal(completion_bytes[:], replayed.completion[:]))
+	delete(completion_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
+workflow_repeated_signal_handler_receives_all_arguments :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"repeated_signal_handler_workflow",
+		"test-queue",
+		fiber_repeated_signal_handler_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_signal_handler_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-signal-handler-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	finish, finish_error := codec.encode_json("done")
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None && finish_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	defer codec.payload_free(&finish)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	proto_finish := proto.encode_payload(codec.payload_view(&finish))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	defer delete(proto_finish.metadata)
+	defer delete(proto_finish.external_payloads)
+	repeated_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "repeated_handler",
+	}
+	defer delete(repeated_signal.input)
+	append(&repeated_signal.input, proto_name, proto_count, proto_enabled)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &repeated_signal,
+			},
+		},
+	)
+	handled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, handled.error.message == nil, "repeated Signal handler failed: %s", string(handled.error.message))
+	testing.expect(t, handled.received_signal && !handled.completed)
+	delete(handled.completion)
+	workflow.error_free(&handled.error)
+
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, proto_finish)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 11
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "finishing repeated Signal handler workflow failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	inspection := inspect_workflow_completion(completed.completion[:])
+	testing.expect_value(t, string(inspection.completion_result), `"repeated Signal handler received"`)
+	delete(inspection.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+workflow_repeated_signal_routine_keeps_arguments_across_suspension :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"repeated_signal_routine_workflow",
+		"test-queue",
+		fiber_repeated_signal_routine_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_signal_routine_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-signal-routine-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	finish, finish_error := codec.encode_json("done")
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None && finish_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	defer codec.payload_free(&finish)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	proto_finish := proto.encode_payload(codec.payload_view(&finish))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	defer delete(proto_finish.metadata)
+	defer delete(proto_finish.external_payloads)
+	repeated_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "repeated_routine",
+	}
+	defer delete(repeated_signal.input)
+	append(&repeated_signal.input, proto_name, proto_count, proto_enabled)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, proto_finish)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &repeated_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	suspended := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, suspended.error.message == nil, "repeated Signal routine start failed: %s", string(suspended.error.message))
+	testing.expect(t, suspended.started_timer && suspended.waiting_handlers)
+	testing.expect_value(t, suspended.signal_handlers_started, 1)
+	testing.expect_value(t, suspended.signal_handlers_completed, 0)
+	delete(suspended.completion)
+	workflow.error_free(&suspended.error)
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "repeated Signal routine resume failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	testing.expect_value(t, completed.signal_handlers_completed, 1)
+	inspection := inspect_workflow_completion(completed.completion[:])
+	testing.expect_value(t, string(inspection.completion_result), `"repeated Signal routine received"`)
+	delete(inspection.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
+workflow_single_signal_adapter_rejects_repeated_arguments :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"single_signal_adapter_workflow",
+		"test-queue",
+		fiber_wait_signal_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "single_signal_adapter_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "single-signal-adapter-run",
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	first, first_error := codec.encode_json(Signal_Test_Value{message = "first", approved = true})
+	second, second_error := codec.encode_json(Signal_Test_Value{message = "second", approved = true})
+	testing.expect(t, first_error == .None && second_error == .None)
+	defer codec.payload_free(&first)
+	defer codec.payload_free(&second)
+	proto_first := proto.encode_payload(codec.payload_view(&first))
+	proto_second := proto.encode_payload(codec.payload_view(&second))
+	defer delete(proto_first.metadata)
+	defer delete(proto_first.external_payloads)
+	defer delete(proto_second.metadata)
+	defer delete(proto_second.external_payloads)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "approval"}
+	defer delete(signal.input)
+	append(&signal.input, proto_first, proto_second)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(
+		t,
+		string(inspection.failure_type),
+		"OdinWorkflowSignalArgumentCountError",
+	)
 	testing.expect(t, inspection.non_retryable)
 	delete(inspection.message)
 	delete(inspection.failure_type)

@@ -121,6 +121,38 @@ worker_pid=""
 cat "$worker_log"
 grep -q 'multiple Workflow arguments completed end-to-end through Core' "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=multiple-signal-arguments \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Repeated-Signal Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+repeated_signal_workflow_id="odin-sdk-repeated-signal-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=multiple-signal-arguments \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$repeated_signal_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+repeated_signal_output="$(<"$workflow_output_file")"
+echo "$repeated_signal_output"
+grep -q "Odin client completed repeated-Signal workflow_id=$repeated_signal_workflow_id" <<<"$repeated_signal_output"
+grep -q 'result="Odin:42:true"' <<<"$repeated_signal_output"
+grep -q 'Client Signal interceptor observed three Signal arguments' <<<"$repeated_signal_output"
+grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$repeated_signal_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'multiple Signal arguments completed end-to-end through Core' "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=signal-with-start \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

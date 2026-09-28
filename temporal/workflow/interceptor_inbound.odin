@@ -54,7 +54,7 @@ Inbound_Handle_Signal_Input :: struct {
 	ctx:           ^Fiber_Context,
 	workflow_type: string,
 	signal:        ^Signal_Context,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 }
 
 Inbound_Handle_Signal_Next_Proc :: #type proc(
@@ -307,28 +307,65 @@ inbound_handle_signal_chain :: proc(
 		)
 	}
 	if state.routine != nil {
+		if state.routine.invoke_payloads_with_context != nil {
+			return state.routine.invoke_payloads_with_context(
+				state.routine.callback_data,
+				input.ctx,
+				input.signal,
+				input.inputs,
+			)
+		}
+		if state.routine.invoke_payloads != nil {
+			return state.routine.invoke_payloads(
+				state.routine.callback_data,
+				input.ctx,
+				input.inputs,
+			)
+		}
+		if len(input.inputs) != 1 {
+			return payload_fail(
+				"single-Payload Workflow Signal routine requires exactly one argument",
+				"OdinWorkflowSignalArgumentCountError",
+			)
+		}
 		if state.routine.invoke_with_context != nil {
 			return state.routine.invoke_with_context(
 				state.routine.callback_data,
 				input.ctx,
 				input.signal,
-				input.input,
+				input.inputs[0],
 			)
 		}
 		return state.routine.invoke(
 			state.routine.callback_data,
 			input.ctx,
-			input.input,
+			input.inputs[0],
+		)
+	}
+	if state.handler.invoke_payloads_with_context != nil {
+		return state.handler.invoke_payloads_with_context(
+			state.handler.callback_data,
+			input.signal,
+			input.inputs,
+		)
+	}
+	if state.handler.invoke_payloads != nil {
+		return state.handler.invoke_payloads(state.handler.callback_data, input.inputs)
+	}
+	if len(input.inputs) != 1 {
+		return payload_fail(
+			"single-Payload Workflow Signal handler requires exactly one argument",
+			"OdinWorkflowSignalArgumentCountError",
 		)
 	}
 	if state.handler.invoke_with_context != nil {
 		return state.handler.invoke_with_context(
 			state.handler.callback_data,
 			input.signal,
-			input.input,
+			input.inputs[0],
 		)
 	}
-	return state.handler.invoke(state.handler.callback_data, input.input)
+	return state.handler.invoke(state.handler.callback_data, input.inputs[0])
 }
 
 Inbound_Handle_Update_Validator_State :: struct {

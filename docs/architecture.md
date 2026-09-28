@@ -1150,12 +1150,15 @@ responsibilities: the TypeScript SDK has an explicit
 and Temporal's Go documentation confirms that
 [signals are retained until matching Workflow code receives them](https://github.com/temporalio/documentation/blob/main/docs/develop/go/workflows/message-passing.mdx#signal-channels).
 
-The Odin runtime currently accepts exactly one generic Payload per signal. It
-copies the name and complete Payload—including metadata and external-payload
-details—into the Workflow instance arena and appends them to an arrival-ordered
-queue. `await_signal_payload(ctx, name)` consumes the oldest unconsumed matching
-entry immediately, or changes the fiber phase to `Waiting_Signal` and yields.
-`await_signal_json` decodes a typed value at the authoring boundary;
+The Odin runtime accepts Core's complete repeated Payload field per signal. It
+copies the name and every Payload—including metadata and external-payload
+details—into the Workflow instance arena and appends the invocation to an
+arrival-ordered queue. `await_signal_payloads(ctx, name)` consumes the oldest
+unconsumed matching entry immediately, or changes the fiber phase to
+`Waiting_Signal` and yields. The contextual form also exposes identity, headers,
+and originating event ID. `await_signal_payload` and `await_signal_json` are
+explicit one-argument adapters; another arity deterministically fails with
+`OdinWorkflowSignalArgumentCountError` rather than dropping values.
 `await_signal` remains the `json/plain` string adapter. Generic, typed, and
 string signal-or-timeout variants share the same buffer and race logic. A signal
 only resumes the fiber when that exact phase/name is active; signals received
@@ -1554,6 +1557,9 @@ Odin now follows that boundary:
   emits a worker warning and `.Abandon` suppresses it.
 - Inputs are cloned into the Workflow arena before the handler starts. Routine
   stacks and routing records live until completion or instance eviction.
+- Codec-neutral `set_signal_handler_payloads` and contextual/stackful variants
+  receive the full ordered borrowed slice. The singular handler registrations
+  enforce exactly one argument.
 
 The offline test starts an Activity-awaiting Signal handler, delivers main's
 finish signal while that handler is suspended, and proves main remains in
@@ -1978,8 +1984,8 @@ Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 recursive Failure chains,
 500 Client start request (including static UserMetadata and eager-start intent)
-round trips, 500 Signal-With-Start request round trips, 500 ordinary Signal
-request/header round trips, 500 paginated Visibility
+round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
+Signal request/header round trips over 0–12 arguments, 500 paginated Visibility
 list/count round trips, 500 query request/header round trips, 500 Update
 request/header round trips,
 500 query response round trips, and

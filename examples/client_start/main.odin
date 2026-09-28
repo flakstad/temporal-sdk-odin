@@ -75,6 +75,23 @@ signal_with_start_interceptor :: proc(
 	return handle, result_error
 }
 
+signal_workflow_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Signal_Workflow_Input,
+	next: temporal_client.Client_Signal_Workflow_Next,
+) -> temporal_client.Error {
+	if input.signal_name == "repeated" {
+		if len(input.inputs) != 3 {
+			return temporal_client.error_from_string(
+				.Invalid_Argument,
+				"Client interceptor did not receive three Signal arguments",
+			)
+		}
+		fmt.println("Client Signal interceptor observed three Signal arguments")
+	}
+	return temporal_client.client_signal_workflow_next(next, input)
+}
+
 get_result_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Get_Result_Input,
@@ -116,6 +133,7 @@ run :: proc() -> int {
 	interceptors := [?]temporal_client.Client_Interceptor{{
 		start_workflow = start_workflow_interceptor,
 		signal_with_start = signal_with_start_interceptor,
+		signal_workflow = signal_workflow_interceptor,
 		get_result = get_result_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -224,6 +242,81 @@ run :: proc() -> int {
 		}
 		fmt.printf(
 			"Odin client completed repeated-argument workflow_id=%s run_id=%s result=%q\n",
+			workflow_id,
+			handle.run_id,
+			result,
+		)
+		return 0
+	}
+	if scenario == "multiple-signal-arguments" {
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_repeated_signal_workflow",
+			"start",
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf("Repeated-Signal Workflow start failed: %s\n", string(start_error.message))
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		name, name_error := codec.encode_json("Odin")
+		count, count_error := codec.encode_json(42)
+		enabled, enabled_error := codec.encode_json(true)
+		if name_error != .None || count_error != .None || enabled_error != .None {
+			fmt.eprintln("Could not encode repeated Signal arguments")
+			codec.payload_free(&name)
+			codec.payload_free(&count)
+			codec.payload_free(&enabled)
+			return 1
+		}
+		defer codec.payload_free(&name)
+		defer codec.payload_free(&count)
+		defer codec.payload_free(&enabled)
+		if codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedSignal"),
+		) != .None || codec.payload_add_external(&name, 3072) != .None {
+			fmt.eprintln("Could not decorate repeated Signal argument")
+			return 1
+		}
+		inputs := [3]codec.Payload_View{
+			codec.payload_view(&name),
+			codec.payload_view(&count),
+			codec.payload_view(&enabled),
+		}
+		signal_error := temporal_client.signal_workflow_payloads(
+			&handle,
+			"repeated",
+			inputs[:],
+		)
+		if signal_error.message != nil {
+			fmt.eprintf("Repeated Signal failed: %s\n", string(signal_error.message))
+			temporal_client.error_free(&signal_error)
+			return 1
+		}
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf("Repeated-Signal Workflow result failed: %s\n", string(result_error.message))
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "Odin:42:true" {
+			fmt.eprintf("Repeated-Signal Workflow returned unexpected result: %q\n", result)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed repeated-Signal workflow_id=%s run_id=%s result=%q\n",
 			workflow_id,
 			handle.run_id,
 			result,
