@@ -109,6 +109,14 @@ first call creates an execution, the second reuses its run, and both Signal
 headers reach Odin Workflow code. Temporal's request has one Signal header map,
 not independent start and Signal headers; the Odin API makes that limitation
 explicit and rejects eager-start intent on this RPC.
+The same owned `Headers` builder now drives ordinary Client Signals and
+Workflow-originated remote/Local Activities, Child Workflow starts, and
+child/external Workflow Signals. Incoming Signal metadata remains borrowed
+from the Workflow instance—including the signal/timer race helpers—and
+Activity headers remain borrowed from `activity.Context`. Unit/property tests
+cover wire encoding, ownership after Core decode arenas are destroyed, and
+byte-identical replay; the CLI-devserver suite proves both Client Signal to
+Workflow and Workflow command through Core to an Odin Activity.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -143,8 +151,8 @@ detail flags (`not_found`, `cancelled`, `paused`, `timed_out`,
 with a user Payload; a Workflow using `Wait_Cancellation_Completed` can request
 the cancellation explicitly and decode that Payload from the resulting
 `CanceledFailureInfo`. `activity.info(ctx)` now exposes the Core-delivered execution
-identity, timestamps/timeouts, effective Retry Policy, priority, and previous
-heartbeat details as callback-scoped borrowed values; a retry integration test
+identity, timestamps/timeouts, effective Retry Policy, priority, interceptor
+headers, and previous heartbeat details as callback-scoped borrowed values; a retry integration test
 recovers typed heartbeat progress on attempt 2. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
@@ -462,7 +470,16 @@ Existing executions can be addressed without an RPC when creating the handle:
 handle, err := temporal_client.get_workflow_handle(&client, "order-42")
 defer temporal_client.workflow_handle_free(&handle)
 
-err = temporal_client.signal_workflow_json(&handle, "approve", approval)
+signal_headers := temporal_client.Headers{}
+err = temporal_client.headers_init(&signal_headers)
+defer temporal_client.headers_free(&signal_headers)
+err = temporal_client.headers_add_json(&signal_headers, "caller", "orders-api")
+err = temporal_client.signal_workflow_json_with_options(
+    &handle,
+    "approve",
+    approval,
+    {headers = &signal_headers},
+)
 status: Order_Status
 err = temporal_client.query_workflow_json(
     &handle,
@@ -992,6 +1009,7 @@ temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/worker/          Activity/Workflow registry and concurrent Core polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
+temporal/headers/         shared owned interceptor/context Payload map
 temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/client/          owned Client and Workflow handle/control APIs
 temporal/failure/         owned recursive Temporal Failure model

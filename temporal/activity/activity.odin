@@ -238,6 +238,11 @@ Priority :: struct {
 	fairness_weight: f32,
 }
 
+Header :: struct {
+	key:     string,
+	payload: codec.Payload_View,
+}
+
 // Info and all nested slices borrow their backing storage from Context. They
 // are valid only for the duration of the Activity callback.
 Info :: struct {
@@ -272,6 +277,7 @@ Info :: struct {
 	priority:     Priority,
 	has_priority: bool,
 	heartbeat_details: []codec.Payload_View,
+	headers:           []Header,
 }
 
 payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
@@ -414,6 +420,30 @@ heartbeat_detail_json :: proc(
 	value: ^$T,
 ) -> (found: bool, error: codec.Error) {
 	payload, payload_found := heartbeat_detail_payload(ctx, index)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+header_payload :: proc(ctx: ^Context, key: string) -> (payload: codec.Payload_View, found: bool) {
+	if ctx == nil {
+		return
+	}
+	for entry in ctx.info_value.headers {
+		if entry.key == key {
+			return entry.payload, true
+		}
+	}
+	return
+}
+
+header_json :: proc(
+	ctx: ^Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := header_payload(ctx, key)
 	if !payload_found {
 		return false, .None
 	}

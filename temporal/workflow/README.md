@@ -45,11 +45,16 @@ the simpler `execute_activity` propagates an unhandled failure to Temporal.
 Named string signals are queued in arrival order and do not resume a fiber that
 is waiting on another operation. `await_signal_or_timeout` schedules a durable
 timer and emits `CancelTimer` only when a signal wins before the timer fires.
+Its result retains the same borrowed Signal metadata as the non-timeout await.
 `await_signal_payload_with_context` and `await_signal_json_with_context`
 preserve Core's Signal identity, headers, and originating history event ID;
 these are borrowed Workflow-instance views. Synchronous handlers can request
 the same metadata with `set_signal_handler_json_with_context`. Header helpers
 remain codec-neutral with an optional typed JSON adapter.
+The shared owned `Headers` builder can also be attached to remote/Local
+Activity options, Child Workflow options, and child/external Signal options.
+Each operation clones it into the Workflow run arena before suspension so the
+caller may free the builder after the scheduling call returns.
 `temporal/worker` now provides experimental name-based Workflow registration
 and dispatch, but neither the fiber API nor its one-string codec is stable or a
 complete Workflow runtime. Do not build production Workflows against them.

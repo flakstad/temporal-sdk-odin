@@ -13,6 +13,7 @@ import codec "../codec"
 import temporal_core "../core"
 import proto "../core/proto"
 import temporal_failure "../failure"
+import temporal_headers "../headers"
 
 Error_Kind :: enum {
 	None,
@@ -293,37 +294,27 @@ Start_Metadata_Named_Payload :: struct {
 	payload: codec.Payload,
 }
 
-// Headers owns a deterministic insertion-ordered map of Temporal Payloads.
-// It is reusable across synchronous Client calls, but must outlive each call
-// whose options borrow it.
-Headers :: struct {
-	entries:   [dynamic]Start_Metadata_Named_Payload,
-	allocator: mem.Allocator,
-}
+// Headers is shared with Workflow command options. It owns a deterministic
+// insertion-ordered map of Temporal Payloads and must outlive each synchronous
+// call whose options borrow it.
+Headers :: temporal_headers.Headers
 
 headers_init :: proc(headers: ^Headers, allocator := context.allocator) -> Error {
-	if headers == nil || allocator.procedure == nil {
-		return error_from_string(.Invalid_Argument, "Temporal headers require an allocator")
+	result := temporal_headers.init(headers, allocator)
+	if result == .None {
+		return {}
 	}
-	if headers.allocator.procedure != nil {
+	if result == .Invalid_Argument && headers != nil && headers.allocator.procedure != nil {
 		return error_from_string(.Invalid_Argument, "Temporal headers are already initialized")
 	}
-	headers.entries = make([dynamic]Start_Metadata_Named_Payload, allocator)
-	headers.allocator = allocator
-	return {}
+	if result == .Invalid_Argument {
+		return error_from_string(.Invalid_Argument, "Temporal headers require an allocator")
+	}
+	return error_from_string(.Payload_Conversion, "could not initialize Temporal headers")
 }
 
 headers_free :: proc(headers: ^Headers) {
-	if headers == nil || headers.allocator.procedure == nil {
-		return
-	}
-	allocator := headers.allocator
-	for &entry in headers.entries {
-		delete(entry.key, allocator)
-		codec.payload_free(&entry.payload)
-	}
-	delete(headers.entries)
-	headers^ = {}
+	temporal_headers.free(headers)
 }
 
 Start_Metadata_Search_Attribute :: struct {
@@ -451,25 +442,27 @@ start_metadata_put_named_owned :: proc(
 }
 
 headers_add_payload :: proc(headers: ^Headers, key: string, value: codec.Payload_View) -> Error {
-	if headers == nil || headers.allocator.procedure == nil {
-		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized")
-	}
-	payload, clone_error := codec.payload_clone(value, headers.allocator)
-	if clone_error != .None {
+	switch result := temporal_headers.add_payload(headers, key, value); result {
+	case .None:
+		return {}
+	case .Invalid_Argument:
+		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized or the key is empty")
+	case .Payload_Conversion, .Allocation_Failed:
 		return error_from_string(.Payload_Conversion, "could not clone Temporal header Payload")
 	}
-	return start_metadata_put_named_owned(&headers.entries, key, payload, headers.allocator)
+	return error_from_string(.Payload_Conversion, "could not clone Temporal header Payload")
 }
 
 headers_add_json :: proc(headers: ^Headers, key: string, value: $T) -> Error {
-	if headers == nil || headers.allocator.procedure == nil {
-		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized")
-	}
-	payload, encode_error := codec.encode_json(value, headers.allocator)
-	if encode_error != .None {
+	switch result := temporal_headers.add_json(headers, key, value); result {
+	case .None:
+		return {}
+	case .Invalid_Argument:
+		return error_from_string(.Invalid_Argument, "Temporal headers are not initialized or the key is empty")
+	case .Payload_Conversion, .Allocation_Failed:
 		return error_from_string(.Payload_Conversion, "could not encode Temporal header")
 	}
-	return start_metadata_put_named_owned(&headers.entries, key, payload, headers.allocator)
+	return error_from_string(.Payload_Conversion, "could not encode Temporal header")
 }
 
 start_metadata_add_named_payload :: proc(
@@ -610,6 +603,11 @@ Workflow_Handle :: struct {
 	first_execution_run_id: string,
 	started_by_request:      bool,
 	eager_execution_accepted: bool,
+}
+
+Signal_Workflow_Options :: struct {
+	request_id: string,
+	headers:    ^Headers,
 }
 
 // Query_Reject_Condition controls whether Temporal may deliver a Query for a
@@ -1359,11 +1357,26 @@ signal_workflow :: proc(
 	signal_name: string,
 	explicit_request_id := "",
 ) -> Error {
+	return signal_workflow_with_options(
+		handle,
+		signal_name,
+		{request_id = explicit_request_id},
+	)
+}
+
+signal_workflow_with_options :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	options: Signal_Workflow_Options,
+) -> Error {
 	if !workflow_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
 	if len(signal_name) == 0 {
 		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow signal headers are not initialized")
 	}
 	execution := workflow_execution(handle)
 	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
@@ -1372,11 +1385,86 @@ signal_workflow :: proc(
 		workflow_execution = &execution,
 		signal_name = signal_name,
 		identity = "temporal-sdk-odin@local",
-		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
+		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
+	}
+	header := proto.Temporal_Api_Common_V1_Header{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer free_start_proto_payloads(header_payloads)
+	if options.headers != nil && len(options.headers.entries) > 0 {
+		header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(options.headers.entries))
+		for &entry, index in options.headers.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in options.headers.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+		request.header = &header
 	}
 	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request)
 	defer delete(request_bytes)
 	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
+}
+
+// encode_signal_workflow_request is the codec-neutral wire-contract boundary
+// for a one-Payload Signal. Returned bytes are owned by the caller.
+encode_signal_workflow_request :: proc(
+	namespace, workflow_id, run_id, signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Workflow_Options = {},
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 || len(signal_name) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Signal namespace, Workflow ID, and name are required")
+	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return nil, error_from_string(.Invalid_Argument, "Workflow signal headers are not initialized")
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
+	encoded_input := proto.encode_payload(input)
+	defer delete(encoded_input.metadata)
+	defer delete(encoded_input.external_payloads)
+	inputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(inputs.payloads)
+	append(&inputs.payloads, encoded_input)
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
+		namespace = namespace,
+		workflow_execution = &execution,
+		signal_name = signal_name,
+		input = &inputs,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
+	}
+	header := proto.Temporal_Api_Common_V1_Header{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer free_start_proto_payloads(header_payloads)
+	if options.headers != nil && len(options.headers.entries) > 0 {
+		header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(options.headers.entries))
+		for &entry, index in options.headers.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in options.headers.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+		request.header = &header
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request), {}
 }
 
 signal_workflow_payload :: proc(
@@ -1385,29 +1473,34 @@ signal_workflow_payload :: proc(
 	input: codec.Payload_View,
 	explicit_request_id := "",
 ) -> Error {
+	return signal_workflow_payload_with_options(
+		handle,
+		signal_name,
+		input,
+		{request_id = explicit_request_id},
+	)
+}
+
+signal_workflow_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Workflow_Options,
+) -> Error {
 	if !workflow_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
-	if len(signal_name) == 0 {
-		return error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	request_bytes, request_error := encode_signal_workflow_request(
+		handle.client.namespace,
+		handle.id,
+		handle.run_id,
+		signal_name,
+		input,
+		options,
+	)
+	if request_error.message != nil {
+		return request_error
 	}
-	execution := workflow_execution(handle)
-	payload := proto.encode_payload(input)
-	defer delete(payload.metadata)
-	defer delete(payload.external_payloads)
-	inputs := proto.Temporal_Api_Common_V1_Payloads{}
-	defer delete(inputs.payloads)
-	append(&inputs.payloads, payload)
-	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
-		workflow_execution = &execution,
-		signal_name = signal_name,
-		input = &inputs,
-		identity = "temporal-sdk-odin@local",
-		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
-	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(&request)
 	defer delete(request_bytes)
 	return rpc_empty_response(handle, "SignalWorkflowExecution", request_bytes[:])
 }
@@ -1418,16 +1511,30 @@ signal_workflow_json :: proc(
 	input: $T,
 	explicit_request_id := "",
 ) -> Error {
+	return signal_workflow_json_with_options(
+		handle,
+		signal_name,
+		input,
+		{request_id = explicit_request_id},
+	)
+}
+
+signal_workflow_json_with_options :: proc(
+	handle: ^Workflow_Handle,
+	signal_name: string,
+	input: $T,
+	options: Signal_Workflow_Options,
+) -> Error {
 	payload, encode_error := codec.encode_json(input)
 	if encode_error != .None {
 		return error_from_string(.Payload_Conversion, "could not encode Workflow signal input")
 	}
 	defer codec.payload_free(&payload)
-	return signal_workflow_payload(
+	return signal_workflow_payload_with_options(
 		handle,
 		signal_name,
 		codec.payload_view(&payload),
-		explicit_request_id,
+		options,
 	)
 }
 

@@ -136,3 +136,92 @@ signal_with_start_requests_preserve_generated_contract :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
+	input_value := pbt.draw(t, pbt.string_ascii(0, 96))
+	header_value := pbt.draw(t, pbt.string_ascii(0, 64))
+	run_id := pbt.draw(t, pbt.string_ascii(0, 48))
+	pbt.cover(t, len(input_value) == 0, 0.2, "empty Signal input")
+	pbt.cover(t, len(header_value) == 0, 0.5, "empty Signal header value")
+	pbt.cover(t, len(run_id) == 0, 0.5, "current-run Signal target")
+
+	input := codec.payload_create(transmute([]u8)input_value)
+	defer codec.payload_free(&input)
+	headers := temporal_client.Headers{}
+	init_error := temporal_client.headers_init(&headers)
+	defer temporal_client.error_free(&init_error)
+	if init_error.message != nil {
+		return pbt.error("could not initialize generated Signal headers")
+	}
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "property-header", header_value)
+	defer temporal_client.error_free(&header_error)
+	if header_error.message != nil {
+		return pbt.error("could not encode generated Signal header")
+	}
+
+	encoded, encode_error := temporal_client.encode_signal_workflow_request(
+		"property-namespace",
+		"property-workflow-id",
+		run_id,
+		"property-signal",
+		codec.payload_view(&input),
+		{request_id = "property-request-id", headers = &headers},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	if encode_error.message != nil {
+		return pbt.fail("valid generated Signal request was rejected")
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize Signal property arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(
+		encoded[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || request.workflow_execution == nil || request.input == nil ||
+	   len(request.input.payloads) != 1 || request.header == nil ||
+	   len(request.header.fields) != 1 || request.header.fields[0].value == nil {
+		return pbt.fail("generated Signal request did not decode")
+	}
+	if request.namespace != "property-namespace" ||
+	   request.workflow_execution.workflow_id != "property-workflow-id" ||
+	   request.workflow_execution.run_id != run_id ||
+	   request.signal_name != "property-signal" ||
+	   request.request_id != "property-request-id" ||
+	   request.header.fields[0].key != "property-header" ||
+	   !bytes.equal(request.input.payloads[0].data, transmute([]u8)input_value) {
+		return pbt.fail("generated Signal scalar fields changed during round trip")
+	}
+	owned_header, clone_error := proto.clone_payload(request.header.fields[0].value)
+	defer codec.payload_free(&owned_header)
+	if clone_error != .None {
+		return pbt.fail("generated Signal header could not be preserved")
+	}
+	decoded_header: string
+	defer delete(decoded_header)
+	if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None ||
+	   decoded_header != header_value {
+		return pbt.fail("generated Signal header changed during round trip")
+	}
+	return pbt.pass()
+}
+
+@(test)
+signal_requests_preserve_generated_headers :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Signal requests preserve request identity, payload, and headers",
+		signal_request_property,
+		{num_tests = 500, seed = 0x5349_474e_414c_4844},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

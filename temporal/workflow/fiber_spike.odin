@@ -10,6 +10,7 @@ import "core:time"
 import codec "../codec"
 import proto "../core/proto"
 import temporal_failure "../failure"
+import temporal_headers "../headers"
 import fiber_raw "fiber/raw"
 
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
@@ -168,6 +169,7 @@ Child_Workflow_Options :: struct {
 	retry_policy:              ^Retry_Policy,
 	cancellation_type:         Child_Workflow_Cancellation_Type,
 	parent_close_policy:       Parent_Close_Policy,
+	headers:                   ^Headers,
 }
 
 Owned_Child_Workflow_Options :: struct {
@@ -179,6 +181,7 @@ Owned_Child_Workflow_Options :: struct {
 	has_retry_policy:          bool,
 	cancellation_type:         Child_Workflow_Cancellation_Type,
 	parent_close_policy:       Parent_Close_Policy,
+	headers:                   [dynamic]Fiber_Named_Payload,
 }
 
 Retry_Policy :: struct {
@@ -244,6 +247,28 @@ Info :: struct {
 
 Search_Attribute_Type :: codec.Search_Attribute_Type
 
+Headers :: temporal_headers.Headers
+
+headers_init :: proc(headers: ^Headers, allocator := context.allocator) -> bool {
+	return temporal_headers.init(headers, allocator) == .None
+}
+
+headers_free :: proc(headers: ^Headers) {
+	temporal_headers.free(headers)
+}
+
+headers_add_payload :: proc(headers: ^Headers, key: string, value: codec.Payload_View) -> bool {
+	return temporal_headers.add_payload(headers, key, value) == .None
+}
+
+headers_add_json :: proc(headers: ^Headers, key: string, value: $T) -> bool {
+	return temporal_headers.add_json(headers, key, value) == .None
+}
+
+Signal_Options :: struct {
+	headers: ^Headers,
+}
+
 // Activity_Options borrows its strings, slices, and retry_policy only for the
 // start/execute call. The Workflow runtime copies them into the run arena before
 // it can suspend. A zero duration means "not specified".
@@ -257,6 +282,7 @@ Activity_Options :: struct {
 	retry_policy:              ^Retry_Policy,
 	cancellation_type:         Activity_Cancellation_Type,
 	disable_eager_execution:   bool,
+	headers:                   ^Headers,
 }
 
 Owned_Activity_Options :: struct {
@@ -269,6 +295,7 @@ Owned_Activity_Options :: struct {
 	has_retry_policy:          bool,
 	cancellation_type:         Activity_Cancellation_Type,
 	disable_eager_execution:   bool,
+	headers:                   [dynamic]Fiber_Named_Payload,
 }
 
 // Local Activities execute in the same Worker process as the Workflow but are
@@ -284,6 +311,7 @@ Local_Activity_Options :: struct {
 	local_retry_threshold:     time.Duration,
 	cancellation_type:         Local_Activity_Cancellation_Type,
 	include_arguments_in_marker: bool,
+	headers:                   ^Headers,
 }
 
 Owned_Local_Activity_Options :: struct {
@@ -295,6 +323,7 @@ Owned_Local_Activity_Options :: struct {
 	local_retry_threshold:     time.Duration,
 	cancellation_type:         Local_Activity_Cancellation_Type,
 	include_arguments_in_marker: bool,
+	headers:                   [dynamic]Fiber_Named_Payload,
 }
 
 // Continue_As_New_Options borrows its strings, slices, and retry_policy only
@@ -570,13 +599,15 @@ Signal_Wait_Status :: enum {
 }
 
 Signal_Wait_Result :: struct {
-	status: Signal_Wait_Status,
-	value:  string,
+	status:   Signal_Wait_Status,
+	value:    string,
+	metadata: Signal_Context,
 }
 
 Payload_Signal_Wait_Result :: struct {
-	status: Signal_Wait_Status,
-	value:  codec.Payload_View,
+	status:   Signal_Wait_Status,
+	value:    codec.Payload_View,
+	metadata: Signal_Context,
 }
 
 // Signal_Context is borrowed from the Workflow instance. Its strings, header
@@ -599,8 +630,9 @@ Json_Signal :: struct(T: typeid) {
 }
 
 Json_Signal_Wait_Result :: struct(T: typeid) {
-	status: Signal_Wait_Status,
-	value:  T,
+	status:   Signal_Wait_Status,
+	value:    T,
+	metadata: Signal_Context,
 }
 
 Cancellation_Scope :: struct {
@@ -739,6 +771,7 @@ Fiber_External_Signal_Operation :: struct {
 	run_id:              string,
 	signal_name:        string,
 	input:              codec.Payload,
+	headers:            [dynamic]Fiber_Named_Payload,
 	failure_message:    string,
 	failure:            ^temporal_failure.Failure,
 	cause:              Workflow_Signal_Failure_Cause,
@@ -1534,6 +1567,29 @@ clone_signal_header_payloads :: proc(
 				delete(key)
 			}
 			codec.payload_free(&payload)
+			return false
+		}
+		append(result, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return true
+}
+
+clone_workflow_headers :: proc(
+	headers: ^Headers,
+	result: ^[dynamic]Fiber_Named_Payload,
+	allocator := context.allocator,
+) -> bool {
+	if headers == nil {
+		return true
+	}
+	if headers.allocator.procedure == nil || result == nil {
+		return false
+	}
+	result^ = make([dynamic]Fiber_Named_Payload, allocator)
+	for &entry in headers.entries {
+		key, key_error := strings.clone(entry.key, allocator)
+		payload, payload_error := codec.payload_clone(codec.payload_view(&entry.payload), allocator)
+		if key_error != nil || payload_error != .None {
 			return false
 		}
 		append(result, Fiber_Named_Payload{key = key, payload = payload})
@@ -3256,6 +3312,9 @@ activity_options_error :: proc(activity_type: string, options: Activity_Options)
 			return "Activity Retry Policy maximum attempts must not be negative"
 		}
 	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return "Activity headers are not initialized"
+	}
 	return ""
 }
 
@@ -3286,6 +3345,9 @@ clone_activity_options :: proc(
 	owned.heartbeat_timeout = options.heartbeat_timeout
 	owned.cancellation_type = options.cancellation_type
 	owned.disable_eager_execution = options.disable_eager_execution
+	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
+		return {}, false
+	}
 	if options.retry_policy != nil {
 		owned.has_retry_policy = true
 		owned.retry_policy = options.retry_policy^
@@ -3544,6 +3606,9 @@ local_activity_options_error :: proc(
 			return "Local Activity Retry Policy maximum interval must not be shorter than its initial interval"
 		}
 	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return "Local Activity headers are not initialized"
+	}
 	return ""
 }
 
@@ -3559,6 +3624,9 @@ clone_local_activity_options :: proc(
 	owned.cancellation_type = options.cancellation_type
 	owned.include_arguments_in_marker = options.include_arguments_in_marker
 	owned.has_retry_policy = true
+	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
+		return {}, false
+	}
 	if options.retry_policy == nil {
 		owned.retry_policy.maximum_attempts = 1
 		return owned, true
@@ -3760,6 +3828,9 @@ child_workflow_options_error :: proc(
 			return "Child Workflow Retry Policy backoff coefficient must be zero or at least one"
 		}
 	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return "Child Workflow headers are not initialized"
+	}
 	return ""
 }
 
@@ -3779,6 +3850,9 @@ clone_child_workflow_options :: proc(
 	owned.workflow_task_timeout = options.workflow_task_timeout
 	owned.cancellation_type = options.cancellation_type
 	owned.parent_close_policy = options.parent_close_policy
+	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
+		return {}, false
+	}
 	if options.retry_policy != nil {
 		owned.has_retry_policy = true
 		owned.retry_policy = options.retry_policy^
@@ -4206,10 +4280,12 @@ signal_child_workflow_owned :: proc(
 	future: Child_Workflow_Future,
 	signal_name: string,
 	input: codec.Payload,
+	options: Signal_Options,
 ) -> Child_Workflow_Signal_Result {
 	owned_input := input
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   future.seq == 0 || len(signal_name) == 0 {
+	   future.seq == 0 || len(signal_name) == 0 ||
+	   options.headers != nil && options.headers.allocator.procedure == nil {
 		codec.payload_free(&owned_input)
 		return {status = .Failed, failure_message = "invalid Child Workflow signal"}
 	}
@@ -4233,15 +4309,22 @@ signal_child_workflow_owned :: proc(
 		return {status = .Failed, failure_message = "Child Workflow is not running"}
 	}
 	owned_name, allocation_error := strings.clone(signal_name, instance.odin_context.allocator)
-	if allocation_error != nil {
+	owned_headers: [dynamic]Fiber_Named_Payload
+	headers_ok := clone_workflow_headers(
+		options.headers,
+		&owned_headers,
+		instance.odin_context.allocator,
+	)
+	if allocation_error != nil || !headers_ok {
 		codec.payload_free(&owned_input)
-		return {status = .Failed, failure_message = "could not preserve Child Workflow signal name"}
+		return {status = .Failed, failure_message = "could not preserve Child Workflow signal name or headers"}
 	}
 	operation := Fiber_External_Signal_Operation{
 		child_workflow_seq = future.seq,
 		child_workflow_id = child.workflow_id,
 		signal_name = owned_name,
 		input = owned_input,
+		headers = owned_headers,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
@@ -4252,6 +4335,16 @@ signal_child_workflow_payload :: proc(
 	signal_name: string,
 	input: codec.Payload_View,
 ) -> Child_Workflow_Signal_Result {
+	return signal_child_workflow_payload_with_options(ctx, future, signal_name, input, {})
+}
+
+signal_child_workflow_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Options,
+) -> Child_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid Child Workflow signal context"}
 	}
@@ -4259,7 +4352,7 @@ signal_child_workflow_payload :: proc(
 	if clone_error != .None {
 		return {status = .Failed, failure_message = "could not preserve Child Workflow signal Payload"}
 	}
-	return signal_child_workflow_owned(ctx, future, signal_name, owned_input)
+	return signal_child_workflow_owned(ctx, future, signal_name, owned_input, options)
 }
 
 signal_child_workflow_json :: proc(
@@ -4268,6 +4361,16 @@ signal_child_workflow_json :: proc(
 	signal_name: string,
 	input: $T,
 ) -> Child_Workflow_Signal_Result {
+	return signal_child_workflow_json_with_options(ctx, future, signal_name, input, {})
+}
+
+signal_child_workflow_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	signal_name: string,
+	input: $T,
+	options: Signal_Options,
+) -> Child_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid Child Workflow signal context"}
 	}
@@ -4275,7 +4378,7 @@ signal_child_workflow_json :: proc(
 	if encode_error != .None {
 		return {status = .Failed, failure_message = "could not encode Child Workflow signal as json/plain"}
 	}
-	return signal_child_workflow_owned(ctx, future, signal_name, payload)
+	return signal_child_workflow_owned(ctx, future, signal_name, payload, options)
 }
 
 signal_external_workflow_owned :: proc(
@@ -4283,11 +4386,13 @@ signal_external_workflow_owned :: proc(
 	execution: External_Workflow_Execution,
 	signal_name: string,
 	input: codec.Payload,
+	options: Signal_Options,
 ) -> External_Workflow_Signal_Result {
 	owned_input := input
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
 	   len(execution.namespace) == 0 || len(execution.workflow_id) == 0 ||
-	   len(signal_name) == 0 {
+	   len(signal_name) == 0 ||
+	   options.headers != nil && options.headers.allocator.procedure == nil {
 		codec.payload_free(&owned_input)
 		return {status = .Failed, failure_message = "invalid external Workflow signal"}
 	}
@@ -4306,8 +4411,14 @@ signal_external_workflow_owned :: proc(
 	)
 	owned_run_id, run_id_error := strings.clone(execution.run_id, instance.odin_context.allocator)
 	owned_name, name_error := strings.clone(signal_name, instance.odin_context.allocator)
+	owned_headers: [dynamic]Fiber_Named_Payload
+	headers_ok := clone_workflow_headers(
+		options.headers,
+		&owned_headers,
+		instance.odin_context.allocator,
+	)
 	if namespace_error != nil || workflow_id_error != nil || run_id_error != nil ||
-	   name_error != nil {
+	   name_error != nil || !headers_ok {
 		codec.payload_free(&owned_input)
 		return {status = .Failed, failure_message = "could not preserve external Workflow signal"}
 	}
@@ -4317,6 +4428,7 @@ signal_external_workflow_owned :: proc(
 		run_id = owned_run_id,
 		signal_name = owned_name,
 		input = owned_input,
+		headers = owned_headers,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
@@ -4327,6 +4439,16 @@ signal_external_workflow_payload :: proc(
 	signal_name: string,
 	input: codec.Payload_View,
 ) -> External_Workflow_Signal_Result {
+	return signal_external_workflow_payload_with_options(ctx, execution, signal_name, input, {})
+}
+
+signal_external_workflow_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Options,
+) -> External_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid external Workflow signal context"}
 	}
@@ -4334,7 +4456,7 @@ signal_external_workflow_payload :: proc(
 	if clone_error != .None {
 		return {status = .Failed, failure_message = "could not preserve external Workflow signal Payload"}
 	}
-	return signal_external_workflow_owned(ctx, execution, signal_name, owned_input)
+	return signal_external_workflow_owned(ctx, execution, signal_name, owned_input, options)
 }
 
 signal_external_workflow_json :: proc(
@@ -4343,6 +4465,16 @@ signal_external_workflow_json :: proc(
 	signal_name: string,
 	input: $T,
 ) -> External_Workflow_Signal_Result {
+	return signal_external_workflow_json_with_options(ctx, execution, signal_name, input, {})
+}
+
+signal_external_workflow_json_with_options :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: $T,
+	options: Signal_Options,
+) -> External_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
 		return {status = .Failed, failure_message = "invalid external Workflow signal context"}
 	}
@@ -4350,7 +4482,7 @@ signal_external_workflow_json :: proc(
 	if encode_error != .None {
 		return {status = .Failed, failure_message = "could not encode external Workflow signal as json/plain"}
 	}
-	return signal_external_workflow_owned(ctx, execution, signal_name, payload)
+	return signal_external_workflow_owned(ctx, execution, signal_name, payload, options)
 }
 
 external_workflow_cancel_failure_cause_from_proto :: proc(
@@ -5459,7 +5591,11 @@ await_signal_payload_or_timeout :: proc(
 	signal, signal_found := find_buffered_signal(instance, name)
 	if signal_found {
 		signal.consumed = true
-		return {status = .Received, value = codec.payload_view(&signal.payload)}
+		return {
+			status = .Received,
+			value = codec.payload_view(&signal.payload),
+			metadata = fiber_signal_context(signal),
+		}
 	}
 	waiting_name, allocation_error := strings.clone(name)
 	if allocation_error != nil {
@@ -5492,7 +5628,11 @@ await_signal_payload_or_timeout :: proc(
 		if timer_found && timer.state == .Commanded {
 			timer.state = .Cancel_Requested
 		}
-		return {status = .Received, value = codec.payload_view(&signal.payload)}
+		return {
+			status = .Received,
+			value = codec.payload_view(&signal.payload),
+			metadata = fiber_signal_context(signal),
+		}
 	}
 	if timer_found && timer.state == .Resolved {
 		return {status = .Timed_Out}
@@ -5508,7 +5648,7 @@ await_signal_or_timeout :: proc(
 ) -> Signal_Wait_Result {
 	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
 	if payload_result.status != .Received {
-		return {status = payload_result.status}
+		return {status = payload_result.status, metadata = payload_result.metadata}
 	}
 	value, decode_error := codec.decode_string(
 		payload_result.value.data,
@@ -5518,9 +5658,9 @@ await_signal_or_timeout :: proc(
 		if ctx != nil {
 			signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain string")
 		}
-		return {status = .Received}
+		return {status = .Received, metadata = payload_result.metadata}
 	}
-	return {status = .Received, value = value}
+	return {status = .Received, value = value, metadata = payload_result.metadata}
 }
 
 await_signal_json_or_timeout :: proc(
@@ -5531,16 +5671,16 @@ await_signal_json_or_timeout :: proc(
 ) -> Json_Signal_Wait_Result(T) {
 	payload_result := await_signal_payload_or_timeout(ctx, name, duration)
 	if payload_result.status != .Received {
-		return {status = payload_result.status}
+		return {status = payload_result.status, metadata = payload_result.metadata}
 	}
 	value: T
 	if codec.decode_json(payload_result.value, &value) != .None {
 		if ctx != nil {
 			signal_payload_conversion_failed(ctx.instance, "could not decode Workflow signal as json/plain")
 		}
-		return {status = .Received}
+		return {status = .Received, metadata = payload_result.metadata}
 	}
-	return {status = .Received, value = value}
+	return {status = .Received, value = value, metadata = payload_result.metadata}
 }
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
@@ -5722,6 +5862,17 @@ append_fiber_start_child_workflow_command :: proc(
 		retry_policy = retry_policy,
 		cancellation_type = child_workflow_cancellation_type_to_proto(operation.options.cancellation_type),
 	}
+	for &entry in operation.options.headers {
+		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		header_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&start.headers,
+			proto.Coresdk_Workflow_Commands_StartChildWorkflowExecution_HeadersEntry{
+				key = entry.key,
+				value = header_payload,
+			},
+		)
+	}
 	append(&start.input, payload^)
 	append(
 		commands,
@@ -5768,6 +5919,17 @@ append_fiber_schedule_command :: proc(
 			cancellation_type = local_activity_cancellation_type_to_proto(options.cancellation_type),
 			include_arguments_in_marker = options.include_arguments_in_marker,
 		}
+		for &entry in options.headers {
+			header_payload := new(proto.Temporal_Api_Common_V1_Payload)
+			header_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+			append(
+				&schedule.headers,
+				proto.Coresdk_Workflow_Commands_ScheduleLocalActivity_HeadersEntry{
+					key = entry.key,
+					value = header_payload,
+				},
+			)
+		}
 		append(&schedule.arguments, payload^)
 		append(
 			commands,
@@ -5806,6 +5968,17 @@ append_fiber_schedule_command :: proc(
 		retry_policy = retry_policy,
 		cancellation_type = activity_cancellation_type_to_proto(operation.options.cancellation_type),
 		do_not_eagerly_execute = operation.options.disable_eager_execution,
+	}
+	for &entry in operation.options.headers {
+		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		header_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&schedule.headers,
+			proto.Coresdk_Workflow_Commands_ScheduleActivity_HeadersEntry{
+				key = entry.key,
+				value = header_payload,
+			},
+		)
 	}
 	append(&schedule.arguments, payload^)
 	append(
@@ -5974,6 +6147,17 @@ append_fiber_signal_external_workflow_command :: proc(
 	request := new(proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution)
 	request.seq = operation.seq
 	request.signal_name = operation.signal_name
+	for &entry in operation.headers {
+		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		header_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&request.headers,
+			proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_HeadersEntry{
+				key = entry.key,
+				value = header_payload,
+			},
+		)
+	}
 	if operation.child_workflow_seq != 0 {
 		request.target = proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id{
 			value = operation.child_workflow_id,

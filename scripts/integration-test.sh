@@ -128,6 +128,90 @@ if [[ "$signal_event_count" -ne 2 ]]; then
   exit 1
 fi
 
+TEMPORAL_ODIN_SCENARIO=activity-headers \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Activity-header Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+activity_header_workflow_id="odin-sdk-activity-header-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$activity_header_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"activity-header"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+activity_header_output="$(<"$workflow_output_file")"
+echo "$activity_header_output"
+grep -q '"result": "Activity header propagated"' <<<"$activity_header_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Activity header crossed Workflow command, Core, and Activity Context" "$worker_log"
+
+TEMPORAL_ODIN_SCENARIO=signal-headers \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal-header Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+signal_header_workflow_id="odin-sdk-signal-header-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$signal_header_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"signal-header"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+for _ in {1..30}; do
+  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Signal-header Workflow did not reach its Signal await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_header_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=approval \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=Approved \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+signal_header_output="$(<"$workflow_output_file")"
+echo "$signal_header_output"
+grep -q '"result": "Hello Approved"' <<<"$signal_header_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
+
 run_activity_case() {
   local mode="$1"
   if [[ "$mode" == "retry" ]]; then

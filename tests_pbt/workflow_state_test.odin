@@ -1610,6 +1610,7 @@ workflow_properties_replay_for_generated_mutations :: proc(t: ^testing.T) {
 Generated_Activity_Options_Input :: struct {
 	activity_id:              string,
 	task_queue:               string,
+	header_value:             string,
 	schedule_to_close_ms:     int,
 	schedule_to_start_ms:     int,
 	start_to_close_ms:        int,
@@ -1625,6 +1626,14 @@ generated_activity_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Activity_Options_Input,
 ) -> string {
+	headers := workflow.Headers{}
+	if !workflow.headers_init(&headers) {
+		return ""
+	}
+	defer workflow.headers_free(&headers)
+	if !workflow.headers_add_json(&headers, "property-header", input.header_value) {
+		return ""
+	}
 	cancellation_type := workflow.Activity_Cancellation_Type.Try_Cancel
 	switch input.cancellation_type {
 	case 1:
@@ -1648,6 +1657,7 @@ generated_activity_options_workflow :: proc(
 		{
 			activity_id = input.activity_id,
 			task_queue = input.task_queue,
+			headers = &headers,
 			schedule_to_close_timeout = time.Duration(input.schedule_to_close_ms) * time.Millisecond,
 			schedule_to_start_timeout = time.Duration(input.schedule_to_start_ms) * time.Millisecond,
 			start_to_close_timeout = time.Duration(input.start_to_close_ms) * time.Millisecond,
@@ -1694,6 +1704,20 @@ generated_activity_options_match :: proc(
 				return false
 			}
 			schedule := variant.value
+			if len(schedule.headers) != 1 || schedule.headers[0].key != "property-header" ||
+			   schedule.headers[0].value == nil {
+				return false
+			}
+			owned_header, clone_error := proto.clone_payload(schedule.headers[0].value)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_header)
+			decoded_header: string
+			if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None {
+				return false
+			}
+			defer delete(decoded_header)
 			policy := schedule.retry_policy
 			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.TRY_CANCEL
 			switch expected.cancellation_type {
@@ -1702,7 +1726,8 @@ generated_activity_options_match :: proc(
 			case 2:
 				expected_cancellation = .ABANDON
 			}
-			return schedule.activity_id == expected.activity_id &&
+			return decoded_header == expected.header_value &&
+				schedule.activity_id == expected.activity_id &&
 				schedule.activity_type == "generated_options_activity" &&
 				schedule.task_queue == expected.task_queue &&
 				pbt_proto_duration(schedule.schedule_to_close_timeout) == time.Duration(expected.schedule_to_close_ms) * time.Millisecond &&
@@ -1732,6 +1757,7 @@ activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	input_value := Generated_Activity_Options_Input{
 		activity_id = pbt.draw(t, pbt.string_ascii(1, 32)),
 		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
+		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		schedule_to_close_ms = schedule_to_close_ms,
 		schedule_to_start_ms = schedule_to_start_ms,
 		start_to_close_ms = start_to_close_ms,
@@ -1858,6 +1884,7 @@ activity_options_replay_for_generated_values :: proc(t: ^testing.T) {
 
 Generated_Local_Activity_Options_Input :: struct {
 	activity_id:                string,
+	header_value:               string,
 	schedule_to_close_ms:       int,
 	schedule_to_start_ms:       int,
 	start_to_close_ms:          int,
@@ -1873,6 +1900,14 @@ generated_local_activity_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Local_Activity_Options_Input,
 ) -> string {
+	headers := workflow.Headers{}
+	if !workflow.headers_init(&headers) {
+		return ""
+	}
+	defer workflow.headers_free(&headers)
+	if !workflow.headers_add_json(&headers, "property-header", input.header_value) {
+		return ""
+	}
 	cancellation_type := workflow.Local_Activity_Cancellation_Type.Wait_Cancellation_Completed
 	switch input.cancellation_type {
 	case 1:
@@ -1893,6 +1928,7 @@ generated_local_activity_options_workflow :: proc(
 		string,
 		{
 			activity_id = input.activity_id,
+			headers = &headers,
 			schedule_to_close_timeout = time.Duration(input.schedule_to_close_ms) * time.Millisecond,
 			schedule_to_start_timeout = time.Duration(input.schedule_to_start_ms) * time.Millisecond,
 			start_to_close_timeout = time.Duration(input.start_to_close_ms) * time.Millisecond,
@@ -1933,6 +1969,20 @@ generated_local_activity_options_match :: proc(
 				return false
 			}
 			schedule := variant.value
+			if len(schedule.headers) != 1 || schedule.headers[0].key != "property-header" ||
+			   schedule.headers[0].value == nil {
+				return false
+			}
+			owned_header, clone_error := proto.clone_payload(schedule.headers[0].value)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_header)
+			decoded_header: string
+			if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None {
+				return false
+			}
+			defer delete(decoded_header)
 			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
 			switch expected.cancellation_type {
 			case 1:
@@ -1940,7 +1990,8 @@ generated_local_activity_options_match :: proc(
 			case 2:
 				expected_cancellation = .ABANDON
 			}
-			return schedule.seq == 1 && schedule.activity_id == expected.activity_id &&
+			return decoded_header == expected.header_value &&
+				schedule.seq == 1 && schedule.activity_id == expected.activity_id &&
 				schedule.activity_type == "generated_local_activity" && schedule.attempt == 1 &&
 				pbt_proto_duration(schedule.schedule_to_close_timeout) == time.Duration(expected.schedule_to_close_ms) * time.Millisecond &&
 				pbt_proto_duration(schedule.schedule_to_start_timeout) == time.Duration(expected.schedule_to_start_ms) * time.Millisecond &&
@@ -1961,6 +2012,7 @@ local_activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	schedule_to_close_ms := pbt.draw(t, pbt.int_range(100, 120_000))
 	input_value := Generated_Local_Activity_Options_Input{
 		activity_id = pbt.draw(t, pbt.string_ascii(1, 32)),
+		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		schedule_to_close_ms = schedule_to_close_ms,
 		schedule_to_start_ms = pbt.draw(t, pbt.int_range(1, schedule_to_close_ms)),
 		start_to_close_ms = pbt.draw(t, pbt.int_range(1, schedule_to_close_ms)),
@@ -2358,6 +2410,7 @@ local_activity_backoff_retries_replay_for_generated_values :: proc(t: ^testing.T
 Generated_Child_Options_Input :: struct {
 	workflow_id:          string,
 	task_queue:           string,
+	header_value:         string,
 	execution_timeout_ms: int,
 	run_timeout_ms:       int,
 	task_timeout_ms:      int,
@@ -2374,6 +2427,14 @@ generated_child_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Child_Options_Input,
 ) -> string {
+	headers := workflow.Headers{}
+	if !workflow.headers_init(&headers) {
+		return ""
+	}
+	defer workflow.headers_free(&headers)
+	if !workflow.headers_add_json(&headers, "property-header", input.header_value) {
+		return ""
+	}
 	cancellation_type := workflow.Child_Workflow_Cancellation_Type.Wait_Cancellation_Completed
 	switch input.cancellation_type {
 	case 1:
@@ -2407,6 +2468,7 @@ generated_child_options_workflow :: proc(
 		{
 			workflow_id = input.workflow_id,
 			task_queue = input.task_queue,
+			headers = &headers,
 			workflow_execution_timeout = time.Duration(input.execution_timeout_ms) * time.Millisecond,
 			workflow_run_timeout = time.Duration(input.run_timeout_ms) * time.Millisecond,
 			workflow_task_timeout = time.Duration(input.task_timeout_ms) * time.Millisecond,
@@ -2419,7 +2481,13 @@ generated_child_options_workflow :: proc(
 	if start.status != .Succeeded {
 		return "start failed"
 	}
-	result := workflow.signal_child_workflow_json(ctx, future, input.signal_name, input.signal_value)
+	result := workflow.signal_child_workflow_json_with_options(
+		ctx,
+		future,
+		input.signal_name,
+		input.signal_value,
+		{headers = &headers},
+	)
 	if result.status != .Succeeded {
 		return "signal failed"
 	}
@@ -2454,6 +2522,20 @@ generated_child_options_match :: proc(
 				return false
 			}
 			start := variant.value
+			if len(start.headers) != 1 || start.headers[0].key != "property-header" ||
+			   start.headers[0].value == nil {
+				return false
+			}
+			owned_header, clone_error := proto.clone_payload(start.headers[0].value)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_header)
+			decoded_header: string
+			if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None {
+				return false
+			}
+			defer delete(decoded_header)
 			cancellation_type := proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED
 			switch expected.cancellation_type {
 			case 1:
@@ -2473,7 +2555,8 @@ generated_child_options_match :: proc(
 				parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL
 			}
 			policy := start.retry_policy
-			return start.seq == 1 && start.workflow_id == expected.workflow_id &&
+			return decoded_header == expected.header_value &&
+				start.seq == 1 && start.workflow_id == expected.workflow_id &&
 				start.workflow_type == "generated_child_workflow" &&
 				start.task_queue == expected.task_queue && len(start.input) == 1 &&
 				pbt_proto_duration(start.workflow_execution_timeout) == time.Duration(expected.execution_timeout_ms) * time.Millisecond &&
@@ -2517,9 +2600,24 @@ generated_child_signal_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
 			if variant.value == nil || variant.value.seq != 1 ||
-			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 {
+			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 ||
+			   len(variant.value.headers) != 1 ||
+			   variant.value.headers[0].key != "property-header" ||
+			   variant.value.headers[0].value == nil {
 				return false
 			}
+			owned_header, clone_error := proto.clone_payload(variant.value.headers[0].value)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_header)
+			decoded_header: string
+			if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None ||
+			   decoded_header != expected.header_value {
+				delete(decoded_header)
+				return false
+			}
+			delete(decoded_header)
 			#partial switch target in variant.value.target {
 			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id:
 				if target.value != expected.workflow_id {
@@ -2548,6 +2646,7 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	input_value := Generated_Child_Options_Input{
 		workflow_id = pbt.draw(t, pbt.string_ascii(1, 32)),
 		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
+		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		execution_timeout_ms = execution_timeout_ms,
 		run_timeout_ms = run_timeout_ms,
 		task_timeout_ms = task_timeout_ms,
@@ -2724,6 +2823,7 @@ Generated_External_Workflow_Input :: struct {
 	run_id:      string,
 	signal_name: string,
 	signal_value: string,
+	header_value: string,
 	cancel_reason: string,
 }
 
@@ -2731,16 +2831,25 @@ generated_external_workflow_operations :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_External_Workflow_Input,
 ) -> string {
+	headers := workflow.Headers{}
+	if !workflow.headers_init(&headers) {
+		return ""
+	}
+	defer workflow.headers_free(&headers)
+	if !workflow.headers_add_json(&headers, "property-header", input.header_value) {
+		return ""
+	}
 	execution := workflow.External_Workflow_Execution{
 		namespace = input.namespace,
 		workflow_id = input.workflow_id,
 		run_id = input.run_id,
 	}
-	signal := workflow.signal_external_workflow_json(
+	signal := workflow.signal_external_workflow_json_with_options(
 		ctx,
 		execution,
 		input.signal_name,
 		input.signal_value,
+		{headers = &headers},
 	)
 	if signal.status != .Succeeded {
 		return "signal failed"
@@ -2777,9 +2886,24 @@ generated_external_signal_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
 			if variant.value == nil || variant.value.seq != 1 ||
-			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 {
+			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 ||
+			   len(variant.value.headers) != 1 ||
+			   variant.value.headers[0].key != "property-header" ||
+			   variant.value.headers[0].value == nil {
 				return false
 			}
+			owned_header, clone_error := proto.clone_payload(variant.value.headers[0].value)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_header)
+			decoded_header: string
+			if codec.decode_json(codec.payload_view(&owned_header), &decoded_header) != .None ||
+			   decoded_header != expected.header_value {
+				delete(decoded_header)
+				return false
+			}
+			delete(decoded_header)
 			#partial switch target in variant.value.target {
 			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Workflow_Execution:
 				if target.value == nil || target.value.namespace != expected.namespace ||
@@ -2842,6 +2966,7 @@ external_workflow_operations_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		run_id = pbt.draw(t, pbt.string_ascii(0, 48)),
 		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		cancel_reason = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
 	pbt.cover(t, len(input_value.run_id) == 0, 0.2, "current run target")

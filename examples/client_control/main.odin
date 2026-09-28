@@ -72,7 +72,30 @@ run :: proc() -> int {
 			signal_name = "approval"
 		}
 		input := env("TEMPORAL_CLIENT_SIGNAL_INPUT", input_buffer[:])
-		operation_error = temporal_client.signal_workflow_json(&handle, signal_name, input)
+		headers := temporal_client.Headers{}
+		headers_error := temporal_client.headers_init(&headers)
+		if headers_error.message != nil {
+			print_error("signal header initialization", &headers_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_error)
+		defer temporal_client.headers_free(&headers)
+		header_error := temporal_client.headers_add_json(
+			&headers,
+			"caller",
+			"odin-client-control",
+		)
+		if header_error.message != nil {
+			print_error("signal header encoding", &header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		operation_error = temporal_client.signal_workflow_json_with_options(
+			&handle,
+			signal_name,
+			input,
+			{headers = &headers},
+		)
 	case "cancel":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.cancel_workflow(&handle, reason)

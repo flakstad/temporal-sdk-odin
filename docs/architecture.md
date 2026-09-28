@@ -1793,7 +1793,8 @@ Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 recursive Failure chains,
 500 Client start request (including static UserMetadata and eager-start intent)
-round trips, 500 Signal-With-Start request round trips, 500 paginated Visibility
+round trips, 500 Signal-With-Start request round trips, 500 ordinary Signal
+request/header round trips, 500 paginated Visibility
 list/count round trips, 500 query request/header round trips,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
@@ -1832,10 +1833,18 @@ preservation, and a typed user-detail round trip are unit-, property-, and
 live-proven. Query headers, Signal-With-Start, and same-connection eager
 Workflow start are now owned, wire-tested, and live-proven; start headers were
 already covered by `Start_Metadata`. Signal-With-Start proved that the protocol
-exposes one Signal header rather than separable start/signal maps. The next
-smallest client-completeness slice is normal Signal request headers plus
-consistent interceptor-style header plumbing for outgoing Workflow commands,
-while backfill should also gain a dedicated multi-execution
+exposes one Signal header rather than separable start/signal maps. Normal
+`SignalWorkflowExecution` now accepts the same explicitly owned header builder,
+and Signal metadata is retained by both direct and signal/timer-race awaits.
+The Workflow runtime clones headers into its run arena and emits Core's header
+maps for remote/Local Activities, Child Workflow starts, and child/external
+Workflow Signals. Core delivers Activity headers back on `ActivityTask.Start`;
+the worker moves them into the callback owner before destroying its protobuf
+decode arena. Generated-value properties require byte-identical replay for all
+four outgoing command families, and the CLI-devserver suite proves the two
+main interceptor paths: Client Signal to Workflow and Workflow command to Odin
+Activity. This adds no C ABI symbol—the boundary remains protobufs over the
+generic Client RPC plus poll/completion calls. Backfill should still gain a dedicated multi-execution
 live case without overloading the one-shot Schedule example. Remaining failure work includes deciding whether start failures
 that only carry Core cause enums need a synthetic language-level Failure.
 

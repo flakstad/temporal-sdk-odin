@@ -4702,6 +4702,80 @@ client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^te
 }
 
 @(test)
+client_signal_projects_request_id_and_headers :: proc(t: ^testing.T) {
+	headers := temporal_client.Headers{}
+	headers_error := temporal_client.headers_init(&headers)
+	testing.expect(t, headers_error.message == nil)
+	temporal_client.error_free(&headers_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "obsolete")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	header_error = temporal_client.headers_add_json(&headers, "caller", "odin-client")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	testing.expect_value(t, len(headers.entries), 1)
+
+	input, input_error := codec.encode_json("approved")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	request_bytes, request_error := temporal_client.encode_signal_workflow_request(
+		"default",
+		"workflow-id",
+		"run-id",
+		"approval",
+		codec.payload_view(&input),
+		{request_id = "signal-request-id", headers = &headers},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Signal encoding failed: %s", string(request_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_SignalWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "default")
+	testing.expect_value(t, request.workflow_execution.workflow_id, "workflow-id")
+	testing.expect_value(t, request.workflow_execution.run_id, "run-id")
+	testing.expect_value(t, request.signal_name, "approval")
+	testing.expect_value(t, request.request_id, "signal-request-id")
+	testing.expect(t, request.input != nil && len(request.input.payloads) == 1)
+	testing.expect(t, request.header != nil && len(request.header.fields) == 1)
+	if request.header != nil && len(request.header.fields) == 1 {
+		testing.expect_value(t, request.header.fields[0].key, "caller")
+		owned_header, clone_error := proto.clone_payload(request.header.fields[0].value)
+		testing.expect(t, clone_error == .None)
+		decoded_header: string
+		testing.expect(t, codec.decode_json(codec.payload_view(&owned_header), &decoded_header) == .None)
+		testing.expect_value(t, decoded_header, "odin-client")
+		delete(decoded_header)
+		codec.payload_free(&owned_header)
+	}
+
+	uninitialized := temporal_client.Headers{}
+	invalid_bytes, invalid_error := temporal_client.encode_signal_workflow_request(
+		"default",
+		"workflow-id",
+		"",
+		"approval",
+		codec.payload_view(&input),
+		{headers = &uninitialized},
+	)
+	delete(invalid_bytes)
+	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+	temporal_client.error_free(&invalid_error)
+}
+
+@(test)
 client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc(t: ^testing.T) {
 	input, input_error := codec.encode_json("query-input")
 	testing.expect(t, input_error == .None)
@@ -6733,6 +6807,17 @@ activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 
 @(test)
 activity_context_info_survives_task_decode_arena :: proc(t: ^testing.T) {
+	header_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"workflow-activity"`),
+	}
+	defer delete(header_payload.metadata)
+	append(
+		&header_payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
 	heartbeat_payload := proto.Temporal_Api_Common_V1_Payload{
 		data = transmute([]u8)string(`{"completed":17}`),
 	}
@@ -6785,6 +6870,14 @@ activity_context_info_survives_task_decode_arena :: proc(t: ^testing.T) {
 		retry_policy = &retry_policy,
 		priority = &priority,
 	}
+	defer delete(start.header_fields)
+	append(
+		&start.header_fields,
+		proto.Coresdk_Activity_Task_Start_HeaderFieldsEntry{
+			key = "trace-chain",
+			value = &header_payload,
+		},
+	)
 	defer delete(start.heartbeat_details)
 	append(&start.heartbeat_details, heartbeat_payload)
 	raw_task := proto.Coresdk_Activity_Task_ActivityTask{
@@ -6837,6 +6930,13 @@ activity_context_info_survives_task_decode_arena :: proc(t: ^testing.T) {
 	testing.expect_value(t, info.workflow_id, "workflow-id")
 	testing.expect_value(t, info.workflow_run_id, "workflow-run-id")
 	testing.expect_value(t, info.workflow_type, "OrderWorkflow")
+	testing.expect_value(t, len(info.headers), 1)
+	header_value: string
+	header_found, header_error := activity.header_json(&ctx, "trace-chain", &header_value)
+	defer delete(header_value)
+	testing.expect(t, header_found)
+	testing.expect(t, header_error == .None)
+	testing.expect_value(t, header_value, "workflow-activity")
 	testing.expect(t, activity.is_workflow_activity(&ctx))
 	testing.expect(t, info.has_scheduled_time)
 	testing.expect(t, info.has_current_attempt_scheduled_time)

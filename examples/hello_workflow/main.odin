@@ -158,6 +158,15 @@ set_greeting_name_from_signal :: proc(
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
+	if name == "activity-header" {
+		trace_chain: string
+		found, decode_error := activity.header_json(ctx, "trace-chain", &trace_chain)
+		defer delete(trace_chain)
+		if !found || decode_error != .None || trace_chain != "odin-workflow" {
+			return "Activity header mismatch"
+		}
+		return "Activity header propagated"
+	}
 	// The integration scenario deliberately resolves the second concurrent
 	// Workflow Update first. Sleeping in an Activity is safe: the ordering is
 	// recorded in history and Workflow replay only observes the resolutions.
@@ -283,6 +292,26 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "activity-header" {
+		headers := workflow.Headers{}
+		if !workflow.headers_init(&headers) {
+			return "could not initialize Activity headers"
+		}
+		defer workflow.headers_free(&headers)
+		if !workflow.headers_add_json(&headers, "trace-chain", "odin-workflow") {
+			return "could not encode Activity header"
+		}
+		return workflow.execute_activity_with_options(
+			ctx,
+			"hello",
+			name,
+			{
+				activity_id = "activity-header",
+				start_to_close_timeout = 10 * time.Second,
+				headers = &headers,
+			},
+		)
+	}
 	if name == "activity-cancel-details" {
 		retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
 		pending := workflow.start_activity_json_with_options(
@@ -385,6 +414,18 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	approval := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
 	if approval.status == .Timed_Out {
 		return "Approval timed out"
+	}
+	if name == "signal-header" {
+		caller: string
+		found, decode_error := workflow.signal_header_json(
+			&approval.metadata,
+			"caller",
+			&caller,
+		)
+		defer delete(caller)
+		if !found || decode_error != .None || caller != "odin-client-control" {
+			return "Signal header mismatch"
+		}
 	}
 	if approval.status == .Canceled && name == "cancel-update" {
 		scope := workflow.detached_cancellation_scope(ctx)
@@ -935,6 +976,7 @@ main :: proc() {
 	expect_properties := scenario == "workflow-properties"
 	expect_signal_with_start := scenario == "signal-with-start"
 	expect_activity_cancel_details := scenario == "activity-cancel-details"
+	expect_activity_headers := scenario == "activity-headers"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
@@ -993,7 +1035,7 @@ main :: proc() {
 				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
 				failed = true
 			}
-		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure || expect_local_activity {
+		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure || expect_local_activity || expect_activity_headers {
 			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
 				fmt.eprintln("Single-Activity Workflow path produced unexpected worker stats")
 				failed = true
@@ -1085,6 +1127,8 @@ main :: proc() {
 		fmt.println("unhandled Activity failure reached the Client as a recursive Temporal Failure")
 	} else if expect_activity_cancel_details {
 		fmt.println("Activity cancellation flags and user details completed end-to-end")
+	} else if expect_activity_headers {
+		fmt.println("Activity header crossed Workflow command, Core, and Activity Context")
 	} else if expect_patch {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
 	} else if expect_properties {

@@ -43,6 +43,11 @@ Priority_View :: struct {
 	present:         bool,
 }
 
+Named_Payload_View :: struct {
+	key:     string,
+	payload: Payload_View,
+}
+
 Activity_Task :: struct {
 	kind:          Task_Kind,
 	task_token:    []u8,
@@ -50,6 +55,7 @@ Activity_Task :: struct {
 	activity_type: string,
 	attempt:       u32,
 	input:         Payload_View,
+	headers:       []Named_Payload_View,
 	heartbeat_details:              []Payload_View,
 	workflow_namespace:             string,
 	workflow_type:                  string,
@@ -227,6 +233,16 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 		task.retry_policy = retry_policy_view(variant.value.retry_policy)
 		task.priority = priority_view(variant.value.priority)
 		task.is_local = variant.value.is_local
+		if len(variant.value.header_fields) > 0 {
+			headers := make([]Named_Payload_View, len(variant.value.header_fields))
+			for &entry, index in variant.value.header_fields {
+				if len(entry.key) == 0 || entry.value == nil {
+					return {}, .Malformed
+				}
+				headers[index] = {key = entry.key, payload = payload_view(entry.value)}
+			}
+			task.headers = headers
+		}
 		if len(variant.value.input) > 0 {
 			task.input = payload_view(&variant.value.input[0])
 		}

@@ -540,6 +540,8 @@ Activity_Execution :: struct {
 Activity_Info_Owner :: struct {
 	info:                    activity.Info,
 	owned_strings:           [dynamic]string,
+	headers:                 [dynamic]codec.Payload,
+	header_views:            [dynamic]activity.Header,
 	heartbeat_details:       [dynamic]codec.Payload,
 	heartbeat_detail_views:  [dynamic]codec.Payload_View,
 	retry_error_type_views:  [dynamic]string,
@@ -588,11 +590,16 @@ activity_info_owner_destroy :: proc(owner: ^Activity_Info_Owner) {
 	for &payload in owner.heartbeat_details {
 		codec.payload_free(&payload)
 	}
+	for &payload in owner.headers {
+		codec.payload_free(&payload)
+	}
 	for value in owner.owned_strings {
 		delete(value, allocator_runtime.heap_allocator())
 	}
 	delete(owner.heartbeat_details)
 	delete(owner.heartbeat_detail_views)
+	delete(owner.headers)
+	delete(owner.header_views)
 	delete(owner.retry_error_type_views)
 	delete(owner.owned_strings)
 	owner^ = {}
@@ -611,6 +618,8 @@ activity_info_owner_init :: proc(
 	owner.owned_strings = make([dynamic]string, heap)
 	owner.heartbeat_details = make([dynamic]codec.Payload, heap)
 	owner.heartbeat_detail_views = make([dynamic]codec.Payload_View, heap)
+	owner.headers = make([dynamic]codec.Payload, heap)
+	owner.header_views = make([dynamic]activity.Header, heap)
 	owner.retry_error_type_views = make([dynamic]string, heap)
 
 	clone_ok: bool
@@ -690,6 +699,26 @@ activity_info_owner_init :: proc(
 			fairness_weight = task.priority.fairness_weight,
 		}
 	}
+
+	for header in task.headers {
+		owned_key, key_ok := activity_info_owner_clone_string(owner, header.key)
+		if !key_ok {
+			return error_from_string("could not allocate Activity header key")
+		}
+		owned_payload, clone_error := proto.clone_payload_view(header.payload, heap)
+		if clone_error != .None {
+			return error_from_string("could not allocate Activity header Payload")
+		}
+		append(&owner.headers, owned_payload)
+		append(
+			&owner.header_views,
+			activity.Header{
+				key = owned_key,
+				payload = codec.payload_view(&owner.headers[len(owner.headers) - 1]),
+			},
+		)
+	}
+	owner.info.headers = owner.header_views[:]
 
 	for detail in task.heartbeat_details {
 		owned_detail, clone_error := proto.clone_payload_view(detail, heap)
