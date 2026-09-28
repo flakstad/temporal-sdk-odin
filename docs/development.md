@@ -1206,6 +1206,36 @@ isolation. `client_start` injects a start header solely through the interceptor;
 suite requires all four headers to arrive in Workflow code, including Update
 context after Activity suspension.
 
+### Workflow outbound interceptor chain
+
+Register `workflow.Outbound_Interceptor` values with
+`worker.add_workflow_interceptor` while the Worker is configuring. Interceptors
+registered before a Workflow are copied when its runtime is created;
+interceptors registered afterward are copied into every existing runtime.
+Registration after `worker.run` starts is rejected. The current typed hooks are
+`start_activity` and `start_local_activity`, each with its own input, future,
+and explicit `next` continuation.
+
+The SDK clones the caller's Activity headers into a Workflow-run-arena working
+map before invoking the chain. Every interceptor sees the same mutable working
+map, the terminal continuation persists it into the operation, and the original
+builder remains unchanged. The record itself is copied; `user_data` remains
+borrowed until `worker.close`. Inputs, header pointers, and `next` values are
+valid only during that scheduling call.
+
+These callbacks run on the Workflow fiber and execute again during history
+replay. They must be deterministic: use no network/filesystem access, wall
+clock, process randomness, or external mutable state that affects the result.
+Use Activities or Temporal-aware Workflow primitives for those operations.
+Logging is possible but will normally appear again on replay.
+
+The unit suite verifies nested entry/unwind order, caller-header isolation,
+remote and Local Activity command headers, and byte-identical completions after
+fresh-stack replay. A 500-case PBT property varies chain depth and
+short-circuit position. The `activity-interceptor` CLI-devserver scenario also
+injects a Workflow outbound header and reads it from the real Activity context
+after it crosses SDK Core.
+
 ## Troubleshooting
 
 - `library not found for -ltemporalio_sdk_core_c_bridge`: run

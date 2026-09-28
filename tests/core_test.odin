@@ -2304,6 +2304,112 @@ Activity_Interceptor_Test_Node :: struct {
 	short_heartbeat: bool,
 }
 
+Workflow_Outbound_Interceptor_Test_State :: struct {
+	events:                    [32]int,
+	event_count:               int,
+	remote_terminal_calls:     int,
+	local_terminal_calls:      int,
+	caller_headers_unchanged:  bool,
+}
+
+Workflow_Outbound_Interceptor_Test_Node :: struct {
+	state:        ^Workflow_Outbound_Interceptor_Test_State,
+	id:           int,
+	short_remote: bool,
+}
+
+workflow_outbound_test_record :: proc(
+	state: ^Workflow_Outbound_Interceptor_Test_State,
+	event: int,
+) {
+	if state == nil || state.event_count >= len(state.events) {
+		return
+	}
+	state.events[state.event_count] = event
+	state.event_count += 1
+}
+
+workflow_outbound_test_activity :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Start_Activity_Input,
+	next: workflow.Outbound_Start_Activity_Next,
+) -> workflow.Activity_Future {
+	node := cast(^Workflow_Outbound_Interceptor_Test_Node)user_data
+	workflow_outbound_test_record(node.state, node.id)
+	_ = workflow.headers_add_json(input.headers, "workflow-interceptor", node.id)
+	if node.short_remote {
+		workflow_outbound_test_record(node.state, -node.id)
+		return {}
+	}
+	if node.id == 2 {
+		node.state.remote_terminal_calls += 1
+	}
+	result := workflow.outbound_start_activity_next(next, input)
+	workflow_outbound_test_record(node.state, -node.id)
+	return result
+}
+
+workflow_outbound_test_local_activity :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Start_Local_Activity_Input,
+	next: workflow.Outbound_Start_Local_Activity_Next,
+) -> workflow.Activity_Future {
+	node := cast(^Workflow_Outbound_Interceptor_Test_Node)user_data
+	workflow_outbound_test_record(node.state, node.id + 10)
+	_ = workflow.headers_add_json(input.headers, "workflow-interceptor", node.id)
+	if node.id == 2 {
+		node.state.local_terminal_calls += 1
+	}
+	result := workflow.outbound_start_local_activity_next(next, input)
+	workflow_outbound_test_record(node.state, -(node.id + 10))
+	return result
+}
+
+workflow_outbound_test_invoker :: proc(
+	callback_data: rawptr,
+	ctx: ^workflow.Fiber_Context,
+	input: codec.Payload_View,
+) -> workflow.Payload_Result {
+	state := cast(^Workflow_Outbound_Interceptor_Test_State)callback_data
+	headers := workflow.Headers{}
+	if !workflow.headers_init(&headers) {
+		return workflow.payload_fail("could not initialize test headers")
+	}
+	defer workflow.headers_free(&headers)
+	if !workflow.headers_add_json(&headers, "caller", "original") {
+		return workflow.payload_fail("could not initialize caller test header")
+	}
+	remote := workflow.start_activity_payload_with_options(
+		ctx,
+		"intercepted-remote",
+		input,
+		{
+			start_to_close_timeout = time.Second,
+			headers = &headers,
+		},
+	)
+	_ = workflow.await_activity_payload(ctx, remote)
+	local := workflow.start_local_activity_payload_with_options(
+		ctx,
+		"intercepted-local",
+		input,
+		{
+			start_to_close_timeout = time.Second,
+			headers = &headers,
+		},
+	)
+	state.caller_headers_unchanged = len(headers.entries) == 1 &&
+	                                 headers.entries[0].key == "caller"
+	_ = workflow.await_activity_payload(ctx, local)
+	output, encode_error := codec.encode_json("done")
+	if encode_error != .None {
+		return workflow.payload_fail("could not encode outbound interceptor test result")
+	}
+	return workflow.payload_complete(output)
+}
+
+workflow_outbound_test_destroy :: proc(_: rawptr) {}
+
 activity_interceptor_test_record :: proc(state: ^Activity_Interceptor_Test_State, event: int) {
 	if state == nil || state.event_count >= len(state.events) {
 		return
@@ -3967,6 +4073,8 @@ Scheduled_Activity_Inspection :: struct {
 	non_retryable_error_types: [dynamic]string,
 	cancellation_type: proto.Coresdk_Workflow_Commands_ActivityCancellationType,
 	disable_eager_execution: bool,
+	header_key:              string,
+	header_payload:          codec.Payload,
 }
 
 Scheduled_Local_Activity_Inspection :: struct {
@@ -3986,6 +4094,8 @@ Scheduled_Local_Activity_Inspection :: struct {
 	cancellation_type:           proto.Coresdk_Workflow_Commands_ActivityCancellationType,
 	include_arguments_in_marker: bool,
 	input:                       codec.Payload,
+	header_key:                  string,
+	header_payload:              codec.Payload,
 }
 
 Workflow_Properties_Inspection :: struct {
@@ -4098,6 +4208,8 @@ scheduled_activity_inspection_free :: proc(inspection: ^Scheduled_Activity_Inspe
 		delete(error_type)
 	}
 	delete(inspection.non_retryable_error_types)
+	delete(inspection.header_key)
+	codec.payload_free(&inspection.header_payload)
 	inspection^ = {}
 }
 
@@ -4110,6 +4222,8 @@ scheduled_local_activity_inspection_free :: proc(
 	delete(inspection.activity_id)
 	delete(inspection.activity_type)
 	codec.payload_free(&inspection.input)
+	delete(inspection.header_key)
+	codec.payload_free(&inspection.header_payload)
 	inspection^ = {}
 }
 
@@ -4162,6 +4276,12 @@ inspect_scheduled_local_activity :: proc(
 				}
 				if len(schedule.arguments) == 1 {
 					inspection.input, _ = proto.clone_payload(&schedule.arguments[0])
+				}
+				for header in schedule.headers {
+					if header.key != "workflow-interceptor" || header.value == nil do continue
+					inspection.header_key, _ = strings.clone(header.key)
+					inspection.header_payload, _ = proto.clone_payload(header.value)
+					break
 				}
 				return
 			}
@@ -4220,6 +4340,12 @@ inspect_scheduled_activity :: proc(
 						cloned, _ := strings.clone(error_type)
 						append(&inspection.non_retryable_error_types, cloned)
 					}
+				}
+				for header in schedule.headers {
+					if header.key != "workflow-interceptor" || header.value == nil do continue
+					inspection.header_key, _ = strings.clone(header.key)
+					inspection.header_payload, _ = proto.clone_payload(header.value)
+					break
 				}
 				return
 			}
@@ -4375,11 +4501,32 @@ language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, sdk_worker.namespace, "test-namespace")
 	testing.expect_value(t, sdk_worker.task_queue, "delayed-core")
 	testing.expect(t, sdk_worker.lifecycle == .Configuring)
+	interceptor_error := worker.add_workflow_interceptor(
+		&sdk_worker,
+		{start_activity = workflow_outbound_test_activity},
+	)
+	testing.expectf(t, interceptor_error.message == nil, "early Workflow interceptor registration failed: %s", string(interceptor_error.message))
+	worker.error_free(&interceptor_error)
 
 	register_error := worker.register_workflow(&sdk_worker, "first_workflow", registry_first_test_workflow)
 	testing.expectf(t, register_error.message == nil, "workflow registration failed: %s", string(register_error.message))
 	worker.error_free(&register_error)
 	testing.expect(t, sdk_worker.core.handle == nil)
+	interceptor_error = worker.add_workflow_interceptor(
+		&sdk_worker,
+		{start_local_activity = workflow_outbound_test_local_activity},
+	)
+	testing.expectf(t, interceptor_error.message == nil, "late Workflow interceptor registration failed: %s", string(interceptor_error.message))
+	worker.error_free(&interceptor_error)
+	testing.expect_value(t, len(sdk_worker.workflow_interceptors), 2)
+	testing.expect_value(t, len(sdk_worker.workflow_registrations), 1)
+	if len(sdk_worker.workflow_registrations) == 1 {
+		testing.expect_value(
+			t,
+			len(sdk_worker.workflow_registrations[0].runtime.outbound_interceptors),
+			2,
+		)
+	}
 
 	client.handle = nil
 	_, run_error := worker.run(&sdk_worker)
@@ -6128,6 +6275,210 @@ activity_interceptors_nest_short_circuit_and_wrap_heartbeats :: proc(t: ^testing
 	for expected, index in expected_heartbeat {
 		testing.expect_value(t, state.events[index], expected)
 	}
+}
+
+@(test)
+workflow_outbound_activity_interceptors_are_nested_isolated_and_replayable :: proc(
+	t: ^testing.T,
+) {
+	state := Workflow_Outbound_Interceptor_Test_State{}
+	first := Workflow_Outbound_Interceptor_Test_Node{state = &state, id = 1}
+	second := Workflow_Outbound_Interceptor_Test_Node{state = &state, id = 2}
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init_invoker(
+		&runtime,
+		"workflow_outbound_interceptor_test",
+		"interceptor-task-queue",
+		&state,
+		workflow_outbound_test_invoker,
+		workflow_outbound_test_destroy,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	first_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{
+			user_data = &first,
+			start_activity = workflow_outbound_test_activity,
+			start_local_activity = workflow_outbound_test_local_activity,
+		},
+	)
+	second_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{
+			user_data = &second,
+			start_activity = workflow_outbound_test_activity,
+			start_local_activity = workflow_outbound_test_local_activity,
+		},
+	)
+	testing.expect(t, first_error.message == nil)
+	testing.expect(t, second_error.message == nil)
+	workflow.error_free(&first_error)
+	workflow.error_free(&second_error)
+
+	payload, payload_error := codec.encode_json("Odin")
+	testing.expect_value(t, payload_error, codec.Error.None)
+	defer codec.payload_free(&payload)
+	proto_input := proto.encode_payload(codec.payload_view(&payload))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "workflow_outbound_interceptor_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-outbound-interceptor-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "outbound interceptor failed: %s", string(initial.error.message))
+	testing.expect_value(t, initial.scheduled_activity_count, 1)
+	testing.expect_value(t, initial.scheduled_local_activity_count, 0)
+	testing.expect(t, !initial.completed)
+	testing.expect_value(t, state.remote_terminal_calls, 1)
+	testing.expect_value(t, state.local_terminal_calls, 0)
+	testing.expect_value(t, state.event_count, 4)
+	expected_remote := [?]int{1, 2, -2, -1}
+	for event, index in expected_remote {
+		testing.expect_value(t, state.events[index], event)
+	}
+	remote := inspect_scheduled_activity(initial.completion[:])
+	defer scheduled_activity_inspection_free(&remote)
+	testing.expect_value(t, remote.header_key, "workflow-interceptor")
+	remote_header: int
+	testing.expect_value(
+		t,
+		codec.decode_json(codec.payload_view(&remote.header_payload), &remote_header),
+		codec.Error.None,
+	)
+	testing.expect_value(t, remote_header, 2)
+	initial_bytes := bytes.clone(initial.completion[:])
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	activity_result, result_error := codec.encode_json("remote-result")
+	testing.expect_value(t, result_error, codec.Error.None)
+	defer codec.payload_free(&activity_result)
+	proto_result := proto.encode_payload(codec.payload_view(&activity_result))
+	defer delete(proto_result.metadata)
+	defer delete(proto_result.external_payloads)
+	success := proto.Coresdk_Activity_Result_Success{result = &proto_result}
+	resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &success},
+	}
+	resolve_remote := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_remote,
+			},
+		},
+	)
+	local_scheduled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, local_scheduled.error.message == nil, "local outbound interceptor failed: %s", string(local_scheduled.error.message))
+	testing.expect_value(t, local_scheduled.scheduled_activity_count, 0)
+	testing.expect_value(t, local_scheduled.scheduled_local_activity_count, 1)
+	testing.expect(t, state.caller_headers_unchanged)
+	testing.expect_value(t, state.event_count, 8)
+	testing.expect_value(t, state.local_terminal_calls, 1)
+	expected_local := [?]int{11, 12, -12, -11}
+	for event, index in expected_local {
+		testing.expect_value(t, state.events[index + 4], event)
+	}
+	local := inspect_scheduled_local_activity(local_scheduled.completion[:])
+	defer scheduled_local_activity_inspection_free(&local)
+	testing.expect_value(t, local.header_key, "workflow-interceptor")
+	local_header: int
+	testing.expect_value(
+		t,
+		codec.decode_json(codec.payload_view(&local.header_payload), &local_header),
+		codec.Error.None,
+	)
+	testing.expect_value(t, local_header, 2)
+	local_bytes := bytes.clone(local_scheduled.completion[:])
+	delete(local_scheduled.completion)
+	workflow.error_free(&local_scheduled.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	state.event_count = 0
+	state.remote_terminal_calls = 0
+	state.local_terminal_calls = 0
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "outbound interceptor replay failed: %s", string(replayed.error.message))
+	testing.expect(t, replayed.is_replaying)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	testing.expect_value(t, state.event_count, 4)
+	testing.expect_value(t, state.remote_terminal_calls, 1)
+	testing.expect_value(t, state.local_terminal_calls, 0)
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_remote,
+			},
+		},
+	)
+	replayed_local := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed_local.error.message == nil, "local outbound interceptor replay failed: %s", string(replayed_local.error.message))
+	testing.expect(t, bytes.equal(local_bytes, replayed_local.completion[:]))
+	testing.expect_value(t, state.event_count, 8)
+	testing.expect_value(t, state.local_terminal_calls, 1)
+	delete(local_bytes)
+	delete(replayed_local.completion)
+	workflow.error_free(&replayed_local.error)
 }
 
 @(test)

@@ -182,6 +182,7 @@ Worker :: struct {
 	task_queue:             string,
 	activity_registrations: [dynamic]Activity_Registration,
 	activity_interceptors:  [dynamic]Activity_Interceptor,
+	workflow_interceptors:  [dynamic]workflow.Outbound_Interceptor,
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
@@ -248,6 +249,7 @@ create :: proc(
 	worker.max_concurrent_activities = max_concurrent_activities
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
+	worker.workflow_interceptors = make([dynamic]workflow.Outbound_Interceptor)
 	worker.workflow_registrations = make([dynamic]Workflow_Registration)
 	worker.workflow_runs = make([dynamic]Workflow_Run)
 	worker.rejected_workflow_runs = make([dynamic]Rejected_Workflow_Run)
@@ -268,6 +270,49 @@ add_activity_interceptor :: proc(
 		return error_from_string("Activity interceptor must implement execute or heartbeat")
 	}
 	append(&worker.activity_interceptors, interceptor)
+	return {}
+}
+
+// add_workflow_interceptor installs deterministic outbound Workflow hooks.
+// Registration order is outermost-first. The record is copied, while user_data
+// remains application-owned and must outlive the Worker.
+add_workflow_interceptor :: proc(
+	worker: ^Worker,
+	interceptor: workflow.Outbound_Interceptor,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("Workflow interceptors cannot be registered after worker.run starts")
+	}
+	if interceptor.start_activity == nil && interceptor.start_local_activity == nil {
+		return error_from_string("Workflow outbound interceptor must implement an operation")
+	}
+	for &registration in worker.workflow_registrations {
+		add_error := workflow.fiber_runtime_add_outbound_interceptor(
+			&registration.runtime,
+			interceptor,
+		)
+		if add_error.message != nil {
+			result := error_from_string(string(add_error.message))
+			workflow.error_free(&add_error)
+			return result
+		}
+	}
+	append(&worker.workflow_interceptors, interceptor)
+	return {}
+}
+
+configure_workflow_runtime :: proc(worker: ^Worker, runtime: ^workflow.Fiber_Runtime) -> Error {
+	for interceptor in worker.workflow_interceptors {
+		add_error := workflow.fiber_runtime_add_outbound_interceptor(runtime, interceptor)
+		if add_error.message != nil {
+			result := error_from_string(string(add_error.message))
+			workflow.error_free(&add_error)
+			return result
+		}
+	}
 	return {}
 }
 
@@ -481,6 +526,12 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 		workflow.error_free(&init_error)
 		return result
 	}
+	configuration_error := configure_workflow_runtime(worker, &runtime)
+	if configuration_error.message != nil {
+		delete(owned_name)
+		workflow.fiber_runtime_close(&runtime)
+		return configuration_error
+	}
 	append(
 		&worker.workflow_registrations,
 		Workflow_Registration{name = owned_name, runtime = runtime},
@@ -524,6 +575,12 @@ register_payload_workflow :: proc(
 		result := error_from_string(string(init_error.message))
 		workflow.error_free(&init_error)
 		return result
+	}
+	configuration_error := configure_workflow_runtime(worker, &runtime)
+	if configuration_error.message != nil {
+		delete(owned_name)
+		workflow.fiber_runtime_close(&runtime)
+		return configuration_error
 	}
 	append(
 		&worker.workflow_registrations,
@@ -600,6 +657,12 @@ register_json_workflow :: proc(
 		result := error_from_string(string(init_error.message))
 		workflow.error_free(&init_error)
 		return result
+	}
+	configuration_error := configure_workflow_runtime(worker, &runtime)
+	if configuration_error.message != nil {
+		delete(owned_name)
+		workflow.fiber_runtime_close(&runtime)
+		return configuration_error
 	}
 	append(
 		&worker.workflow_registrations,
@@ -1691,6 +1754,7 @@ close :: proc(worker: ^Worker) -> Error {
 	}
 	delete(worker.activity_registrations)
 	delete(worker.activity_interceptors)
+	delete(worker.workflow_interceptors)
 	delete(worker.workflow_registrations)
 	delete(worker.workflow_runs)
 	delete(worker.rejected_workflow_runs)
@@ -1698,6 +1762,7 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.task_queue)
 	worker.activity_registrations = nil
 	worker.activity_interceptors = nil
+	worker.workflow_interceptors = nil
 	worker.workflow_registrations = nil
 	worker.workflow_runs = nil
 	worker.rejected_workflow_runs = nil

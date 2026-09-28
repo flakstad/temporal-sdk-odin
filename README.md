@@ -157,7 +157,10 @@ recovers typed heartbeat progress on attempt 2. Workers can register ordered
 Activity interceptors that wrap both callback execution and heartbeat calls
 with real `next` continuations. The first registered interceptor is outermost;
 it may inspect or replace inputs/results or deliberately skip `next`. Interceptor
-user data is borrowed until `worker.close`. Unknown Workflow types fail the retryable Workflow Task without
+user data is borrowed until `worker.close`. Workers can also register deterministic
+Workflow outbound interceptors for remote and Local Activity scheduling. These
+run inside the Workflow fiber on normal execution and replay, receive isolated
+per-call headers, and emit through the existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
@@ -221,6 +224,34 @@ Interceptor records are copied at connect time, while `user_data` remains
 application-owned until `client.close`. Headers are cloned per call: interceptor
 mutations reach the RPC but never mutate the caller-owned builder. Shared
 mutable `user_data` must be safe for concurrent Client calls.
+
+Workflow outbound interception is registered on the Worker. The callbacks are
+part of deterministic Workflow execution: do not read wall-clock time, perform
+I/O, use process randomness, or mutate replay-sensitive external state. Remote
+and Local Activities have separate typed inputs and continuations:
+
+```odin
+propagate_activity :: proc(
+    data: rawptr,
+    input: ^workflow.Outbound_Start_Activity_Input,
+    next: workflow.Outbound_Start_Activity_Next,
+) -> workflow.Activity_Future {
+    if !workflow.headers_add_json(input.headers, "trace-id", "request-42") {
+        return {}
+    }
+    return workflow.outbound_start_activity_next(next, input)
+}
+
+_ = worker.add_workflow_interceptor(
+    &sdk_worker,
+    {start_activity = propagate_activity},
+)
+```
+
+Registration order is outermost-first. Interceptor records are copied into
+each registered Workflow runtime, while `user_data` remains application-owned
+until `worker.close`. Inputs, headers, and `next` continuations are scoped to
+the synchronous scheduling call and must not be retained.
 
 ```text
 Temporal CLI dev server

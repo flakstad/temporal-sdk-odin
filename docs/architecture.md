@@ -1345,7 +1345,10 @@ uses that split rather than one universal hook. The Activity family is now the
 first complete chain: Worker-level interceptors wrap inbound callback execution
 and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
-start, Signal, Query, and Update start. Workflow chains remain future work.
+start, Signal, Query, and Update start. Workflow outbound now applies that same
+contract to remote and Local Activity scheduling; Child Workflows, external
+Signals/cancellation, Continue-As-New, timers, and Workflow inbound handlers
+remain future interceptor surfaces.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1379,6 +1382,27 @@ short-circuit depth. Live start, Signal, Query, and Update paths prove header
 projection through Service/Core. Schedule and Visibility operations, result
 polling, cancellation, termination, Signal-With-Start, and connection mutation
 are not yet intercepted.
+
+Workflow outbound interception lives inside the deterministic fiber boundary.
+The Worker copies configured `workflow.Outbound_Interceptor` records into every
+Workflow runtime, whether the interceptor or Workflow was registered first.
+Once polling begins the arrays are immutable. Each remote or Local Activity
+start clones caller headers into a run-arena working map, invokes typed nested
+continuations outermost-first, and makes the terminal continuation clone the
+possibly changed semantic input into the operation table. The existing command
+encoder then serializes it into `ScheduleActivity` or `ScheduleLocalActivity`.
+The caller-owned builder is never mutated, and call-scoped inputs/continuations
+cannot safely be retained.
+
+The chain intentionally executes again during replay. Its code must therefore
+obey the same determinism rules as Workflow code; logging may duplicate and
+ordinary I/O, wall-clock reads, and process randomness are unsafe. Header and
+option mutations become part of the command bytes and must be reproduced on
+fresh-stack replay. Offline tests require byte-identical remote and Local
+Activity completions after eviction, while the CLI-devserver scenario proves a
+Workflow interceptor header crosses Core and is visible in the Activity
+context. This feature adds no C symbol or protobuf type: it is a language-layer
+semantic hook immediately before the already implemented command construction.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines

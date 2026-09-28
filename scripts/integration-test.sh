@@ -194,6 +194,8 @@ grep -q "Activity execute interceptor entered before callback" "$worker_log"
 grep -q "Activity execute interceptor exited after callback status=Completed" "$worker_log"
 grep -q "Activity heartbeat interceptor entered before Core" "$worker_log"
 grep -q "Activity heartbeat interceptor exited after Core status=Recorded" "$worker_log"
+grep -q "Workflow Activity interceptor entered before command" "$worker_log"
+grep -q "Workflow Activity interceptor exited after command" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=signal-headers \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

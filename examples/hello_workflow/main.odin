@@ -176,6 +176,16 @@ set_greeting_name_from_signal :: proc(
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	if name == "activity-interceptor" {
+		workflow_header: string
+		found, decode_error := activity.header_json(
+			ctx,
+			"workflow-interceptor",
+			&workflow_header,
+		)
+		defer delete(workflow_header)
+		if !found || decode_error != .None || workflow_header != "odin-workflow-outbound" {
+			return "Workflow interceptor header mismatch"
+		}
 		status := activity.heartbeat(ctx, "activity-interceptor-heartbeat")
 		if status != .Recorded {
 			return "Activity interceptor heartbeat failed"
@@ -260,6 +270,32 @@ activity_heartbeat_interceptor :: proc(
 		fmt.printf("Activity heartbeat interceptor exited after Core status=%v\n", status)
 	}
 	return status
+}
+
+workflow_activity_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Start_Activity_Input,
+	next: workflow.Outbound_Start_Activity_Next,
+) -> workflow.Activity_Future {
+	name: string
+	decode_error := codec.decode_json(input.input, &name)
+	defer delete(name)
+	is_probe := decode_error == .None && name == "activity-interceptor"
+	if is_probe {
+		fmt.println("Workflow Activity interceptor entered before command")
+		if !workflow.headers_add_json(
+			input.headers,
+			"workflow-interceptor",
+			"odin-workflow-outbound",
+		) {
+			return {}
+		}
+	}
+	result := workflow.outbound_start_activity_next(next, input)
+	if is_probe {
+		fmt.println("Workflow Activity interceptor exited after command")
+	}
+	return result
 }
 
 cancel_with_details :: proc(
@@ -852,6 +888,21 @@ main :: proc() {
 			string(interceptor_error.message),
 		)
 		worker.error_free(&interceptor_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
+	workflow_interceptor_error := worker.add_workflow_interceptor(
+		&activity_worker,
+		{start_activity = workflow_activity_interceptor},
+	)
+	if workflow_interceptor_error.message != nil {
+		fmt.eprintf(
+			"Workflow interceptor registration failed: %s\n",
+			string(workflow_interceptor_error.message),
+		)
+		worker.error_free(&workflow_interceptor_error)
 		_ = worker.close(&activity_worker)
 		temporal_core.client_close(&client)
 		temporal_core.runtime_close(&runtime)

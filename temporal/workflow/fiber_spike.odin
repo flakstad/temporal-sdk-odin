@@ -896,6 +896,7 @@ Fiber_Update_Routine :: struct {
 }
 
 Fiber_Instance :: struct {
+	runtime:         ^Fiber_Runtime,
 	namespace:       string,
 	run_id:          string,
 	workflow_id:     string,
@@ -968,6 +969,7 @@ Fiber_Runtime :: struct {
 	invoke:                 Workflow_Invoke_Proc,
 	callback_destroy:       Workflow_Callback_Destroy_Proc,
 	instances:              [dynamic]^Fiber_Instance,
+	outbound_interceptors:   [dynamic]Outbound_Interceptor,
 	activations:            int,
 	replay_activations:     int,
 	replay_initializations: int,
@@ -1011,6 +1013,24 @@ fiber_runtime_init_invoker :: proc(
 	runtime.invoke = invoke
 	runtime.callback_destroy = callback_destroy
 	runtime.instances = make([dynamic]^Fiber_Instance)
+	runtime.outbound_interceptors = make([dynamic]Outbound_Interceptor)
+	return {}
+}
+
+fiber_runtime_add_outbound_interceptor :: proc(
+	runtime: ^Fiber_Runtime,
+	interceptor: Outbound_Interceptor,
+) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow runtime is not initialized")
+	}
+	if len(runtime.instances) != 0 {
+		return error_from_string("Workflow interceptors cannot be registered after execution starts")
+	}
+	if interceptor.start_activity == nil && interceptor.start_local_activity == nil {
+		return error_from_string("Workflow outbound interceptor must implement an operation")
+	}
+	append(&runtime.outbound_interceptors, interceptor)
 	return {}
 }
 
@@ -1421,6 +1441,7 @@ fiber_runtime_close :: proc(runtime: ^Fiber_Runtime) {
 		_ = fiber_instance_destroy(instance)
 	}
 	delete(runtime.instances)
+	delete(runtime.outbound_interceptors)
 	delete(runtime.namespace)
 	delete(runtime.workflow_type)
 	delete(runtime.task_queue)
@@ -1675,6 +1696,7 @@ add_fiber_instance :: proc(
 	}
 
 	instance := new(Fiber_Instance)
+	instance.runtime = runtime
 	instance.owner_allocator = context.allocator
 	arena_error := virtual.arena_init_growing(&instance.arena)
 	if arena_error != nil {
@@ -3694,14 +3716,25 @@ start_activity_payload_with_options :: proc(
 		}
 		return {}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
 		ctx.instance.phase = .Failed
-		ctx.instance.failure_message = "could not preserve Activity input Payload"
-		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		ctx.instance.failure_message = "could not initialize Workflow Activity interceptor headers"
+		ctx.instance.failure_type = "OdinWorkflowInterceptorError"
 		return {}
 	}
-	return start_activity_owned(ctx, activity_type, owned_input, options)
+	defer headers_free(&headers)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Start_Activity_Input{
+		ctx = ctx,
+		activity_type = activity_type,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_start_activity_chain(&state, &interceptor_input)
 }
 
 start_activity_json :: proc(ctx: ^Fiber_Context, activity_type: string, input: $T) -> Activity_Future {
@@ -3734,7 +3767,13 @@ start_activity_json_with_options :: proc(
 		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
 		return {}
 	}
-	return start_activity_owned(ctx, activity_type, payload, options)
+	defer codec.payload_free(&payload)
+	return start_activity_payload_with_options(
+		ctx,
+		activity_type,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 start_activity :: proc(ctx: ^Fiber_Context, activity_type, input: string) -> Activity_Future {
@@ -3945,14 +3984,25 @@ start_local_activity_payload_with_options :: proc(
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
 		return {}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
+	headers := Headers{}
+	if !outbound_headers_init(&headers, options.headers, ctx.instance) {
 		ctx.instance.phase = .Failed
-		ctx.instance.failure_message = "could not preserve Local Activity input Payload"
-		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
+		ctx.instance.failure_message = "could not initialize Workflow Local Activity interceptor headers"
+		ctx.instance.failure_type = "OdinWorkflowInterceptorError"
 		return {}
 	}
-	return start_local_activity_owned(ctx, activity_type, owned_input, options)
+	defer headers_free(&headers)
+	intercepted_options := options
+	intercepted_options.headers = &headers
+	interceptor_input := Outbound_Start_Local_Activity_Input{
+		ctx = ctx,
+		activity_type = activity_type,
+		input = input,
+		options = intercepted_options,
+		headers = &headers,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_start_local_activity_chain(&state, &interceptor_input)
 }
 
 start_local_activity_payload :: proc(
@@ -3984,7 +4034,13 @@ start_local_activity_json_with_options :: proc(
 		ctx.instance.failure_type = "OdinWorkflowPayloadConversionError"
 		return {}
 	}
-	return start_local_activity_owned(ctx, activity_type, payload, options)
+	defer codec.payload_free(&payload)
+	return start_local_activity_payload_with_options(
+		ctx,
+		activity_type,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 start_local_activity_json :: proc(
