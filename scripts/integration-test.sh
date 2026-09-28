@@ -1458,6 +1458,41 @@ for _ in {1..30}; do
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin repeated-argument Child Workflow Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+repeated_child_parent_id="odin-sdk-repeated-child-parent-$$-$(date +%s)"
+repeated_child_input="Odin-repeated-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$repeated_child_parent_id" \
+  --type odin_repeated_child_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input "\"$repeated_child_input\"" \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+repeated_child_output="$(<"$workflow_output_file")"
+echo "$repeated_child_output"
+grep -q '"status": "COMPLETED"' <<<"$repeated_child_output"
+grep -q "Repeated child received $repeated_child_input:42:true" <<<"$repeated_child_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Workflow start-Child interceptor entered" "$worker_log"
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
     echo "Odin Child Workflow failure Worker exited before polling" >&2
     cat "$worker_log" >&2
     exit 1

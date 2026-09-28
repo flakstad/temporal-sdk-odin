@@ -872,7 +872,7 @@ Fiber_Child_Workflow_Operation :: struct {
 	workflow_id:   string,
 	workflow_type: string,
 	options:       Owned_Child_Workflow_Options,
-	input:         codec.Payload,
+	inputs:        [dynamic]codec.Payload,
 	run_id:        string,
 	result:        codec.Payload,
 	failure_message: string,
@@ -1601,7 +1601,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		codec.payload_free(&operation.result)
 	}
 	for &operation in instance.child_workflows {
-		codec.payload_free(&operation.input)
+		for &input in operation.inputs {
+			codec.payload_free(&input)
+		}
+		delete(operation.inputs)
 		codec.payload_free(&operation.result)
 	}
 	for &operation in instance.external_signals {
@@ -4904,18 +4907,18 @@ mark_child_workflow_failure :: proc(ctx: ^Fiber_Context, message, failure_type: 
 start_child_workflow_owned :: proc(
 	ctx: ^Fiber_Context,
 	workflow_type: string,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options: Child_Workflow_Options,
 ) -> Child_Workflow_Future {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {}
 	}
 	instance := ctx.instance
 	validation_error := child_workflow_options_error(workflow_type, options)
 	if len(validation_error) > 0 {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_child_workflow_failure(ctx, validation_error, "OdinChildWorkflowOptionsError")
 		return {}
 	}
@@ -4923,7 +4926,7 @@ start_child_workflow_owned :: proc(
 	owned_id, id_error := strings.clone(options.workflow_id, instance.odin_context.allocator)
 	owned_options, options_ok := clone_child_workflow_options(instance, options)
 	if type_error != nil || id_error != nil || !options_ok {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		mark_child_workflow_failure(ctx, "could not preserve Child Workflow options", "OdinChildWorkflowOptionsError")
 		return {}
 	}
@@ -4933,7 +4936,7 @@ start_child_workflow_owned :: proc(
 		workflow_id = owned_id,
 		workflow_type = owned_type,
 		options = owned_options,
-		input = owned_input,
+		inputs = owned_inputs,
 		command_state = .Scheduled,
 		start_state = .Pending,
 		completion_state = .Pending,
@@ -4943,10 +4946,10 @@ start_child_workflow_owned :: proc(
 	return {seq = operation.seq}
 }
 
-start_child_workflow_payload :: proc(
+start_child_workflow_payloads :: proc(
 	ctx: ^Fiber_Context,
 	workflow_type: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Child_Workflow_Options,
 ) -> Child_Workflow_Future {
 	if ctx == nil || ctx.instance == nil {
@@ -4963,12 +4966,34 @@ start_child_workflow_payload :: proc(
 	interceptor_input := Outbound_Start_Child_Workflow_Input{
 		ctx = ctx,
 		workflow_type = workflow_type,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	return outbound_start_child_workflow_chain(&state, &interceptor_input)
+}
+
+start_child_workflow_payload :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	input: codec.Payload_View,
+	options: Child_Workflow_Options,
+) -> Child_Workflow_Future {
+	inputs := [?]codec.Payload_View{input}
+	return start_child_workflow_payloads(ctx, workflow_type, inputs[:], options)
+}
+
+execute_child_workflow_payloads :: proc(
+	ctx: ^Fiber_Context,
+	workflow_type: string,
+	inputs: []codec.Payload_View,
+	options: Child_Workflow_Options,
+) -> Payload_Child_Workflow_Result {
+	return await_child_workflow_payload_result(
+		ctx,
+		start_child_workflow_payloads(ctx, workflow_type, inputs, options),
+	)
 }
 
 start_child_workflow_json :: proc(
@@ -7071,8 +7096,6 @@ append_fiber_start_child_workflow_command :: proc(
 	operation: ^Fiber_Child_Workflow_Operation,
 	default_task_queue: string,
 ) {
-	payload := new(proto.Temporal_Api_Common_V1_Payload)
-	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 	task_queue := operation.options.task_queue
 	if len(task_queue) == 0 {
 		task_queue = default_task_queue
@@ -7105,7 +7128,9 @@ append_fiber_start_child_workflow_command :: proc(
 			},
 		)
 	}
-	append(&start.input, payload^)
+	for &input in operation.inputs {
+		append(&start.input, proto.encode_payload(codec.payload_view(&input)))
+	}
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{

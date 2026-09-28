@@ -321,7 +321,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		input := workflow.Outbound_Start_Child_Workflow_Input{
 			ctx = &ctx,
 			workflow_type = "property-child",
-			input = codec.Payload_View{},
+			inputs = []codec.Payload_View{{}},
 			headers = &working_headers,
 		}
 		_ = workflow.outbound_start_child_workflow_chain(&chain, &input)

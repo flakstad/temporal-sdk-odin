@@ -13,6 +13,8 @@ import workflow "../../temporal/workflow"
 TASK_QUEUE :: "odin-child-workflow"
 PARENT_WORKFLOW_TYPE :: "odin_parent_workflow"
 CHILD_WORKFLOW_TYPE :: "odin_child_workflow"
+REPEATED_PARENT_WORKFLOW_TYPE :: "odin_repeated_child_parent_workflow"
+REPEATED_CHILD_WORKFLOW_TYPE :: "odin_repeated_child_workflow"
 FAILURE_PARENT_WORKFLOW_TYPE :: "odin_child_failure_parent_workflow"
 FAILURE_CHILD_WORKFLOW_TYPE :: "odin_failing_child_workflow"
 SIGNAL_PARENT_WORKFLOW_TYPE :: "odin_child_signal_parent_workflow"
@@ -367,6 +369,111 @@ parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	)
 }
 
+repeated_child_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	inputs: []codec.Payload_View,
+) -> workflow.Payload_Result {
+	if len(inputs) != 3 || len(inputs[0].external_payloads) != 1 ||
+	   inputs[0].external_payloads[0].size_bytes != 6144 {
+		return workflow.payload_fail(
+			"repeated Child Workflow input shape mismatch",
+			"OdinChildWorkflowArgumentCountError",
+		)
+	}
+	message_type, found := codec.metadata_get(inputs[0], "messageType")
+	if !found || string(message_type) != "odin.RepeatedChild" {
+		return workflow.payload_fail(
+			"repeated Child Workflow metadata mismatch",
+			"OdinChildWorkflowMetadataError",
+		)
+	}
+	interceptor_header: string
+	header_found, header_error := workflow.header_json(
+		ctx,
+		"odin-workflow-start-child",
+		&interceptor_header,
+	)
+	defer delete(interceptor_header)
+	if !header_found || header_error != .None || interceptor_header != "intercepted" {
+		return workflow.payload_fail(
+			"repeated Child Workflow interceptor header mismatch",
+			"OdinChildWorkflowHeaderError",
+		)
+	}
+	name: string
+	count: int
+	enabled: bool
+	if codec.decode_json(inputs[0], &name) != .None ||
+	   codec.decode_json(inputs[1], &count) != .None ||
+	   codec.decode_json(inputs[2], &enabled) != .None {
+		delete(name)
+		return workflow.payload_fail(
+			"repeated Child Workflow could not decode its inputs",
+			"OdinChildWorkflowPayloadConversionError",
+		)
+	}
+	defer delete(name)
+	message := fmt.aprintf("Repeated child received %s:%d:%v", name, count, enabled)
+	defer delete(message)
+	payload, encode_error := codec.encode_json(message)
+	if encode_error != .None {
+		return workflow.payload_fail(
+			"repeated Child Workflow could not encode its result",
+			"OdinChildWorkflowPayloadConversionError",
+		)
+	}
+	return workflow.payload_complete(payload)
+}
+
+repeated_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	name_payload, name_error := codec.encode_json(name)
+	if name_error != .None {
+		return "could not encode repeated Child Workflow name"
+	}
+	defer codec.payload_free(&name_payload)
+	count_payload, count_error := codec.encode_json(42)
+	if count_error != .None {
+		return "could not encode repeated Child Workflow count"
+	}
+	defer codec.payload_free(&count_payload)
+	enabled_payload, enabled_error := codec.encode_json(true)
+	if enabled_error != .None {
+		return "could not encode repeated Child Workflow flag"
+	}
+	defer codec.payload_free(&enabled_payload)
+	if codec.payload_add_metadata(
+		&name_payload,
+		"messageType",
+		transmute([]u8)string("odin.RepeatedChild"),
+	) != .None || codec.payload_add_external(&name_payload, 6144) != .None {
+		return "could not decorate repeated Child Workflow input"
+	}
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&name_payload),
+		codec.payload_view(&count_payload),
+		codec.payload_view(&enabled_payload),
+	}
+	child_id, allocation_error := strings.concatenate({"odin-repeated-child-", name})
+	if allocation_error != nil {
+		return "could not allocate repeated Child Workflow ID"
+	}
+	defer delete(child_id)
+	future := workflow.start_child_workflow_payloads(
+		ctx,
+		REPEATED_CHILD_WORKFLOW_TYPE,
+		inputs[:],
+		{
+			workflow_id = child_id,
+			workflow_execution_timeout = time.Minute,
+		},
+	)
+	result := workflow.await_child_workflow_json_result(ctx, future, string)
+	if result.status != .Succeeded {
+		return "Repeated Child Workflow did not complete"
+	}
+	return result.value
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -434,6 +541,26 @@ main :: proc() {
 	if child_error.message != nil {
 		fmt.eprintf("Child registration failed: %s\n", string(child_error.message))
 		worker.error_free(&child_error)
+		os.exit(1)
+	}
+	repeated_parent_error := worker.register_workflow(
+		&sdk_worker,
+		REPEATED_PARENT_WORKFLOW_TYPE,
+		repeated_parent_workflow,
+	)
+	if repeated_parent_error.message != nil {
+		fmt.eprintf("Repeated parent registration failed: %s\n", string(repeated_parent_error.message))
+		worker.error_free(&repeated_parent_error)
+		os.exit(1)
+	}
+	repeated_child_error := worker.register_payloads_workflow(
+		&sdk_worker,
+		REPEATED_CHILD_WORKFLOW_TYPE,
+		repeated_child_workflow,
+	)
+	if repeated_child_error.message != nil {
+		fmt.eprintf("Repeated child registration failed: %s\n", string(repeated_child_error.message))
+		worker.error_free(&repeated_child_error)
 		os.exit(1)
 	}
 	failure_parent_error := worker.register_workflow(

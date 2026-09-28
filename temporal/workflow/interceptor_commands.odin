@@ -49,7 +49,7 @@ Outbound_Cancel_Child_Workflow_Interceptor_Proc :: #type proc(
 Outbound_Start_Child_Workflow_Input :: struct {
 	ctx:           ^Fiber_Context,
 	workflow_type: string,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 	options:       Child_Workflow_Options,
 	headers:       ^Headers,
 }
@@ -318,12 +318,12 @@ outbound_start_child_workflow_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(input.input, state.instance.odin_context.allocator)
-	if clone_error != .None {
-		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Child Workflow input Payload")
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
+		workflow_interceptor_failure(input.ctx, "could not preserve intercepted Child Workflow input Payloads")
 		return {}
 	}
-	return start_child_workflow_owned(input.ctx, input.workflow_type, owned_input, options)
+	return start_child_workflow_owned(input.ctx, input.workflow_type, owned_inputs, options)
 }
 
 outbound_signal_child_workflow_chain :: proc(

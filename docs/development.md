@@ -984,6 +984,8 @@ and Core evicts both cached fibers. `scripts/integration-test.sh` runs these
 server-backed paths automatically:
 
 - successful typed child result delivery;
+- a codec-neutral three-argument Child Workflow start that preserves argument
+  order, custom metadata, external payload details, and interceptor headers;
 - a failing child whose parent catches a structured Temporal child wrapper and
   typed Application Failure detail;
 - cancellation of a waiting parent through the public Odin Client, which emits
@@ -1009,7 +1011,8 @@ server-backed paths automatically:
   Attribute. The test observes `EVENT_TYPE_WORKFLOW_PROPERTIES_MODIFIED` and
   `EVENT_TYPE_UPSERT_WORKFLOW_SEARCH_ATTRIBUTES` in Service history.
 
-The unit suite additionally evicts the parent immediately after its start
+The unit suite additionally starts a child with three ordered Payloads, evicts
+the parent immediately after its start
 command, replays onto a fresh stack, compares the completions byte for byte,
 then applies separate start and completion resolutions. It verifies the exact
 cancellation reason, structured failure ownership after the activation decode
@@ -1020,7 +1023,9 @@ both commands. A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
 the parent closes as canceled. External-operation unit tests inspect namespace,
 Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
-and fresh-stack replay bytes. Continue-As-New unit tests additionally prove the
+and fresh-stack replay bytes. The 500-case Child Workflow property also varies
+the start argument count from zero through twelve and checks each argument's
+order, JSON bytes, custom metadata, and external payload details. Continue-As-New unit tests additionally prove the
 non-returning terminal path, default type/queue reuse, options encoding, invalid
 option failure, second-run initialization, and exact replay. Patch unit tests
 cover fresh history, replay with and without a preemptive notification, Core's

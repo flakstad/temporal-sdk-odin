@@ -2474,6 +2474,8 @@ Generated_Child_Options_Input :: struct {
 	workflow_id:          string,
 	task_queue:           string,
 	header_value:         string,
+	argument_count:       int,
+	argument_prefix:      string,
 	execution_timeout_ms: int,
 	run_timeout_ms:       int,
 	task_timeout_ms:      int,
@@ -2524,10 +2526,43 @@ generated_child_options_workflow :: proc(
 		maximum_attempts = i32(input.retry_attempts),
 		non_retryable_error_types = non_retryable_types[:],
 	}
-	future := workflow.start_child_workflow_json(
+	arguments := make([dynamic]codec.Payload)
+	defer {
+		for &argument in arguments {
+			codec.payload_free(&argument)
+		}
+		delete(arguments)
+	}
+	argument_views := make([dynamic]codec.Payload_View)
+	defer delete(argument_views)
+	for index in 0..<input.argument_count {
+		value := fmt.aprintf("%s:%d", input.argument_prefix, index)
+		argument, encode_error := codec.encode_json(value)
+		delete(value)
+		if encode_error != .None {
+			return ""
+		}
+		ordinal := fmt.aprintf("%d", index)
+		metadata_error := codec.payload_add_metadata(
+			&argument,
+			"generated-ordinal",
+			transmute([]u8)ordinal,
+		)
+		delete(ordinal)
+		if metadata_error != .None ||
+		   codec.payload_add_external(&argument, i64(index * 101)) != .None {
+			codec.payload_free(&argument)
+			return ""
+		}
+		append(&arguments, argument)
+	}
+	for &argument in arguments {
+		append(&argument_views, codec.payload_view(&argument))
+	}
+	future := workflow.start_child_workflow_payloads(
 		ctx,
 		"generated_child_workflow",
-		input.workflow_id,
+		argument_views[:],
 		{
 			workflow_id = input.workflow_id,
 			task_queue = input.task_queue,
@@ -2618,10 +2653,37 @@ generated_child_options_match :: proc(
 				parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL
 			}
 			policy := start.retry_policy
+			if len(start.input) != expected.argument_count {
+				return false
+			}
+			for &argument, index in start.input {
+				value := fmt.aprintf("%s:%d", expected.argument_prefix, index)
+				expected_payload, encode_error := codec.encode_json(value)
+				delete(value)
+				if encode_error != .None {
+					return false
+				}
+				ordinal := fmt.aprintf("%d", index)
+				metadata_matches := false
+				for metadata in argument.metadata {
+					if metadata.key == "generated-ordinal" {
+						metadata_matches = string(metadata.value) == ordinal
+						break
+					}
+				}
+				delete(ordinal)
+				argument_matches := bytes.equal(argument.data, expected_payload.data) &&
+				                    metadata_matches && len(argument.external_payloads) == 1 &&
+				                    argument.external_payloads[0].size_bytes == i64(index * 101)
+				codec.payload_free(&expected_payload)
+				if !argument_matches {
+					return false
+				}
+			}
 			return decoded_header == expected.header_value &&
 				start.seq == 1 && start.workflow_id == expected.workflow_id &&
 				start.workflow_type == "generated_child_workflow" &&
-				start.task_queue == expected.task_queue && len(start.input) == 1 &&
+				start.task_queue == expected.task_queue &&
 				pbt_proto_duration(start.workflow_execution_timeout) == time.Duration(expected.execution_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(start.workflow_run_timeout) == time.Duration(expected.run_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(start.workflow_task_timeout) == time.Duration(expected.task_timeout_ms) * time.Millisecond &&
@@ -2710,6 +2772,8 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		workflow_id = pbt.draw(t, pbt.string_ascii(1, 32)),
 		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
 		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		argument_count = pbt.draw(t, pbt.int_range(0, 12)),
+		argument_prefix = pbt.draw(t, pbt.string_ascii(0, 24)),
 		execution_timeout_ms = execution_timeout_ms,
 		run_timeout_ms = run_timeout_ms,
 		task_timeout_ms = task_timeout_ms,
@@ -2721,6 +2785,9 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
+	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero Child Workflow arguments")
+	pbt.cover(t, input_value.argument_count == 1, 3.0, "one Child Workflow argument")
+	pbt.cover(t, input_value.argument_count >= 8, 25.0, "many Child Workflow arguments")
 	pbt.cover(t, input_value.cancellation_type == 0, 15.0, "wait cancellation completed")
 	pbt.cover(t, input_value.cancellation_type == 1, 15.0, "abandon child")
 	pbt.cover(t, input_value.cancellation_type == 2, 15.0, "try cancel child")

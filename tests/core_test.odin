@@ -240,6 +240,12 @@ child_workflow_start_completion_and_fresh_stack_replay :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(inspection.child_workflow_id), "child-test-id")
 	testing.expect_value(t, string(inspection.child_workflow_type), "child_test_workflow")
 	testing.expect_value(t, string(inspection.child_workflow_task_queue), "parent-task-queue")
+	testing.expect_value(t, inspection.child_workflow_input_count, 3)
+	testing.expect_value(t, string(inspection.child_workflow_inputs[0]), `"Odin"`)
+	testing.expect_value(t, string(inspection.child_workflow_inputs[1]), "42")
+	testing.expect_value(t, string(inspection.child_workflow_inputs[2]), "true")
+	testing.expect_value(t, string(inspection.child_workflow_input_marker), "repeated-child")
+	testing.expect_value(t, inspection.child_workflow_input_external_size, i64(4096))
 	testing.expect_value(
 		t,
 		inspection.child_workflow_cancellation_type,
@@ -248,6 +254,10 @@ child_workflow_start_completion_and_fresh_stack_replay :: proc(t: ^testing.T) {
 	delete(inspection.child_workflow_id)
 	delete(inspection.child_workflow_type)
 	delete(inspection.child_workflow_task_queue)
+	for input_data in inspection.child_workflow_inputs {
+		delete(input_data)
+	}
+	delete(inspection.child_workflow_input_marker)
 	delete(initial.completion)
 	workflow.error_free(&initial.error)
 
@@ -3785,10 +3795,37 @@ registry_second_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: strin
 }
 
 child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
-	return workflow.execute_child_workflow(
+	name, name_error := codec.encode_json(input)
+	if name_error != .None {
+		return ""
+	}
+	defer codec.payload_free(&name)
+	count, count_error := codec.encode_json(42)
+	if count_error != .None {
+		return ""
+	}
+	defer codec.payload_free(&count)
+	enabled, enabled_error := codec.encode_json(true)
+	if enabled_error != .None {
+		return ""
+	}
+	defer codec.payload_free(&enabled)
+	if codec.payload_add_metadata(
+		&name,
+		"odin-test",
+		transmute([]u8)string("repeated-child"),
+	) != .None || codec.payload_add_external(&name, 4096) != .None {
+		return ""
+	}
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&name),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	future := workflow.start_child_workflow_payloads(
 		ctx,
 		"child_test_workflow",
-		input,
+		inputs[:],
 		{
 			workflow_id = "child-test-id",
 			workflow_execution_timeout = 10 * time.Minute,
@@ -3796,6 +3833,7 @@ child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) 
 			workflow_task_timeout = 10 * time.Second,
 		},
 	)
+	return workflow.await_child_workflow_result(ctx, future).value
 }
 
 child_handle_signal_cancel_test_workflow :: proc(
@@ -4385,6 +4423,10 @@ Workflow_Completion_Inspection :: struct {
 	child_workflow_id: []u8,
 	child_workflow_type: []u8,
 	child_workflow_task_queue: []u8,
+	child_workflow_input_count: int,
+	child_workflow_inputs: [3][]u8,
+	child_workflow_input_marker: []u8,
+	child_workflow_input_external_size: i64,
 	child_workflow_cancellation_type: proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType,
 	canceled_child_workflow_seq: u32,
 	canceled_child_workflow_reason: []u8,
@@ -4473,6 +4515,25 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 					inspection.child_workflow_id = bytes.clone(transmute([]u8)variant.value.workflow_id)
 					inspection.child_workflow_type = bytes.clone(transmute([]u8)variant.value.workflow_type)
 					inspection.child_workflow_task_queue = bytes.clone(transmute([]u8)variant.value.task_queue)
+					inspection.child_workflow_input_count = len(variant.value.input)
+					for &input, index in variant.value.input {
+						if index >= len(inspection.child_workflow_inputs) {
+							break
+						}
+						inspection.child_workflow_inputs[index] = bytes.clone(input.data)
+					}
+					if len(variant.value.input) > 0 {
+						first := &variant.value.input[0]
+						for metadata in first.metadata {
+							if metadata.key == "odin-test" {
+								inspection.child_workflow_input_marker = bytes.clone(metadata.value)
+								break
+							}
+						}
+						if len(first.external_payloads) > 0 {
+							inspection.child_workflow_input_external_size = first.external_payloads[0].size_bytes
+						}
+					}
 					inspection.child_workflow_cancellation_type = variant.value.cancellation_type
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Child_Workflow_Execution:

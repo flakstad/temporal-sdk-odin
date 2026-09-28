@@ -2006,7 +2006,7 @@ list/count round trips, 500 repeated Query request/header round trips over 0–1
 arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
-500 Child Workflow option/signal/replay cases, 500 external Workflow
+500 Child Workflow option/argument/signal/replay cases, 500 external Workflow
 signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
 truth-table cases, 500 deterministic time/random activation contexts, and 1,000
 statechart-backed Update lifecycle traces,
@@ -2093,7 +2093,8 @@ through the existing serialized Workflow Activation and Activation Completion
 messages:
 
 - Odin emits `StartChildWorkflowExecution`, including one language-assigned
-  `seq`, explicit Workflow ID/type, task queue, input Payload, timeouts, Retry
+  `seq`, explicit Workflow ID/type, task queue, an ordered repeated input
+  Payload field, timeouts, Retry
   Policy, Parent Close Policy, and Child Cancellation Type.
 - Core later emits `ResolveChildWorkflowExecutionStart(seq, status)`. Success
   carries the child Run ID; failure carries Workflow ID/type and
@@ -2115,13 +2116,23 @@ the second. A completion delivered in the same activation as the start
 resolution is retained before either fiber resume, so activation ordering does
 not lose it.
 
-Owned Workflow ID/type/options/input, Run ID, output Payload, structured failure
+Owned Workflow ID/type/options/input Payloads, Run ID, output Payload, structured failure
 fields/details, and original encoded Failure bytes live in the Workflow instance
 arena. Activation decode values remain borrowed only for that callback and are
 cloned before the decode arena is destroyed.
 Eviction destroys the entire operation table; replay recreates it by rerunning
 deterministic Odin code. The offline acceptance test evicts immediately after
 the start command and requires a byte-identical command from a fresh stack.
+
+`start_child_workflow_payloads` is the codec-neutral public boundary. Its
+borrowed slice, Payload bytes, metadata entries, and external payload details
+are synchronously cloned into the run arena. The interceptor sees the complete
+slice and may replace it before the terminal clone. The singular Payload and
+typed JSON helpers delegate as one-element slices. Core's protobuf already
+models `StartChildWorkflowExecution.input` as repeated, so this required no C
+ABI change and no native bridge symbol. `execute_child_workflow_payloads` is
+the start-plus-await convenience form and returns the codec-neutral child
+result without imposing a JSON result type.
 
 The default Odin cancellation enum intentionally maps its zero value to Core's
 `WAIT_CANCELLATION_COMPLETED`, matching the safe Core SDK default rather than

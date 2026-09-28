@@ -64,9 +64,13 @@ signals a started child through `SignalExternalWorkflowExecution`, and requests
 explicit or inherited cancellation through `CancelChildWorkflowExecution`. The
 signal API waits for Core's resolution and reports server failure causes. Unhandled
 child failures preserve Core's original Temporal Failure wrapper and cause
-chain when the parent fails. The CLI-devserver suite proves successful child
+chain when the parent fails. `start_child_workflow_payloads` preserves Core's
+repeated input field, including order, metadata, and external payload details;
+the singular Payload and typed JSON helpers are one-argument adapters. The
+CLI-devserver suite proves successful child
 completion, a caught server-generated child failure, duplicate-ID start failure,
-and parent cancellation that waits for child cancellation before closing.
+parent cancellation that waits for child cancellation before closing, and a
+three-argument parent-to-child call handled by a codec-neutral child registration.
 Workflow code can also signal and request cancellation of arbitrary external
 Workflow executions by namespace/Workflow ID/optional Run ID, suspending until
 Core resolves each outbound operation. The live suite proves this against two
@@ -376,6 +380,16 @@ then execute the parent from another terminal:
 temporal workflow execute \
   --workflow-id odin-parent-manual \
   --type odin_parent_workflow \
+  --task-queue odin-child-workflow \
+  --input '"Odin"'
+```
+
+The same worker also exposes the repeated-argument boundary:
+
+```bash
+temporal workflow execute \
+  --workflow-id odin-repeated-parent-manual \
+  --type odin_repeated_child_parent_workflow \
   --task-queue odin-child-workflow \
   --input '"Odin"'
 ```
@@ -852,6 +866,12 @@ Start-to-Close/one-attempt behavior.
 `register_payload_workflow` is the single-argument lower-level form;
 `register_payloads_workflow` exposes Temporal's repeated Workflow argument
 field. String Workflows remain a compatibility adapter over `json/plain`.
+Child Workflow starts follow the same shape:
+`start_child_workflow_payloads` accepts a borrowed ordered slice and clones all
+Payloads into Workflow-owned storage before suspension, while
+`start_child_workflow_payload` and `start_child_workflow_json` preserve the
+single-argument convenience API. `execute_child_workflow_payloads` combines
+start and await while retaining the codec-neutral result.
 Workflow signal buffering preserves a
 complete ordered Payload slice. `await_signal_payloads` exposes the repeated
 codec-neutral boundary; `await_signal_payload` and `await_signal_json` are
