@@ -992,7 +992,8 @@ server-backed paths automatically:
   `CancelChildWorkflowExecution(seq=1)` and does not close the parent until Core
   resolves the child as canceled;
 - signaling a child through its Workflow-local Future and waiting for Core's
-  `ResolveSignalExternalWorkflow` acknowledgement;
+  `ResolveSignalExternalWorkflow` acknowledgement, using three ordered Payloads
+  with custom metadata and external payload details;
 - explicit child cancellation through the Future while the parent remains live
   and completes normally after observing the canceled child result;
 - a second start with the same running child ID, producing Core's
@@ -1000,7 +1001,7 @@ server-backed paths automatically:
 - two independent Workflows where one sends an external signal, waits for
   `ResolveSignalExternalWorkflow`, requests target cancellation, waits for
   `ResolveRequestCancelExternalWorkflow`, and completes while the target closes
-  as canceled;
+  as canceled; the signal carries three ordered Payloads across both workers;
 - a Workflow that emits `ContinueAsNewWorkflowExecution` with replacement
   input/timeouts, is evicted, starts a second run under the same Workflow ID,
   and returns the second run's result to Temporal CLI; and
@@ -1018,14 +1019,14 @@ then applies separate start and completion resolutions. It verifies the exact
 cancellation reason, structured failure ownership after the activation decode
 arena is gone, and lossless propagation of an unhandled original Temporal
 Failure wrapper. The 500-case Child Workflow property varies start options,
-signal names, and signal Payloads, then requires exact fresh-stack replay of
-both commands. A cancellation unit test also requires an in-flight child signal
+signal names, and zero to twelve ordered start/signal Payloads with metadata
+and external details, then requires exact fresh-stack replay of both commands.
+A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
 the parent closes as canceled. External-operation unit tests inspect namespace,
 Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
-and fresh-stack replay bytes. The 500-case Child Workflow property also varies
-the start argument count from zero through twelve and checks each argument's
-order, JSON bytes, custom metadata, and external payload details. Continue-As-New unit tests additionally prove the
+and fresh-stack replay bytes. The 500-case external Workflow property likewise
+varies its signal from zero through twelve ordered Payloads. Continue-As-New unit tests additionally prove the
 non-returning terminal path, default type/queue reuse, options encoding, invalid
 option failure, second-run initialization, and exact replay. Patch unit tests
 cover fresh history, replay with and without a preemptive notification, Core's

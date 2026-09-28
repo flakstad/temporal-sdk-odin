@@ -2579,17 +2579,52 @@ generated_child_options_workflow :: proc(
 	if start.status != .Succeeded {
 		return "start failed"
 	}
-	result := workflow.signal_child_workflow_json_with_options(
+	result := workflow.signal_child_workflow_payloads_with_options(
 		ctx,
 		future,
 		input.signal_name,
-		input.signal_value,
+		argument_views[:],
 		{headers = &headers},
 	)
 	if result.status != .Succeeded {
 		return "signal failed"
 	}
 	return "signaled"
+}
+
+generated_workflow_arguments_match :: proc(
+	arguments: []proto.Temporal_Api_Common_V1_Payload,
+	argument_count: int,
+	argument_prefix: string,
+) -> bool {
+	if len(arguments) != argument_count {
+		return false
+	}
+	for &argument, index in arguments {
+		value := fmt.aprintf("%s:%d", argument_prefix, index)
+		expected_payload, encode_error := codec.encode_json(value)
+		delete(value)
+		if encode_error != .None {
+			return false
+		}
+		ordinal := fmt.aprintf("%d", index)
+		metadata_matches := false
+		for metadata in argument.metadata {
+			if metadata.key == "generated-ordinal" {
+				metadata_matches = string(metadata.value) == ordinal
+				break
+			}
+		}
+		delete(ordinal)
+		argument_matches := bytes.equal(argument.data, expected_payload.data) &&
+		                    metadata_matches && len(argument.external_payloads) == 1 &&
+		                    argument.external_payloads[0].size_bytes == i64(index * 101)
+		codec.payload_free(&expected_payload)
+		if !argument_matches {
+			return false
+		}
+	}
+	return true
 }
 
 generated_child_options_match :: proc(
@@ -2653,32 +2688,12 @@ generated_child_options_match :: proc(
 				parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL
 			}
 			policy := start.retry_policy
-			if len(start.input) != expected.argument_count {
+			if !generated_workflow_arguments_match(
+				start.input[:],
+				expected.argument_count,
+				expected.argument_prefix,
+			) {
 				return false
-			}
-			for &argument, index in start.input {
-				value := fmt.aprintf("%s:%d", expected.argument_prefix, index)
-				expected_payload, encode_error := codec.encode_json(value)
-				delete(value)
-				if encode_error != .None {
-					return false
-				}
-				ordinal := fmt.aprintf("%d", index)
-				metadata_matches := false
-				for metadata in argument.metadata {
-					if metadata.key == "generated-ordinal" {
-						metadata_matches = string(metadata.value) == ordinal
-						break
-					}
-				}
-				delete(ordinal)
-				argument_matches := bytes.equal(argument.data, expected_payload.data) &&
-				                    metadata_matches && len(argument.external_payloads) == 1 &&
-				                    argument.external_payloads[0].size_bytes == i64(index * 101)
-				codec.payload_free(&expected_payload)
-				if !argument_matches {
-					return false
-				}
 			}
 			return decoded_header == expected.header_value &&
 				start.seq == 1 && start.workflow_id == expected.workflow_id &&
@@ -2725,7 +2740,7 @@ generated_child_signal_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
 			if variant.value == nil || variant.value.seq != 1 ||
-			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 ||
+			   variant.value.signal_name != expected.signal_name ||
 			   len(variant.value.headers) != 1 ||
 			   variant.value.headers[0].key != "property-header" ||
 			   variant.value.headers[0].value == nil {
@@ -2751,12 +2766,11 @@ generated_child_signal_match :: proc(
 			case:
 				return false
 			}
-			expected_payload, encode_error := codec.encode_json(expected.signal_value)
-			if encode_error != .None {
-				return false
-			}
-			defer codec.payload_free(&expected_payload)
-			return bytes.equal(variant.value.args[0].data, expected_payload.data)
+			return generated_workflow_arguments_match(
+				variant.value.args[:],
+				expected.argument_count,
+				expected.argument_prefix,
+			)
 		}
 	}
 	return false
@@ -2953,6 +2967,7 @@ Generated_External_Workflow_Input :: struct {
 	run_id:      string,
 	signal_name: string,
 	signal_value: string,
+	argument_count: int,
 	header_value: string,
 	cancel_reason: string,
 }
@@ -2974,11 +2989,44 @@ generated_external_workflow_operations :: proc(
 		workflow_id = input.workflow_id,
 		run_id = input.run_id,
 	}
-	signal := workflow.signal_external_workflow_json_with_options(
+	arguments := make([dynamic]codec.Payload)
+	defer {
+		for &argument in arguments {
+			codec.payload_free(&argument)
+		}
+		delete(arguments)
+	}
+	argument_views := make([dynamic]codec.Payload_View)
+	defer delete(argument_views)
+	for index in 0..<input.argument_count {
+		value := fmt.aprintf("%s:%d", input.signal_value, index)
+		argument, encode_error := codec.encode_json(value)
+		delete(value)
+		if encode_error != .None {
+			return ""
+		}
+		ordinal := fmt.aprintf("%d", index)
+		metadata_error := codec.payload_add_metadata(
+			&argument,
+			"generated-ordinal",
+			transmute([]u8)ordinal,
+		)
+		delete(ordinal)
+		if metadata_error != .None ||
+		   codec.payload_add_external(&argument, i64(index * 101)) != .None {
+			codec.payload_free(&argument)
+			return ""
+		}
+		append(&arguments, argument)
+	}
+	for &argument in arguments {
+		append(&argument_views, codec.payload_view(&argument))
+	}
+	signal := workflow.signal_external_workflow_payloads_with_options(
 		ctx,
 		execution,
 		input.signal_name,
-		input.signal_value,
+		argument_views[:],
 		{headers = &headers},
 	)
 	if signal.status != .Succeeded {
@@ -3016,7 +3064,7 @@ generated_external_signal_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution:
 			if variant.value == nil || variant.value.seq != 1 ||
-			   variant.value.signal_name != expected.signal_name || len(variant.value.args) != 1 ||
+			   variant.value.signal_name != expected.signal_name ||
 			   len(variant.value.headers) != 1 ||
 			   variant.value.headers[0].key != "property-header" ||
 			   variant.value.headers[0].value == nil {
@@ -3043,12 +3091,11 @@ generated_external_signal_match :: proc(
 			case:
 				return false
 			}
-			expected_payload, encode_error := codec.encode_json(expected.signal_value)
-			if encode_error != .None {
-				return false
-			}
-			defer codec.payload_free(&expected_payload)
-			return bytes.equal(variant.value.args[0].data, expected_payload.data)
+			return generated_workflow_arguments_match(
+				variant.value.args[:],
+				expected.argument_count,
+				expected.signal_value,
+			)
 		}
 	}
 	return false
@@ -3096,9 +3143,13 @@ external_workflow_operations_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		run_id = pbt.draw(t, pbt.string_ascii(0, 48)),
 		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		argument_count = pbt.draw(t, pbt.int_range(0, 12)),
 		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		cancel_reason = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
+	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero external Signal arguments")
+	pbt.cover(t, input_value.argument_count == 1, 3.0, "one external Signal argument")
+	pbt.cover(t, input_value.argument_count >= 8, 25.0, "many external Signal arguments")
 	pbt.cover(t, len(input_value.run_id) == 0, 0.2, "current run target")
 	pbt.cover(t, len(input_value.run_id) > 32, 15.0, "specific long run id")
 	pbt.cover(t, len(input_value.cancel_reason) == 0, 0.2, "empty cancellation reason")

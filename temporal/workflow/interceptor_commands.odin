@@ -74,7 +74,7 @@ Outbound_Signal_Child_Workflow_Input :: struct {
 	ctx:         ^Fiber_Context,
 	future:      Child_Workflow_Future,
 	signal_name: string,
-	input:       codec.Payload_View,
+	inputs:      []codec.Payload_View,
 	options:     Signal_Options,
 	headers:     ^Headers,
 }
@@ -99,7 +99,7 @@ Outbound_Signal_External_Workflow_Input :: struct {
 	ctx:         ^Fiber_Context,
 	execution:   External_Workflow_Execution,
 	signal_name: string,
-	input:       codec.Payload_View,
+	inputs:      []codec.Payload_View,
 	options:     Signal_Options,
 	headers:     ^Headers,
 }
@@ -350,15 +350,15 @@ outbound_signal_child_workflow_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(input.input, state.instance.odin_context.allocator)
-	if clone_error != .None {
-		return {status = .Failed, failure_message = "could not preserve intercepted Child Workflow Signal Payload"}
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
+		return {status = .Failed, failure_message = "could not preserve intercepted Child Workflow Signal Payloads"}
 	}
-	return signal_child_workflow_owned(
+	return signal_child_workflow_payloads_owned(
 		input.ctx,
 		input.future,
 		input.signal_name,
-		owned_input,
+		owned_inputs,
 		options,
 	)
 }
@@ -387,15 +387,15 @@ outbound_signal_external_workflow_chain :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	owned_input, clone_error := codec.payload_clone(input.input, state.instance.odin_context.allocator)
-	if clone_error != .None {
-		return {status = .Failed, failure_message = "could not preserve intercepted external Workflow Signal Payload"}
+	owned_inputs, inputs_ok := clone_activity_inputs(state.instance, input.inputs)
+	if !inputs_ok {
+		return {status = .Failed, failure_message = "could not preserve intercepted external Workflow Signal Payloads"}
 	}
-	return signal_external_workflow_owned(
+	return signal_external_workflow_payloads_owned(
 		input.ctx,
 		input.execution,
 		input.signal_name,
-		owned_input,
+		owned_inputs,
 		options,
 	)
 }

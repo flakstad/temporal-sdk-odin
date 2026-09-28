@@ -1604,7 +1604,7 @@ temporal workflow execute \
 child_signal_output="$(<"$workflow_output_file")"
 echo "$child_signal_output"
 grep -q '"status": "COMPLETED"' <<<"$child_signal_output"
-grep -q 'Odin received approval-from-parent' <<<"$child_signal_output"
+grep -q 'Odin received approval-from-parent:42:true' <<<"$child_signal_output"
 
 wait "$worker_pid"
 worker_pid=""

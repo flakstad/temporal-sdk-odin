@@ -62,7 +62,8 @@ Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and c
 resolutions, decodes typed JSON results and structured Child Workflow failures,
 signals a started child through `SignalExternalWorkflowExecution`, and requests
 explicit or inherited cancellation through `CancelChildWorkflowExecution`. The
-signal API waits for Core's resolution and reports server failure causes. Unhandled
+signal APIs preserve Core's repeated argument field, wait for Core's resolution,
+and report server failure causes. Unhandled
 child failures preserve Core's original Temporal Failure wrapper and cause
 chain when the parent fails. `start_child_workflow_payloads` preserves Core's
 repeated input field, including order, metadata, and external payload details;
@@ -903,8 +904,10 @@ if signal.status == .Succeeded {
 ```
 
 The identity and signal name are borrowed for the call and copied into the
-Workflow arena before suspension. The `_payload` signal form clones a borrowed
-Payload; `_owned` consumes its Payload. Failure results map Core's not-found,
+Workflow arena before suspension. `signal_external_workflow_payloads` and the
+Child Workflow equivalent clone every borrowed Payload in order; their
+singular Payload and JSON forms remain one-argument adapters. The singular
+`_owned` form consumes its Payload. Failure results map Core's not-found,
 namespace-not-found, and signal-count-limit causes. This remains a low-level
 execution reference rather than a general client-style handle.
 

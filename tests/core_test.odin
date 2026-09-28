@@ -548,10 +548,20 @@ child_workflow_handle_signals_and_explicitly_cancels :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(signal_inspection.child_workflow_signal_id), "child-handle-test-id")
 	testing.expect_value(t, string(signal_inspection.child_workflow_signal_name), "approve")
 	testing.expect_value(t, string(signal_inspection.child_workflow_signal_input), `"approved-by-parent"`)
+	testing.expect_value(t, signal_inspection.workflow_signal_input_count, 3)
+	testing.expect_value(t, string(signal_inspection.workflow_signal_inputs[0]), `"approved-by-parent"`)
+	testing.expect_value(t, string(signal_inspection.workflow_signal_inputs[1]), "42")
+	testing.expect_value(t, string(signal_inspection.workflow_signal_inputs[2]), "true")
+	testing.expect_value(t, string(signal_inspection.workflow_signal_input_marker), "repeated-signal")
+	testing.expect_value(t, signal_inspection.workflow_signal_input_external_size, i64(5120))
 	signal_command_bytes := bytes.clone(signaled.completion[:])
 	delete(signal_inspection.child_workflow_signal_id)
 	delete(signal_inspection.child_workflow_signal_name)
 	delete(signal_inspection.child_workflow_signal_input)
+	for input_data in signal_inspection.workflow_signal_inputs {
+		delete(input_data)
+	}
+	delete(signal_inspection.workflow_signal_input_marker)
 	delete(signaled.completion)
 	workflow.error_free(&signaled.error)
 
@@ -3853,7 +3863,34 @@ child_handle_signal_cancel_test_workflow :: proc(
 	if start.status != .Succeeded || start.run_id != "child-handle-run" {
 		return "Child Workflow did not start"
 	}
-	signal := workflow.signal_child_workflow_json(ctx, future, "approve", "approved-by-parent")
+	approval, approval_error := codec.encode_json("approved-by-parent")
+	if approval_error != .None {
+		return "Child Workflow signal input encoding failed"
+	}
+	defer codec.payload_free(&approval)
+	count, count_error := codec.encode_json(42)
+	if count_error != .None {
+		return "Child Workflow signal input encoding failed"
+	}
+	defer codec.payload_free(&count)
+	enabled, enabled_error := codec.encode_json(true)
+	if enabled_error != .None {
+		return "Child Workflow signal input encoding failed"
+	}
+	defer codec.payload_free(&enabled)
+	if codec.payload_add_metadata(
+		&approval,
+		"odin-test",
+		transmute([]u8)string("repeated-signal"),
+	) != .None || codec.payload_add_external(&approval, 5120) != .None {
+		return "Child Workflow signal input decoration failed"
+	}
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&approval),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	signal := workflow.signal_child_workflow_payloads(ctx, future, "approve", inputs[:])
 	if signal.status != .Succeeded {
 		return "Child Workflow signal failed"
 	}
@@ -4434,6 +4471,10 @@ Workflow_Completion_Inspection :: struct {
 	child_workflow_signal_id: []u8,
 	child_workflow_signal_name: []u8,
 	child_workflow_signal_input: []u8,
+	workflow_signal_input_count: int,
+	workflow_signal_inputs: [3][]u8,
+	workflow_signal_input_marker: []u8,
+	workflow_signal_input_external_size: i64,
 	external_workflow_signal_namespace: []u8,
 	external_workflow_signal_id: []u8,
 	external_workflow_signal_run_id: []u8,
@@ -4567,8 +4608,27 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 							)
 						}
 					}
-					if len(variant.value.args) == 1 {
+					if len(variant.value.args) > 0 {
 						inspection.child_workflow_signal_input = bytes.clone(variant.value.args[0].data)
+					}
+					if len(variant.value.args) > 1 {
+						inspection.workflow_signal_input_count = len(variant.value.args)
+						for &input, index in variant.value.args {
+							if index >= len(inspection.workflow_signal_inputs) {
+								break
+							}
+							inspection.workflow_signal_inputs[index] = bytes.clone(input.data)
+						}
+						first := &variant.value.args[0]
+						for metadata in first.metadata {
+							if metadata.key == "odin-test" {
+								inspection.workflow_signal_input_marker = bytes.clone(metadata.value)
+								break
+							}
+						}
+						if len(first.external_payloads) > 0 {
+							inspection.workflow_signal_input_external_size = first.external_payloads[0].size_bytes
+						}
 					}
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Signal_Workflow:

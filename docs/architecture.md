@@ -2006,8 +2006,8 @@ list/count round trips, 500 repeated Query request/header round trips over 0–1
 arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
-500 Child Workflow option/argument/signal/replay cases, 500 external Workflow
-signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
+500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
+repeated-signal/cancel/replay cases, 500 Continue-As-New option/replay cases, 500 patch
 truth-table cases, 500 deterministic time/random activation contexts, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
@@ -2105,7 +2105,8 @@ messages:
   inherited parent cancellation reaches a commanded child. Core applies the
   cancellation type carried by the original start command.
 - Odin emits `SignalExternalWorkflowExecution` with the child Workflow ID as
-  its target. Core later emits `ResolveSignalExternalWorkflow(seq, failure,
+  its target and an ordered repeated argument field. Core later emits
+  `ResolveSignalExternalWorkflow(seq, failure,
   cause)`, which Odin maps back to the waiting fiber.
 
 This means one child sequence has two independent readiness milestones. The
@@ -2162,7 +2163,10 @@ reason. Typed JSON or raw Payload signals are copied into the Workflow arena, as
 independent external-signal sequence, and suspended until Core acknowledges the
 command. Signal failures expose Core's not-found, namespace-not-found, and
 signal-count-limit causes. Both signal command bytes and their generated input
-Payloads are covered by eviction/fresh-stack replay properties.
+Payloads are covered by eviction/fresh-stack replay properties. The
+codec-neutral child/external signal APIs clone zero or more Payloads—including
+metadata and external payload details—into the run arena; singular Payload,
+owned-Payload, and typed JSON helpers adapt to one element.
 
 The API enum for `StartChildWorkflowExecutionFailedCause` has additional
 namespace/versioning values, but the pinned Core activation schema deliberately
@@ -2200,15 +2204,16 @@ They use the existing activation/completion protobuf channel:
 - Signals and cancellation requests have independent sequence spaces because
   Core resolves them through different activation job types.
 
-The execution identity, signal name, reason, Payload, failure text, and encoded
+The execution identity, signal name, reason, ordered Payloads, failure text, and encoded
 failure bytes are copied into the Workflow instance arena before the user fiber
-can suspend. `signal_external_workflow_payload` clones its borrowed Payload;
-`signal_external_workflow_owned` consumes an owned Payload. Returned strings are
+can suspend. `signal_external_workflow_payloads` clones its borrowed Payload
+slice; the singular Payload and JSON helpers delegate with one element, while
+`signal_external_workflow_owned` consumes one owned Payload. Returned strings are
 Workflow-owned views and must not escape the execution. Eviction destroys this
 state; deterministic replay recreates it from Workflow code and history.
 
 Core owns server delivery and maps history events back to the matching `seq`.
-Odin owns validation, sequence allocation, command construction, suspension,
+Odin owns validation, sequence allocation, ordered argument cloning, command construction, suspension,
 resolution lookup, failure-cause mapping, and fiber resumption. Signal failures
 map `WorkflowNotFound`, `NamespaceNotFound`, and `SignalCountLimitExceeded`;
 cancellation failures map the first two. Root Workflow cancellation can cancel

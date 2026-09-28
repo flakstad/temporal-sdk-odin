@@ -170,7 +170,7 @@ signaled_child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> s
 		"odin-workflow-start-child",
 		&start_header,
 	)
-	approval := workflow.await_signal_json_with_context(ctx, "approve", string)
+	approval := workflow.await_signal_payloads_with_context(ctx, "approve")
 	signal_header: string
 	signal_found, signal_error := workflow.signal_header_json(
 		&approval.metadata,
@@ -181,10 +181,25 @@ signaled_child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> s
 	   !signal_found || signal_error != .None || signal_header != "intercepted" {
 		return "Child Workflow interceptor header mismatch"
 	}
-	message, allocation_error := strings.concatenate({name, " received ", approval.value})
-	if allocation_error != nil {
-		return ""
+	if len(approval.values) != 3 || len(approval.values[0].external_payloads) != 1 ||
+	   approval.values[0].external_payloads[0].size_bytes != 7168 {
+		return "Child Workflow repeated signal shape mismatch"
 	}
+	message_type, metadata_found := codec.metadata_get(approval.values[0], "messageType")
+	if !metadata_found || string(message_type) != "odin.RepeatedChildSignal" {
+		return "Child Workflow repeated signal metadata mismatch"
+	}
+	approval_value: string
+	count: int
+	enabled: bool
+	if codec.decode_json(approval.values[0], &approval_value) != .None ||
+	   codec.decode_json(approval.values[1], &count) != .None ||
+	   codec.decode_json(approval.values[2], &enabled) != .None {
+		delete(approval_value)
+		return "Child Workflow repeated signal decoding failed"
+	}
+	defer delete(approval_value)
+	message := fmt.aprintf("%s received %s:%d:%v", name, approval_value, count, enabled)
 	return message
 }
 
@@ -198,7 +213,34 @@ signal_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> st
 			workflow_execution_timeout = time.Minute,
 		},
 	)
-	signal := workflow.signal_child_workflow_json(ctx, future, "approve", "approval-from-parent")
+	approval, approval_error := codec.encode_json("approval-from-parent")
+	if approval_error != .None {
+		return "Child Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&approval)
+	count, count_error := codec.encode_json(42)
+	if count_error != .None {
+		return "Child Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&count)
+	enabled, enabled_error := codec.encode_json(true)
+	if enabled_error != .None {
+		return "Child Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&enabled)
+	if codec.payload_add_metadata(
+		&approval,
+		"messageType",
+		transmute([]u8)string("odin.RepeatedChildSignal"),
+	) != .None || codec.payload_add_external(&approval, 7168) != .None {
+		return "Child Workflow signal decoration failed"
+	}
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&approval),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	signal := workflow.signal_child_workflow_payloads(ctx, future, "approve", inputs[:])
 	if signal.status != .Succeeded {
 		return "Child Workflow signal failed"
 	}
@@ -261,17 +303,32 @@ duplicate_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 
 external_target_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
-	approval := workflow.await_signal_json_with_context(ctx, "external-approve", string)
+	approval := workflow.await_signal_payloads_with_context(ctx, "external-approve")
 	signal_header: string
 	header_found, header_error := workflow.signal_header_json(
 		&approval.metadata,
 		"odin-workflow-signal-external",
 		&signal_header,
 	)
-	if approval.value != "approval-from-external-caller" || !header_found ||
+	if len(approval.values) != 3 || !header_found ||
 	   header_error != .None || signal_header != "intercepted" {
 		return "External Workflow signal payload mismatch"
 	}
+	approval_value: string
+	count: int
+	enabled: bool
+	message_type, metadata_found := codec.metadata_get(approval.values[0], "messageType")
+	if !metadata_found || string(message_type) != "odin.RepeatedExternalSignal" ||
+	   len(approval.values[0].external_payloads) != 1 ||
+	   approval.values[0].external_payloads[0].size_bytes != 8192 ||
+	   codec.decode_json(approval.values[0], &approval_value) != .None ||
+	   codec.decode_json(approval.values[1], &count) != .None ||
+	   codec.decode_json(approval.values[2], &enabled) != .None ||
+	   approval_value != "approval-from-external-caller" || count != 42 || !enabled {
+		delete(approval_value)
+		return "External Workflow repeated signal payload mismatch"
+	}
+	delete(approval_value)
 	workflow.sleep(ctx, time.Hour)
 	return "External target was not canceled"
 }
@@ -281,11 +338,38 @@ external_caller_workflow :: proc(ctx: ^workflow.Fiber_Context, target_workflow_i
 		namespace = "default",
 		workflow_id = target_workflow_id,
 	}
-	signal := workflow.signal_external_workflow_json(
+	approval, approval_error := codec.encode_json("approval-from-external-caller")
+	if approval_error != .None {
+		return "External Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&approval)
+	count, count_error := codec.encode_json(42)
+	if count_error != .None {
+		return "External Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&count)
+	enabled, enabled_error := codec.encode_json(true)
+	if enabled_error != .None {
+		return "External Workflow signal encoding failed"
+	}
+	defer codec.payload_free(&enabled)
+	if codec.payload_add_metadata(
+		&approval,
+		"messageType",
+		transmute([]u8)string("odin.RepeatedExternalSignal"),
+	) != .None || codec.payload_add_external(&approval, 8192) != .None {
+		return "External Workflow signal decoration failed"
+	}
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&approval),
+		codec.payload_view(&count),
+		codec.payload_view(&enabled),
+	}
+	signal := workflow.signal_external_workflow_payloads(
 		ctx,
 		execution,
 		"external-approve",
-		"approval-from-external-caller",
+		inputs[:],
 	)
 	if signal.status != .Succeeded {
 		return "External Workflow signal failed"

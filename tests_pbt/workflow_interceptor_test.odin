@@ -330,7 +330,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			ctx = &ctx,
 			future = {seq = 1},
 			signal_name = "property-signal",
-			input = codec.Payload_View{},
+			inputs = []codec.Payload_View{{}},
 			headers = &working_headers,
 		}
 		_ = workflow.outbound_signal_child_workflow_chain(&chain, &input)
@@ -339,7 +339,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			ctx = &ctx,
 			execution = {namespace = "default", workflow_id = "property-target"},
 			signal_name = "property-signal",
-			input = codec.Payload_View{},
+			inputs = []codec.Payload_View{{}},
 			headers = &working_headers,
 		}
 		_ = workflow.outbound_signal_external_workflow_chain(&chain, &input)

@@ -895,7 +895,7 @@ Fiber_External_Signal_Operation :: struct {
 	child_workflow_id:  string,
 	run_id:              string,
 	signal_name:        string,
-	input:              codec.Payload,
+	inputs:             [dynamic]codec.Payload,
 	headers:            [dynamic]Fiber_Named_Payload,
 	failure_message:    string,
 	failure:            ^temporal_failure.Failure,
@@ -1608,7 +1608,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 		codec.payload_free(&operation.result)
 	}
 	for &operation in instance.external_signals {
-		codec.payload_free(&operation.input)
+		for &input in operation.inputs {
+			codec.payload_free(&input)
+		}
+		delete(operation.inputs)
 	}
 	if instance.continue_as_new.present {
 		codec.payload_free(&instance.continue_as_new.input)
@@ -5354,23 +5357,23 @@ schedule_external_signal_and_await :: proc(
 	return workflow_signal_result_from_operation(operation_ptr)
 }
 
-signal_child_workflow_owned :: proc(
+signal_child_workflow_payloads_owned :: proc(
 	ctx: ^Fiber_Context,
 	future: Child_Workflow_Future,
 	signal_name: string,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options: Signal_Options,
 ) -> Child_Workflow_Signal_Result {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
 	   future.seq == 0 || len(signal_name) == 0 ||
 	   options.headers != nil && options.headers.allocator.procedure == nil {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "invalid Child Workflow signal"}
 	}
 	start_result := await_child_workflow_start(ctx, future)
 	if start_result.status != .Succeeded {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		status := Child_Workflow_Signal_Status.Failed
 		if start_result.status == .Canceled {
 			status = .Canceled
@@ -5379,12 +5382,12 @@ signal_child_workflow_owned :: proc(
 	}
 	instance := ctx.instance
 	if root_cancellation_applies(instance) {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Canceled, failure_message = instance.cancellation_reason}
 	}
 	child, found := find_child_workflow_operation(instance, future.seq)
 	if !found || child.completion_state != .Pending {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "Child Workflow is not running"}
 	}
 	owned_name, allocation_error := strings.clone(signal_name, instance.odin_context.allocator)
@@ -5395,33 +5398,45 @@ signal_child_workflow_owned :: proc(
 		instance.odin_context.allocator,
 	)
 	if allocation_error != nil || !headers_ok {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "could not preserve Child Workflow signal name or headers"}
 	}
 	operation := Fiber_External_Signal_Operation{
 		child_workflow_seq = future.seq,
 		child_workflow_id = child.workflow_id,
 		signal_name = owned_name,
-		input = owned_input,
+		inputs = owned_inputs,
 		headers = owned_headers,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
 
-signal_child_workflow_payload :: proc(
+signal_child_workflow_owned :: proc(
 	ctx: ^Fiber_Context,
 	future: Child_Workflow_Future,
 	signal_name: string,
-	input: codec.Payload_View,
+	input: codec.Payload,
+	options: Signal_Options,
 ) -> Child_Workflow_Signal_Result {
-	return signal_child_workflow_payload_with_options(ctx, future, signal_name, input, {})
+	inputs := make([dynamic]codec.Payload)
+	append(&inputs, input)
+	return signal_child_workflow_payloads_owned(ctx, future, signal_name, inputs, options)
 }
 
-signal_child_workflow_payload_with_options :: proc(
+signal_child_workflow_payloads :: proc(
 	ctx: ^Fiber_Context,
 	future: Child_Workflow_Future,
 	signal_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
+) -> Child_Workflow_Signal_Result {
+	return signal_child_workflow_payloads_with_options(ctx, future, signal_name, inputs, {})
+}
+
+signal_child_workflow_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	signal_name: string,
+	inputs: []codec.Payload_View,
 	options: Signal_Options,
 ) -> Child_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
@@ -5438,12 +5453,33 @@ signal_child_workflow_payload_with_options :: proc(
 		ctx = ctx,
 		future = future,
 		signal_name = signal_name,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	return outbound_signal_child_workflow_chain(&state, &interceptor_input)
+}
+
+signal_child_workflow_payload :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	signal_name: string,
+	input: codec.Payload_View,
+) -> Child_Workflow_Signal_Result {
+	inputs := [?]codec.Payload_View{input}
+	return signal_child_workflow_payloads(ctx, future, signal_name, inputs[:])
+}
+
+signal_child_workflow_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Options,
+) -> Child_Workflow_Signal_Result {
+	inputs := [?]codec.Payload_View{input}
+	return signal_child_workflow_payloads_with_options(ctx, future, signal_name, inputs[:], options)
 }
 
 signal_child_workflow_json :: proc(
@@ -5479,24 +5515,24 @@ signal_child_workflow_json_with_options :: proc(
 	)
 }
 
-signal_external_workflow_owned :: proc(
+signal_external_workflow_payloads_owned :: proc(
 	ctx: ^Fiber_Context,
 	execution: External_Workflow_Execution,
 	signal_name: string,
-	input: codec.Payload,
+	inputs: [dynamic]codec.Payload,
 	options: Signal_Options,
 ) -> External_Workflow_Signal_Result {
-	owned_input := input
+	owned_inputs := inputs
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
 	   len(execution.namespace) == 0 || len(execution.workflow_id) == 0 ||
 	   len(signal_name) == 0 ||
 	   options.headers != nil && options.headers.allocator.procedure == nil {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "invalid external Workflow signal"}
 	}
 	instance := ctx.instance
 	if root_cancellation_applies(instance) {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Canceled, failure_message = instance.cancellation_reason}
 	}
 	owned_namespace, namespace_error := strings.clone(
@@ -5517,7 +5553,7 @@ signal_external_workflow_owned :: proc(
 	)
 	if namespace_error != nil || workflow_id_error != nil || run_id_error != nil ||
 	   name_error != nil || !headers_ok {
-		codec.payload_free(&owned_input)
+		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "could not preserve external Workflow signal"}
 	}
 	operation := Fiber_External_Signal_Operation{
@@ -5525,26 +5561,38 @@ signal_external_workflow_owned :: proc(
 		child_workflow_id = owned_workflow_id,
 		run_id = owned_run_id,
 		signal_name = owned_name,
-		input = owned_input,
+		inputs = owned_inputs,
 		headers = owned_headers,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
 
-signal_external_workflow_payload :: proc(
+signal_external_workflow_owned :: proc(
 	ctx: ^Fiber_Context,
 	execution: External_Workflow_Execution,
 	signal_name: string,
-	input: codec.Payload_View,
+	input: codec.Payload,
+	options: Signal_Options,
 ) -> External_Workflow_Signal_Result {
-	return signal_external_workflow_payload_with_options(ctx, execution, signal_name, input, {})
+	inputs := make([dynamic]codec.Payload)
+	append(&inputs, input)
+	return signal_external_workflow_payloads_owned(ctx, execution, signal_name, inputs, options)
 }
 
-signal_external_workflow_payload_with_options :: proc(
+signal_external_workflow_payloads :: proc(
 	ctx: ^Fiber_Context,
 	execution: External_Workflow_Execution,
 	signal_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
+) -> External_Workflow_Signal_Result {
+	return signal_external_workflow_payloads_with_options(ctx, execution, signal_name, inputs, {})
+}
+
+signal_external_workflow_payloads_with_options :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	inputs: []codec.Payload_View,
 	options: Signal_Options,
 ) -> External_Workflow_Signal_Result {
 	if ctx == nil || ctx.instance == nil {
@@ -5561,12 +5609,33 @@ signal_external_workflow_payload_with_options :: proc(
 		ctx = ctx,
 		execution = execution,
 		signal_name = signal_name,
-		input = input,
+		inputs = inputs,
 		options = intercepted_options,
 		headers = &headers,
 	}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	return outbound_signal_external_workflow_chain(&state, &interceptor_input)
+}
+
+signal_external_workflow_payload :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: codec.Payload_View,
+) -> External_Workflow_Signal_Result {
+	inputs := [?]codec.Payload_View{input}
+	return signal_external_workflow_payloads(ctx, execution, signal_name, inputs[:])
+}
+
+signal_external_workflow_payload_with_options :: proc(
+	ctx: ^Fiber_Context,
+	execution: External_Workflow_Execution,
+	signal_name: string,
+	input: codec.Payload_View,
+	options: Signal_Options,
+) -> External_Workflow_Signal_Result {
+	inputs := [?]codec.Payload_View{input}
+	return signal_external_workflow_payloads_with_options(ctx, execution, signal_name, inputs[:], options)
 }
 
 signal_external_workflow_json :: proc(
@@ -7399,8 +7468,6 @@ append_fiber_signal_external_workflow_command :: proc(
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
 	operation: ^Fiber_External_Signal_Operation,
 ) {
-	payload := new(proto.Temporal_Api_Common_V1_Payload)
-	payload^ = proto.encode_payload(codec.payload_view(&operation.input))
 	request := new(proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution)
 	request.seq = operation.seq
 	request.signal_name = operation.signal_name
@@ -7430,7 +7497,9 @@ append_fiber_signal_external_workflow_command :: proc(
 			value = execution,
 		}
 	}
-	append(&request.args, payload^)
+	for &input in operation.inputs {
+		append(&request.args, proto.encode_payload(codec.payload_view(&input)))
+	}
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{
