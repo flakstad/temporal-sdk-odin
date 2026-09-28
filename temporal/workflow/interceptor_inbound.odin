@@ -50,14 +50,121 @@ Inbound_Handle_Query_Interceptor_Proc :: #type proc(
 	next: Inbound_Handle_Query_Next,
 ) -> Payload_Result
 
+Inbound_Handle_Signal_Input :: struct {
+	ctx:           ^Fiber_Context,
+	workflow_type: string,
+	signal:        ^Signal_Context,
+	input:         codec.Payload_View,
+}
+
+Inbound_Handle_Signal_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Signal_Input,
+) -> Payload_Result
+
+Inbound_Handle_Signal_Next :: struct {
+	data:   rawptr,
+	invoke: Inbound_Handle_Signal_Next_Proc,
+}
+
+Inbound_Handle_Signal_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Inbound_Handle_Signal_Input,
+	next: Inbound_Handle_Signal_Next,
+) -> Payload_Result
+
+Inbound_Handle_Update_Input :: struct {
+	ctx:           ^Fiber_Context,
+	workflow_type: string,
+	update:        ^Update_Context,
+	input:         codec.Payload_View,
+}
+
+Inbound_Handle_Update_Validator_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+) -> Update_Validation
+
+Inbound_Handle_Update_Validator_Next :: struct {
+	data:   rawptr,
+	invoke: Inbound_Handle_Update_Validator_Next_Proc,
+}
+
+Inbound_Handle_Update_Validator_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+	next: Inbound_Handle_Update_Validator_Next,
+) -> Update_Validation
+
+Inbound_Handle_Update_Handler_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+) -> Payload_Result
+
+Inbound_Handle_Update_Handler_Next :: struct {
+	data:   rawptr,
+	invoke: Inbound_Handle_Update_Handler_Next_Proc,
+}
+
+Inbound_Handle_Update_Handler_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+	next: Inbound_Handle_Update_Handler_Next,
+) -> Payload_Result
+
 Inbound_Interceptor :: struct {
-	user_data:        rawptr,
-	execute_workflow: Inbound_Execute_Workflow_Interceptor_Proc,
-	handle_query:     Inbound_Handle_Query_Interceptor_Proc,
+	user_data:                rawptr,
+	execute_workflow:         Inbound_Execute_Workflow_Interceptor_Proc,
+	handle_query:             Inbound_Handle_Query_Interceptor_Proc,
+	handle_signal:            Inbound_Handle_Signal_Interceptor_Proc,
+	handle_update_validator:  Inbound_Handle_Update_Validator_Interceptor_Proc,
+	handle_update_handler:    Inbound_Handle_Update_Handler_Interceptor_Proc,
 }
 
 inbound_interceptor_has_operation :: proc(interceptor: Inbound_Interceptor) -> bool {
-	return interceptor.execute_workflow != nil || interceptor.handle_query != nil
+	return interceptor.execute_workflow != nil || interceptor.handle_query != nil ||
+	       interceptor.handle_signal != nil ||
+	       interceptor.handle_update_validator != nil ||
+	       interceptor.handle_update_handler != nil
+}
+
+inbound_handle_signal_next :: proc(
+	next: Inbound_Handle_Signal_Next,
+	input: ^Inbound_Handle_Signal_Input,
+) -> Payload_Result {
+	if next.invoke == nil || input == nil || input.signal == nil {
+		return payload_fail(
+			"invalid Workflow Signal interceptor continuation",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	return next.invoke(next.data, input)
+}
+
+inbound_handle_update_validator_next :: proc(
+	next: Inbound_Handle_Update_Validator_Next,
+	input: ^Inbound_Handle_Update_Input,
+) -> Update_Validation {
+	if next.invoke == nil || input == nil || input.update == nil {
+		return update_reject(
+			"invalid Workflow Update validator interceptor continuation",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	return next.invoke(next.data, input)
+}
+
+inbound_handle_update_handler_next :: proc(
+	next: Inbound_Handle_Update_Handler_Next,
+	input: ^Inbound_Handle_Update_Input,
+) -> Payload_Result {
+	if next.invoke == nil || input == nil || input.update == nil {
+		return payload_fail(
+			"invalid Workflow Update handler interceptor continuation",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	return next.invoke(next.data, input)
 }
 
 inbound_execute_workflow_next :: proc(
@@ -159,6 +266,166 @@ inbound_handle_query_chain :: proc(
 		return state.handler.invoke_with_context(
 			state.handler.callback_data,
 			input.query,
+			input.input,
+		)
+	}
+	return state.handler.invoke(state.handler.callback_data, input.input)
+}
+
+Inbound_Handle_Signal_State :: struct {
+	instance: ^Fiber_Instance,
+	handler:  ^Fiber_Signal_Handler,
+	routine:  ^Fiber_Signal_Routine,
+	index:    int,
+}
+
+inbound_handle_signal_chain :: proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Signal_Input,
+) -> Payload_Result {
+	state := cast(^Inbound_Handle_Signal_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil ||
+	   state.handler == nil && state.routine == nil || input == nil || input.signal == nil {
+		return payload_fail(
+			"invalid Workflow Signal interceptor state",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	for index := state.index; index < len(state.instance.runtime.inbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.inbound_interceptors[index]
+		if entry.handle_signal == nil do continue
+		next_state := Inbound_Handle_Signal_State{
+			instance = state.instance,
+			handler = state.handler,
+			routine = state.routine,
+			index = index + 1,
+		}
+		return entry.handle_signal(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = inbound_handle_signal_chain},
+		)
+	}
+	if state.routine != nil {
+		if state.routine.invoke_with_context != nil {
+			return state.routine.invoke_with_context(
+				state.routine.callback_data,
+				input.ctx,
+				input.signal,
+				input.input,
+			)
+		}
+		return state.routine.invoke(
+			state.routine.callback_data,
+			input.ctx,
+			input.input,
+		)
+	}
+	if state.handler.invoke_with_context != nil {
+		return state.handler.invoke_with_context(
+			state.handler.callback_data,
+			input.signal,
+			input.input,
+		)
+	}
+	return state.handler.invoke(state.handler.callback_data, input.input)
+}
+
+Inbound_Handle_Update_Validator_State :: struct {
+	instance: ^Fiber_Instance,
+	handler:  ^Fiber_Update_Handler,
+	index:    int,
+}
+
+inbound_handle_update_validator_chain :: proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+) -> Update_Validation {
+	state := cast(^Inbound_Handle_Update_Validator_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil ||
+	   state.handler == nil || input == nil || input.update == nil {
+		return update_reject(
+			"invalid Workflow Update validator interceptor state",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	for index := state.index; index < len(state.instance.runtime.inbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.inbound_interceptors[index]
+		if entry.handle_update_validator == nil do continue
+		next_state := Inbound_Handle_Update_Validator_State{
+			instance = state.instance,
+			handler = state.handler,
+			index = index + 1,
+		}
+		return entry.handle_update_validator(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = inbound_handle_update_validator_chain},
+		)
+	}
+	if state.handler.validate_with_context != nil {
+		return state.handler.validate_with_context(
+			state.handler.callback_data,
+			input.update,
+			input.input,
+		)
+	}
+	return state.handler.validate(state.handler.callback_data, input.input)
+}
+
+Inbound_Handle_Update_Handler_State :: struct {
+	instance: ^Fiber_Instance,
+	handler:  ^Fiber_Update_Handler,
+	routine:  ^Fiber_Update_Routine,
+	index:    int,
+}
+
+inbound_handle_update_handler_chain :: proc(
+	data: rawptr,
+	input: ^Inbound_Handle_Update_Input,
+) -> Payload_Result {
+	state := cast(^Inbound_Handle_Update_Handler_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil ||
+	   state.handler == nil && state.routine == nil || input == nil || input.update == nil {
+		return payload_fail(
+			"invalid Workflow Update handler interceptor state",
+			"OdinWorkflowInterceptorError",
+		)
+	}
+	for index := state.index; index < len(state.instance.runtime.inbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.inbound_interceptors[index]
+		if entry.handle_update_handler == nil do continue
+		next_state := Inbound_Handle_Update_Handler_State{
+			instance = state.instance,
+			handler = state.handler,
+			routine = state.routine,
+			index = index + 1,
+		}
+		return entry.handle_update_handler(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = inbound_handle_update_handler_chain},
+		)
+	}
+	if state.routine != nil {
+		if state.routine.invoke_with_context != nil {
+			return state.routine.invoke_with_context(
+				state.routine.callback_data,
+				input.ctx,
+				input.update,
+				input.input,
+			)
+		}
+		return state.routine.invoke(
+			state.routine.callback_data,
+			input.ctx,
+			input.input,
+		)
+	}
+	if state.handler.invoke_with_context != nil {
+		return state.handler.invoke_with_context(
+			state.handler.callback_data,
+			input.update,
 			input.input,
 		)
 	}

@@ -80,6 +80,12 @@ Signal_Routine_Invoke_Proc :: #type proc(
 	ctx: ^Fiber_Context,
 	input: codec.Payload_View,
 ) -> Payload_Result
+Signal_Context_Routine_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	signal: ^Signal_Context,
+	input: codec.Payload_View,
+) -> Payload_Result
 
 Payload_Result_Status :: enum {
 	Completed,
@@ -684,12 +690,13 @@ Fiber_Query_Handler :: struct {
 }
 
 Fiber_Signal_Handler :: struct {
-	name:              string,
-	callback_data:     rawptr,
-	invoke:            Signal_Invoke_Proc,
-	invoke_with_context: Signal_Context_Invoke_Proc,
-	invoke_routine:    Signal_Routine_Invoke_Proc,
-	unfinished_policy: Handler_Unfinished_Policy,
+	name:                        string,
+	callback_data:               rawptr,
+	invoke:                      Signal_Invoke_Proc,
+	invoke_with_context:         Signal_Context_Invoke_Proc,
+	invoke_routine:              Signal_Routine_Invoke_Proc,
+	invoke_routine_with_context: Signal_Context_Routine_Invoke_Proc,
+	unfinished_policy:           Handler_Unfinished_Policy,
 }
 
 Fiber_Update_Handler :: struct {
@@ -849,8 +856,10 @@ Fiber_Signal_Routine :: struct {
 	instance:             ^Fiber_Instance,
 	name:                 string,
 	input:                codec.Payload,
+	signal_context:       Signal_Context,
 	callback_data:        rawptr,
 	invoke:               Signal_Routine_Invoke_Proc,
+	invoke_with_context:  Signal_Context_Routine_Invoke_Proc,
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
@@ -1257,11 +1266,17 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 	routine := cast(^Fiber_Signal_Routine)user_data
 	instance := routine.instance
 	context = instance.odin_context
-	result := routine.invoke(
-		routine.callback_data,
-		&routine.ctx,
-		codec.payload_view(&routine.input),
-	)
+	interceptor_input := Inbound_Handle_Signal_Input{
+		ctx = &routine.ctx,
+		workflow_type = instance.workflow_type,
+		signal = &routine.signal_context,
+		input = codec.payload_view(&routine.input),
+	}
+	interceptor_state := Inbound_Handle_Signal_State{
+		instance = instance,
+		routine = routine,
+	}
+	result := inbound_handle_signal_chain(&interceptor_state, &interceptor_input)
 	if instance.phase == .Failed {
 		codec.payload_free(&result.payload)
 		message := instance.failure_message
@@ -1351,21 +1366,17 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 	routine := cast(^Fiber_Update_Routine)user_data
 	instance := routine.instance
 	context = instance.odin_context
-	result: Payload_Result
-	if routine.invoke_with_context != nil {
-		result = routine.invoke_with_context(
-			routine.callback_data,
-			&routine.ctx,
-			&routine.update_context,
-			codec.payload_view(&routine.input),
-		)
-	} else {
-		result = routine.invoke(
-			routine.callback_data,
-			&routine.ctx,
-			codec.payload_view(&routine.input),
-		)
+	interceptor_input := Inbound_Handle_Update_Input{
+		ctx = &routine.ctx,
+		workflow_type = instance.workflow_type,
+		update = &routine.update_context,
+		input = codec.payload_view(&routine.input),
 	}
+	interceptor_state := Inbound_Handle_Update_Handler_State{
+		instance = instance,
+		routine = routine,
+	}
+	result := inbound_handle_update_handler_chain(&interceptor_state, &interceptor_input)
 	if instance.phase == .Failed {
 		codec.payload_free(&result.payload)
 		message := instance.failure_message
@@ -2256,6 +2267,43 @@ set_signal_handler_payload :: proc(
 	return true
 }
 
+set_signal_routine_payload_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	callback: Signal_Context_Routine_Invoke_Proc,
+	options := Signal_Handler_Options{},
+) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(name) == 0 || callback_data == nil || callback == nil {
+		if ctx != nil {
+			signal_registration_failed(ctx.instance, "invalid contextual Workflow Signal routine")
+		}
+		return false
+	}
+	instance := ctx.instance
+	_, duplicate := find_signal_handler(instance, name)
+	if duplicate {
+		signal_registration_failed(instance, "Workflow Signal handler is already registered")
+		return false
+	}
+	owned_name, allocation_error := strings.clone(name, instance.odin_context.allocator)
+	if allocation_error != nil {
+		signal_registration_failed(instance, "could not preserve Workflow Signal handler name")
+		return false
+	}
+	append(
+		&instance.signal_handlers,
+		Fiber_Signal_Handler{
+			name = owned_name,
+			callback_data = callback_data,
+			invoke_routine_with_context = callback,
+			unfinished_policy = options.unfinished_policy,
+		},
+	)
+	return true
+}
+
 set_signal_handler_payload_with_context :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
@@ -2438,6 +2486,69 @@ set_signal_routine_json :: proc(
 				)
 			}
 			owned.callback(routine_ctx, owned.state, value)
+			return payload_complete({})
+		},
+		options,
+	)
+}
+
+// set_signal_routine_json_with_context exposes run-owned Signal metadata to a
+// stackful handler. The context remains valid across durable suspension and
+// must not escape the Workflow run.
+set_signal_routine_json_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	callback: proc(
+		ctx: ^Fiber_Context,
+		signal: ^Signal_Context,
+		state: ^State,
+		input: $Input,
+	),
+	options := Signal_Handler_Options{},
+) -> bool {
+	Callback :: #type proc(
+		ctx: ^Fiber_Context,
+		signal: ^Signal_Context,
+		state: ^State,
+		input: Input,
+	)
+	Data :: struct {
+		state:    ^State,
+		callback: Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || callback == nil {
+		if ctx != nil {
+			signal_registration_failed(ctx.instance, "invalid contextual Workflow Signal routine")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		signal_registration_failed(ctx.instance, "could not allocate contextual Workflow Signal routine")
+		return false
+	}
+	data.state = state
+	data.callback = callback
+	return set_signal_routine_payload_with_context(
+		ctx,
+		name,
+		data,
+		proc(
+			callback_data: rawptr,
+			routine_ctx: ^Fiber_Context,
+			signal: ^Signal_Context,
+			input: codec.Payload_View,
+		) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Signal input as json/plain",
+					"OdinWorkflowSignalPayloadConversionError",
+				)
+			}
+			owned.callback(routine_ctx, signal, owned.state, value)
 			return payload_complete({})
 		},
 		options,
@@ -6907,13 +7018,49 @@ append_pending_update_response :: proc(
 	)
 }
 
+clone_signal_context_for_routine :: proc(
+	instance: ^Fiber_Instance,
+	source: ^Signal_Context,
+) -> (result: Signal_Context, ok: bool) {
+	if instance == nil || source == nil || len(source.name) == 0 {
+		return {}, false
+	}
+	allocator := instance.odin_context.allocator
+	name, name_error := strings.clone(source.name, allocator)
+	identity, identity_error := strings.clone(source.identity, allocator)
+	if name_error != nil || identity_error != nil {
+		return {}, false
+	}
+	result = {
+		name = name,
+		identity = identity,
+		headers = make([dynamic]Fiber_Named_Payload, allocator),
+		originating_event_id = source.originating_event_id,
+	}
+	for &entry in source.headers {
+		key, key_error := strings.clone(entry.key, allocator)
+		payload, payload_error := codec.payload_clone(
+			codec.payload_view(&entry.payload),
+			allocator,
+		)
+		if key_error != nil || payload_error != .None {
+			return {}, false
+		}
+		append(&result.headers, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return result, true
+}
+
 start_signal_routine :: proc(
 	instance: ^Fiber_Instance,
 	handler: ^Fiber_Signal_Handler,
 	name: string,
+	signal_context: ^Signal_Context,
 	input: codec.Payload_View,
 ) -> (^Fiber_Signal_Routine, Error) {
-	if instance == nil || handler == nil || handler.invoke_routine == nil || len(name) == 0 {
+	if instance == nil || handler == nil ||
+	   (handler.invoke_routine == nil) == (handler.invoke_routine_with_context == nil) ||
+	   signal_context == nil || len(name) == 0 {
 		return nil, error_from_string("invalid Workflow Signal routine")
 	}
 	allocator := instance.odin_context.allocator
@@ -6923,14 +7070,17 @@ start_signal_routine :: proc(
 	}
 	owned_name, name_error := strings.clone(name, allocator)
 	owned_input, input_error := codec.payload_clone(input, allocator)
-	if name_error != nil || input_error != .None {
+	owned_context, context_ok := clone_signal_context_for_routine(instance, signal_context)
+	if name_error != nil || input_error != .None || !context_ok {
 		return nil, error_from_string("could not preserve Workflow Signal routine input")
 	}
 	routine.instance = instance
 	routine.name = owned_name
 	routine.input = owned_input
+	routine.signal_context = owned_context
 	routine.callback_data = handler.callback_data
 	routine.invoke = handler.invoke_routine
+	routine.invoke_with_context = handler.invoke_routine_with_context
 	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
 	routine.phase = .Ready
@@ -7100,11 +7250,12 @@ invoke_workflow_signal :: proc(
 	input_view := codec.payload_view(&preserved.payload)
 	signal_context := fiber_signal_context(&preserved)
 	result.signal_handlers_started += 1
-	if handler.invoke_routine != nil {
+	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil {
 		routine, routine_error := start_signal_routine(
 			instance,
 			handler,
 			signal.signal_name,
+			&signal_context,
 			input_view,
 		)
 		if routine_error.message != nil {
@@ -7113,16 +7264,16 @@ invoke_workflow_signal :: proc(
 		return finish_signal_routine(routine, result)
 	}
 	command_state := workflow_command_state(instance)
-	handler_result: Payload_Result
-	if handler.invoke_with_context != nil {
-		handler_result = handler.invoke_with_context(
-			handler.callback_data,
-			&signal_context,
-			input_view,
-		)
-	} else {
-		handler_result = handler.invoke(handler.callback_data, input_view)
+	interceptor_input := Inbound_Handle_Signal_Input{
+		workflow_type = instance.workflow_type,
+		signal = &signal_context,
+		input = input_view,
 	}
+	interceptor_state := Inbound_Handle_Signal_State{
+		instance = instance,
+		handler = handler,
+	}
+	handler_result := inbound_handle_signal_chain(&interceptor_state, &interceptor_input)
 	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&handler_result.payload)
 		restore_workflow_command_state(instance, command_state)
@@ -7419,16 +7570,19 @@ invoke_workflow_update :: proc(
 
 	if update.run_validator && (handler.validate != nil || handler.validate_with_context != nil) {
 		command_state := workflow_command_state(instance)
-		validation: Update_Validation
-		if handler.validate_with_context != nil {
-			validation = handler.validate_with_context(
-				handler.callback_data,
-				&update_context,
-				codec.payload_view(&input),
-			)
-		} else {
-			validation = handler.validate(handler.callback_data, codec.payload_view(&input))
+		interceptor_input := Inbound_Handle_Update_Input{
+			workflow_type = instance.workflow_type,
+			update = &update_context,
+			input = codec.payload_view(&input),
 		}
+		interceptor_state := Inbound_Handle_Update_Validator_State{
+			instance = instance,
+			handler = handler,
+		}
+		validation := inbound_handle_update_validator_chain(
+			&interceptor_state,
+			&interceptor_input,
+		)
 		if workflow_command_state_changed(instance, command_state) {
 			restore_workflow_command_state(instance, command_state)
 			append_pending_update_response(
@@ -7497,16 +7651,16 @@ invoke_workflow_update :: proc(
 		return
 	}
 	command_state := workflow_command_state(instance)
-	result: Payload_Result
-	if handler.invoke_with_context != nil {
-		result = handler.invoke_with_context(
-			handler.callback_data,
-			&update_context,
-			codec.payload_view(&input),
-		)
-	} else {
-		result = handler.invoke(handler.callback_data, codec.payload_view(&input))
+	interceptor_input := Inbound_Handle_Update_Input{
+		workflow_type = instance.workflow_type,
+		update = &update_context,
+		input = codec.payload_view(&input),
 	}
+	interceptor_state := Inbound_Handle_Update_Handler_State{
+		instance = instance,
+		handler = handler,
+	}
+	result := inbound_handle_update_handler_chain(&interceptor_state, &interceptor_input)
 	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&result.payload)
 		restore_workflow_command_state(instance, command_state)

@@ -182,21 +182,75 @@ workflow_interceptor_property_query :: proc(
 	return result
 }
 
+workflow_interceptor_property_signal :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Signal_Input,
+	next: workflow.Inbound_Handle_Signal_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := workflow.payload_fail("generated short circuit")
+	if !node.short_circuit {
+		result = workflow.inbound_handle_signal_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
+workflow_interceptor_property_update_validator :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Validator_Next,
+) -> workflow.Update_Validation {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := workflow.update_reject("generated short circuit")
+	if !node.short_circuit {
+		result = workflow.inbound_handle_update_validator_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
+workflow_interceptor_property_update_handler :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Handler_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := workflow.payload_fail("generated short circuit")
+	if !node.short_circuit {
+		result = workflow.inbound_handle_update_handler_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
 workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 8))
+	operation := pbt.draw(t, pbt.int_range(0, 11))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 1, 7.0, "Child Workflow start")
-	pbt.cover(t, operation == 2, 7.0, "Child Workflow Signal")
-	pbt.cover(t, operation == 3, 7.0, "external Workflow Signal")
-	pbt.cover(t, operation == 4, 7.0, "external Workflow cancellation")
-	pbt.cover(t, operation == 5, 7.0, "Workflow sleep")
-	pbt.cover(t, operation == 6, 7.0, "Child Workflow cancellation")
-	pbt.cover(t, operation == 7, 7.0, "Workflow execution")
-	pbt.cover(t, operation == 8, 7.0, "Workflow Query")
+	pbt.cover(t, operation == 1, 5.0, "Child Workflow start")
+	pbt.cover(t, operation == 2, 5.0, "Child Workflow Signal")
+	pbt.cover(t, operation == 3, 5.0, "external Workflow Signal")
+	pbt.cover(t, operation == 4, 5.0, "external Workflow cancellation")
+	pbt.cover(t, operation == 5, 5.0, "Workflow sleep")
+	pbt.cover(t, operation == 6, 5.0, "Child Workflow cancellation")
+	pbt.cover(t, operation == 7, 5.0, "Workflow execution")
+	pbt.cover(t, operation == 8, 5.0, "Workflow Query")
+	pbt.cover(t, operation == 9, 5.0, "Workflow Signal")
+	pbt.cover(t, operation == 10, 5.0, "Workflow Update validator")
+	pbt.cover(t, operation == 11, 5.0, "Workflow Update handler")
 
 	state := Workflow_Interceptor_Property_State{}
 	nodes: [12]Workflow_Interceptor_Property_Node
@@ -220,6 +274,9 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 				user_data = &nodes[index],
 				execute_workflow = workflow_interceptor_property_execute,
 				handle_query = workflow_interceptor_property_query,
+				handle_signal = workflow_interceptor_property_signal,
+				handle_update_validator = workflow_interceptor_property_update_validator,
+				handle_update_handler = workflow_interceptor_property_update_handler,
 			},
 		)
 		append(
@@ -322,6 +379,42 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			query = &query,
 		}
 		_ = workflow.inbound_handle_query_chain(&inbound_chain, &input)
+	case 9:
+		signal := workflow.Signal_Context{name = "property-signal"}
+		handler := workflow.Fiber_Signal_Handler{name = "property-signal"}
+		inbound_chain := workflow.Inbound_Handle_Signal_State{
+			instance = &instance,
+			handler = &handler,
+		}
+		input := workflow.Inbound_Handle_Signal_Input{
+			workflow_type = "property-workflow",
+			signal = &signal,
+		}
+		_ = workflow.inbound_handle_signal_chain(&inbound_chain, &input)
+	case 10:
+		update := workflow.Update_Context{id = "property-update", name = "rename"}
+		handler := workflow.Fiber_Update_Handler{name = "rename"}
+		inbound_chain := workflow.Inbound_Handle_Update_Validator_State{
+			instance = &instance,
+			handler = &handler,
+		}
+		input := workflow.Inbound_Handle_Update_Input{
+			workflow_type = "property-workflow",
+			update = &update,
+		}
+		_ = workflow.inbound_handle_update_validator_chain(&inbound_chain, &input)
+	case 11:
+		update := workflow.Update_Context{id = "property-update", name = "rename"}
+		handler := workflow.Fiber_Update_Handler{name = "rename"}
+		inbound_chain := workflow.Inbound_Handle_Update_Handler_State{
+			instance = &instance,
+			handler = &handler,
+		}
+		input := workflow.Inbound_Handle_Update_Input{
+			workflow_type = "property-workflow",
+			update = &update,
+		}
+		_ = workflow.inbound_handle_update_handler_chain(&inbound_chain, &input)
 	}
 	reached := short_index + 1
 	if state.event_count != reached * 2 {

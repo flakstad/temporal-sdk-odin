@@ -868,6 +868,10 @@ grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates
 grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
+grep -q "Workflow Update validator interceptor entered" "$worker_log"
+grep -q "Workflow Update validator interceptor exited" "$worker_log"
+grep -q "Workflow Update handler interceptor entered before handler" "$worker_log"
+grep -q "Workflow Update handler interceptor exited after handler" "$worker_log"
 grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
@@ -963,6 +967,8 @@ grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*signal=
 grep -Eq "replay=false .*resolved=1 .*signal_handlers_started=0 signal_handlers_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
 grep -q "asynchronous Workflow Signal handler awaited an Activity and replayed" "$worker_log"
+grep -q "Workflow Signal interceptor entered before handler" "$worker_log"
+grep -q "Workflow Signal interceptor exited after handler" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=abandon-update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

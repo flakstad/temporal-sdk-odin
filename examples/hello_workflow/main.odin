@@ -165,12 +165,20 @@ update_greeting_name_detached :: proc(
 
 set_greeting_name_from_signal :: proc(
 	ctx: ^workflow.Fiber_Context,
+	signal: ^workflow.Signal_Context,
 	state: ^Greeting_Query_State,
 	name: string,
 ) {
 	activity_result := workflow.execute_activity_result(ctx, "hello", name)
 	if activity_result.status == .Succeeded {
-		state.name = name
+		caller: string
+		found, decode_error := workflow.signal_header_json(signal, "caller", &caller)
+		defer delete(caller)
+		if found && decode_error == .None && caller == "odin-client-control" {
+			state.name = name
+		} else {
+			state.name = "Signal context lost across suspension"
+		}
 	}
 }
 
@@ -329,6 +337,63 @@ workflow_query_interceptor :: proc(
 	result := workflow.inbound_handle_query_next(next, input)
 	if is_probe {
 		fmt.println("Workflow Query interceptor exited after handler")
+	}
+	return result
+}
+
+workflow_signal_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Handle_Signal_Input,
+	next: workflow.Inbound_Handle_Signal_Next,
+) -> workflow.Payload_Result {
+	is_probe := input.signal != nil && input.signal.name == "set_greeting_name_async"
+	if is_probe {
+		fmt.println("Workflow Signal interceptor entered before handler")
+	}
+	result := workflow.inbound_handle_signal_next(next, input)
+	if is_probe {
+		caller: string
+		found, decode_error := workflow.signal_header_json(input.signal, "caller", &caller)
+		defer delete(caller)
+		if !found || decode_error != .None || caller != "odin-client-control" {
+			codec.payload_free(&result.payload)
+			return workflow.payload_fail(
+				"Workflow Signal interceptor context did not survive suspension",
+			)
+		}
+		fmt.println("Workflow Signal interceptor exited after handler")
+	}
+	return result
+}
+
+workflow_update_validator_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Validator_Next,
+) -> workflow.Update_Validation {
+	is_probe := input.update != nil && input.update.name == "set_greeting_name"
+	if is_probe {
+		fmt.println("Workflow Update validator interceptor entered")
+	}
+	result := workflow.inbound_handle_update_validator_next(next, input)
+	if is_probe {
+		fmt.println("Workflow Update validator interceptor exited")
+	}
+	return result
+}
+
+workflow_update_handler_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Handler_Next,
+) -> workflow.Payload_Result {
+	is_probe := input.update != nil && input.update.name == "set_greeting_name"
+	if is_probe {
+		fmt.println("Workflow Update handler interceptor entered before handler")
+	}
+	result := workflow.inbound_handle_update_handler_next(next, input)
+	if is_probe {
+		fmt.println("Workflow Update handler interceptor exited after handler")
 	}
 	return result
 }
@@ -539,7 +604,7 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register detached greeting name Update"
 	}
-	if !workflow.set_signal_routine_json(
+	if !workflow.set_signal_routine_json_with_context(
 		ctx,
 		"set_greeting_name_async",
 		&query_state,
@@ -948,6 +1013,9 @@ main :: proc() {
 		{
 			execute_workflow = workflow_execute_interceptor,
 			handle_query = workflow_query_interceptor,
+			handle_signal = workflow_signal_interceptor,
+			handle_update_validator = workflow_update_validator_interceptor,
+			handle_update_handler = workflow_update_handler_interceptor,
 		},
 	)
 	if workflow_inbound_interceptor_error.message != nil {

@@ -54,7 +54,9 @@ warning by default, registration can suppress that warning, and
 Typed Signals may now be registered as immediate handlers or independent
 stackful routines. An asynchronous Signal handler can await an Activity, mutate
 Workflow-owned state, participate in handler draining, and replay on a fresh
-stack; the CLI-devserver suite proves the state through a public Client Query.
+stack. `set_signal_routine_json_with_context` keeps Signal identity, event ID,
+and headers available across those waits; the CLI-devserver suite proves the
+state and propagated header through a public Client Query.
 Child Workflows now have a vertical start/result/failure/cancellation path:
 Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and completion
 resolutions, decodes typed JSON results and structured Child Workflow failures,
@@ -164,8 +166,9 @@ Continue-As-New, durable sleep, and explicit Child Workflow cancellation.
 These run inside the Workflow fiber on normal execution and replay, receive
 isolated per-call headers where the command supports them, and emit through the
 existing Core command path. Workflow inbound interceptors now wrap the complete
-Workflow execution and synchronous Query handlers with typed `next`
-continuations. Signal and Update inbound interception is not implemented yet.
+Workflow execution, Queries, Signals, Update validation, and Update handlers
+with typed `next` continuations. Stackful Signal and Update continuations remain
+open across their own durable suspensions.
 Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
@@ -279,10 +282,14 @@ _ = worker.add_workflow_inbound_interceptor(
 )
 ```
 
-`handle_query` wraps a synchronous Query handler and retains the runtime's
-read-only command-state guard. Both hooks execute during replay and must be
-deterministic. Their input records and continuations are call/fiber-stack scoped;
-`user_data` is borrowed until `worker.close`.
+`handle_query`, `handle_signal`, `handle_update_validator`, and
+`handle_update_handler` wrap their corresponding language callbacks. Query,
+synchronous Signal/Update, and validator chains retain their existing
+command-state guards. Stackful Signal and Update handler continuations live on
+the handler fiber and unwind only after the handler finishes. All five hooks
+execute during replay and must be deterministic. Their input records and
+continuations are call/fiber-stack scoped; `user_data` is borrowed until
+`worker.close`.
 
 ```text
 Temporal CLI dev server
@@ -978,9 +985,10 @@ _ = workflow.set_validated_update_routine_json_with_context(
 headers. Its run-arena-owned values survive handler suspension, and
 `workflow.current_update(ctx)` returns the same invocation while the routine is
 running. They must not escape the Workflow run. Workflow execution and Query
-now have composable inbound interceptor chains; Signal and Update handlers do
-not yet, because their stackful handler continuations require a separate
-fiber-lifetime chain rather than an activation-scoped wrapper.
+have composable inbound interceptor chains, as do Signal handling, Update
+validation, and Update handling. Stackful Signal and Update chains are created
+on their handler fibers, so their interceptor continuations remain live across
+durable suspension rather than being limited to one activation.
 
 The runtime emits `Accepted` with the Activity command, preserves the Update
 routine by `protocol_instance_id`, and emits `Completed` after the Activity

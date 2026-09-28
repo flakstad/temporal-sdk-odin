@@ -1349,8 +1349,8 @@ start, Signal, Query, and Update start. Workflow outbound now applies that same
 contract to remote and Local Activity scheduling, Child Workflow start/Signal,
 external Workflow Signal/cancellation, Continue-As-New, durable sleep, and
 explicit Child Workflow cancellation. Workflow inbound interception now wraps
-the complete Workflow execution and synchronous Query handlers. Signal and
-Update handlers remain the next inbound surface.
+the complete Workflow execution, Queries, Signals, Update validation, and
+Update handlers, including independently suspended handler fibers.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1440,20 +1440,34 @@ handler, preserving Query read-only semantics. Query input/context remain valid
 only for the synchronous chain; returned Payload ownership follows the existing
 handler contract.
 
+`handle_signal` selects the synchronous terminal for immediate handlers and the
+routine terminal when the handler has its own fiber. The routine creates its
+interceptor chain inside `signal_routine_entry`; consequently `next` remains on
+that fiber stack across durable suspension. Odin now clones Signal identity,
+originating event ID, headers, and Payload into the run arena before starting
+the fiber. This is both the ownership boundary required by the interceptor and
+an improvement over the earlier routine path, which did not retain contextual
+Signal metadata.
+The typed `set_signal_routine_json_with_context` API exposes this run-owned
+context directly to user code and applies the same non-escaping lifetime rule.
+
+Update validation and handling use distinct continuation/result types.
+`handle_update_validator` is invoked only when Core sets `run_validator` and is
+enclosed by the existing command-state mutation guard. Replay activations that
+skip validation also skip this interceptor. `handle_update_handler` chooses the
+synchronous callback terminal or is created inside `update_routine_entry` on
+the Update fiber. In the latter case its stack and the run-arena-owned
+`Update_Context` survive until the handler returns a result.
+
 The runtime and Worker copy interceptor records, but borrow `user_data` until
 close. Inputs and continuations are stack-scoped. Registration becomes
 immutable before polling. All inbound callbacks execute during replay and must
-be deterministic. Live CLI-devserver coverage crosses Core for both a Workflow
-that suspends on an Activity and a Query activation; offline tests prove nested
-order, delayed Workflow unwind, Query read-only enforcement, and fresh-stack
-replay command equality.
-
-Signal and Update are not modeled as activation-scoped hooks. Their current
-routine handlers own independent stackful fibers and may outlive the activation
-that started them. A correct inbound `next` must be created and retained on that
-handler fiber through its durable suspensions, then unwind at handler completion.
-This is why their interceptor hooks are a separate runtime slice rather than a
-thin wrapper around activation dispatch.
+be deterministic. Live CLI-devserver coverage crosses Core for Workflow
+execution, Query, Signal routines, Update validation, and Update routines.
+Offline tests prove nested order, delayed fiber-specific unwind, context
+ownership after suspension, command-state guards, and fresh-stack replay
+command equality. This feature remains entirely language-side and adds no C
+symbol or protobuf type.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines

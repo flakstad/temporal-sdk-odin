@@ -2469,8 +2469,11 @@ Workflow_Sleep_Test_State :: struct {
 }
 
 Workflow_Inbound_Interceptor_Test_State :: struct {
-	events:      [32]int,
-	event_count: int,
+	events:                       [64]int,
+	event_count:                  int,
+	signal_context_after_next:    bool,
+	update_context_after_next:    bool,
+	update_validator_context_seen: bool,
 }
 
 Workflow_Inbound_Interceptor_Test_Node :: struct {
@@ -2508,6 +2511,61 @@ workflow_inbound_test_query :: proc(
 	workflow_inbound_test_record(node.state, node.id + 10)
 	result := workflow.inbound_handle_query_next(next, input)
 	workflow_inbound_test_record(node.state, -(node.id + 10))
+	return result
+}
+
+workflow_inbound_test_signal :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Signal_Input,
+	next: workflow.Inbound_Handle_Signal_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Inbound_Interceptor_Test_Node)user_data
+	workflow_inbound_test_record(node.state, node.id + 20)
+	result := workflow.inbound_handle_signal_next(next, input)
+	if input.signal != nil && input.signal.name == "rename_with_activity" {
+		caller: string
+		found, decode_error := workflow.signal_header_json(input.signal, "caller", &caller)
+		node.state.signal_context_after_next = input.ctx != nil &&
+		                                      input.signal.identity == "signal-client" &&
+		                                      input.signal.originating_event_id == 42 &&
+		                                      found && decode_error == .None && caller == "odin-client"
+		delete(caller)
+	}
+	workflow_inbound_test_record(node.state, -(node.id + 20))
+	return result
+}
+
+workflow_inbound_test_update_validator :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Validator_Next,
+) -> workflow.Update_Validation {
+	node := cast(^Workflow_Inbound_Interceptor_Test_Node)user_data
+	workflow_inbound_test_record(node.state, node.id + 30)
+	node.state.update_validator_context_seen = input.ctx == nil && input.update != nil &&
+	                                           input.update.id == "rename-with-activity-1"
+	result := workflow.inbound_handle_update_validator_next(next, input)
+	workflow_inbound_test_record(node.state, -(node.id + 30))
+	return result
+}
+
+workflow_inbound_test_update_handler :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Update_Input,
+	next: workflow.Inbound_Handle_Update_Handler_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Inbound_Interceptor_Test_Node)user_data
+	workflow_inbound_test_record(node.state, node.id + 40)
+	result := workflow.inbound_handle_update_handler_next(next, input)
+	if input.update != nil && input.update.id == "rename-with-activity-1" {
+		caller: string
+		found, decode_error := workflow.update_header_json(input.update, "caller", &caller)
+		node.state.update_context_after_next = input.ctx != nil &&
+		                                      input.update.identity == "client-identity" &&
+		                                      found && decode_error == .None && caller == "odin-client"
+		delete(caller)
+	}
+	workflow_inbound_test_record(node.state, -(node.id + 40))
 	return result
 }
 
@@ -2894,16 +2952,24 @@ fiber_signal_handler_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 
 fiber_signal_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Signal_Routine_State{name = name}
-	registered := workflow.set_signal_routine_json(
+	registered := workflow.set_signal_routine_json_with_context(
 		ctx,
 		"rename_with_activity",
 		&state,
 		proc(
 			routine_ctx: ^workflow.Fiber_Context,
+			signal: ^workflow.Signal_Context,
 			state: ^Signal_Routine_State,
 			input: Signal_Routine_Input,
 		) {
 			state.name = workflow.execute_activity(routine_ctx, "decorate_name", input.name)
+			caller: string
+			found, decode_error := workflow.signal_header_json(signal, "caller", &caller)
+			defer delete(caller)
+			if !found || decode_error != .None || caller != "odin-client" ||
+			   signal.identity != "signal-client" || signal.originating_event_id != 42 {
+				state.name = "Signal context lost across suspension"
+			}
 		},
 	)
 	if !registered {
@@ -8892,6 +8958,23 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_nodes := [?]Workflow_Inbound_Interceptor_Test_Node{
+		{state = &inbound_state, id = 1},
+		{state = &inbound_state, id = 2},
+	}
+	for &node in inbound_nodes {
+		inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+			&runtime,
+			{
+				user_data = &node,
+				handle_update_validator = workflow_inbound_test_update_validator,
+				handle_update_handler = workflow_inbound_test_update_handler,
+			},
+		)
+		testing.expect(t, inbound_error.message == nil)
+		workflow.error_free(&inbound_error)
+	}
 
 	workflow_input, workflow_input_error := codec.encode_json("Odin")
 	testing.expect(t, workflow_input_error == .None)
@@ -8991,6 +9074,15 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect(t, !processed.completed)
 	testing.expect(t, processed.waiting_handlers)
 	testing.expect_value(t, processed.activity_seq, u32(1))
+	testing.expect_value(t, inbound_state.event_count, 6)
+	testing.expect_value(t, inbound_state.events[0], 31)
+	testing.expect_value(t, inbound_state.events[1], 32)
+	testing.expect_value(t, inbound_state.events[2], -32)
+	testing.expect_value(t, inbound_state.events[3], -31)
+	testing.expect_value(t, inbound_state.events[4], 41)
+	testing.expect_value(t, inbound_state.events[5], 42)
+	testing.expect(t, inbound_state.update_validator_context_seen)
+	testing.expect(t, !inbound_state.update_context_after_next)
 	started_update := inspect_update_responses(
 		processed.completion[:],
 		"update-routine-protocol-1",
@@ -9035,6 +9127,10 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect_value(t, processed.updates_completed, 1)
 	testing.expect(t, processed.completed)
 	testing.expect(t, !processed.waiting_handlers)
+	testing.expect_value(t, inbound_state.event_count, 8)
+	testing.expect_value(t, inbound_state.events[6], -42)
+	testing.expect_value(t, inbound_state.events[7], -41)
+	testing.expect(t, inbound_state.update_context_after_next)
 	completed_update := inspect_update_responses(
 		processed.completion[:],
 		"update-routine-protocol-1",
@@ -9409,6 +9505,14 @@ workflow_synchronous_signal_handler_mutates_state_before_main_resumes :: proc(t:
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_node := Workflow_Inbound_Interceptor_Test_Node{state = &inbound_state, id = 1}
+	inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+		&runtime,
+		{user_data = &inbound_node, handle_signal = workflow_inbound_test_signal},
+	)
+	testing.expect(t, inbound_error.message == nil)
+	workflow.error_free(&inbound_error)
 
 	workflow_input, workflow_input_error := codec.encode_json("Odin")
 	testing.expect(t, workflow_input_error == .None)
@@ -9484,6 +9588,9 @@ workflow_synchronous_signal_handler_mutates_state_before_main_resumes :: proc(t:
 	testing.expect_value(t, processed.signal_handlers_started, 1)
 	testing.expect_value(t, processed.signal_handlers_completed, 1)
 	testing.expect(t, processed.completed)
+	testing.expect_value(t, inbound_state.event_count, 2)
+	testing.expect_value(t, inbound_state.events[0], 21)
+	testing.expect_value(t, inbound_state.events[1], -21)
 	inspection := inspect_workflow_completion(processed.completion[:])
 	testing.expect(t, inspection.decoded)
 	testing.expect_value(t, inspection.command_count, 1)
@@ -9507,6 +9614,19 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_nodes := [?]Workflow_Inbound_Interceptor_Test_Node{
+		{state = &inbound_state, id = 1},
+		{state = &inbound_state, id = 2},
+	}
+	for &node in inbound_nodes {
+		inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+			&runtime,
+			{user_data = &node, handle_signal = workflow_inbound_test_signal},
+		)
+		testing.expect(t, inbound_error.message == nil)
+		workflow.error_free(&inbound_error)
+	}
 
 	workflow_input, workflow_input_error := codec.encode_json("Odin")
 	testing.expect(t, workflow_input_error == .None)
@@ -9546,9 +9666,25 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 	defer delete(handler_input_proto.external_payloads)
 	handler_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
 		signal_name = "rename_with_activity",
+		identity = "signal-client",
+		originating_event_id = 42,
 	}
 	defer delete(handler_signal.input)
+	defer delete(handler_signal.headers)
 	append(&handler_signal.input, handler_input_proto)
+	signal_header, signal_header_error := codec.encode_json("odin-client")
+	testing.expect(t, signal_header_error == .None)
+	defer codec.payload_free(&signal_header)
+	signal_header_proto := proto.encode_payload(codec.payload_view(&signal_header))
+	defer delete(signal_header_proto.metadata)
+	defer delete(signal_header_proto.external_payloads)
+	append(
+		&handler_signal.headers,
+		proto.Coresdk_Workflow_Activation_SignalWorkflow_HeadersEntry{
+			key = "caller",
+			value = &signal_header_proto,
+		},
+	)
 	delete(activation.jobs)
 	activation.jobs = nil
 	activation.history_length = 5
@@ -9567,6 +9703,10 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 	testing.expect_value(t, processed.signal_handlers_completed, 0)
 	testing.expect(t, processed.scheduled_activity)
 	testing.expect_value(t, processed.activity_seq, u32(1))
+	testing.expect_value(t, inbound_state.event_count, 2)
+	testing.expect_value(t, inbound_state.events[0], 21)
+	testing.expect_value(t, inbound_state.events[1], 22)
+	testing.expect(t, !inbound_state.signal_context_after_next)
 	handler_start_completion := processed.completion
 	workflow.error_free(&processed.error)
 
@@ -9629,6 +9769,10 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 	testing.expect_value(t, processed.signal_handlers_completed, 1)
 	testing.expect(t, processed.completed)
 	testing.expect_value(t, processed.unfinished_signal_handlers, 0)
+	testing.expect_value(t, inbound_state.event_count, 4)
+	testing.expect_value(t, inbound_state.events[2], -22)
+	testing.expect_value(t, inbound_state.events[3], -21)
+	testing.expect(t, inbound_state.signal_context_after_next)
 	terminal_inspection := inspect_workflow_completion(processed.completion[:])
 	testing.expect(t, terminal_inspection.decoded)
 	testing.expect_value(t, terminal_inspection.command_count, 1)
@@ -10365,6 +10509,18 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_node := Workflow_Inbound_Interceptor_Test_Node{state = &inbound_state, id = 1}
+	inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+		&runtime,
+		{
+			user_data = &inbound_node,
+			handle_update_validator = workflow_inbound_test_update_validator,
+			handle_update_handler = workflow_inbound_test_update_handler,
+		},
+	)
+	testing.expect(t, inbound_error.message == nil)
+	workflow.error_free(&inbound_error)
 
 	workflow_input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
 	defer delete(workflow_input.metadata)
@@ -10430,6 +10586,11 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 	testing.expect_value(t, processed.updates_accepted, 1)
 	testing.expect_value(t, processed.updates_rejected, 0)
 	testing.expect_value(t, processed.updates_completed, 1)
+	testing.expect_value(t, inbound_state.event_count, 4)
+	testing.expect_value(t, inbound_state.events[0], 31)
+	testing.expect_value(t, inbound_state.events[1], -31)
+	testing.expect_value(t, inbound_state.events[2], 41)
+	testing.expect_value(t, inbound_state.events[3], -41)
 	update_inspection := inspect_update_responses(processed.completion[:], "update-protocol-1")
 	testing.expect_value(t, update_inspection.command_count, 2)
 	testing.expect_value(t, update_inspection.accepted, 1)

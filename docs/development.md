@@ -1244,7 +1244,7 @@ sleep-interceptor unwind until timer resolution,
 Continue-As-New header merging, and byte-identical completions after
 fresh-stack replay. A 500-case PBT property varies seven operations, chain
 depth, and short-circuit position on the outbound side; the shared property now
-varies nine operations after including inbound Workflow execution and Query.
+varies twelve operations after including all five inbound hooks.
 CLI-devserver scenarios read interceptor-injected
 headers from real Activity, Child Workflow, Signal, and next-run Workflow
 contexts after they cross SDK Core. The Child Workflow scenario also proves
@@ -1255,7 +1255,8 @@ commands.
 
 Register `workflow.Inbound_Interceptor` with
 `worker.add_workflow_inbound_interceptor` while the Worker is configuring. The
-current hooks are `execute_workflow` and `handle_query`; registration order is
+current hooks are `execute_workflow`, `handle_query`, `handle_signal`,
+`handle_update_validator`, and `handle_update_handler`; registration order is
 outermost-first, and registration works both before and after Workflow
 registration. The Worker copies each record into every Workflow runtime.
 `user_data` remains application-owned and borrowed until `worker.close`.
@@ -1273,18 +1274,35 @@ command-state snapshot still encloses the whole interceptor chain, so an
 interceptor or handler that tries to schedule Workflow commands produces
 `OdinWorkflowQueryMutationError` and has those mutations rolled back.
 
-Both hooks execute inside deterministic Workflow code and again during replay.
+`handle_signal` wraps both immediate handlers and independent stackful Signal
+routines. Immediate handlers retain their command-state guard. A routine chain
+is constructed inside `signal_routine_entry`, so its `next` and every
+interceptor stack frame remain suspended with the handler fiber. Signal name,
+identity, originating event ID, headers, and Payload are cloned into the
+Workflow run arena before that fiber starts; the context therefore remains
+valid after arbitrarily many activation boundaries.
+`set_signal_routine_json_with_context` exposes that same run-owned context to
+user handler code; the pointer must not escape the Workflow run.
+
+Update validation and handling are separate hooks, matching Core's
+`run_validator` contract. `handle_update_validator` runs synchronously only
+when Core requests validation and remains command-free.
+`handle_update_handler` wraps either the immediate handler or the independent
+Update fiber. For a routine, the chain stays open across Activities, timers,
+and Signals and unwinds only when the Update result is ready. Replayed Updates
+with `run_validator=false` correctly skip only the validator chain.
+
+All hooks execute inside deterministic Workflow code and again during replay.
 The unit suite proves nested execute entry remains open across multiple
 activations and unwinds only at completion; Query entry/unwind completes while
-the main fiber remains suspended. The 500-case Workflow-interceptor property
-now varies nine inbound/outbound operations and arbitrary short-circuit depth.
+the main fiber remains suspended. Signal and Update tests prove nested handler
+chains stay open across Activity resolution and that their invocation contexts
+remain valid afterward. The 500-case Workflow-interceptor property now varies
+twelve inbound/outbound operations and arbitrary short-circuit depth.
 The CLI-devserver suite proves execute wrapping around an Activity-suspending
-Workflow and Query wrapping across Core's Query activation path.
-
-Signal and Update inbound hooks are intentionally deferred. Their routine
-handlers can suspend on their own fibers, so a correct `next` chain must live on
-the handler fiber until completion. Wrapping only activation dispatch would
-run interceptor cleanup too early and would not match Python/.NET semantics.
+Workflow, Query wrapping across Core's Query activation path, validator
+entry/exit around rejection and acceptance, and Signal/Update handler unwind
+after real Activity round trips.
 
 ## Troubleshooting
 
