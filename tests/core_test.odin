@@ -338,6 +338,12 @@ child_workflow_handle_signals_and_explicitly_cancels :: proc(t: ^testing.T) {
 	testing.expect(t, init_error.message == nil)
 	workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{cancel_child_workflow = workflow_cancel_child_test_interceptor},
+	)
+	testing.expect(t, interceptor_error.message == nil)
+	workflow.error_free(&interceptor_error)
 
 	input, input_error := codec.encode_json("Odin")
 	testing.expect(t, input_error == .None)
@@ -483,7 +489,7 @@ child_workflow_handle_signals_and_explicitly_cancels :: proc(t: ^testing.T) {
 	testing.expect_value(
 		t,
 		string(cancel_inspection.canceled_child_workflow_reason),
-		"parent requested explicit child cancellation",
+		"intercepted Child Workflow cancellation",
 	)
 	delete(cancel_inspection.canceled_child_workflow_reason)
 	delete(cancel_requested.completion)
@@ -2446,6 +2452,32 @@ workflow_external_cancel_test_interceptor :: proc(
 ) -> workflow.External_Workflow_Cancel_Result {
 	input.reason = "intercepted cancellation reason"
 	return workflow.outbound_cancel_external_workflow_next(next, input)
+}
+
+workflow_cancel_child_test_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Cancel_Child_Workflow_Input,
+	next: workflow.Outbound_Cancel_Child_Workflow_Next,
+) -> bool {
+	input.reason = "intercepted Child Workflow cancellation"
+	return workflow.outbound_cancel_child_workflow_next(next, input)
+}
+
+Workflow_Sleep_Test_State :: struct {
+	entered: int,
+	exited:  int,
+}
+
+workflow_sleep_test_interceptor :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Sleep_Input,
+	next: workflow.Outbound_Sleep_Next,
+) {
+	state := cast(^Workflow_Sleep_Test_State)user_data
+	state.entered += 1
+	input.duration *= 2
+	workflow.outbound_sleep_next(next, input)
+	state.exited += 1
 }
 
 workflow_continue_as_new_test_interceptor :: proc(
@@ -8308,6 +8340,13 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	sleep_state := Workflow_Sleep_Test_State{}
+	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{user_data = &sleep_state, sleep = workflow_sleep_test_interceptor},
+	)
+	testing.expect(t, interceptor_error.message == nil)
+	workflow.error_free(&interceptor_error)
 
 	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
 	defer delete(input.metadata)
@@ -8340,6 +8379,8 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.scheduled_activity)
 	testing.expect_value(t, processed.activity_seq, u32(1))
+	testing.expect_value(t, sleep_state.entered, 0)
+	testing.expect_value(t, sleep_state.exited, 0)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
@@ -8377,6 +8418,10 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.started_timer)
 	testing.expect_value(t, processed.timer_seq, u32(1))
+	testing.expect_value(t, sleep_state.entered, 1)
+	testing.expect_value(t, sleep_state.exited, 0)
+	timer_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect_value(t, timer_inspection.started_timer_duration, 2 * time.Millisecond)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
@@ -8396,6 +8441,8 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.scheduled_activity)
 	testing.expect_value(t, processed.activity_seq, u32(2))
+	testing.expect_value(t, sleep_state.entered, 1)
+	testing.expect_value(t, sleep_state.exited, 1)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 

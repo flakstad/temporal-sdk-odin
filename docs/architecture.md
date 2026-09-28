@@ -1347,8 +1347,9 @@ and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
 start, Signal, Query, and Update start. Workflow outbound now applies that same
 contract to remote and Local Activity scheduling, Child Workflow start/Signal,
-external Workflow Signal/cancellation, and Continue-As-New. Timers, child
-cancellation, and Workflow inbound handlers remain future interceptor surfaces.
+external Workflow Signal/cancellation, Continue-As-New, durable sleep, and
+explicit Child Workflow cancellation. Workflow inbound handlers remain the
+next major interceptor surface.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1396,14 +1397,23 @@ preserves its non-returning `-> !` contract through every continuation. The
 caller-owned builder is never mutated, and call-scoped inputs/continuations
 cannot safely be retained.
 
+Sleep interception deliberately wraps the entire stackful wait rather than
+only `StartTimer` command construction: code after `next` resumes only when the
+timer fires or cancellation unwinds the wait. This matches .NET's outbound
+`DelayAsync` boundary. Explicit Child cancellation is a separate Odin hook
+because Odin exposes a procedural Future API rather than an extensible child
+handle object; its continuation owns the same reason mutation and command-state
+transition as `cancel_child_workflow`.
+
 The chain intentionally executes again during replay. Its code must therefore
 obey the same determinism rules as Workflow code; logging may duplicate and
 ordinary I/O, wall-clock reads, and process randomness are unsafe. Header and
 option mutations become part of the command bytes and must be reproduced on
 fresh-stack replay. Offline tests require byte-identical command completions
 after eviction. CLI-devserver scenarios prove interceptor headers cross Core
-into Activity, Child Workflow, Signal, and continued-run contexts. This feature
-adds no C symbol or protobuf type: it is a language-layer semantic hook
+into Activity, Child Workflow, Signal, and continued-run contexts. Live sleep
+and Child-cancellation callbacks also execute across Core timer/cancellation
+delivery. This feature adds no C symbol or protobuf type: it is a language-layer semantic hook
 immediately before the already implemented command construction. Its shape
 follows the corresponding outbound operations in the current
 [Python](https://github.com/temporalio/sdk-python/blob/main/temporalio/worker/_interceptor.py)

@@ -160,9 +160,10 @@ it may inspect or replace inputs/results or deliberately skip `next`. Intercepto
 user data is borrowed until `worker.close`. Workers can also register deterministic
 Workflow outbound interceptors for remote and Local Activity scheduling, Child
 Workflow start/Signal, external Workflow Signal/cancellation, and
-Continue-As-New. These run inside the Workflow fiber on normal execution and
-replay, receive isolated per-call headers where the command supports them, and
-emit through the existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
+Continue-As-New, durable sleep, and explicit Child Workflow cancellation.
+These run inside the Workflow fiber on normal execution and replay, receive
+isolated per-call headers where the command supports them, and emit through the
+existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from

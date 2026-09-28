@@ -1,6 +1,50 @@
 package workflow
 
+import "core:time"
 import codec "../codec"
+
+Outbound_Sleep_Input :: struct {
+	ctx:      ^Fiber_Context,
+	duration: time.Duration,
+}
+
+Outbound_Sleep_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Outbound_Sleep_Input,
+)
+
+Outbound_Sleep_Next :: struct {
+	data:   rawptr,
+	invoke: Outbound_Sleep_Next_Proc,
+}
+
+Outbound_Sleep_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Outbound_Sleep_Input,
+	next: Outbound_Sleep_Next,
+)
+
+Outbound_Cancel_Child_Workflow_Input :: struct {
+	ctx:    ^Fiber_Context,
+	future: Child_Workflow_Future,
+	reason: string,
+}
+
+Outbound_Cancel_Child_Workflow_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Outbound_Cancel_Child_Workflow_Input,
+) -> bool
+
+Outbound_Cancel_Child_Workflow_Next :: struct {
+	data:   rawptr,
+	invoke: Outbound_Cancel_Child_Workflow_Next_Proc,
+}
+
+Outbound_Cancel_Child_Workflow_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Outbound_Cancel_Child_Workflow_Input,
+	next: Outbound_Cancel_Child_Workflow_Next,
+) -> bool
 
 Outbound_Start_Child_Workflow_Input :: struct {
 	ctx:           ^Fiber_Context,
@@ -121,6 +165,28 @@ Outbound_Continue_As_New_Interceptor_Proc :: #type proc(
 	next: Outbound_Continue_As_New_Next,
 ) -> !
 
+outbound_sleep_next :: proc(
+	next: Outbound_Sleep_Next,
+	input: ^Outbound_Sleep_Input,
+) {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Workflow sleep interceptor continuation")
+		return
+	}
+	next.invoke(next.data, input)
+}
+
+outbound_cancel_child_workflow_next :: proc(
+	next: Outbound_Cancel_Child_Workflow_Next,
+	input: ^Outbound_Cancel_Child_Workflow_Input,
+) -> bool {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Child Workflow cancellation interceptor continuation")
+		return false
+	}
+	return next.invoke(next.data, input)
+}
+
 outbound_start_child_workflow_next :: proc(
 	next: Outbound_Start_Child_Workflow_Next,
 	input: ^Outbound_Start_Child_Workflow_Input,
@@ -180,6 +246,51 @@ outbound_continue_as_new_next :: proc(
 		)
 	}
 	next.invoke(next.data, input)
+}
+
+outbound_sleep_chain :: proc(
+	data: rawptr,
+	input: ^Outbound_Sleep_Input,
+) {
+	state := cast(^Outbound_Interceptor_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil || input == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Workflow sleep interceptor state")
+		return
+	}
+	for index := state.index; index < len(state.instance.runtime.outbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.outbound_interceptors[index]
+		if entry.sleep == nil do continue
+		next_state := Outbound_Interceptor_State{instance = state.instance, index = index + 1}
+		entry.sleep(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = outbound_sleep_chain},
+		)
+		return
+	}
+	sleep_terminal(input.ctx, input.duration)
+}
+
+outbound_cancel_child_workflow_chain :: proc(
+	data: rawptr,
+	input: ^Outbound_Cancel_Child_Workflow_Input,
+) -> bool {
+	state := cast(^Outbound_Interceptor_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil || input == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Child Workflow cancellation interceptor state")
+		return false
+	}
+	for index := state.index; index < len(state.instance.runtime.outbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.outbound_interceptors[index]
+		if entry.cancel_child_workflow == nil do continue
+		next_state := Outbound_Interceptor_State{instance = state.instance, index = index + 1}
+		return entry.cancel_child_workflow(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = outbound_cancel_child_workflow_chain},
+		)
+	}
+	return cancel_child_workflow_terminal(input.ctx, input.future, input.reason)
 }
 
 outbound_start_child_workflow_chain :: proc(

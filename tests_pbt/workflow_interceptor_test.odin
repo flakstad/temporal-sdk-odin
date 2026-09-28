@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:testing"
+import "core:time"
 import pbt "pbt:pbt"
 import codec "../temporal/codec"
 import workflow "../temporal/workflow"
@@ -114,10 +115,43 @@ workflow_interceptor_property_cancel_external :: proc(
 	return result
 }
 
+workflow_interceptor_property_sleep :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Sleep_Input,
+	next: workflow.Outbound_Sleep_Next,
+) {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	input.duration += time.Duration(node.id)
+	if !node.short_circuit {
+		workflow.outbound_sleep_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+}
+
+workflow_interceptor_property_cancel_child :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Cancel_Child_Workflow_Input,
+	next: workflow.Outbound_Cancel_Child_Workflow_Next,
+) -> bool {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := false
+	if !node.short_circuit {
+		result = workflow.outbound_cancel_child_workflow_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
 workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 4))
+	operation := pbt.draw(t, pbt.int_range(0, 6))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -125,6 +159,8 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 2, 10.0, "Child Workflow Signal")
 	pbt.cover(t, operation == 3, 10.0, "external Workflow Signal")
 	pbt.cover(t, operation == 4, 10.0, "external Workflow cancellation")
+	pbt.cover(t, operation == 5, 10.0, "Workflow sleep")
+	pbt.cover(t, operation == 6, 10.0, "Child Workflow cancellation")
 
 	state := Workflow_Interceptor_Property_State{}
 	nodes: [12]Workflow_Interceptor_Property_Node
@@ -149,6 +185,8 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 				signal_child_workflow = workflow_interceptor_property_signal_child,
 				signal_external_workflow = workflow_interceptor_property_signal_external,
 				cancel_external_workflow = workflow_interceptor_property_cancel_external,
+				sleep = workflow_interceptor_property_sleep,
+				cancel_child_workflow = workflow_interceptor_property_cancel_child,
 			},
 		)
 	}
@@ -209,6 +247,16 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			reason = "property cancellation",
 		}
 		_ = workflow.outbound_cancel_external_workflow_chain(&chain, &input)
+	case 5:
+		input := workflow.Outbound_Sleep_Input{ctx = &ctx, duration = time.Second}
+		workflow.outbound_sleep_chain(&chain, &input)
+	case 6:
+		input := workflow.Outbound_Cancel_Child_Workflow_Input{
+			ctx = &ctx,
+			future = {seq = 1},
+			reason = "property child cancellation",
+		}
+		_ = workflow.outbound_cancel_child_workflow_chain(&chain, &input)
 	}
 	reached := short_index + 1
 	if state.event_count != reached * 2 {
@@ -226,7 +274,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.fail("Workflow interceptor mutated caller-owned headers")
 	}
 	expected_working_headers := 2
-	if operation == 4 {
+	if operation >= 4 {
 		expected_working_headers = 1
 	}
 	if len(working_headers.entries) != expected_working_headers {

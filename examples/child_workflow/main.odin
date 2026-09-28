@@ -81,6 +81,26 @@ workflow_continue_as_new_interceptor :: proc(
 	workflow.outbound_continue_as_new_next(next, input)
 }
 
+workflow_sleep_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Sleep_Input,
+	next: workflow.Outbound_Sleep_Next,
+) {
+	fmt.printf("Workflow sleep interceptor entered duration=%v\n", input.duration)
+	workflow.outbound_sleep_next(next, input)
+	fmt.println("Workflow sleep interceptor exited")
+}
+
+workflow_cancel_child_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Cancel_Child_Workflow_Input,
+	next: workflow.Outbound_Cancel_Child_Workflow_Next,
+) -> bool {
+	fmt.println("Workflow cancel-Child interceptor entered")
+	input.reason = "Child Workflow cancellation passed through Odin interceptor"
+	return workflow.outbound_cancel_child_workflow_next(next, input)
+}
+
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	interceptor_header: string
 	header_found, header_error := workflow.header_json(
@@ -383,6 +403,8 @@ main :: proc() {
 			signal_external_workflow = workflow_signal_external_interceptor,
 			cancel_external_workflow = workflow_cancel_external_interceptor,
 			continue_as_new = workflow_continue_as_new_interceptor,
+			sleep = workflow_sleep_interceptor,
+			cancel_child_workflow = workflow_cancel_child_interceptor,
 		},
 	)
 	if workflow_interceptor_error.message != nil {

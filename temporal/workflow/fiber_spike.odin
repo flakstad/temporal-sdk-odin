@@ -4436,7 +4436,7 @@ execute_child_workflow :: proc(
 // or requests cancellation through Core using the cancellation type selected
 // when the child was started. The Future remains valid and can be awaited for
 // the resulting terminal state.
-cancel_child_workflow :: proc(
+cancel_child_workflow_terminal :: proc(
 	ctx: ^Fiber_Context,
 	future: Child_Workflow_Future,
 	reason := "Child Workflow cancellation requested",
@@ -4487,6 +4487,23 @@ cancel_child_workflow :: proc(
 		operation.command_state = .Cancel_Requested
 	}
 	return true
+}
+
+cancel_child_workflow :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	reason := "Child Workflow cancellation requested",
+) -> bool {
+	if ctx == nil || ctx.instance == nil {
+		return false
+	}
+	input := Outbound_Cancel_Child_Workflow_Input{
+		ctx = ctx,
+		future = future,
+		reason = reason,
+	}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_cancel_child_workflow_chain(&state, &input)
 }
 
 workflow_signal_failure_cause_from_proto :: proc(
@@ -6044,7 +6061,7 @@ await_signal_json_or_timeout :: proc(
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
 // It never reads wall-clock time in the language runtime.
-sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
@@ -6068,6 +6085,15 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
 		instance.phase = .Failed
 	}
+}
+
+sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	input := Outbound_Sleep_Input{ctx = ctx, duration = duration}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	outbound_sleep_chain(&state, &input)
 }
 
 // all_handlers_finished reports whether every concurrent Signal and accepted

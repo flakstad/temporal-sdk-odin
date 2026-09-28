@@ -1215,9 +1215,12 @@ interceptors registered afterward are copied into every existing runtime.
 Registration after `worker.run` starts is rejected. The current typed hooks are
 `start_activity`, `start_local_activity`, `start_child_workflow`,
 `signal_child_workflow`, `signal_external_workflow`,
-`cancel_external_workflow`, and `continue_as_new`. Each has a semantic input,
-its natural result type, and an explicit `next` continuation. Continue-As-New
-and its continuation are `-> !`, preserving the terminal control-flow contract.
+`cancel_external_workflow`, `continue_as_new`, `sleep`, and
+`cancel_child_workflow`. Each has a semantic input, its natural result type,
+and an explicit `next` continuation. Continue-As-New and its continuation are
+`-> !`, preserving the terminal control-flow contract. A sleep interceptor's
+`next` remains on the Workflow fiber stack while the durable timer is pending,
+so code after `next` runs only after timer resolution or cancellation.
 
 The SDK clones the caller's command headers into a Workflow-run-arena working
 map before invoking the chain. Every interceptor sees the same mutable working
@@ -1236,12 +1239,15 @@ Use Activities or Temporal-aware Workflow primitives for those operations.
 Logging is possible but will normally appear again on replay.
 
 The unit suite verifies nested entry/unwind order, caller-header isolation,
-command headers, Continue-As-New header merging, and byte-identical completions
-after fresh-stack replay. A 500-case PBT property varies operation, chain depth,
-and short-circuit position. CLI-devserver scenarios read interceptor-injected
+command headers, timer-duration and cancellation-reason replacement, delayed
+sleep-interceptor unwind until timer resolution,
+Continue-As-New header merging, and byte-identical completions after
+fresh-stack replay. A 500-case PBT property varies seven operations, chain
+depth, and short-circuit position. CLI-devserver scenarios read interceptor-injected
 headers from real Activity, Child Workflow, Signal, and next-run Workflow
-contexts after they cross SDK Core; external cancellation also proves semantic
-reason replacement reaches the terminal command path.
+contexts after they cross SDK Core. The Child Workflow scenario also proves
+sleep suspension/unwind and explicit Child cancellation hooks around real Core
+commands.
 
 ## Troubleshooting
 

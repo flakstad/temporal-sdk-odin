@@ -1432,6 +1432,9 @@ worker_pid=""
 cat "$worker_log"
 grep -q 'cancel_requested=true canceled_child=1' "$worker_log"
 grep -q 'resolved=1 .*completed=true' "$worker_log"
+grep -q 'Workflow sleep interceptor entered' "$worker_log"
+grep -q 'Workflow sleep interceptor exited' "$worker_log"
+grep -q 'Workflow cancel-Child interceptor entered' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
