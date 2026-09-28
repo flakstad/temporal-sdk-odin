@@ -971,6 +971,7 @@ Fiber_Runtime :: struct {
 	invoke:                 Workflow_Invoke_Proc,
 	callback_destroy:       Workflow_Callback_Destroy_Proc,
 	instances:              [dynamic]^Fiber_Instance,
+	inbound_interceptors:    [dynamic]Inbound_Interceptor,
 	outbound_interceptors:   [dynamic]Outbound_Interceptor,
 	activations:            int,
 	replay_activations:     int,
@@ -1015,7 +1016,25 @@ fiber_runtime_init_invoker :: proc(
 	runtime.invoke = invoke
 	runtime.callback_destroy = callback_destroy
 	runtime.instances = make([dynamic]^Fiber_Instance)
+	runtime.inbound_interceptors = make([dynamic]Inbound_Interceptor)
 	runtime.outbound_interceptors = make([dynamic]Outbound_Interceptor)
+	return {}
+}
+
+fiber_runtime_add_inbound_interceptor :: proc(
+	runtime: ^Fiber_Runtime,
+	interceptor: Inbound_Interceptor,
+) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow runtime is not initialized")
+	}
+	if len(runtime.instances) != 0 {
+		return error_from_string("Workflow interceptors cannot be registered after execution starts")
+	}
+	if !inbound_interceptor_has_operation(interceptor) {
+		return error_from_string("Workflow inbound interceptor must implement an operation")
+	}
+	append(&runtime.inbound_interceptors, interceptor)
 	return {}
 }
 
@@ -1443,6 +1462,7 @@ fiber_runtime_close :: proc(runtime: ^Fiber_Runtime) {
 		_ = fiber_instance_destroy(instance)
 	}
 	delete(runtime.instances)
+	delete(runtime.inbound_interceptors)
 	delete(runtime.outbound_interceptors)
 	delete(runtime.namespace)
 	delete(runtime.workflow_type)
@@ -1488,11 +1508,13 @@ remove_fiber_instance :: proc(runtime: ^Fiber_Runtime, run_id: string) -> Error 
 fiber_entry :: proc "c" (user_data: rawptr) {
 	instance := (^Fiber_Instance)(user_data)
 	context = instance.odin_context
-	workflow_result := instance.invoke(
-		instance.callback_data,
-		&instance.workflow_context,
-		codec.payload_view(&instance.input),
-	)
+	execute_input := Inbound_Execute_Workflow_Input{
+		ctx = &instance.workflow_context,
+		workflow_type = instance.workflow_type,
+		input = codec.payload_view(&instance.input),
+	}
+	execute_state := Inbound_Execute_Workflow_State{instance = instance}
+	workflow_result := inbound_execute_workflow_chain(&execute_state, &execute_input)
 	if instance.phase == .Failed {
 		codec.payload_free(&workflow_result.payload)
 		return
@@ -6806,16 +6828,16 @@ invoke_workflow_query :: proc(
 			"OdinWorkflowQueryHeaderConversionError",
 		)
 	}
-	result: Payload_Result
-	if handler.invoke_with_context != nil {
-		result = handler.invoke_with_context(
-			handler.callback_data,
-			&query_context,
-			codec.payload_view(&input),
-		)
-	} else {
-		result = handler.invoke(handler.callback_data, codec.payload_view(&input))
+	interceptor_input := Inbound_Handle_Query_Input{
+		workflow_type = instance.workflow_type,
+		query = &query_context,
+		input = codec.payload_view(&input),
 	}
+	interceptor_state := Inbound_Handle_Query_State{
+		instance = instance,
+		handler = handler,
+	}
+	result := inbound_handle_query_chain(&interceptor_state, &interceptor_input)
 	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&result.payload)
 		restore_workflow_command_state(instance, command_state)

@@ -298,6 +298,41 @@ workflow_activity_interceptor :: proc(
 	return result
 }
 
+workflow_execute_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Execute_Workflow_Input,
+	next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+	name: string
+	decode_error := codec.decode_json(input.input, &name)
+	defer delete(name)
+	is_probe := decode_error == .None && name == "activity-interceptor"
+	if is_probe {
+		fmt.println("Workflow execute interceptor entered before Workflow")
+	}
+	result := workflow.inbound_execute_workflow_next(next, input)
+	if is_probe {
+		fmt.println("Workflow execute interceptor exited after Workflow")
+	}
+	return result
+}
+
+workflow_query_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Handle_Query_Input,
+	next: workflow.Inbound_Handle_Query_Next,
+) -> workflow.Payload_Result {
+	is_probe := input.query != nil && input.query.type == "greeting_status"
+	if is_probe {
+		fmt.println("Workflow Query interceptor entered before handler")
+	}
+	result := workflow.inbound_handle_query_next(next, input)
+	if is_probe {
+		fmt.println("Workflow Query interceptor exited after handler")
+	}
+	return result
+}
+
 cancel_with_details :: proc(
 	ctx: ^activity.Context,
 	name: string,
@@ -903,6 +938,24 @@ main :: proc() {
 			string(workflow_interceptor_error.message),
 		)
 		worker.error_free(&workflow_interceptor_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
+	workflow_inbound_interceptor_error := worker.add_workflow_inbound_interceptor(
+		&activity_worker,
+		{
+			execute_workflow = workflow_execute_interceptor,
+			handle_query = workflow_query_interceptor,
+		},
+	)
+	if workflow_inbound_interceptor_error.message != nil {
+		fmt.eprintf(
+			"Workflow inbound interceptor registration failed: %s\n",
+			string(workflow_inbound_interceptor_error.message),
+		)
+		worker.error_free(&workflow_inbound_interceptor_error)
 		_ = worker.close(&activity_worker)
 		temporal_core.client_close(&client)
 		temporal_core.runtime_close(&runtime)

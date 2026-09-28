@@ -1243,11 +1243,48 @@ command headers, timer-duration and cancellation-reason replacement, delayed
 sleep-interceptor unwind until timer resolution,
 Continue-As-New header merging, and byte-identical completions after
 fresh-stack replay. A 500-case PBT property varies seven operations, chain
-depth, and short-circuit position. CLI-devserver scenarios read interceptor-injected
+depth, and short-circuit position on the outbound side; the shared property now
+varies nine operations after including inbound Workflow execution and Query.
+CLI-devserver scenarios read interceptor-injected
 headers from real Activity, Child Workflow, Signal, and next-run Workflow
 contexts after they cross SDK Core. The Child Workflow scenario also proves
 sleep suspension/unwind and explicit Child cancellation hooks around real Core
 commands.
+
+### Workflow inbound interceptor chain
+
+Register `workflow.Inbound_Interceptor` with
+`worker.add_workflow_inbound_interceptor` while the Worker is configuring. The
+current hooks are `execute_workflow` and `handle_query`; registration order is
+outermost-first, and registration works both before and after Workflow
+registration. The Worker copies each record into every Workflow runtime.
+`user_data` remains application-owned and borrowed until `worker.close`.
+
+`execute_workflow` runs on the main Workflow fiber. Its `next` continuation
+contains the complete user Workflow call, so it remains suspended on that fiber
+across Activities, timers, Signals, and any other durable waits. Code after
+`inbound_execute_workflow_next` runs only when the Workflow returns with a
+result or failure. The call-scoped input and continuation remain valid on the
+suspended fiber stack, but must never be retained elsewhere.
+
+`handle_query` wraps the synchronous registered Query handler. It receives the
+borrowed `Query_Context`, Workflow type, and Payload view. The existing
+command-state snapshot still encloses the whole interceptor chain, so an
+interceptor or handler that tries to schedule Workflow commands produces
+`OdinWorkflowQueryMutationError` and has those mutations rolled back.
+
+Both hooks execute inside deterministic Workflow code and again during replay.
+The unit suite proves nested execute entry remains open across multiple
+activations and unwinds only at completion; Query entry/unwind completes while
+the main fiber remains suspended. The 500-case Workflow-interceptor property
+now varies nine inbound/outbound operations and arbitrary short-circuit depth.
+The CLI-devserver suite proves execute wrapping around an Activity-suspending
+Workflow and Query wrapping across Core's Query activation path.
+
+Signal and Update inbound hooks are intentionally deferred. Their routine
+handlers can suspend on their own fibers, so a correct `next` chain must live on
+the handler fiber until completion. Wrapping only activation dispatch would
+run interceptor cleanup too early and would not match Python/.NET semantics.
 
 ## Troubleshooting
 

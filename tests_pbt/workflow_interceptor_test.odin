@@ -148,25 +148,63 @@ workflow_interceptor_property_cancel_child :: proc(
 	return result
 }
 
+workflow_interceptor_property_execute :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Execute_Workflow_Input,
+	next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := workflow.payload_fail("generated short circuit")
+	if !node.short_circuit {
+		result = workflow.inbound_execute_workflow_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
+workflow_interceptor_property_query :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Query_Input,
+	next: workflow.Inbound_Handle_Query_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	result := workflow.payload_fail("generated short circuit")
+	if !node.short_circuit {
+		result = workflow.inbound_handle_query_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
 workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 6))
+	operation := pbt.draw(t, pbt.int_range(0, 8))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 1, 10.0, "Child Workflow start")
-	pbt.cover(t, operation == 2, 10.0, "Child Workflow Signal")
-	pbt.cover(t, operation == 3, 10.0, "external Workflow Signal")
-	pbt.cover(t, operation == 4, 10.0, "external Workflow cancellation")
-	pbt.cover(t, operation == 5, 10.0, "Workflow sleep")
-	pbt.cover(t, operation == 6, 10.0, "Child Workflow cancellation")
+	pbt.cover(t, operation == 1, 7.0, "Child Workflow start")
+	pbt.cover(t, operation == 2, 7.0, "Child Workflow Signal")
+	pbt.cover(t, operation == 3, 7.0, "external Workflow Signal")
+	pbt.cover(t, operation == 4, 7.0, "external Workflow cancellation")
+	pbt.cover(t, operation == 5, 7.0, "Workflow sleep")
+	pbt.cover(t, operation == 6, 7.0, "Child Workflow cancellation")
+	pbt.cover(t, operation == 7, 7.0, "Workflow execution")
+	pbt.cover(t, operation == 8, 7.0, "Workflow Query")
 
 	state := Workflow_Interceptor_Property_State{}
 	nodes: [12]Workflow_Interceptor_Property_Node
 	runtime := workflow.Fiber_Runtime{
+		inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor),
 		outbound_interceptors = make([dynamic]workflow.Outbound_Interceptor),
 	}
+	defer delete(runtime.inbound_interceptors)
 	defer delete(runtime.outbound_interceptors)
 	instance := workflow.Fiber_Instance{runtime = &runtime}
 	ctx := workflow.Fiber_Context{instance = &instance}
@@ -176,6 +214,14 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			id = index + 1,
 			short_circuit = index == short_index,
 		}
+		append(
+			&runtime.inbound_interceptors,
+			workflow.Inbound_Interceptor{
+				user_data = &nodes[index],
+				execute_workflow = workflow_interceptor_property_execute,
+				handle_query = workflow_interceptor_property_query,
+			},
+		)
 		append(
 			&runtime.outbound_interceptors,
 			workflow.Outbound_Interceptor{
@@ -257,6 +303,25 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			reason = "property child cancellation",
 		}
 		_ = workflow.outbound_cancel_child_workflow_chain(&chain, &input)
+	case 7:
+		inbound_chain := workflow.Inbound_Execute_Workflow_State{instance = &instance}
+		input := workflow.Inbound_Execute_Workflow_Input{
+			ctx = &ctx,
+			workflow_type = "property-workflow",
+		}
+		_ = workflow.inbound_execute_workflow_chain(&inbound_chain, &input)
+	case 8:
+		query := workflow.Query_Context{id = "property-query", type = "status"}
+		handler := workflow.Fiber_Query_Handler{name = "status"}
+		inbound_chain := workflow.Inbound_Handle_Query_State{
+			instance = &instance,
+			handler = &handler,
+		}
+		input := workflow.Inbound_Handle_Query_Input{
+			workflow_type = "property-workflow",
+			query = &query,
+		}
+		_ = workflow.inbound_handle_query_chain(&inbound_chain, &input)
 	}
 	reached := short_index + 1
 	if state.event_count != reached * 2 {

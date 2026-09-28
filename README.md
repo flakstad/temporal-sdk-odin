@@ -163,7 +163,10 @@ Workflow start/Signal, external Workflow Signal/cancellation, and
 Continue-As-New, durable sleep, and explicit Child Workflow cancellation.
 These run inside the Workflow fiber on normal execution and replay, receive
 isolated per-call headers where the command supports them, and emit through the
-existing Core command path. Unknown Workflow types fail the retryable Workflow Task without
+existing Core command path. Workflow inbound interceptors now wrap the complete
+Workflow execution and synchronous Query handlers with typed `next`
+continuations. Signal and Update inbound interception is not implemented yet.
+Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
@@ -255,6 +258,31 @@ Registration order is outermost-first. Interceptor records are copied into
 each registered Workflow runtime, while `user_data` remains application-owned
 until `worker.close`. Inputs, headers, and `next` continuations are scoped to
 the synchronous scheduling call and must not be retained.
+
+Inbound Workflow execution uses the same nesting contract, but its continuation
+stays on the Workflow fiber stack across every durable suspension:
+
+```odin
+trace_workflow :: proc(
+    data: rawptr,
+    input: ^workflow.Inbound_Execute_Workflow_Input,
+    next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+    result := workflow.inbound_execute_workflow_next(next, input)
+    // Runs only when the Workflow returns, not at each activation boundary.
+    return result
+}
+
+_ = worker.add_workflow_inbound_interceptor(
+    &sdk_worker,
+    {execute_workflow = trace_workflow},
+)
+```
+
+`handle_query` wraps a synchronous Query handler and retains the runtime's
+read-only command-state guard. Both hooks execute during replay and must be
+deterministic. Their input records and continuations are call/fiber-stack scoped;
+`user_data` is borrowed until `worker.close`.
 
 ```text
 Temporal CLI dev server
@@ -949,9 +977,10 @@ _ = workflow.set_validated_update_routine_json_with_context(
 `Update_Context` exposes the server Update ID, name, client identity, and
 headers. Its run-arena-owned values survive handler suspension, and
 `workflow.current_update(ctx)` returns the same invocation while the routine is
-running. They must not escape the Workflow run. The context-aware form is the
-first propagation/interceptor seam; a composable interceptor chain is not yet
-implemented.
+running. They must not escape the Workflow run. Workflow execution and Query
+now have composable inbound interceptor chains; Signal and Update handlers do
+not yet, because their stackful handler continuations require a separate
+fiber-lifetime chain rather than an activation-scoped wrapper.
 
 The runtime emits `Accepted` with the Activity command, preserves the Update
 routine by `protocol_instance_id`, and emits `Completed` after the Activity

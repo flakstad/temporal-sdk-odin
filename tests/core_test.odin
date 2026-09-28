@@ -2468,6 +2468,49 @@ Workflow_Sleep_Test_State :: struct {
 	exited:  int,
 }
 
+Workflow_Inbound_Interceptor_Test_State :: struct {
+	events:      [32]int,
+	event_count: int,
+}
+
+Workflow_Inbound_Interceptor_Test_Node :: struct {
+	state: ^Workflow_Inbound_Interceptor_Test_State,
+	id:    int,
+}
+
+workflow_inbound_test_record :: proc(
+	state: ^Workflow_Inbound_Interceptor_Test_State,
+	event: int,
+) {
+	if state == nil || state.event_count >= len(state.events) do return
+	state.events[state.event_count] = event
+	state.event_count += 1
+}
+
+workflow_inbound_test_execute :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Execute_Workflow_Input,
+	next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Inbound_Interceptor_Test_Node)user_data
+	workflow_inbound_test_record(node.state, node.id)
+	result := workflow.inbound_execute_workflow_next(next, input)
+	workflow_inbound_test_record(node.state, -node.id)
+	return result
+}
+
+workflow_inbound_test_query :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Handle_Query_Input,
+	next: workflow.Inbound_Handle_Query_Next,
+) -> workflow.Payload_Result {
+	node := cast(^Workflow_Inbound_Interceptor_Test_Node)user_data
+	workflow_inbound_test_record(node.state, node.id + 10)
+	result := workflow.inbound_handle_query_next(next, input)
+	workflow_inbound_test_record(node.state, -(node.id + 10))
+	return result
+}
+
 workflow_sleep_test_interceptor :: proc(
 	user_data: rawptr,
 	input: ^workflow.Outbound_Sleep_Input,
@@ -4612,6 +4655,12 @@ language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, interceptor_error.message == nil, "early Workflow interceptor registration failed: %s", string(interceptor_error.message))
 	worker.error_free(&interceptor_error)
+	inbound_interceptor_error := worker.add_workflow_inbound_interceptor(
+		&sdk_worker,
+		{execute_workflow = workflow_inbound_test_execute},
+	)
+	testing.expectf(t, inbound_interceptor_error.message == nil, "early Workflow inbound interceptor registration failed: %s", string(inbound_interceptor_error.message))
+	worker.error_free(&inbound_interceptor_error)
 
 	register_error := worker.register_workflow(&sdk_worker, "first_workflow", registry_first_test_workflow)
 	testing.expectf(t, register_error.message == nil, "workflow registration failed: %s", string(register_error.message))
@@ -4623,12 +4672,24 @@ language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	)
 	testing.expectf(t, interceptor_error.message == nil, "late Workflow interceptor registration failed: %s", string(interceptor_error.message))
 	worker.error_free(&interceptor_error)
+	inbound_interceptor_error = worker.add_workflow_inbound_interceptor(
+		&sdk_worker,
+		{handle_query = workflow_inbound_test_query},
+	)
+	testing.expectf(t, inbound_interceptor_error.message == nil, "late Workflow inbound interceptor registration failed: %s", string(inbound_interceptor_error.message))
+	worker.error_free(&inbound_interceptor_error)
 	testing.expect_value(t, len(sdk_worker.workflow_interceptors), 2)
+	testing.expect_value(t, len(sdk_worker.workflow_inbound_interceptors), 2)
 	testing.expect_value(t, len(sdk_worker.workflow_registrations), 1)
 	if len(sdk_worker.workflow_registrations) == 1 {
 		testing.expect_value(
 			t,
 			len(sdk_worker.workflow_registrations[0].runtime.outbound_interceptors),
+			2,
+		)
+		testing.expect_value(
+			t,
+			len(sdk_worker.workflow_registrations[0].runtime.inbound_interceptors),
 			2,
 		)
 	}
@@ -8341,6 +8402,19 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
 	sleep_state := Workflow_Sleep_Test_State{}
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_nodes := [?]Workflow_Inbound_Interceptor_Test_Node{
+		{state = &inbound_state, id = 1},
+		{state = &inbound_state, id = 2},
+	}
+	for &node in inbound_nodes {
+		inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+			&runtime,
+			{user_data = &node, execute_workflow = workflow_inbound_test_execute},
+		)
+		testing.expect(t, inbound_error.message == nil)
+		workflow.error_free(&inbound_error)
+	}
 	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
 		&runtime,
 		{user_data = &sleep_state, sleep = workflow_sleep_test_interceptor},
@@ -8381,6 +8455,9 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.activity_seq, u32(1))
 	testing.expect_value(t, sleep_state.entered, 0)
 	testing.expect_value(t, sleep_state.exited, 0)
+	testing.expect_value(t, inbound_state.event_count, 2)
+	testing.expect_value(t, inbound_state.events[0], 1)
+	testing.expect_value(t, inbound_state.events[1], 2)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
@@ -8420,6 +8497,7 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.timer_seq, u32(1))
 	testing.expect_value(t, sleep_state.entered, 1)
 	testing.expect_value(t, sleep_state.exited, 0)
+	testing.expect_value(t, inbound_state.event_count, 2)
 	timer_inspection := inspect_workflow_completion(processed.completion[:])
 	testing.expect_value(t, timer_inspection.started_timer_duration, 2 * time.Millisecond)
 	delete(processed.completion)
@@ -8443,6 +8521,7 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.activity_seq, u32(2))
 	testing.expect_value(t, sleep_state.entered, 1)
 	testing.expect_value(t, sleep_state.exited, 1)
+	testing.expect_value(t, inbound_state.event_count, 2)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
@@ -8481,6 +8560,9 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect(t, processed.completed)
 	testing.expect(t, !processed.scheduled_activity)
 	testing.expect(t, !processed.started_timer)
+	testing.expect_value(t, inbound_state.event_count, 4)
+	testing.expect_value(t, inbound_state.events[2], -2)
+	testing.expect_value(t, inbound_state.events[3], -1)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
@@ -10548,6 +10630,23 @@ workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^test
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	inbound_state := Workflow_Inbound_Interceptor_Test_State{}
+	inbound_nodes := [?]Workflow_Inbound_Interceptor_Test_Node{
+		{state = &inbound_state, id = 1},
+		{state = &inbound_state, id = 2},
+	}
+	for &node in inbound_nodes {
+		inbound_error := workflow.fiber_runtime_add_inbound_interceptor(
+			&runtime,
+			{
+				user_data = &node,
+				execute_workflow = workflow_inbound_test_execute,
+				handle_query = workflow_inbound_test_query,
+			},
+		)
+		testing.expect(t, inbound_error.message == nil)
+		workflow.error_free(&inbound_error)
+	}
 
 	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
 	defer delete(input.metadata)
@@ -10579,6 +10678,7 @@ workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^test
 	processed := process_fiber_test_activation(&runtime, &activation)
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.waiting_signal)
+	testing.expect_value(t, inbound_state.event_count, 2)
 	initial_completion := processed.completion
 	workflow.error_free(&processed.error)
 
@@ -10610,6 +10710,13 @@ workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^test
 	testing.expect_value(t, processed.queries_answered, 1)
 	testing.expect_value(t, processed.queries_failed, 0)
 	testing.expect(t, processed.waiting_signal)
+	testing.expect_value(t, inbound_state.event_count, 6)
+	testing.expect_value(t, inbound_state.events[0], 1)
+	testing.expect_value(t, inbound_state.events[1], 2)
+	testing.expect_value(t, inbound_state.events[2], 11)
+	testing.expect_value(t, inbound_state.events[3], 12)
+	testing.expect_value(t, inbound_state.events[4], -12)
+	testing.expect_value(t, inbound_state.events[5], -11)
 	query_inspection := inspect_query_response(processed.completion[:], "query-1")
 	testing.expect(t, query_inspection.found)
 	testing.expect(t, !query_inspection.failed)

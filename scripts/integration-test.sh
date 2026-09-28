@@ -196,6 +196,8 @@ grep -q "Activity heartbeat interceptor entered before Core" "$worker_log"
 grep -q "Activity heartbeat interceptor exited after Core status=Recorded" "$worker_log"
 grep -q "Workflow Activity interceptor entered before command" "$worker_log"
 grep -q "Workflow Activity interceptor exited after command" "$worker_log"
+grep -q "Workflow execute interceptor entered before Workflow" "$worker_log"
+grep -q "Workflow execute interceptor exited after Workflow" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=signal-headers \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
@@ -838,6 +840,8 @@ echo "$query_output"
 grep -q "Odin client query=greeting_status workflow_id=$workflow_id" <<<"$query_output"
 grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$query_output"
 grep -q 'caller="odin-client-control"' <<<"$query_output"
+grep -q "Workflow Query interceptor entered before handler" "$worker_log"
+grep -q "Workflow Query interceptor exited after handler" "$worker_log"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \

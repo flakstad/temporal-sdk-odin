@@ -1348,8 +1348,9 @@ outbound now uses the same nesting contract with separate types for Workflow
 start, Signal, Query, and Update start. Workflow outbound now applies that same
 contract to remote and Local Activity scheduling, Child Workflow start/Signal,
 external Workflow Signal/cancellation, Continue-As-New, durable sleep, and
-explicit Child Workflow cancellation. Workflow inbound handlers remain the
-next major interceptor surface.
+explicit Child Workflow cancellation. Workflow inbound interception now wraps
+the complete Workflow execution and synchronous Query handlers. Signal and
+Update handlers remain the next inbound surface.
 
 Activity interceptors live wholly above Core. Core still owns polling,
 cancellation delivery, heartbeat transport, and task completion; the chain
@@ -1420,6 +1421,39 @@ follows the corresponding outbound operations in the current
 and
 [.NET](https://github.com/temporalio/sdk-dotnet/blob/main/src/Temporalio/Worker/Interceptors/WorkflowOutboundInterceptor.cs)
 SDK interceptor APIs.
+
+Workflow inbound interception also remains entirely above Core and adds no ABI
+or protobuf surface. `execute_workflow` is entered from the main stackful fiber,
+before the registered Workflow invoker. Its nested continuation therefore stays
+on that same fiber stack through every activation suspension and unwinds only
+when user Workflow code reaches a terminal return. This is the semantic unit
+exposed by current Python
+[`WorkflowInboundInterceptor.execute_workflow`](https://github.com/temporalio/sdk-python/blob/main/temporalio/worker/_interceptor.py)
+and .NET
+[`WorkflowInboundInterceptor.ExecuteWorkflowAsync`](https://github.com/temporalio/sdk-dotnet/blob/main/src/Temporalio/Worker/Interceptors/WorkflowInboundInterceptor.cs),
+not one callback per Core activation.
+
+`handle_query` surrounds the synchronous Query handler after Core has delivered
+`QueryWorkflow` and Odin has cloned the borrowed argument and headers. The
+runtime's command-state snapshot surrounds both interceptor and terminal
+handler, preserving Query read-only semantics. Query input/context remain valid
+only for the synchronous chain; returned Payload ownership follows the existing
+handler contract.
+
+The runtime and Worker copy interceptor records, but borrow `user_data` until
+close. Inputs and continuations are stack-scoped. Registration becomes
+immutable before polling. All inbound callbacks execute during replay and must
+be deterministic. Live CLI-devserver coverage crosses Core for both a Workflow
+that suspends on an Activity and a Query activation; offline tests prove nested
+order, delayed Workflow unwind, Query read-only enforcement, and fresh-stack
+replay command equality.
+
+Signal and Update are not modeled as activation-scoped hooks. Their current
+routine handlers own independent stackful fibers and may outlive the activation
+that started them. A correct inbound `next` must be created and retained on that
+handler fiber through its durable suspensions, then unwind at handler completion.
+This is why their interceptor hooks are a separate runtime slice rather than a
+thin wrapper around activation dispatch.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines
