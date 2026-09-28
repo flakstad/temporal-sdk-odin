@@ -153,7 +153,11 @@ the cancellation explicitly and decode that Payload from the resulting
 `CanceledFailureInfo`. `activity.info(ctx)` now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor
 headers, and previous heartbeat details as callback-scoped borrowed values; a retry integration test
-recovers typed heartbeat progress on attempt 2. Unknown Workflow types fail the retryable Workflow Task without
+recovers typed heartbeat progress on attempt 2. Workers can register ordered
+Activity interceptors that wrap both callback execution and heartbeat calls
+with real `next` continuations. The first registered interceptor is outermost;
+it may inspect or replace inputs/results or deliberately skip `next`. Interceptor
+user data is borrowed until `worker.close`. Unknown Workflow types fail the retryable Workflow Task without
 terminating the worker. Typed Activities can return explicit retryable or
 non-retryable Application Failures with a failure type, JSON details, and an
 optional next-retry delay; the live suite proves Core/Server redelivery from
@@ -166,6 +170,28 @@ nested cancellation-token trees, client
 cancellation of an accepted Update, multiple Activity arguments,
 in-process panic containment, or a stable public API.
 Do not use it in production.
+
+```odin
+_ = worker.add_activity_interceptor(
+    &sdk_worker,
+    {
+        user_data = tracing_state,
+        execute = trace_activity,
+        heartbeat = trace_heartbeat,
+    },
+)
+
+trace_activity :: proc(
+    data: rawptr,
+    input: ^worker.Activity_Execute_Input,
+    next: worker.Activity_Execute_Next,
+) -> activity.Payload_Result {
+    // Start span / extract propagated headers.
+    result := worker.activity_execute_next(next, input)
+    // Finish span / inspect result.
+    return result
+}
+```
 
 ```text
 Temporal CLI dev server

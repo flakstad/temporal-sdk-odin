@@ -1157,6 +1157,29 @@ Update scenario proves its header before validation and again after an Activity
 resume. Together these cover both directions across Core rather than only
 protobuf round trips.
 
+### Activity interceptor chain
+
+Register Activity interceptors while the Worker is still configuring with
+`worker.add_activity_interceptor`. Each entry may implement `execute`,
+`heartbeat`, or both. Registration order is outermost-first: execute callbacks
+enter in forward order, the registered Activity runs at the terminal, and
+callbacks unwind in reverse order. Calling `next` is explicit, so an
+interceptor can reject or synthesize a result without invoking later entries.
+Heartbeat calls use the same nesting model and terminate at Core's existing
+`record_activity_heartbeat` operation.
+
+The SDK borrows `Activity_Interceptor.user_data` until `worker.close`; it never
+frees application state. Execute inputs, Payload views, `activity.Context`, and
+`next` continuations are invocation-scoped and must not be retained. Results
+retain their normal callback lifetime. Interceptor registration is
+rejected after `worker.run` starts, which keeps the chain immutable while the
+Activity pool invokes it concurrently.
+
+A unit test covers nested execute order, short-circuiting, and heartbeat order.
+A 500-case property varies chain depth and the short-circuit position. The
+`activity-interceptor` integration scenario proves execute-before/after and
+heartbeat-before/after across a real Core worker and CLI dev server.
+
 ## Troubleshooting
 
 - `library not found for -ltemporalio_sdk_core_c_bridge`: run

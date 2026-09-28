@@ -5,6 +5,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 import activity "../../temporal/activity"
+import codec "../../temporal/codec"
 import temporal_core "../../temporal/core"
 import temporal_failure "../../temporal/failure"
 import worker "../../temporal/worker"
@@ -174,6 +175,13 @@ set_greeting_name_from_signal :: proc(
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
+	if name == "activity-interceptor" {
+		status := activity.heartbeat(ctx, "activity-interceptor-heartbeat")
+		if status != .Recorded {
+			return "Activity interceptor heartbeat failed"
+		}
+		return "Activity interceptor executed"
+	}
 	if name == "activity-header" {
 		trace_chain: string
 		found, decode_error := activity.header_json(ctx, "trace-chain", &trace_chain)
@@ -214,6 +222,44 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 		return ""
 	}
 	return greeting
+}
+
+activity_execute_interceptor :: proc(
+	_: rawptr,
+	input: ^worker.Activity_Execute_Input,
+	next: worker.Activity_Execute_Next,
+) -> activity.Payload_Result {
+	name: string
+	decode_error := codec.decode_json(input.input, &name)
+	defer delete(name)
+	is_probe := decode_error == .None && name == "activity-interceptor"
+	if is_probe {
+		fmt.println("Activity execute interceptor entered before callback")
+	}
+	result := worker.activity_execute_next(next, input)
+	if is_probe {
+		fmt.printf("Activity execute interceptor exited after callback status=%v\n", result.status)
+	}
+	return result
+}
+
+activity_heartbeat_interceptor :: proc(
+	_: rawptr,
+	input: ^worker.Activity_Heartbeat_Input,
+	next: worker.Activity_Heartbeat_Next,
+) -> activity.Heartbeat_Status {
+	details: string
+	decode_error := codec.decode_json(input.details, &details)
+	defer delete(details)
+	is_probe := decode_error == .None && details == "activity-interceptor-heartbeat"
+	if is_probe {
+		fmt.println("Activity heartbeat interceptor entered before Core")
+	}
+	status := worker.activity_heartbeat_next(next, input)
+	if is_probe {
+		fmt.printf("Activity heartbeat interceptor exited after Core status=%v\n", status)
+	}
+	return status
 }
 
 cancel_with_details :: proc(
@@ -308,6 +354,9 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "activity-interceptor" {
+		return workflow.execute_activity(ctx, "hello", name)
+	}
 	if name == "activity-header" {
 		headers := workflow.Headers{}
 		if !workflow.headers_init(&headers) {
@@ -782,6 +831,24 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	interceptor_error := worker.add_activity_interceptor(
+		&activity_worker,
+		{
+			execute = activity_execute_interceptor,
+			heartbeat = activity_heartbeat_interceptor,
+		},
+	)
+	if interceptor_error.message != nil {
+		fmt.eprintf(
+			"Activity interceptor registration failed: %s\n",
+			string(interceptor_error.message),
+		)
+		worker.error_free(&interceptor_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	register_error := worker.register_activity(&activity_worker, "hello", hello)
 	if register_error.message != nil {
@@ -993,6 +1060,7 @@ main :: proc() {
 	expect_signal_with_start := scenario == "signal-with-start"
 	expect_activity_cancel_details := scenario == "activity-cancel-details"
 	expect_activity_headers := scenario == "activity-headers"
+	expect_activity_interceptor := scenario == "activity-interceptor"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
@@ -1051,7 +1119,8 @@ main :: proc() {
 				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
 				failed = true
 			}
-		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure || expect_local_activity || expect_activity_headers {
+		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure ||
+		           expect_local_activity || expect_activity_headers || expect_activity_interceptor {
 			if run_stats.activity_tasks_completed != 1 || run_stats.workflow_signals_received != 0 || run_stats.timers_canceled != 0 {
 				fmt.eprintln("Single-Activity Workflow path produced unexpected worker stats")
 				failed = true

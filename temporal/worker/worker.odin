@@ -26,6 +26,82 @@ Activity_Invoke_Proc :: #type proc(
 	input: codec.Payload_View,
 ) -> activity.Payload_Result
 
+// Activity interceptors are registered on a Worker and form a real nested
+// chain. Registration order is outermost-first. An interceptor may inspect or
+// replace the input, decide whether to call next, and inspect or replace the
+// result. User data is borrowed for the Worker lifetime. Inputs and next values
+// are call-scoped and must not be retained.
+Activity_Execute_Input :: struct {
+	ctx:   ^activity.Context,
+	input: codec.Payload_View,
+}
+
+Activity_Execute_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Activity_Execute_Input,
+) -> activity.Payload_Result
+
+Activity_Execute_Next :: struct {
+	data:   rawptr,
+	invoke: Activity_Execute_Next_Proc,
+}
+
+Activity_Execute_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Activity_Execute_Input,
+	next: Activity_Execute_Next,
+) -> activity.Payload_Result
+
+Activity_Heartbeat_Input :: struct {
+	ctx:     ^activity.Context,
+	details: codec.Payload_View,
+}
+
+Activity_Heartbeat_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Activity_Heartbeat_Input,
+) -> activity.Heartbeat_Status
+
+Activity_Heartbeat_Next :: struct {
+	data:   rawptr,
+	invoke: Activity_Heartbeat_Next_Proc,
+}
+
+Activity_Heartbeat_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Activity_Heartbeat_Input,
+	next: Activity_Heartbeat_Next,
+) -> activity.Heartbeat_Status
+
+Activity_Interceptor :: struct {
+	user_data: rawptr,
+	execute:   Activity_Execute_Interceptor_Proc,
+	heartbeat: Activity_Heartbeat_Interceptor_Proc,
+}
+
+activity_execute_next :: proc(
+	next: Activity_Execute_Next,
+	input: ^Activity_Execute_Input,
+) -> activity.Payload_Result {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		return activity.payload_fail(
+			"invalid Activity execute interceptor continuation",
+			failure_type = "OdinActivityInterceptorError",
+		)
+	}
+	return next.invoke(next.data, input)
+}
+
+activity_heartbeat_next :: proc(
+	next: Activity_Heartbeat_Next,
+	input: ^Activity_Heartbeat_Input,
+) -> activity.Heartbeat_Status {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		return .Invalid_Context
+	}
+	return next.invoke(next.data, input)
+}
+
 Activity_Registration :: struct {
 	name:          string,
 	callback_data: rawptr,
@@ -105,6 +181,7 @@ Worker :: struct {
 	namespace:              string,
 	task_queue:             string,
 	activity_registrations: [dynamic]Activity_Registration,
+	activity_interceptors:  [dynamic]Activity_Interceptor,
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
@@ -170,10 +247,28 @@ create :: proc(
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = max_concurrent_activities
 	worker.activity_registrations = make([dynamic]Activity_Registration)
+	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_registrations = make([dynamic]Workflow_Registration)
 	worker.workflow_runs = make([dynamic]Workflow_Run)
 	worker.rejected_workflow_runs = make([dynamic]Rejected_Workflow_Run)
 	return
+}
+
+add_activity_interceptor :: proc(
+	worker: ^Worker,
+	interceptor: Activity_Interceptor,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("Activity interceptors cannot be registered after worker.run starts")
+	}
+	if interceptor.execute == nil && interceptor.heartbeat == nil {
+		return error_from_string("Activity interceptor must implement execute or heartbeat")
+	}
+	append(&worker.activity_interceptors, interceptor)
+	return {}
 }
 
 register_activity_invoker :: proc(
@@ -771,9 +866,96 @@ activity_heartbeat_recorder :: proc(
 	if execution == nil || execution.worker == nil {
 		return .Invalid_Context
 	}
-	heartbeat := proto.encode_activity_heartbeat_payload(execution.task_token, details)
+	input := Activity_Heartbeat_Input{ctx = &execution.ctx, details = details}
+	state := Activity_Heartbeat_Chain_State{execution = execution}
+	return activity_heartbeat_chain_invoke(&state, &input)
+}
+
+Activity_Execute_Chain_State :: struct {
+	execution: ^Activity_Execution,
+	index:     int,
+}
+
+activity_execute_chain_invoke :: proc(
+	data: rawptr,
+	input: ^Activity_Execute_Input,
+) -> activity.Payload_Result {
+	state := cast(^Activity_Execute_Chain_State)data
+	if state == nil || state.execution == nil || state.execution.worker == nil ||
+	   input == nil || input.ctx == nil {
+		return activity.payload_fail(
+			"invalid Activity execute interceptor state",
+			failure_type = "OdinActivityInterceptorError",
+		)
+	}
+	interceptors := state.execution.worker.activity_interceptors[:]
+	for index := state.index; index < len(interceptors); index += 1 {
+		interceptor := &interceptors[index]
+		if interceptor.execute == nil {
+			continue
+		}
+		next_state := Activity_Execute_Chain_State{
+			execution = state.execution,
+			index = index + 1,
+		}
+		return interceptor.execute(
+			interceptor.user_data,
+			input,
+			Activity_Execute_Next{
+				data = &next_state,
+				invoke = activity_execute_chain_invoke,
+			},
+		)
+	}
+	return state.execution.invoke(
+		state.execution.callback_data,
+		input.ctx,
+		input.input,
+	)
+}
+
+Activity_Heartbeat_Chain_State :: struct {
+	execution: ^Activity_Execution,
+	index:     int,
+}
+
+activity_heartbeat_chain_invoke :: proc(
+	data: rawptr,
+	input: ^Activity_Heartbeat_Input,
+) -> activity.Heartbeat_Status {
+	state := cast(^Activity_Heartbeat_Chain_State)data
+	if state == nil || state.execution == nil || state.execution.worker == nil ||
+	   input == nil || input.ctx == nil {
+		return .Invalid_Context
+	}
+	interceptors := state.execution.worker.activity_interceptors[:]
+	for index := state.index; index < len(interceptors); index += 1 {
+		interceptor := &interceptors[index]
+		if interceptor.heartbeat == nil {
+			continue
+		}
+		next_state := Activity_Heartbeat_Chain_State{
+			execution = state.execution,
+			index = index + 1,
+		}
+		return interceptor.heartbeat(
+			interceptor.user_data,
+			input,
+			Activity_Heartbeat_Next{
+				data = &next_state,
+				invoke = activity_heartbeat_chain_invoke,
+			},
+		)
+	}
+	heartbeat := proto.encode_activity_heartbeat_payload(
+		state.execution.task_token,
+		input.details,
+	)
 	defer delete(heartbeat)
-	core_error := temporal_core.worker_record_activity_heartbeat(&execution.worker.core, heartbeat[:])
+	core_error := temporal_core.worker_record_activity_heartbeat(
+		&state.execution.worker.core,
+		heartbeat[:],
+	)
 	if core_error.message != nil {
 		temporal_core.error_free(&core_error)
 		return .Core_Error
@@ -794,11 +976,12 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	defer virtual.arena_destroy(&arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&arena)
-	result := execution.invoke(
-		execution.callback_data,
-		&execution.ctx,
-		codec.payload_view(&execution.input),
-	)
+	input := Activity_Execute_Input{
+		ctx = &execution.ctx,
+		input = codec.payload_view(&execution.input),
+	}
+	chain_state := Activity_Execute_Chain_State{execution = execution}
+	result := activity_execute_chain_invoke(&chain_state, &input)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
 	defer activity.application_failure_free(&result.failure)
@@ -1507,12 +1690,14 @@ close :: proc(worker: ^Worker) -> Error {
 		delete(rejected_run.run_id)
 	}
 	delete(worker.activity_registrations)
+	delete(worker.activity_interceptors)
 	delete(worker.workflow_registrations)
 	delete(worker.workflow_runs)
 	delete(worker.rejected_workflow_runs)
 	delete(worker.namespace)
 	delete(worker.task_queue)
 	worker.activity_registrations = nil
+	worker.activity_interceptors = nil
 	worker.workflow_registrations = nil
 	worker.workflow_runs = nil
 	worker.rejected_workflow_runs = nil

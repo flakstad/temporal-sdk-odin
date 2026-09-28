@@ -160,6 +160,41 @@ worker_pid=""
 cat "$worker_log"
 grep -q "Activity header crossed Workflow command, Core, and Activity Context" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=activity-interceptor \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Activity-interceptor Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+activity_interceptor_workflow_id="odin-sdk-activity-interceptor-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$activity_interceptor_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"activity-interceptor"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+activity_interceptor_output="$(<"$workflow_output_file")"
+echo "$activity_interceptor_output"
+grep -q '"result": "Activity interceptor executed"' <<<"$activity_interceptor_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Activity execute interceptor entered before callback" "$worker_log"
+grep -q "Activity execute interceptor exited after callback status=Completed" "$worker_log"
+grep -q "Activity heartbeat interceptor entered before Core" "$worker_log"
+grep -q "Activity heartbeat interceptor exited after Core status=Recorded" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=signal-headers \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

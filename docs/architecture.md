@@ -1341,8 +1341,26 @@ carries headers through its Workflow inbound interceptor, while the outbound
 interceptor is responsible for commands issued by handler code. .NET's
 [OpenTelemetry interceptor](https://github.com/temporalio/sdk-dotnet/blob/main/src/Temporalio.Extensions.OpenTelemetry/TracingInterceptor.cs)
 demonstrates the same client/workflow/activity interception split. Odin
-currently exposes the data-bearing context seam only; ordering, middleware
-composition, and outbound/inbound interceptor chains remain future work.
+uses that split rather than one universal hook. The Activity family is now the
+first complete chain: Worker-level interceptors wrap inbound callback execution
+and outbound heartbeat calls through explicit `next` continuations. Client and
+Workflow chains remain future work.
+
+Activity interceptors live wholly above Core. Core still owns polling,
+cancellation delivery, heartbeat transport, and task completion; the chain
+wraps the language callback and the existing heartbeat recorder. Registration
+order is outermost-first and unwind order is reversed. The Worker copies only
+the interceptor records; `user_data` remains application-owned and borrowed
+until close. The array becomes immutable when polling begins, so concurrent
+Activity executions can read it without chain-level locking. Interceptor code
+runs in ordinary Activity threads and may perform side effects. This rule must
+not be reused unchanged for Workflow interceptors, which must be deterministic
+and replay-aware.
+
+No C ABI or protobuf change is involved. Unit coverage proves nested execution,
+short-circuiting, and heartbeat wrapping; a 500-case PBT property varies chain
+depth and rejection position; the CLI-devserver scenario sends one heartbeat
+through Core and returns the Activity result through the same interceptor set.
 
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines

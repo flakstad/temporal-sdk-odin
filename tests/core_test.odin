@@ -2257,6 +2257,75 @@ typed_activity_test :: proc(
 	}
 }
 
+Activity_Interceptor_Test_State :: struct {
+	events:         [16]int,
+	event_count:    int,
+	terminal_calls: int,
+}
+
+Activity_Interceptor_Test_Node :: struct {
+	state:           ^Activity_Interceptor_Test_State,
+	id:              int,
+	short_execute:   bool,
+	short_heartbeat: bool,
+}
+
+activity_interceptor_test_record :: proc(state: ^Activity_Interceptor_Test_State, event: int) {
+	if state == nil || state.event_count >= len(state.events) {
+		return
+	}
+	state.events[state.event_count] = event
+	state.event_count += 1
+}
+
+activity_interceptor_test_execute :: proc(
+	user_data: rawptr,
+	input: ^worker.Activity_Execute_Input,
+	next: worker.Activity_Execute_Next,
+) -> activity.Payload_Result {
+	node := cast(^Activity_Interceptor_Test_Node)user_data
+	activity_interceptor_test_record(node.state, node.id)
+	if node.short_execute {
+		return activity.payload_fail(
+			"Activity execution rejected by test interceptor",
+			failure_type = "TestActivityInterceptorRejection",
+		)
+	}
+	result := worker.activity_execute_next(next, input)
+	activity_interceptor_test_record(node.state, -node.id)
+	return result
+}
+
+activity_interceptor_test_heartbeat :: proc(
+	user_data: rawptr,
+	input: ^worker.Activity_Heartbeat_Input,
+	next: worker.Activity_Heartbeat_Next,
+) -> activity.Heartbeat_Status {
+	node := cast(^Activity_Interceptor_Test_Node)user_data
+	activity_interceptor_test_record(node.state, node.id + 10)
+	if node.short_heartbeat {
+		return .Recorded
+	}
+	status := worker.activity_heartbeat_next(next, input)
+	activity_interceptor_test_record(node.state, -(node.id + 10))
+	return status
+}
+
+activity_interceptor_test_terminal :: proc(
+	callback_data: rawptr,
+	_: ^activity.Context,
+	input: codec.Payload_View,
+) -> activity.Payload_Result {
+	state := cast(^Activity_Interceptor_Test_State)callback_data
+	activity_interceptor_test_record(state, 99)
+	state.terminal_calls += 1
+	payload, clone_error := codec.payload_clone(input)
+	if clone_error != .None {
+		return activity.payload_fail("test terminal clone failed")
+	}
+	return activity.payload_complete(payload)
+}
+
 Activity_Failure_Details :: struct {
 	dependency: string,
 	attempt:    u32,
@@ -5881,6 +5950,102 @@ json_payload_codec_round_trips_structs_and_owns_metadata :: proc(t: ^testing.T) 
 	testing.expect_value(t, codec.encoding(codec.payload_view(&cloned)), "json/plain")
 	testing.expect(t, len(cloned.data) > 0)
 	codec.payload_free(&cloned)
+}
+
+@(test)
+activity_interceptors_nest_short_circuit_and_wrap_heartbeats :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+		activity_interceptors = make([dynamic]worker.Activity_Interceptor),
+		lifecycle = .Configuring,
+	}
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+
+	state := Activity_Interceptor_Test_State{}
+	first := Activity_Interceptor_Test_Node{state = &state, id = 1}
+	second := Activity_Interceptor_Test_Node{state = &state, id = 2}
+	first_error := worker.add_activity_interceptor(
+		&sdk_worker,
+		{
+			user_data = &first,
+			execute = activity_interceptor_test_execute,
+			heartbeat = activity_interceptor_test_heartbeat,
+		},
+	)
+	second_error := worker.add_activity_interceptor(
+		&sdk_worker,
+		{
+			user_data = &second,
+			execute = activity_interceptor_test_execute,
+			heartbeat = activity_interceptor_test_heartbeat,
+		},
+	)
+	testing.expect(t, first_error.message == nil)
+	testing.expect(t, second_error.message == nil)
+	worker.error_free(&first_error)
+	worker.error_free(&second_error)
+
+	payload, payload_error := codec.encode_json("intercepted")
+	testing.expect(t, payload_error == .None)
+	defer codec.payload_free(&payload)
+	ctx := activity.Context{}
+	execution := worker.Activity_Execution{
+		worker = &sdk_worker,
+		callback_data = &state,
+		invoke = activity_interceptor_test_terminal,
+		ctx = ctx,
+	}
+	input := worker.Activity_Execute_Input{
+		ctx = &execution.ctx,
+		input = codec.payload_view(&payload),
+	}
+	chain := worker.Activity_Execute_Chain_State{execution = &execution}
+	result := worker.activity_execute_chain_invoke(&chain, &input)
+	defer codec.payload_free(&result.payload)
+	defer activity.application_failure_free(&result.failure)
+	testing.expect_value(t, result.status, activity.Result_Status.Completed)
+	testing.expect_value(t, state.terminal_calls, 1)
+	testing.expect_value(t, state.event_count, 5)
+	expected_nested := [?]int{1, 2, 99, -2, -1}
+	for expected, index in expected_nested {
+		testing.expect_value(t, state.events[index], expected)
+	}
+
+	state.event_count = 0
+	second.short_execute = true
+	rejected := worker.activity_execute_chain_invoke(&chain, &input)
+	defer codec.payload_free(&rejected.payload)
+	defer activity.application_failure_free(&rejected.failure)
+	testing.expect_value(t, rejected.status, activity.Result_Status.Failed)
+	testing.expect_value(t, rejected.failure.type, "TestActivityInterceptorRejection")
+	testing.expect_value(t, state.terminal_calls, 1)
+	testing.expect_value(t, state.event_count, 3)
+	expected_short := [?]int{1, 2, -1}
+	for expected, index in expected_short {
+		testing.expect_value(t, state.events[index], expected)
+	}
+
+	state.event_count = 0
+	second.short_heartbeat = true
+	heartbeat_input := worker.Activity_Heartbeat_Input{
+		ctx = &execution.ctx,
+		details = codec.payload_view(&payload),
+	}
+	heartbeat_chain := worker.Activity_Heartbeat_Chain_State{execution = &execution}
+	heartbeat_status := worker.activity_heartbeat_chain_invoke(
+		&heartbeat_chain,
+		&heartbeat_input,
+	)
+	testing.expect_value(t, heartbeat_status, activity.Heartbeat_Status.Recorded)
+	testing.expect_value(t, state.event_count, 3)
+	expected_heartbeat := [?]int{11, 12, -11}
+	for expected, index in expected_heartbeat {
+		testing.expect_value(t, state.events[index], expected)
+	}
 }
 
 @(test)
