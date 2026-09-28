@@ -1285,7 +1285,7 @@ encode_signal_with_start_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest(&request), {}
 }
 
-signal_with_start_workflow_payload :: proc(
+signal_with_start_workflow_payload_unintercepted :: proc(
 	client: ^Client,
 	workflow_type: string,
 	workflow_input: codec.Payload_View,
@@ -1352,6 +1352,57 @@ signal_with_start_workflow_payload :: proc(
 	}
 	handle.started_by_request = response.started
 	return handle, {}
+}
+
+signal_with_start_workflow_payload_terminal :: proc(
+	input: ^Client_Signal_With_Start_Input,
+) -> (Workflow_Handle, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Signal-With-Start input is missing")
+	}
+	if input.headers == nil || input.headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Signal-With-Start interceptor headers are invalid")
+	}
+	options := input.options
+	options.signal_headers = input.headers
+	return signal_with_start_workflow_payload_unintercepted(
+		input.client,
+		input.workflow_type,
+		input.workflow_input,
+		input.signal_name,
+		input.signal_input,
+		options,
+	)
+}
+
+signal_with_start_workflow_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_input: codec.Payload_View,
+	signal_name: string,
+	signal_input: codec.Payload_View,
+	options: Signal_With_Start_Options,
+) -> (handle: Workflow_Handle, error: Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	headers := Headers{}
+	headers_error := client_interceptor_headers_init(&headers, options.signal_headers)
+	if headers_error.message != nil {
+		return {}, headers_error
+	}
+	defer headers_free(&headers)
+	interceptor_input := Client_Signal_With_Start_Input{
+		client = client,
+		workflow_type = workflow_type,
+		workflow_input = workflow_input,
+		signal_name = signal_name,
+		signal_input = signal_input,
+		options = options,
+		headers = &headers,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_signal_with_start_chain(&state, &interceptor_input)
 }
 
 signal_with_start_workflow_json :: proc(

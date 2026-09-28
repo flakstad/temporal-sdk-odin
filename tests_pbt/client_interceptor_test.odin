@@ -40,6 +40,30 @@ client_interceptor_property_signal :: proc(
 	return result
 }
 
+client_interceptor_property_signal_with_start :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Signal_With_Start_Input,
+	next: temporal_client.Client_Signal_With_Start_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	header_error := temporal_client.headers_add_json(input.headers, "generated-depth", node.id)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	result: temporal_client.Workflow_Handle
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, result_error = temporal_client.client_signal_with_start_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result, result_error
+}
+
 client_interceptor_property_cancel :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_Cancel_Workflow_Input,
@@ -83,13 +107,14 @@ client_interceptor_property_terminate :: proc(
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 2))
+	operation := pbt.draw(t, pbt.int_range(0, 3))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
 	pbt.cover(t, operation == 0, 20.0, "Workflow Signal")
 	pbt.cover(t, operation == 1, 20.0, "Workflow cancellation")
 	pbt.cover(t, operation == 2, 20.0, "Workflow termination")
+	pbt.cover(t, operation == 3, 15.0, "Signal-With-Start")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -113,6 +138,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.cancel_workflow = client_interceptor_property_cancel
 		case 2:
 			interceptor.terminate_workflow = client_interceptor_property_terminate
+		case 3:
+			interceptor.signal_with_start = client_interceptor_property_signal_with_start
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -144,6 +171,18 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		operation_error = temporal_client.cancel_workflow(&handle, "caller cancellation")
 	case 2:
 		operation_error = temporal_client.terminate_workflow(&handle, "caller termination")
+	case 3:
+		_, operation_error = temporal_client.signal_with_start_workflow_payload(
+			&client,
+			"property_workflow",
+			{},
+			"property-signal",
+			{},
+			{
+				start_options = {id = "property-workflow", task_queue = "property-queue"},
+				signal_headers = &headers,
+			},
+		)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

@@ -28,6 +28,7 @@ Client_Interceptor_Test_State :: struct {
 	cancel_reason_seen:      bool,
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
+	signal_start_input_seen: bool,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -57,6 +58,48 @@ client_interceptor_test_signal :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result
+}
+
+client_interceptor_test_signal_with_start :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Signal_With_Start_Input,
+	next: temporal_client.Client_Signal_With_Start_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 2 {
+		outer_value: int
+		found := false
+		decode_error := codec.Error.None
+		for &entry in input.headers.entries {
+			if entry.key != "signal-start-interceptor" do continue
+			found = true
+			decode_error = codec.decode_json(codec.payload_view(&entry.payload), &outer_value)
+			break
+		}
+		node.state.signal_start_input_seen = found && decode_error == .None && outer_value == 1 &&
+		                                     input.workflow_type == "signal_start_workflow" &&
+		                                     input.signal_name == "approve"
+	}
+	header_error := temporal_client.headers_add_json(
+		input.headers,
+		"signal-start-interceptor",
+		node.id,
+	)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	result: temporal_client.Workflow_Handle
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Signal-With-Start short circuit")
+	} else {
+		result, result_error = temporal_client.client_signal_with_start_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
 }
 
 client_interceptor_test_cancel :: proc(
@@ -5266,6 +5309,68 @@ client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^te
 	delete(invalid_bytes)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
 	temporal_client.error_free(&invalid_error)
+}
+
+@(test)
+client_signal_with_start_interceptors_nest_and_isolate_signal_headers :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		namespace = "default",
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			signal_with_start = client_interceptor_test_signal_with_start,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			signal_with_start = client_interceptor_test_signal_with_start,
+		},
+	)
+	headers := temporal_client.Headers{}
+	headers_error := temporal_client.headers_init(&headers)
+	testing.expect(t, headers_error.message == nil)
+	temporal_client.error_free(&headers_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "original")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	workflow_input, workflow_encode_error := codec.encode_json("workflow-input")
+	testing.expect(t, workflow_encode_error == .None)
+	defer codec.payload_free(&workflow_input)
+	signal_input, signal_encode_error := codec.encode_json("signal-input")
+	testing.expect(t, signal_encode_error == .None)
+	defer codec.payload_free(&signal_input)
+
+	_, signal_start_error := temporal_client.signal_with_start_workflow_payload(
+		&client,
+		"signal_start_workflow",
+		codec.payload_view(&workflow_input),
+		"approve",
+		codec.payload_view(&signal_input),
+		{
+			start_options = {id = "workflow-id", task_queue = "task-queue"},
+			signal_headers = &headers,
+		},
+	)
+	defer temporal_client.error_free(&signal_start_error)
+	testing.expect_value(t, signal_start_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(signal_start_error.message), "Signal-With-Start short circuit")
+	testing.expect(t, state.signal_start_input_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+	testing.expect_value(t, len(headers.entries), 1)
+	testing.expect_value(t, headers.entries[0].key, "caller")
 }
 
 @(test)

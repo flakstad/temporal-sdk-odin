@@ -44,6 +44,27 @@ start_workflow_interceptor :: proc(
 	return temporal_client.client_start_workflow_next(next, input)
 }
 
+signal_with_start_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Signal_With_Start_Input,
+	next: temporal_client.Client_Signal_With_Start_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	fmt.println("Client Signal-With-Start interceptor entered before Core")
+	header_error := temporal_client.headers_add_json(
+		input.headers,
+		"odin-signal-with-start-interceptor",
+		"odin-client-signal-with-start",
+	)
+	if header_error.message != nil {
+		return {}, header_error
+	}
+	handle, result_error := temporal_client.client_signal_with_start_next(next, input)
+	if result_error.message == nil {
+		fmt.println("Client Signal-With-Start interceptor exited after Core")
+	}
+	return handle, result_error
+}
+
 run :: proc() -> int {
 	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
 		key = "x-odin-sdk",
@@ -71,6 +92,7 @@ run :: proc() -> int {
 	}
 	interceptors := [?]temporal_client.Client_Interceptor{{
 		start_workflow = start_workflow_interceptor,
+		signal_with_start = signal_with_start_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",

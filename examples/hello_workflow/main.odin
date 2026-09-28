@@ -873,6 +873,12 @@ signal_with_start_workflow :: proc(ctx: ^workflow.Fiber_Context, seed: string) -
 		"caller",
 		&first_caller,
 	)
+	first_interceptor: string
+	first_interceptor_found, first_interceptor_error := workflow.signal_header_json(
+		&first.metadata,
+		"odin-signal-with-start-interceptor",
+		&first_interceptor,
+	)
 	second := workflow.await_signal_json_with_context(ctx, "append", string)
 	second_caller: string
 	second_found, second_error := workflow.signal_header_json(
@@ -880,8 +886,20 @@ signal_with_start_workflow :: proc(ctx: ^workflow.Fiber_Context, seed: string) -
 		"caller",
 		&second_caller,
 	)
+	second_interceptor: string
+	second_interceptor_found, second_interceptor_error := workflow.signal_header_json(
+		&second.metadata,
+		"odin-signal-with-start-interceptor",
+		&second_interceptor,
+	)
 	if !first_found || first_error != .None || !second_found || second_error != .None {
 		return "Signal-With-Start metadata missing"
+	}
+	if !first_interceptor_found || first_interceptor_error != .None ||
+	   first_interceptor != "odin-client-signal-with-start" ||
+	   !second_interceptor_found || second_interceptor_error != .None ||
+	   second_interceptor != "odin-client-signal-with-start" {
+		return "Signal-With-Start interceptor metadata missing"
 	}
 	result, allocation_error := strings.concatenate(
 		{

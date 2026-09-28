@@ -114,6 +114,8 @@ signal_with_start_output="$(<"$workflow_output_file")"
 echo "$signal_with_start_output"
 grep -q "Odin Signal-With-Start created and reused workflow_id=$signal_with_start_workflow_id" <<<"$signal_with_start_output"
 grep -q 'result="seed:first/first-client:second/second-client"' <<<"$signal_with_start_output"
+[[ "$(grep -c 'Client Signal-With-Start interceptor entered before Core' <<<"$signal_with_start_output")" -eq 2 ]]
+[[ "$(grep -c 'Client Signal-With-Start interceptor exited after Core' <<<"$signal_with_start_output")" -eq 2 ]]
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

@@ -29,6 +29,32 @@ Client_Start_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Start_Workflow_Next,
 ) -> (Workflow_Handle, Error)
 
+Client_Signal_With_Start_Input :: struct {
+	client:         ^Client,
+	workflow_type:  string,
+	workflow_input: activity_codec.Payload_View,
+	signal_name:    string,
+	signal_input:   activity_codec.Payload_View,
+	options:        Signal_With_Start_Options,
+	headers:        ^Headers,
+}
+
+Client_Signal_With_Start_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Signal_With_Start_Input,
+) -> (Workflow_Handle, Error)
+
+Client_Signal_With_Start_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Signal_With_Start_Next_Proc,
+}
+
+Client_Signal_With_Start_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Signal_With_Start_Input,
+	next: Client_Signal_With_Start_Next,
+) -> (Workflow_Handle, Error)
+
 Client_Signal_Workflow_Input :: struct {
 	handle:      ^Workflow_Handle,
 	signal_name: string,
@@ -150,6 +176,7 @@ Client_Terminate_Workflow_Interceptor_Proc :: #type proc(
 Client_Interceptor :: struct {
 	user_data:          rawptr,
 	start_workflow:     Client_Start_Workflow_Interceptor_Proc,
+	signal_with_start:  Client_Signal_With_Start_Interceptor_Proc,
 	signal_workflow:    Client_Signal_Workflow_Interceptor_Proc,
 	query_workflow:     Client_Query_Workflow_Interceptor_Proc,
 	start_update:       Client_Start_Update_Interceptor_Proc,
@@ -163,6 +190,16 @@ client_start_workflow_next :: proc(
 ) -> (Workflow_Handle, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid start Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_signal_with_start_next :: proc(
+	next: Client_Signal_With_Start_Next,
+	input: ^Client_Signal_With_Start_Input,
+) -> (Workflow_Handle, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Signal-With-Start interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -288,6 +325,27 @@ client_start_workflow_chain :: proc(
 		)
 	}
 	return start_workflow_payload_terminal(input)
+}
+
+client_signal_with_start_chain :: proc(
+	data: rawptr,
+	input: ^Client_Signal_With_Start_Input,
+) -> (Workflow_Handle, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Signal-With-Start interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.signal_with_start == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.signal_with_start(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_signal_with_start_chain},
+		)
+	}
+	return signal_with_start_workflow_payload_terminal(input)
 }
 
 client_signal_workflow_chain :: proc(data: rawptr, input: ^Client_Signal_Workflow_Input) -> Error {
