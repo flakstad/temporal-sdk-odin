@@ -104,6 +104,11 @@ two starts against the CLI dev server to return the same run ID. Eager Workflow
 start is also live-proven: a validated worker on the same Core connection
 reserves a slot, Core dispatches the response task directly into that worker,
 and history records `eagerExecutionAccepted`.
+Signal-With-Start is live-proven as a separate atomic Client operation: the
+first call creates an execution, the second reuses its run, and both Signal
+headers reach Odin Workflow code. Temporal's request has one Signal header map,
+not independent start and Signal headers; the Odin API makes that limitation
+explicit and rejects eager-start intent on this RPC.
 Mutations emit Core's `ModifyWorkflowProperties` and
 `UpsertWorkflowSearchAttributes` commands, update the local Workflow view
 immediately, support explicit removal, and replay byte-for-byte. The live
@@ -310,6 +315,25 @@ handle, err := temporal_client.start_workflow_json(
     },
 )
 defer temporal_client.workflow_handle_free(&handle)
+
+signal_headers := temporal_client.Headers{}
+err = temporal_client.headers_init(&signal_headers)
+defer temporal_client.headers_free(&signal_headers)
+err = temporal_client.headers_add_json(&signal_headers, "caller", "orders-api")
+
+signaled, err := temporal_client.signal_with_start_workflow_json(
+    &client,
+    "order_workflow",
+    order,
+    "approve",
+    approval,
+    {
+        start_options = {id = "order-42", task_queue = "orders"},
+        signal_headers = &signal_headers,
+    },
+)
+defer temporal_client.workflow_handle_free(&signaled)
+// signaled.started_by_request distinguishes create from reuse.
 
 result: Order_Result
 err = temporal_client.get_result_json(&handle, &result)

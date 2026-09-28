@@ -89,6 +89,45 @@ temporal workflow show \
   --output json >"$typed_history_file"
 grep -q '"eagerExecutionAccepted": true' "$typed_history_file"
 
+TEMPORAL_ODIN_SCENARIO=signal-with-start \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal-With-Start Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+signal_with_start_workflow_id="odin-sdk-signal-with-start-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=signal-with-start \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_with_start_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+signal_with_start_output="$(<"$workflow_output_file")"
+echo "$signal_with_start_output"
+grep -q "Odin Signal-With-Start created and reused workflow_id=$signal_with_start_workflow_id" <<<"$signal_with_start_output"
+grep -q 'result="seed:first/first-client:second/second-client"' <<<"$signal_with_start_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Signal-With-Start created once, reused the execution, and delivered both Signal headers" "$worker_log"
+temporal workflow show \
+  --workflow-id "$signal_with_start_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+signal_event_count="$(grep -c 'EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED' "$typed_history_file")"
+if [[ "$signal_event_count" -ne 2 ]]; then
+  echo "Signal-With-Start history contained $signal_event_count Signal events, expected 2" >&2
+  exit 1
+fi
+
 run_activity_case() {
   local mode="$1"
   if [[ "$mode" == "retry" ]]; then

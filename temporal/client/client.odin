@@ -237,6 +237,15 @@ Start_Workflow_Options :: struct {
 	enable_eager_workflow_start: bool,
 }
 
+// Signal_With_Start_Options borrows ordinary start options plus the one Header
+// map exposed by Temporal's SignalWithStart RPC. That Header belongs to the
+// Signal event. The wire contract cannot represent independent Workflow-start
+// and Signal headers, so start_options.metadata.headers must be empty.
+Signal_With_Start_Options :: struct {
+	start_options:  Start_Workflow_Options,
+	signal_headers: ^Headers,
+}
+
 // Workflow_Id_Reuse_Policy controls reuse after a previous execution with the
 // same ID has closed. Unspecified uses the Service default (Allow_Duplicate).
 Workflow_Id_Reuse_Policy :: enum {
@@ -599,6 +608,7 @@ Workflow_Handle :: struct {
 	id:                     string,
 	run_id:                 string,
 	first_execution_run_id: string,
+	started_by_request:      bool,
 	eager_execution_accepted: bool,
 }
 
@@ -1057,6 +1067,7 @@ start_workflow_payload :: proc(
 		return {}, handle_error
 	}
 	handle.eager_execution_accepted = response.eager_workflow_task != nil
+	handle.started_by_request = response.started
 	return handle, {}
 }
 
@@ -1072,6 +1083,232 @@ start_workflow_json :: proc(
 	}
 	defer codec.payload_free(&payload)
 	return start_workflow_payload(client, workflow_type, codec.payload_view(&payload), options)
+}
+
+signal_with_start_options_error :: proc(options: Signal_With_Start_Options) -> string {
+	start_options := options.start_options
+	if message := start_workflow_options_error(start_options); len(message) > 0 {
+		return message
+	}
+	if start_options.id_conflict_policy == .Fail {
+		return "Signal-With-Start cannot use the Fail Workflow ID conflict policy"
+	}
+	if start_options.enable_eager_workflow_start {
+		return "Signal-With-Start does not support eager Workflow start"
+	}
+	if start_options.metadata != nil && len(start_options.metadata.headers) > 0 {
+		return "Signal-With-Start cannot represent separate Workflow-start headers; use signal_headers"
+	}
+	if options.signal_headers != nil && options.signal_headers.allocator.procedure == nil {
+		return "Signal-With-Start headers are not initialized"
+	}
+	return ""
+}
+
+// encode_signal_with_start_workflow_request is exposed for wire-contract
+// testing. It deliberately projects the already-tested Start request into the
+// combined RPC so new start fields cannot silently drift between the two paths.
+// Returned bytes are owned by the caller.
+encode_signal_with_start_workflow_request :: proc(
+	namespace: string,
+	workflow_type: string,
+	workflow_input: codec.Payload_View,
+	signal_name: string,
+	signal_input: codec.Payload_View,
+	options: Signal_With_Start_Options,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(signal_name) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
+	}
+	if message := signal_with_start_options_error(options); len(message) > 0 {
+		return nil, error_from_string(.Invalid_Argument, message)
+	}
+
+	start_bytes, start_error := encode_start_workflow_request(
+		namespace,
+		workflow_type,
+		workflow_input,
+		options.start_options,
+	)
+	if start_error.message != nil {
+		return nil, start_error
+	}
+	defer delete(start_bytes)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return nil, error_from_string(.Payload_Conversion, "could not initialize Signal-With-Start request arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	start := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		start_bytes[:],
+		&start,
+	)
+	context.allocator = previous_allocator
+	if !decoded {
+		return nil, error_from_string(.Payload_Conversion, "could not project Workflow start request")
+	}
+
+	encoded_signal := proto.encode_payload(signal_input)
+	defer delete(encoded_signal.metadata)
+	defer delete(encoded_signal.external_payloads)
+	signal_inputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(signal_inputs.payloads)
+	append(&signal_inputs.payloads, encoded_signal)
+
+	header := proto.Temporal_Api_Common_V1_Header{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer free_start_proto_payloads(header_payloads)
+	if options.signal_headers != nil && len(options.signal_headers.entries) > 0 {
+		header_payloads = make(
+			[]proto.Temporal_Api_Common_V1_Payload,
+			len(options.signal_headers.entries),
+		)
+		for &entry, index in options.signal_headers.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in options.signal_headers.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+	}
+
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest{
+		namespace = start.namespace,
+		workflow_id = start.workflow_id,
+		workflow_type = start.workflow_type,
+		task_queue = start.task_queue,
+		input = start.input,
+		workflow_execution_timeout = start.workflow_execution_timeout,
+		workflow_run_timeout = start.workflow_run_timeout,
+		workflow_task_timeout = start.workflow_task_timeout,
+		identity = start.identity,
+		request_id = start.request_id,
+		workflow_id_reuse_policy = start.workflow_id_reuse_policy,
+		workflow_id_conflict_policy = start.workflow_id_conflict_policy,
+		signal_name = signal_name,
+		signal_input = &signal_inputs,
+		retry_policy = start.retry_policy,
+		cron_schedule = start.cron_schedule,
+		memo = start.memo,
+		search_attributes = start.search_attributes,
+		workflow_start_delay = start.workflow_start_delay,
+		user_metadata = start.user_metadata,
+		links = start.links,
+		versioning_override = start.versioning_override,
+		priority = start.priority,
+		time_skipping_config = start.time_skipping_config,
+	}
+	if len(header.fields) > 0 {
+		request.header = &header
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest(&request), {}
+}
+
+signal_with_start_workflow_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_input: codec.Payload_View,
+	signal_name: string,
+	signal_input: codec.Payload_View,
+	options: Signal_With_Start_Options,
+) -> (handle: Workflow_Handle, error: Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	request_bytes, request_error := encode_signal_with_start_workflow_request(
+		client.namespace,
+		workflow_type,
+		workflow_input,
+		signal_name,
+		signal_input,
+		options,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		client.connection,
+		.Workflow,
+		"SignalWithStartWorkflowExecution",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		return {}, error_from_core(&rpc_result.error)
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize client response arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionResponse(
+		rpc_result.protobuf,
+		&response,
+	)
+	context.allocator = previous_allocator
+	if !decoded || len(response.run_id) == 0 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Signal-With-Start response")
+	}
+
+	first_execution_run_id := response.first_execution_run_id
+	if len(first_execution_run_id) == 0 {
+		first_execution_run_id = response.run_id
+	}
+	handle_error: Error
+	handle, handle_error = get_workflow_handle(
+		client,
+		options.start_options.id,
+		response.run_id,
+		first_execution_run_id,
+	)
+	if handle_error.message != nil {
+		return {}, handle_error
+	}
+	handle.started_by_request = response.started
+	return handle, {}
+}
+
+signal_with_start_workflow_json :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_input: $Workflow_Input,
+	signal_name: string,
+	signal_input: $Signal_Input,
+	options: Signal_With_Start_Options,
+) -> (handle: Workflow_Handle, error: Error) {
+	encoded_workflow_input, workflow_encode_error := codec.encode_json(workflow_input)
+	if workflow_encode_error != .None {
+		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow input")
+	}
+	defer codec.payload_free(&encoded_workflow_input)
+	encoded_signal_input, signal_encode_error := codec.encode_json(signal_input)
+	if signal_encode_error != .None {
+		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow signal input")
+	}
+	defer codec.payload_free(&encoded_signal_input)
+	return signal_with_start_workflow_payload(
+		client,
+		workflow_type,
+		codec.payload_view(&encoded_workflow_input),
+		signal_name,
+		codec.payload_view(&encoded_signal_input),
+		options,
+	)
 }
 
 workflow_handle_valid :: proc(handle: ^Workflow_Handle) -> bool {

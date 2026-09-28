@@ -371,6 +371,38 @@ the Client. Free handles before closing the Client. `start_workflow_payload`
 and `get_result_payload` are the codec-neutral forms; JSON helpers currently
 represent one Workflow argument and one result Payload.
 
+The combined start/signal path reuses the same start projection but has a
+dedicated option wrapper because Temporal exposes only one header map and it is
+delivered on the Signal event:
+
+```odin
+headers := temporal_client.Headers{}
+_ = temporal_client.headers_init(&headers)
+defer temporal_client.headers_free(&headers)
+_ = temporal_client.headers_add_json(&headers, "caller", "odin-client")
+
+handle, err := temporal_client.signal_with_start_workflow_json(
+    &client,
+    "greeting_workflow",
+    "initial input",
+    "append",
+    "signal input",
+    {
+        start_options = {id = "greeting-42", task_queue = "greetings"},
+        signal_headers = &headers,
+    },
+)
+```
+
+`started_by_request` reports whether that call created the execution. Start
+headers and eager start are rejected for this operation because the upstream
+request cannot encode them separately. To run its create-then-reuse acceptance
+case manually, start the worker with
+`TEMPORAL_ODIN_SCENARIO=signal-with-start`, then run
+`examples/client_start` with `TEMPORAL_CLIENT_SCENARIO=signal-with-start` and a
+shared `TEMPORAL_CLIENT_WORKFLOW_ID`. The full integration script does this and
+requires exactly two `WORKFLOW_EXECUTION_SIGNALED` history events.
+
 Initial Payload maps use a separate owned builder:
 
 ```odin

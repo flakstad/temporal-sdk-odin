@@ -2806,6 +2806,29 @@ fiber_wait_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: stri
 	return approval.message
 }
 
+fiber_signal_context_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	_ = name
+	received := workflow.await_signal_json_with_context(ctx, "approval", Signal_Test_Value)
+	caller: string
+	found, decode_error := workflow.signal_header_json(&received.metadata, "caller", &caller)
+	if !found || decode_error != .None {
+		return "missing signal context"
+	}
+	result, allocation_error := strings.concatenate(
+		{
+			received.value.message,
+			"/",
+			caller,
+			"/",
+			received.metadata.identity,
+		},
+	)
+	if allocation_error != nil {
+		return ""
+	}
+	return result
+}
+
 fiber_signal_timeout_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
@@ -4546,6 +4569,136 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	defer delete(invalid_bytes)
 	defer temporal_client.error_free(&invalid_error)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+}
+
+@(test)
+client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^testing.T) {
+	metadata := temporal_client.Start_Metadata{}
+	metadata_error := temporal_client.start_metadata_init(&metadata)
+	testing.expect(t, metadata_error.message == nil)
+	temporal_client.error_free(&metadata_error)
+	defer temporal_client.start_metadata_free(&metadata)
+	memo_error := temporal_client.start_metadata_add_memo_json(&metadata, "purpose", "signal-start")
+	testing.expect(t, memo_error.message == nil)
+	temporal_client.error_free(&memo_error)
+
+	headers := temporal_client.Headers{}
+	headers_error := temporal_client.headers_init(&headers)
+	testing.expect(t, headers_error.message == nil)
+	temporal_client.error_free(&headers_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "odin-signal")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+
+	workflow_input, workflow_error := codec.encode_json("workflow-input")
+	testing.expect(t, workflow_error == .None)
+	defer codec.payload_free(&workflow_input)
+	signal_input, signal_error := codec.encode_json("signal-input")
+	testing.expect(t, signal_error == .None)
+	defer codec.payload_free(&signal_input)
+	priority := temporal_client.Priority{priority_key = 4, fairness_key = "tenant-a"}
+	request_bytes, request_error := temporal_client.encode_signal_with_start_workflow_request(
+		"default",
+		"signal_start_workflow",
+		codec.payload_view(&workflow_input),
+		"approve",
+		codec.payload_view(&signal_input),
+		{
+			start_options = {
+				id = "signal-start-id",
+				task_queue = "signal-start-queue",
+				request_id = "signal-start-request",
+				workflow_run_timeout = 5 * time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+				id_reuse_policy = .Reject_Duplicate,
+				id_conflict_policy = .Use_Existing,
+				start_delay = 2 * time.Second,
+				priority = &priority,
+				metadata = &metadata,
+			},
+			signal_headers = &headers,
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Signal-With-Start encoding failed: %s", string(request_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "default")
+	testing.expect_value(t, request.workflow_id, "signal-start-id")
+	testing.expect_value(t, request.workflow_type.name, "signal_start_workflow")
+	testing.expect_value(t, request.task_queue.name, "signal-start-queue")
+	testing.expect_value(t, request.request_id, "signal-start-request")
+	testing.expect_value(t, request.signal_name, "approve")
+	testing.expect(t, request.input != nil && len(request.input.payloads) == 1)
+	testing.expect(t, request.signal_input != nil && len(request.signal_input.payloads) == 1)
+	testing.expect(t, request.header != nil && len(request.header.fields) == 1)
+	if request.header != nil && len(request.header.fields) == 1 {
+		testing.expect_value(t, request.header.fields[0].key, "caller")
+		owned_header, clone_error := proto.clone_payload(request.header.fields[0].value)
+		testing.expect(t, clone_error == .None)
+		decoded_header: string
+		testing.expect(t, codec.decode_json(codec.payload_view(&owned_header), &decoded_header) == .None)
+		testing.expect_value(t, decoded_header, "odin-signal")
+		delete(decoded_header)
+		codec.payload_free(&owned_header)
+	}
+	testing.expect(t, request.memo != nil && len(request.memo.fields) == 1)
+	testing.expect(t, request.priority != nil && request.priority.priority_key == 4)
+	testing.expect(t, request.workflow_start_delay != nil && request.workflow_start_delay.seconds == 2)
+	testing.expect(t, request.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING)
+
+	invalid_cases := [?]temporal_client.Signal_With_Start_Options{
+		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Fail}},
+		{start_options = {id = "id", task_queue = "queue", enable_eager_workflow_start = true}},
+	}
+	for invalid_options in invalid_cases {
+		invalid_bytes, invalid_error := temporal_client.encode_signal_with_start_workflow_request(
+			"default",
+			"workflow",
+			codec.payload_view(&workflow_input),
+			"signal",
+			codec.payload_view(&signal_input),
+			invalid_options,
+		)
+		delete(invalid_bytes)
+		testing.expect(t, invalid_error.kind == .Invalid_Argument)
+		temporal_client.error_free(&invalid_error)
+	}
+
+	start_header_error := temporal_client.start_metadata_add_header_json(
+		&metadata,
+		"start-only",
+		"unsupported",
+	)
+	testing.expect(t, start_header_error.message == nil)
+	temporal_client.error_free(&start_header_error)
+	invalid_bytes, invalid_error := temporal_client.encode_signal_with_start_workflow_request(
+		"default",
+		"workflow",
+		codec.payload_view(&workflow_input),
+		"signal",
+		codec.payload_view(&signal_input),
+		{
+			start_options = {id = "id", task_queue = "queue", metadata = &metadata},
+			signal_headers = &headers,
+		},
+	)
+	delete(invalid_bytes)
+	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+	temporal_client.error_free(&invalid_error)
 }
 
 @(test)
@@ -10261,6 +10414,97 @@ workflow_fiber_resumes_direct_signal_await :: proc(t: ^testing.T) {
 	testing.expect(t, inspection.decoded)
 	testing.expect(t, inspection.completed)
 	testing.expect_value(t, string(inspection.completion_result), `"Approved"`)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_fiber_exposes_signal_identity_headers_and_event_id :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_signal_context_workflow",
+		"test-queue",
+		fiber_signal_context_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(input.metadata)
+	defer delete(input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_signal_context_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{run_id = "signal-context-run"}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	owned_signal, signal_encode_error := codec.encode_json(
+		Signal_Test_Value{message = "Approved", approved = true},
+	)
+	testing.expect(t, signal_encode_error == .None)
+	defer codec.payload_free(&owned_signal)
+	signal_payload := proto.encode_payload(codec.payload_view(&owned_signal))
+	defer delete(signal_payload.metadata)
+	defer delete(signal_payload.external_payloads)
+	owned_header, header_encode_error := codec.encode_json("odin-client")
+	testing.expect(t, header_encode_error == .None)
+	defer codec.payload_free(&owned_header)
+	header_payload := proto.encode_payload(codec.payload_view(&owned_header))
+	defer delete(header_payload.metadata)
+	defer delete(header_payload.external_payloads)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "approval",
+		identity = "signal-sender",
+		originating_event_id = 17,
+	}
+	defer delete(signal.input)
+	defer delete(signal.headers)
+	append(&signal.input, signal_payload)
+	append(
+		&signal.headers,
+		proto.Coresdk_Workflow_Activation_SignalWorkflow_HeadersEntry{
+			key = "caller",
+			value = &header_payload,
+		},
+	)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "signal context failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	defer delete(inspection.completion_result)
+	testing.expect(t, inspection.decoded)
+	testing.expect_value(t, string(inspection.completion_result), `"Approved/odin-client/signal-sender"`)
+	testing.expect_value(t, runtime.instances[0].signals[0].originating_event_id, i64(17))
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

@@ -176,6 +176,22 @@ true`. Core owns gRPC transport and retries. The handle result loop maps
 completed, failed, canceled, terminated, timed-out, and Continue-As-New close
 events, following the next run by default as the current .NET SDK does.
 
+`SignalWithStartWorkflowExecution` uses that same generic RPC symbol; the C ABI
+adds no operation-specific function. The pinned Service request has exactly one
+`Header` field. Core's Rust client builds the combined request from ordinary
+start options and places that header on the Signal event, and Core's own
+integration test observes it through the Workflow Signal interceptor. It is
+therefore not possible to encode independent Workflow-start and Signal header
+maps in this RPC. Odin exposes the field as `signal_headers`, rejects non-empty
+`Start_Metadata.headers` for this operation, and continues to project memo,
+Search Attributes, UserMetadata, timeouts, Retry Policy, start delay, priority,
+and ID policies from `Start_Workflow_Options`. Eager start is rejected because
+the combined request has no eager-task field. The Service rejects conflict
+policy `Fail`; zero/unspecified retains Signal-With-Start's `UseExisting`
+default. The response's `started` bit becomes
+`Workflow_Handle.started_by_request`, allowing callers to distinguish creation
+from reuse without comparing histories.
+
 The same generic RPC boundary now implements four read APIs without adding C
 symbols:
 
@@ -1743,6 +1759,10 @@ Workflows are enabled.
    memo, and typed Search Attributes are implemented through an explicitly owned
    metadata builder. ID reuse/conflict, Retry Policy, cron, start delay, and
    Priority are implemented and wire/live tested.
+   Signal-With-Start is now wire-, property-, and CLI-devserver-tested for both
+   create and reuse paths, including its single Signal-header map and response
+   `started` bit. The absence of separate start headers and eager dispatch is a
+   protocol constraint, not an Odin wrapper omission.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -1773,7 +1793,8 @@ Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 recursive Failure chains,
 500 Client start request (including static UserMetadata and eager-start intent)
-round trips, 500 paginated Visibility list/count round trips, 500 query request/header round trips,
+round trips, 500 Signal-With-Start request round trips, 500 paginated Visibility
+list/count round trips, 500 query request/header round trips,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
@@ -1808,11 +1829,13 @@ Activity cancellation detail completeness is now implemented: all Core flags,
 an explicit Workflow cancel primitive, correct
 `Wait_Cancellation_Completed` suspension, recursive canceled Failure
 preservation, and a typed user-detail round trip are unit-, property-, and
-live-proven. Query headers and same-connection eager Workflow start are now
-owned, wire-tested, and live-proven; start headers were already covered by
-`Start_Metadata`. The next smallest client-completeness slice is
-Signal-With-Start (including header separation and conflict semantics), while
-backfill should also gain a dedicated multi-execution
+live-proven. Query headers, Signal-With-Start, and same-connection eager
+Workflow start are now owned, wire-tested, and live-proven; start headers were
+already covered by `Start_Metadata`. Signal-With-Start proved that the protocol
+exposes one Signal header rather than separable start/signal maps. The next
+smallest client-completeness slice is normal Signal request headers plus
+consistent interceptor-style header plumbing for outgoing Workflow commands,
+while backfill should also gain a dedicated multi-execution
 live case without overloading the one-shot Schedule example. Remaining failure work includes deciding whether start failures
 that only carry Core cause enums need a synthetic language-level Failure.
 

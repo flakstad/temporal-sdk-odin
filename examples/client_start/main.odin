@@ -107,6 +107,98 @@ run :: proc() -> int {
 	}
 	scenario_buffer: [64]u8
 	scenario := os.get_env(scenario_buffer[:], "TEMPORAL_CLIENT_SCENARIO")
+	if scenario == "signal-with-start" {
+		headers := temporal_client.Headers{}
+		headers_init_error := temporal_client.headers_init(&headers)
+		if headers_init_error.message != nil {
+			fmt.eprintf("Signal header initialization failed: %s\n", string(headers_init_error.message))
+			temporal_client.error_free(&headers_init_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_init_error)
+		defer temporal_client.headers_free(&headers)
+		first_header_error := temporal_client.headers_add_json(&headers, "caller", "first-client")
+		if first_header_error.message != nil {
+			fmt.eprintf("First Signal header encoding failed: %s\n", string(first_header_error.message))
+			temporal_client.error_free(&first_header_error)
+			return 1
+		}
+		temporal_client.error_free(&first_header_error)
+		options := temporal_client.Signal_With_Start_Options{
+			start_options = {
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+			signal_headers = &headers,
+		}
+		first, first_error := temporal_client.signal_with_start_workflow_json(
+			&client,
+			"odin_signal_with_start_workflow",
+			"seed",
+			"append",
+			"first",
+			options,
+		)
+		if first_error.message != nil {
+			fmt.eprintf("First Signal-With-Start failed: %s\n", string(first_error.message))
+			temporal_client.error_free(&first_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&first)
+		if !first.started_by_request {
+			fmt.eprintln("First Signal-With-Start did not create the Workflow Execution")
+			return 1
+		}
+
+		second_header_error := temporal_client.headers_add_json(&headers, "caller", "second-client")
+		if second_header_error.message != nil {
+			fmt.eprintf("Second Signal header encoding failed: %s\n", string(second_header_error.message))
+			temporal_client.error_free(&second_header_error)
+			return 1
+		}
+		temporal_client.error_free(&second_header_error)
+		second, second_error := temporal_client.signal_with_start_workflow_json(
+			&client,
+			"odin_signal_with_start_workflow",
+			"ignored-on-reuse",
+			"append",
+			"second",
+			options,
+		)
+		if second_error.message != nil {
+			fmt.eprintf("Second Signal-With-Start failed: %s\n", string(second_error.message))
+			temporal_client.error_free(&second_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&second)
+		if second.started_by_request || second.run_id != first.run_id ||
+		   second.first_execution_run_id != first.first_execution_run_id {
+			fmt.eprintln("Second Signal-With-Start did not reuse the original Workflow Execution")
+			return 1
+		}
+		result: string
+		result_error := temporal_client.get_result_json(&second, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf("Signal-With-Start result failed: %s\n", string(result_error.message))
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "seed:first/first-client:second/second-client" {
+			fmt.eprintf("Signal-With-Start returned unexpected result: %q\n", result)
+			return 1
+		}
+		fmt.printf(
+			"Odin Signal-With-Start created and reused workflow_id=%s run_id=%s result=%q\n",
+			workflow_id,
+			second.run_id,
+			result,
+		)
+		return 0
+	}
 	if scenario == "terminal-failure" {
 		handle, start_error := temporal_client.start_workflow_json(
 			&client,

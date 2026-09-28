@@ -19,6 +19,7 @@ FAILURE_DETAILS_WORKFLOW_TYPE :: "odin_failure_details_workflow"
 TERMINAL_FAILURE_WORKFLOW_TYPE :: "odin_terminal_failure_workflow"
 PATCH_WORKFLOW_TYPE :: "odin_patch_workflow"
 WORKFLOW_PROPERTIES_TYPE :: "odin_workflow_properties"
+SIGNAL_WITH_START_WORKFLOW_TYPE :: "odin_signal_with_start_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
 
 Typed_Greeting_Input :: struct {
@@ -614,6 +615,43 @@ workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: 
 	return "Workflow properties updated"
 }
 
+signal_with_start_workflow :: proc(ctx: ^workflow.Fiber_Context, seed: string) -> string {
+	first := workflow.await_signal_json_with_context(ctx, "append", string)
+	first_caller: string
+	first_found, first_error := workflow.signal_header_json(
+		&first.metadata,
+		"caller",
+		&first_caller,
+	)
+	second := workflow.await_signal_json_with_context(ctx, "append", string)
+	second_caller: string
+	second_found, second_error := workflow.signal_header_json(
+		&second.metadata,
+		"caller",
+		&second_caller,
+	)
+	if !first_found || first_error != .None || !second_found || second_error != .None {
+		return "Signal-With-Start metadata missing"
+	}
+	result, allocation_error := strings.concatenate(
+		{
+			seed,
+			":",
+			first.value,
+			"/",
+			first_caller,
+			":",
+			second.value,
+			"/",
+			second_caller,
+		},
+	)
+	if allocation_error != nil {
+		return ""
+	}
+	return result
+}
+
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	error_message := ""
 	if processed.error.message != nil {
@@ -860,6 +898,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	signal_with_start_register_error := worker.register_workflow(
+		&activity_worker,
+		SIGNAL_WITH_START_WORKFLOW_TYPE,
+		signal_with_start_workflow,
+	)
+	if signal_with_start_register_error.message != nil {
+		fmt.eprintf(
+			"Signal-With-Start Workflow registration failed: %s\n",
+			string(signal_with_start_register_error.message),
+		)
+		worker.error_free(&signal_with_start_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 
 	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
 	env_buffer: [64]u8
@@ -879,6 +933,7 @@ main :: proc() {
 	expect_terminal_failure := scenario == "terminal-failure"
 	expect_patch := scenario == "patch"
 	expect_properties := scenario == "workflow-properties"
+	expect_signal_with_start := scenario == "signal-with-start"
 	expect_activity_cancel_details := scenario == "activity-cancel-details"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
@@ -887,7 +942,7 @@ main :: proc() {
 		{
 			max_activity_tasks = expect_cancel ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -922,8 +977,12 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_properties {
-			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 ||
+		} else if expect_patch || expect_properties || expect_signal_with_start {
+			expected_signals := 0
+			if expect_signal_with_start {
+				expected_signals = 2
+			}
+			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != expected_signals ||
 			   run_stats.timers_canceled != 0 {
 				fmt.eprintln("Command-only Workflow path produced unexpected worker stats")
 				failed = true
@@ -1030,6 +1089,8 @@ main :: proc() {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
 	} else if expect_properties {
 		fmt.println("Workflow info, memo, and Search Attributes completed through Core and Temporal Server")
+	} else if expect_signal_with_start {
+		fmt.println("Signal-With-Start created once, reused the execution, and delivered both Signal headers")
 	} else if expect_abandon_update {
 		fmt.println("Workflow close abandoned the unfinished Update handler with a warning")
 	} else if expect_cancel_update {

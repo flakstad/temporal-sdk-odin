@@ -73,6 +73,8 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.CountSchedulesRequest \
   temporal.api.workflowservice.v1.CountSchedulesResponse \
   temporal.api.workflowservice.v1.SignalWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.SignalWithStartWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.QueryWorkflowRequest \
   temporal.api.workflowservice.v1.QueryWorkflowResponse \
   temporal.api.workflowservice.v1.UpdateWorkflowExecutionRequest \
