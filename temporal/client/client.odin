@@ -2363,6 +2363,25 @@ execute_update_json :: proc(
 	return {}
 }
 
+cancel_workflow_terminal :: proc(input: ^Client_Cancel_Workflow_Input) -> Error {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	execution := workflow_execution(input.handle)
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{
+		namespace = input.handle.client.namespace,
+		workflow_execution = &execution,
+		identity = "temporal-sdk-odin@local",
+		request_id = resolve_request_id(input.request_id, request_id_buffer[:]),
+		first_execution_run_id = input.handle.first_execution_run_id,
+		reason = input.reason,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(&request)
+	defer delete(request_bytes)
+	return rpc_empty_response(input.handle, "RequestCancelWorkflowExecution", request_bytes[:])
+}
+
 cancel_workflow :: proc(
 	handle: ^Workflow_Handle,
 	reason := "",
@@ -2371,39 +2390,68 @@ cancel_workflow :: proc(
 	if !workflow_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
-	execution := workflow_execution(handle)
-	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
-		workflow_execution = &execution,
-		identity = "temporal-sdk-odin@local",
-		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
-		first_execution_run_id = handle.first_execution_run_id,
+	input := Client_Cancel_Workflow_Input{
+		handle = handle,
 		reason = reason,
+		request_id = explicit_request_id,
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(&request)
+	state := Client_Interceptor_State{client = handle.client}
+	return client_cancel_workflow_chain(&state, &input)
+}
+
+terminate_workflow_terminal :: proc(input: ^Client_Terminate_Workflow_Input) -> Error {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	execution := workflow_execution(input.handle)
+	detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(detail_payloads.payloads)
+	payload := proto.Temporal_Api_Common_V1_Payload{}
+	if input.has_details {
+		payload = proto.encode_payload(input.details)
+		defer delete(payload.metadata)
+		defer delete(payload.external_payloads)
+		append(&detail_payloads.payloads, payload)
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
+		namespace = input.handle.client.namespace,
+		workflow_execution = &execution,
+		reason = input.reason,
+		identity = "temporal-sdk-odin@local",
+		first_execution_run_id = input.handle.first_execution_run_id,
+	}
+	if input.has_details {
+		request.details = &detail_payloads
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
 	defer delete(request_bytes)
-	return rpc_empty_response(handle, "RequestCancelWorkflowExecution", request_bytes[:])
+	return rpc_empty_response(input.handle, "TerminateWorkflowExecution", request_bytes[:])
+}
+
+terminate_workflow_intercept :: proc(
+	handle: ^Workflow_Handle,
+	reason: string,
+	details: codec.Payload_View,
+	has_details: bool,
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	input := Client_Terminate_Workflow_Input{
+		handle = handle,
+		reason = reason,
+		details = details,
+		has_details = has_details,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_terminate_workflow_chain(&state, &input)
 }
 
 terminate_workflow :: proc(
 	handle: ^Workflow_Handle,
 	reason := "",
 ) -> Error {
-	if !workflow_handle_valid(handle) {
-		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
-	}
-	execution := workflow_execution(handle)
-	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
-		workflow_execution = &execution,
-		reason = reason,
-		identity = "temporal-sdk-odin@local",
-		first_execution_run_id = handle.first_execution_run_id,
-	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
-	defer delete(request_bytes)
-	return rpc_empty_response(handle, "TerminateWorkflowExecution", request_bytes[:])
+	return terminate_workflow_intercept(handle, reason, {}, false)
 }
 
 terminate_workflow_payload :: proc(
@@ -2411,27 +2459,7 @@ terminate_workflow_payload :: proc(
 	reason: string,
 	details: codec.Payload_View,
 ) -> Error {
-	if !workflow_handle_valid(handle) {
-		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
-	}
-	execution := workflow_execution(handle)
-	payload := proto.encode_payload(details)
-	defer delete(payload.metadata)
-	defer delete(payload.external_payloads)
-	detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
-	defer delete(detail_payloads.payloads)
-	append(&detail_payloads.payloads, payload)
-	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
-		workflow_execution = &execution,
-		reason = reason,
-		details = &detail_payloads,
-		identity = "temporal-sdk-odin@local",
-		first_execution_run_id = handle.first_execution_run_id,
-	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
-	defer delete(request_bytes)
-	return rpc_empty_response(handle, "TerminateWorkflowExecution", request_bytes[:])
+	return terminate_workflow_intercept(handle, reason, details, true)
 }
 
 terminate_workflow_json :: proc(

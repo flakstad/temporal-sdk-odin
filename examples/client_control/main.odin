@@ -80,6 +80,36 @@ update_interceptor :: proc(
 	return temporal_client.client_start_update_next(next, input)
 }
 
+cancel_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Cancel_Workflow_Input,
+	next: temporal_client.Client_Cancel_Workflow_Next,
+) -> temporal_client.Error {
+	fmt.printf("Client cancel interceptor entered reason=%q\n", input.reason)
+	result := temporal_client.client_cancel_workflow_next(next, input)
+	if result.message == nil {
+		fmt.println("Client cancel interceptor exited after Core")
+	}
+	return result
+}
+
+terminate_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Terminate_Workflow_Input,
+	next: temporal_client.Client_Terminate_Workflow_Next,
+) -> temporal_client.Error {
+	fmt.printf(
+		"Client terminate interceptor entered reason=%q has_details=%v\n",
+		input.reason,
+		input.has_details,
+	)
+	result := temporal_client.client_terminate_workflow_next(next, input)
+	if result.message == nil {
+		fmt.println("Client terminate interceptor exited after Core")
+	}
+	return result
+}
+
 run :: proc() -> int {
 	action_buffer: [32]u8
 	id_buffer: [256]u8
@@ -97,6 +127,8 @@ run :: proc() -> int {
 		signal_workflow = signal_interceptor,
 		query_workflow = query_interceptor,
 		start_update = update_interceptor,
+		cancel_workflow = cancel_interceptor,
+		terminate_workflow = terminate_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",

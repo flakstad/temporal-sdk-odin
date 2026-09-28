@@ -1345,8 +1345,9 @@ uses that split rather than one universal hook. The Activity family is now the
 first complete chain: Worker-level interceptors wrap inbound callback execution
 and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
-start, Signal, Query, and Update start. Workflow outbound now applies that same
-contract to remote and Local Activity scheduling, Child Workflow start/Signal,
+start, Signal, Query, Update start, cancellation, and termination. Workflow
+outbound now applies that same contract to remote and Local Activity scheduling,
+Child Workflow start/Signal,
 external Workflow Signal/cancellation, Continue-As-New, durable sleep, and
 explicit Child Workflow cancellation. Workflow inbound interception now wraps
 the complete Workflow execution, Queries, Signals, Update validation, and
@@ -1378,12 +1379,15 @@ into the shared working map; memo, Search Attributes, static metadata, policies,
 and timeouts remain in the mutable start options. This is an allocation per
 intercepted call, chosen to make ownership and caller isolation unambiguous.
 
-The Client owns a copy of interceptor records, but callback `user_data` is
-borrowed. A 500-case property checks nested Signal chains and arbitrary
-short-circuit depth. Live start, Signal, Query, and Update paths prove header
-projection through Service/Core. Schedule and Visibility operations, result
-polling, cancellation, termination, Signal-With-Start, and connection mutation
-are not yet intercepted.
+Cancellation provides mutable reason/request-ID fields, while termination
+provides a mutable reason and optional borrowed Payload view. Both terminal
+continuations encode only after the complete chain has run. The Client owns a
+copy of interceptor records, but callback `user_data` is borrowed. A 500-case
+property checks nested Signal/cancel/terminate chains and arbitrary
+short-circuit depth. Live start, Signal, Query, Update, cancellation, and
+termination paths cross Service/Core. Schedule and Visibility operations,
+result polling, Signal-With-Start, and connection mutation are not yet
+intercepted.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.
 The Worker copies configured `workflow.Outbound_Interceptor` records into every

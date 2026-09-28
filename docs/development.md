@@ -1183,11 +1183,14 @@ heartbeat-before/after across a real Core worker and CLI dev server.
 ### Client outbound interceptor chain
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
-for Workflow start, Signal, Query, and Update start. Each operation has a
-dedicated mutable input and result-bearing `next`; no result passes through an
-untyped pointer. Registration order is outermost-first and unwind order is
+for Workflow start, Signal, Query, Update start, cancellation, and termination.
+Each operation has a dedicated mutable input and result-bearing `next`; no
+result passes through an untyped pointer. Cancellation exposes its reason and
+request ID. Termination exposes its reason plus an optional codec-neutral
+details Payload. Registration order is outermost-first and unwind order is
 reversed. Skipping `next` deliberately short-circuits the RPC, so a successful
-short circuit must return a valid operation-specific handle or Payload.
+start/update/query short circuit must return a valid operation-specific handle
+or Payload.
 
 Before the chain runs, the SDK clones existing headers into a per-call owned
 `Headers` value. Workflow-start headers are adapted from `Start_Metadata`; the
@@ -1200,11 +1203,13 @@ their `user_data` until `close`.
 Client calls may run concurrently; mutable interceptor user data therefore needs
 application-level synchronization.
 
-The unit and 500-case PBT tests cover nested order, short-circuiting, and header
-isolation. `client_start` injects a start header solely through the interceptor;
-`client_control` does the same for Signal, Query, and Update. The full dev-server
-suite requires all four headers to arrive in Workflow code, including Update
-context after Activity suspension.
+The unit and 500-case PBT tests cover nested order, short-circuiting, header
+isolation, and mutable cancellation/termination inputs. `client_start` injects
+a start header solely through the interceptor; `client_control` does the same
+for Signal, Query, and Update. The full dev-server suite requires all four
+headers to arrive in Workflow code, including Update context after Activity
+suspension, and requires cancellation and termination chains to unwind only
+after their real Core RPC succeeds.
 
 ### Workflow outbound interceptor chain
 

@@ -206,8 +206,9 @@ trace_activity :: proc(
 ```
 
 Client connections accept an ordered `[]Client_Interceptor`. The current
-typesafe outbound surface wraps Workflow start, Signal, Query, and Update start;
-each operation has its own input, result, and `next` type:
+typesafe outbound surface wraps Workflow start, Signal, Query, Update start,
+cancellation, and termination; each operation has its own input, result, and
+`next` type:
 
 ```odin
 propagate_signal :: proc(

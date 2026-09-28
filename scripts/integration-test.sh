@@ -741,11 +741,14 @@ grep -q 'activation_failed=true error="Workflow type odin_missing_workflow not f
 grep -q 'activation_failed=false .*evicted=true' "$worker_log"
 grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file"
 kill -0 "$worker_pid"
-TEMPORAL_CLIENT_ACTION=terminate \
+unknown_terminate_output="$(TEMPORAL_CLIENT_ACTION=terminate \
   TEMPORAL_CLIENT_WORKFLOW_ID="$unknown_workflow_id" \
   TEMPORAL_CLIENT_REASON="unknown Workflow type test completed" \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
-  "$repo_root/scripts/run-client-control.sh"
+  "$repo_root/scripts/run-client-control.sh")"
+echo "$unknown_terminate_output"
+grep -q 'Client terminate interceptor entered reason="unknown Workflow type test completed" has_details=false' <<<"$unknown_terminate_output"
+grep -q 'Client terminate interceptor exited after Core' <<<"$unknown_terminate_output"
 unknown_workflow_id=""
 
 workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
@@ -1117,11 +1120,14 @@ for _ in {1..30}; do
   sleep 0.1
 done
 
-TEMPORAL_CLIENT_ACTION=cancel \
+cancel_update_output="$(TEMPORAL_CLIENT_ACTION=cancel \
   TEMPORAL_CLIENT_WORKFLOW_ID="$cancel_update_workflow_id" \
   TEMPORAL_CLIENT_REASON="drain detached Update" \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
-  "$repo_root/scripts/run-client-control.sh"
+  "$repo_root/scripts/run-client-control.sh")"
+echo "$cancel_update_output"
+grep -q 'Client cancel interceptor entered reason="drain detached Update"' <<<"$cancel_update_output"
+grep -q 'Client cancel interceptor exited after Core' <<<"$cancel_update_output"
 
 wait "$slow_update_pid"
 slow_update_pid=""

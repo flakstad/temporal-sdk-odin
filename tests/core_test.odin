@@ -23,8 +23,11 @@ Heartbeat_Capture :: struct {
 }
 
 Client_Interceptor_Test_State :: struct {
-	events: [8]int,
-	count:  int,
+	events:                  [8]int,
+	count:                   int,
+	cancel_reason_seen:      bool,
+	terminate_reason_seen:   bool,
+	terminate_details_seen:  bool,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -50,6 +53,59 @@ client_interceptor_test_signal :: proc(
 		result = temporal_client.error_from_string(.Rpc, "interceptor short circuit")
 	} else {
 		result = temporal_client.client_signal_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
+client_interceptor_test_cancel :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Cancel_Workflow_Input,
+	next: temporal_client.Client_Cancel_Workflow_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.reason = "intercepted cancellation"
+	} else {
+		node.state.cancel_reason_seen = input.reason == "intercepted cancellation"
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "cancel short circuit")
+	} else {
+		result = temporal_client.client_cancel_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
+client_interceptor_test_terminate :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Terminate_Workflow_Input,
+	next: temporal_client.Client_Terminate_Workflow_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.reason = "intercepted termination"
+	} else {
+		node.state.terminate_reason_seen = input.reason == "intercepted termination"
+		details: string
+		decode_error := codec.decode_json(input.details, &details)
+		node.state.terminate_details_seen = input.has_details && decode_error == .None &&
+		                                    details == "caller details"
+		delete(details)
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "terminate short circuit")
+	} else {
+		result = temporal_client.client_terminate_workflow_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -5332,6 +5388,90 @@ client_signal_interceptors_nest_and_isolate_working_headers :: proc(t: ^testing.
 	// builder remains unchanged and can be reused safely.
 	testing.expect_value(t, len(headers.entries), 1)
 	testing.expect_value(t, headers.entries[0].key, "caller")
+}
+
+@(test)
+client_cancel_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			cancel_workflow = client_interceptor_test_cancel,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			cancel_workflow = client_interceptor_test_cancel,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+
+	cancel_error := temporal_client.cancel_workflow(
+		&handle,
+		"caller cancellation",
+		"caller-request-id",
+	)
+	defer temporal_client.error_free(&cancel_error)
+	testing.expect_value(t, cancel_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(cancel_error.message), "cancel short circuit")
+	testing.expect(t, state.cancel_reason_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_terminate_interceptors_nest_and_preserve_details :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			terminate_workflow = client_interceptor_test_terminate,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			terminate_workflow = client_interceptor_test_terminate,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+	details, encode_error := codec.encode_json("caller details")
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&details)
+
+	terminate_error := temporal_client.terminate_workflow_payload(
+		&handle,
+		"caller termination",
+		codec.payload_view(&details),
+	)
+	defer temporal_client.error_free(&terminate_error)
+	testing.expect_value(t, terminate_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(terminate_error.message), "terminate short circuit")
+	testing.expect(t, state.terminate_reason_seen)
+	testing.expect(t, state.terminate_details_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
 }
 
 @(test)

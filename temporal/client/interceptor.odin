@@ -102,12 +102,59 @@ Client_Start_Update_Interceptor_Proc :: #type proc(
 	next: Client_Start_Update_Next,
 ) -> (Update_Handle, Error)
 
+Client_Cancel_Workflow_Input :: struct {
+	handle:     ^Workflow_Handle,
+	reason:     string,
+	request_id: string,
+}
+
+Client_Cancel_Workflow_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Cancel_Workflow_Input,
+) -> Error
+
+Client_Cancel_Workflow_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Cancel_Workflow_Next_Proc,
+}
+
+Client_Cancel_Workflow_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Cancel_Workflow_Input,
+	next: Client_Cancel_Workflow_Next,
+) -> Error
+
+Client_Terminate_Workflow_Input :: struct {
+	handle:      ^Workflow_Handle,
+	reason:      string,
+	details:     activity_codec.Payload_View,
+	has_details: bool,
+}
+
+Client_Terminate_Workflow_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Terminate_Workflow_Input,
+) -> Error
+
+Client_Terminate_Workflow_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Terminate_Workflow_Next_Proc,
+}
+
+Client_Terminate_Workflow_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Terminate_Workflow_Input,
+	next: Client_Terminate_Workflow_Next,
+) -> Error
+
 Client_Interceptor :: struct {
-	user_data:      rawptr,
-	start_workflow: Client_Start_Workflow_Interceptor_Proc,
-	signal_workflow: Client_Signal_Workflow_Interceptor_Proc,
-	query_workflow: Client_Query_Workflow_Interceptor_Proc,
-	start_update:   Client_Start_Update_Interceptor_Proc,
+	user_data:          rawptr,
+	start_workflow:     Client_Start_Workflow_Interceptor_Proc,
+	signal_workflow:    Client_Signal_Workflow_Interceptor_Proc,
+	query_workflow:     Client_Query_Workflow_Interceptor_Proc,
+	start_update:       Client_Start_Update_Interceptor_Proc,
+	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
+	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 }
 
 client_start_workflow_next :: proc(
@@ -146,6 +193,26 @@ client_start_update_next :: proc(
 ) -> (Update_Handle, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Update interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_cancel_workflow_next :: proc(
+	next: Client_Cancel_Workflow_Next,
+	input: ^Client_Cancel_Workflow_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid cancel Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_terminate_workflow_next :: proc(
+	next: Client_Terminate_Workflow_Next,
+	input: ^Client_Terminate_Workflow_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid terminate Workflow interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -281,4 +348,46 @@ client_start_update_chain :: proc(
 		)
 	}
 	return start_update_payload_terminal(input)
+}
+
+client_cancel_workflow_chain :: proc(
+	data: rawptr,
+	input: ^Client_Cancel_Workflow_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid cancel Workflow interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.cancel_workflow == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.cancel_workflow(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_cancel_workflow_chain},
+		)
+	}
+	return cancel_workflow_terminal(input)
+}
+
+client_terminate_workflow_chain :: proc(
+	data: rawptr,
+	input: ^Client_Terminate_Workflow_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid terminate Workflow interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.terminate_workflow == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.terminate_workflow(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_terminate_workflow_chain},
+		)
+	}
+	return terminate_workflow_terminal(input)
 }
