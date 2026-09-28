@@ -36,6 +36,7 @@ Greeting_Update_Input :: struct {
 Greeting_Update_Output :: struct {
 	previous_name: string,
 	current_name:  string,
+	caller:        string,
 }
 
 run :: proc() -> int {
@@ -155,10 +156,29 @@ run :: proc() -> int {
 		if len(new_name) == 0 {
 			new_name = "Temporal"
 		}
-		update_handle, start_update_error := temporal_client.start_update_json(
+		headers := temporal_client.Headers{}
+		headers_error := temporal_client.headers_init(&headers)
+		if headers_error.message != nil {
+			print_error("Update header initialization", &headers_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_error)
+		defer temporal_client.headers_free(&headers)
+		header_error := temporal_client.headers_add_json(
+			&headers,
+			"caller",
+			"odin-client-control",
+		)
+		if header_error.message != nil {
+			print_error("Update header encoding", &header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		update_handle, start_update_error := temporal_client.start_update_json_with_options(
 			&handle,
 			update_name,
 			Greeting_Update_Input{name = new_name},
+			{headers = &headers},
 		)
 		if start_update_error.message != nil {
 			operation_error = start_update_error
@@ -174,12 +194,14 @@ run :: proc() -> int {
 		}
 		defer delete(output.previous_name)
 		defer delete(output.current_name)
+		defer delete(output.caller)
 		fmt.printf(
-			"Odin client update=%s workflow_id=%s previous=%q current=%q\n",
+			"Odin client update=%s workflow_id=%s previous=%q current=%q caller=%q\n",
 			update_name,
 			workflow_id,
 			output.previous_name,
 			output.current_name,
+			output.caller,
 		)
 		return 0
 	case "terminate":

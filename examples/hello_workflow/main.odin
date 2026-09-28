@@ -80,6 +80,7 @@ Greeting_Update_Input :: struct {
 Greeting_Update_Output :: struct {
 	previous_name: string,
 	current_name:  string,
+	caller:        string,
 }
 
 greeting_status_query :: proc(
@@ -96,24 +97,39 @@ greeting_status_query :: proc(
 }
 
 validate_greeting_name :: proc(
+	update: ^workflow.Update_Context,
 	_: Greeting_Query_State,
 	input: Greeting_Update_Input,
 ) -> workflow.Update_Validation {
 	if len(input.name) == 0 || input.name == "reject" {
 		return workflow.update_reject("greeting name is invalid", "InvalidGreetingName")
 	}
+	caller: string
+	found, decode_error := workflow.update_header_json(update, "caller", &caller)
+	defer delete(caller)
+	if !found || decode_error != .None || caller != "odin-client-control" ||
+	   len(update.id) == 0 || update.name != "set_greeting_name" || len(update.identity) == 0 {
+		return workflow.update_reject("greeting Update context is invalid", "InvalidUpdateContext")
+	}
 	return workflow.update_accept()
 }
 
 update_greeting_name :: proc(
 	ctx: ^workflow.Fiber_Context,
+	update: ^workflow.Update_Context,
 	state: ^Greeting_Query_State,
 	input: Greeting_Update_Input,
 ) -> Greeting_Update_Output {
 	previous := state.name
+	caller: string
+	_, _ = workflow.update_header_json(update, "caller", &caller)
 	_ = workflow.execute_activity(ctx, "hello", input.name)
+	current_update, update_present := workflow.current_update(ctx)
+	if !update_present || current_update != update {
+		caller = "Update context lost across suspension"
+	}
 	state.name = input.name
-	return {previous_name = previous, current_name = state.name}
+	return {previous_name = previous, current_name = state.name, caller = caller}
 }
 
 hold_greeting_name :: proc(
@@ -378,7 +394,7 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register greeting status query"
 	}
-	if !workflow.set_validated_update_routine_json(
+	if !workflow.set_validated_update_routine_json_with_context(
 		ctx,
 		"set_greeting_name",
 		&query_state,

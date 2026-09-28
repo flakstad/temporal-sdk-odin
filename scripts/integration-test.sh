@@ -781,6 +781,7 @@ fast_update_output="$(<"$workflow_control_output_file")"
 echo "$fast_update_output"
 grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$fast_update_output"
 grep -q 'previous="Odin" current="Temporal-fast"' <<<"$fast_update_output"
+grep -q 'caller="odin-client-control"' <<<"$fast_update_output"
 
 wait "$slow_update_pid"
 slow_update_pid=""
@@ -788,6 +789,7 @@ slow_update_output="$(<"$slow_update_output_file")"
 echo "$slow_update_output"
 grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$slow_update_output"
 grep -q 'previous="Odin" current="Temporal-slow"' <<<"$slow_update_output"
+grep -q 'caller="odin-client-control"' <<<"$slow_update_output"
 
 TEMPORAL_CLIENT_ACTION=query \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \

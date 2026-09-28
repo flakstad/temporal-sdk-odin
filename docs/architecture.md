@@ -1324,6 +1324,26 @@ returned by the start RPC is owned by `Update_Handle` and served locally by
 `wait_update_*`; this is required for validator rejections, whose completed
 reference is not guaranteed to be pollable as a later accepted Update.
 
+The option-aware start variants project the shared owned `Headers` builder into
+`Temporal_Api_Update_V1_Input.header`. Core later exposes that map together with
+Update ID/name and `Request.meta.identity` on `DoUpdate`. Odin clones those
+borrowed activation fields into the Workflow run arena before invoking either
+the validator or handler. This ownership transfer is necessary because a
+stackful handler may suspend for arbitrarily many activations; its
+`Update_Context` remains stable until eviction, then replay reconstructs it
+from history. The client RPC and worker paths both use existing generic C
+bridge symbols, so this feature adds no ABI surface.
+
+This shape follows the upstream language boundary rather than inventing an
+Odin-only header channel: Python's
+[`HandleUpdateInput`](https://github.com/temporalio/sdk-python/blob/main/temporalio/worker/_interceptor.py)
+carries headers through its Workflow inbound interceptor, while the outbound
+interceptor is responsible for commands issued by handler code. .NET's
+[OpenTelemetry interceptor](https://github.com/temporalio/sdk-dotnet/blob/main/src/Temporalio.Extensions.OpenTelemetry/TracingInterceptor.cs)
+demonstrates the same client/workflow/activity interception split. Odin
+currently exposes the data-bearing context seam only; ordering, middleware
+composition, and outbound/inbound interceptor chains remain future work.
+
 The live CLI-devserver test first rejects an invalid name through the validator,
 then holds two typed rename Updates concurrently. Their independent routines
 schedule Activity sequences 1 and 2; sequence 2 resolves first, then sequence 1.
@@ -1795,7 +1815,8 @@ command/replay cases, plus 500 Activity deadline combinations,
 500 Client start request (including static UserMetadata and eager-start intent)
 round trips, 500 Signal-With-Start request round trips, 500 ordinary Signal
 request/header round trips, 500 paginated Visibility
-list/count round trips, 500 query request/header round trips,
+list/count round trips, 500 query request/header round trips, 500 Update
+request/header round trips,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow

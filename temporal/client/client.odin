@@ -610,6 +610,11 @@ Signal_Workflow_Options :: struct {
 	headers:    ^Headers,
 }
 
+Update_Workflow_Options :: struct {
+	update_id: string,
+	headers:   ^Headers,
+}
+
 // Query_Reject_Condition controls whether Temporal may deliver a Query for a
 // closed execution. Unspecified preserves the Service default.
 Query_Reject_Condition :: enum {
@@ -1827,19 +1832,25 @@ poll_update_result_payload :: proc(
 	}
 }
 
-start_update_payload :: proc(
-	handle: ^Workflow_Handle,
-	update_name: string,
+// encode_update_workflow_request is exposed for wire-contract testing. The
+// returned request waits only for acceptance; result polling remains a separate
+// Client operation.
+encode_update_workflow_request :: proc(
+	namespace, workflow_id, run_id, first_execution_run_id, update_name: string,
 	input: codec.Payload_View,
-	explicit_update_id := "",
-) -> (Update_Handle, Error) {
-	if !workflow_handle_valid(handle) {
-		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	options: Update_Workflow_Options = {},
+	explicit_request_id := "",
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 || len(update_name) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Update namespace, Workflow ID, and name are required")
 	}
-	if len(update_name) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow Update name must not be empty")
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return nil, error_from_string(.Invalid_Argument, "Workflow Update headers are not initialized")
 	}
-	execution := workflow_execution(handle)
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
 	encoded_input := proto.encode_payload(input)
 	defer delete(encoded_input.metadata)
 	defer delete(encoded_input.external_payloads)
@@ -1848,31 +1859,93 @@ start_update_payload :: proc(
 	append(&arguments.payloads, encoded_input)
 	update_id_buffer: [uuid.EXPECTED_LENGTH]u8
 	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	update_id := resolve_request_id(explicit_update_id, update_id_buffer[:])
 	meta := proto.Temporal_Api_Update_V1_Meta{
-		update_id = update_id,
+		update_id = resolve_request_id(options.update_id, update_id_buffer[:]),
 		identity = "temporal-sdk-odin@local",
 	}
 	update_input := proto.Temporal_Api_Update_V1_Input{
 		name = update_name,
 		args = &arguments,
 	}
+	header := proto.Temporal_Api_Common_V1_Header{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer free_start_proto_payloads(header_payloads)
+	if options.headers != nil && len(options.headers.entries) > 0 {
+		header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(options.headers.entries))
+		for &entry, index in options.headers.entries {
+			header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+		}
+		for entry, index in options.headers.entries {
+			append(
+				&header.fields,
+				proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				},
+			)
+		}
+		update_input.header = &header
+	}
 	update_request := proto.Temporal_Api_Update_V1_Request{
 		meta = &meta,
 		input = &update_input,
-		request_id = resolve_request_id("", request_id_buffer[:]),
+		request_id = resolve_request_id(explicit_request_id, request_id_buffer[:]),
 	}
 	wait_policy := proto.Temporal_Api_Update_V1_WaitPolicy{
 		lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED,
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest{
-		namespace = handle.client.namespace,
+		namespace = namespace,
 		workflow_execution = &execution,
-		first_execution_run_id = handle.first_execution_run_id,
+		first_execution_run_id = first_execution_run_id,
 		wait_policy = &wait_policy,
 		request = &update_request,
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(&request)
+	return proto.encode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(&request), {}
+}
+
+start_update_payload :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: codec.Payload_View,
+	explicit_update_id := "",
+) -> (Update_Handle, Error) {
+	return start_update_payload_with_options(
+		handle,
+		update_name,
+		input,
+		{update_id = explicit_update_id},
+	)
+}
+
+start_update_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: codec.Payload_View,
+	options: Update_Workflow_Options,
+) -> (Update_Handle, Error) {
+	if !workflow_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if len(update_name) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update name must not be empty")
+	}
+	if options.headers != nil && options.headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update headers are not initialized")
+	}
+	request_bytes, request_error := encode_update_workflow_request(
+		handle.client.namespace,
+		handle.id,
+		handle.run_id,
+		handle.first_execution_run_id,
+		update_name,
+		input,
+		options,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
 	defer delete(request_bytes)
 	for {
 		rpc_result := temporal_core.client_rpc_call(
@@ -1983,16 +2056,30 @@ start_update_json :: proc(
 	input: $Input,
 	explicit_update_id := "",
 ) -> (Update_Handle, Error) {
+	return start_update_json_with_options(
+		handle,
+		update_name,
+		input,
+		{update_id = explicit_update_id},
+	)
+}
+
+start_update_json_with_options :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: $Input,
+	options: Update_Workflow_Options,
+) -> (Update_Handle, Error) {
 	payload, encode_error := codec.encode_json(input)
 	if encode_error != .None {
 		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow Update input")
 	}
 	defer codec.payload_free(&payload)
-	return start_update_payload(
+	return start_update_payload_with_options(
 		handle,
 		update_name,
 		codec.payload_view(&payload),
-		explicit_update_id,
+		options,
 	)
 }
 

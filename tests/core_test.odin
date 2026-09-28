@@ -2521,6 +2521,9 @@ Update_Routine_Output :: struct {
 	previous:        string,
 	current:         string,
 	activity_result: string,
+	update_id:       string,
+	identity:        string,
+	caller:          string,
 }
 
 Update_Routine_State :: struct {
@@ -2580,28 +2583,54 @@ fiber_signal_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 
 fiber_update_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Update_Routine_State{name = name}
-	registered := workflow.set_validated_update_routine_json(
+	registered := workflow.set_validated_update_routine_json_with_context(
 		ctx,
 		"rename_with_activity",
 		&state,
-		proc(_: Update_Routine_State, input: Update_Routine_Input) -> workflow.Update_Validation {
+		proc(
+			update: ^workflow.Update_Context,
+			_: Update_Routine_State,
+			input: Update_Routine_Input,
+		) -> workflow.Update_Validation {
 			if len(input.name) == 0 {
 				return workflow.update_reject("name is required", "InvalidName")
+			}
+			caller: string
+			found, decode_error := workflow.update_header_json(update, "caller", &caller)
+			defer delete(caller)
+			if decode_error != .None || update.name != "rename_with_activity" {
+				return workflow.update_reject("Update context mismatch", "InvalidUpdateContext")
+			}
+			// Existing replay/concurrency fixtures intentionally omit optional
+			// client context. When it is supplied, validate it before acceptance.
+			if found && (caller != "odin-client" ||
+			   update.id != "rename-with-activity-1" || update.identity != "client-identity") {
+				return workflow.update_reject("Update context mismatch", "InvalidUpdateContext")
 			}
 			return workflow.update_accept()
 		},
 		proc(
 			routine_ctx: ^workflow.Fiber_Context,
+			update: ^workflow.Update_Context,
 			state: ^Update_Routine_State,
 			input: Update_Routine_Input,
 		) -> Update_Routine_Output {
 			previous := state.name
+			caller: string
+			_, _ = workflow.update_header_json(update, "caller", &caller)
 			activity_result := workflow.execute_activity(routine_ctx, "decorate_name", input.name)
+			current_update, update_present := workflow.current_update(routine_ctx)
+			if !update_present || current_update != update {
+				caller = "Update context lost across suspension"
+			}
 			state.name = activity_result
 			return {
 				previous = previous,
 				current = state.name,
 				activity_result = activity_result,
+				update_id = update.id,
+				identity = update.identity,
+				caller = caller,
 			}
 		},
 	)
@@ -4773,6 +4802,72 @@ client_signal_projects_request_id_and_headers :: proc(t: ^testing.T) {
 	delete(invalid_bytes)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
 	temporal_client.error_free(&invalid_error)
+}
+
+@(test)
+client_update_projects_identity_and_headers :: proc(t: ^testing.T) {
+	headers := temporal_client.Headers{}
+	init_error := temporal_client.headers_init(&headers)
+	testing.expect(t, init_error.message == nil)
+	temporal_client.error_free(&init_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "caller", "odin-client")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	input, encode_error := codec.encode_json("renamed")
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&input)
+
+	request_bytes, request_error := temporal_client.encode_update_workflow_request(
+		"default",
+		"workflow-id",
+		"run-id",
+		"first-run-id",
+		"rename",
+		codec.payload_view(&input),
+		{update_id = "update-id", headers = &headers},
+		"request-id",
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Update encoding failed: %s", string(request_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "default")
+	testing.expect_value(t, request.workflow_execution.workflow_id, "workflow-id")
+	testing.expect_value(t, request.workflow_execution.run_id, "run-id")
+	testing.expect_value(t, request.first_execution_run_id, "first-run-id")
+	testing.expect(t, request.request != nil && request.request.input != nil)
+	if request.request != nil && request.request.input != nil {
+		testing.expect_value(t, request.request.meta.update_id, "update-id")
+		testing.expect_value(t, request.request.request_id, "request-id")
+		testing.expect_value(t, request.request.input.name, "rename")
+		testing.expect(t, request.request.input.header != nil)
+		if request.request.input.header != nil {
+			testing.expect_value(t, len(request.request.input.header.fields), 1)
+			testing.expect_value(t, request.request.input.header.fields[0].key, "caller")
+			owned_header, clone_error := proto.clone_payload(
+				request.request.input.header.fields[0].value,
+			)
+			testing.expect(t, clone_error == .None)
+			caller: string
+			testing.expect(t, codec.decode_json(codec.payload_view(&owned_header), &caller) == .None)
+			testing.expect_value(t, caller, "odin-client")
+			delete(caller)
+			codec.payload_free(&owned_header)
+		}
+	}
 }
 
 @(test)
@@ -8041,7 +8136,23 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 		run_validator = true,
 	}
 	defer delete(update.input)
+	defer delete(update.headers)
 	append(&update.input, update_input_proto)
+	update_meta := proto.Temporal_Api_Update_V1_Meta{identity = "client-identity"}
+	update.meta = &update_meta
+	update_header, update_header_error := codec.encode_json("odin-client")
+	testing.expect(t, update_header_error == .None)
+	defer codec.payload_free(&update_header)
+	update_header_proto := proto.encode_payload(codec.payload_view(&update_header))
+	defer delete(update_header_proto.metadata)
+	defer delete(update_header_proto.external_payloads)
+	append(
+		&update.headers,
+		proto.Coresdk_Workflow_Activation_DoUpdate_HeadersEntry{
+			key = "caller",
+			value = &update_header_proto,
+		},
+	)
 	finish_input, finish_input_error := codec.encode_json("done")
 	testing.expect(t, finish_input_error == .None)
 	defer codec.payload_free(&finish_input)
@@ -8138,9 +8249,15 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect_value(t, output.previous, "Odin")
 	testing.expect_value(t, output.current, "Hello Temporal")
 	testing.expect_value(t, output.activity_result, "Hello Temporal")
+	testing.expect_value(t, output.update_id, "rename-with-activity-1")
+	testing.expect_value(t, output.identity, "client-identity")
+	testing.expect_value(t, output.caller, "odin-client")
 	delete(output.previous)
 	delete(output.current)
 	delete(output.activity_result)
+	delete(output.update_id)
+	delete(output.identity)
+	delete(output.caller)
 	update_response_inspection_free(&completed_update)
 	update_finish_completion := processed.completion
 	workflow.error_free(&processed.error)
@@ -8965,6 +9082,9 @@ workflow_detached_update_finishes_before_cancellation_and_replays :: proc(t: ^te
 	delete(update_output.previous)
 	delete(update_output.current)
 	delete(update_output.activity_result)
+	delete(update_output.update_id)
+	delete(update_output.identity)
+	delete(update_output.caller)
 	update_response_inspection_free(&update_finished)
 	terminal_completion := processed.completion
 	workflow.error_free(&processed.error)
@@ -9222,6 +9342,9 @@ workflow_update_routines_complete_out_of_order_and_replay :: proc(t: ^testing.T)
 	delete(second_result.previous)
 	delete(second_result.current)
 	delete(second_result.activity_result)
+	delete(second_result.update_id)
+	delete(second_result.identity)
+	delete(second_result.caller)
 	update_response_inspection_free(&second_completed)
 	second_completed_completion := processed.completion
 	workflow.error_free(&processed.error)
@@ -9276,6 +9399,9 @@ workflow_update_routines_complete_out_of_order_and_replay :: proc(t: ^testing.T)
 	delete(first_result.previous)
 	delete(first_result.current)
 	delete(first_result.activity_result)
+	delete(first_result.update_id)
+	delete(first_result.identity)
+	delete(first_result.caller)
 	update_response_inspection_free(&first_completed)
 	first_completed_completion := processed.completion
 	workflow.error_free(&processed.error)

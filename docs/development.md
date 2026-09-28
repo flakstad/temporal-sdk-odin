@@ -1132,18 +1132,30 @@ Client RPC or Workflow operation only borrows the builder during the call.
 Workflow operations clone it into the run arena before they can suspend.
 
 Ordinary Client Signals use `signal_workflow_json_with_options` (or the
-Payload variant) with `Signal_Workflow_Options.headers`. Workflow Activity,
+Payload variant) with `Signal_Workflow_Options.headers`. Client Updates use
+`start_update_json_with_options`/`start_update_payload_with_options` with
+`Update_Workflow_Options.headers`. Workflow Activity,
 Local Activity, Child Workflow, and child/external Signal options expose the
 same `workflow.Headers` alias. Incoming values are borrowed: use
 `workflow.signal_header_*` while the Signal context is valid, and
 `activity.header_*` during the Activity callback.
 
+Context-aware Workflow Update routines additionally receive
+`^workflow.Update_Context`. Core activation data is cloned into the Workflow
+run arena before validation or handler start, so Update ID, name, client
+identity, and headers remain valid across Activity/timer/signal suspension and
+fresh-stack replay. `workflow.update_header_*` reads the map, and
+`workflow.current_update(ctx)` identifies the currently executing Update
+routine. Do not retain these views after run eviction.
+
 The offline properties generate arbitrary header strings for ordinary Client
-Signals and every implemented outgoing Workflow command family, evict the
+Signals, Client Updates, and every implemented outgoing Workflow command family, evict the
 Workflow, and require byte-identical commands after fresh-stack replay. The
 full integration script additionally runs `activity-headers` and
-`signal-headers` scenarios against `temporal server start-dev`, proving both
-directions across Core rather than only protobuf round trips.
+`signal-headers` scenarios against `temporal server start-dev`; the normal
+Update scenario proves its header before validation and again after an Activity
+resume. Together these cover both directions across Core rather than only
+protobuf round trips.
 
 ## Troubleshooting
 

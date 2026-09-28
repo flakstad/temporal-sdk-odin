@@ -510,10 +510,15 @@ if err.kind == .Workflow_Query_Rejected && err.has_workflow_status {
     fmt.println("query rejected for", err.workflow_status)
 }
 updated: Rename_Result
-update, err := temporal_client.start_update_json(
+update_headers := temporal_client.Headers{}
+err = temporal_client.headers_init(&update_headers)
+defer temporal_client.headers_free(&update_headers)
+err = temporal_client.headers_add_json(&update_headers, "caller", "orders-api")
+update, err := temporal_client.start_update_json_with_options(
     &handle,
     "rename_order",
     Rename_Input{name = "priority-order"},
+    {headers = &update_headers},
 )
 defer temporal_client.update_handle_free(&update)
 err = temporal_client.wait_update_json(&update, &updated)
@@ -521,7 +526,8 @@ err = temporal_client.cancel_workflow(&handle, "customer canceled")
 ```
 
 `execute_update_json` remains the one-call convenience wrapper around
-`start_update_json` plus `wait_update_json`.
+`start_update_json` plus `wait_update_json`; the codec-neutral and option-aware
+variants are available when callers need custom Payloads or propagation headers.
 
 Terminal Workflow and Update errors may carry a complete Temporal Failure:
 
@@ -819,7 +825,11 @@ Typed Updates use a mutable state pointer plus an optional read-only validator.
 The routine form receives a Workflow context and can suspend:
 
 ```odin
-rename_validator :: proc(state: Status_State, input: Rename_Input) -> workflow.Update_Validation {
+rename_validator :: proc(
+    update: ^workflow.Update_Context,
+    state: Status_State,
+    input: Rename_Input,
+) -> workflow.Update_Validation {
     if len(input.name) == 0 {
         return workflow.update_reject("name is required", "InvalidName")
     }
@@ -828,6 +838,7 @@ rename_validator :: proc(state: Status_State, input: Rename_Input) -> workflow.U
 
 rename :: proc(
     ctx: ^workflow.Fiber_Context,
+    update: ^workflow.Update_Context,
     state: ^Status_State,
     input: Rename_Input,
 ) -> Rename_Result {
@@ -837,7 +848,7 @@ rename :: proc(
     return {previous = previous, current = state.order_id}
 }
 
-_ = workflow.set_validated_update_routine_json(
+_ = workflow.set_validated_update_routine_json_with_context(
     ctx,
     "rename_order",
     &state,
@@ -845,6 +856,13 @@ _ = workflow.set_validated_update_routine_json(
     rename,
 )
 ```
+
+`Update_Context` exposes the server Update ID, name, client identity, and
+headers. Its run-arena-owned values survive handler suspension, and
+`workflow.current_update(ctx)` returns the same invocation while the routine is
+running. They must not escape the Workflow run. The context-aware form is the
+first propagation/interceptor seam; a composable interceptor chain is not yet
+implemented.
 
 The runtime emits `Accepted` with the Activity command, preserves the Update
 routine by `protocol_instance_id`, and emits `Completed` after the Activity

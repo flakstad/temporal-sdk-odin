@@ -51,6 +51,11 @@ preserve Core's Signal identity, headers, and originating history event ID;
 these are borrowed Workflow-instance views. Synchronous handlers can request
 the same metadata with `set_signal_handler_json_with_context`. Header helpers
 remain codec-neutral with an optional typed JSON adapter.
+`set_validated_update_routine_json_with_context` similarly exposes an
+arena-owned `Update_Context` with Update ID/name, client identity, and headers
+to both validation and the stackful handler. The same context remains available
+through `current_update` after suspension and resume; it must not escape the
+Workflow run.
 The shared owned `Headers` builder can also be attached to remote/Local
 Activity options, Child Workflow options, and child/external Signal options.
 Each operation clones it into the Workflow run arena before suspension so the

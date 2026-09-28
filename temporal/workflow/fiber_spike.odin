@@ -16,7 +16,8 @@ import fiber_raw "fiber/raw"
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
 // operations, not a general worker/client handle. This remains an experiment.
 Fiber_Context :: struct {
-	instance: ^Fiber_Instance,
+	instance:       ^Fiber_Instance,
+	update_context: ^Update_Context,
 }
 
 Fiber_Proc :: proc(ctx: ^Fiber_Context, input: string) -> string
@@ -40,13 +41,29 @@ Update_Validate_Proc :: #type proc(
 	callback_data: rawptr,
 	input: codec.Payload_View,
 ) -> Update_Validation
+Update_Context_Validate_Proc :: #type proc(
+	callback_data: rawptr,
+	update: ^Update_Context,
+	input: codec.Payload_View,
+) -> Update_Validation
 Update_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
+	input: codec.Payload_View,
+) -> Payload_Result
+Update_Context_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	update: ^Update_Context,
 	input: codec.Payload_View,
 ) -> Payload_Result
 Update_Routine_Invoke_Proc :: #type proc(
 	callback_data: rawptr,
 	ctx: ^Fiber_Context,
+	input: codec.Payload_View,
+) -> Payload_Result
+Update_Context_Routine_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^Fiber_Context,
+	update: ^Update_Context,
 	input: codec.Payload_View,
 ) -> Payload_Result
 Signal_Invoke_Proc :: #type proc(
@@ -648,6 +665,15 @@ Query_Context :: struct {
 	headers: [dynamic]Fiber_Named_Payload,
 }
 
+// Update_Context is owned by the Workflow run arena. Header Payload views and
+// strings are valid until run eviction, but must not escape Workflow code.
+Update_Context :: struct {
+	id:       string,
+	name:     string,
+	identity: string,
+	headers:  [dynamic]Fiber_Named_Payload,
+}
+
 Fiber_Query_Handler :: struct {
 	name:                string,
 	callback_data:       rawptr,
@@ -665,11 +691,14 @@ Fiber_Signal_Handler :: struct {
 }
 
 Fiber_Update_Handler :: struct {
-	name:          string,
-	callback_data: rawptr,
-	validate:      Update_Validate_Proc,
-	invoke:        Update_Invoke_Proc,
-	invoke_routine: Update_Routine_Invoke_Proc,
+	name:                       string,
+	callback_data:              rawptr,
+	validate:                   Update_Validate_Proc,
+	validate_with_context:      Update_Context_Validate_Proc,
+	invoke:                     Update_Invoke_Proc,
+	invoke_with_context:        Update_Context_Invoke_Proc,
+	invoke_routine:             Update_Routine_Invoke_Proc,
+	invoke_routine_with_context: Update_Context_Routine_Invoke_Proc,
 	unfinished_policy: Handler_Unfinished_Policy,
 }
 
@@ -845,6 +874,8 @@ Fiber_Update_Routine :: struct {
 	input:                codec.Payload,
 	callback_data:        rawptr,
 	invoke:               Update_Routine_Invoke_Proc,
+	invoke_with_context:  Update_Context_Routine_Invoke_Proc,
+	update_context:       Update_Context,
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
@@ -1279,11 +1310,21 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 	routine := cast(^Fiber_Update_Routine)user_data
 	instance := routine.instance
 	context = instance.odin_context
-	result := routine.invoke(
-		routine.callback_data,
-		&routine.ctx,
-		codec.payload_view(&routine.input),
-	)
+	result: Payload_Result
+	if routine.invoke_with_context != nil {
+		result = routine.invoke_with_context(
+			routine.callback_data,
+			&routine.ctx,
+			&routine.update_context,
+			codec.payload_view(&routine.input),
+		)
+	} else {
+		result = routine.invoke(
+			routine.callback_data,
+			&routine.ctx,
+			codec.payload_view(&routine.input),
+		)
+	}
 	if instance.phase == .Failed {
 		codec.payload_free(&result.payload)
 		message := instance.failure_message
@@ -2382,17 +2423,34 @@ update_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
 	instance.phase = .Failed
 }
 
-set_update_handler_payload :: proc(
+set_update_handler_payload_internal :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
 	callback_data: rawptr,
 	validator: Update_Validate_Proc,
+	validator_with_context: Update_Context_Validate_Proc,
 	callback: Update_Invoke_Proc,
-	routine_callback: Update_Routine_Invoke_Proc = nil,
+	callback_with_context: Update_Context_Invoke_Proc,
+	routine_callback: Update_Routine_Invoke_Proc,
+	routine_callback_with_context: Update_Context_Routine_Invoke_Proc,
 	options := Update_Handler_Options{},
 ) -> bool {
+	callback_count := 0
+	if callback != nil {
+		callback_count += 1
+	}
+	if callback_with_context != nil {
+		callback_count += 1
+	}
+	if routine_callback != nil {
+		callback_count += 1
+	}
+	if routine_callback_with_context != nil {
+		callback_count += 1
+	}
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || (callback == nil) == (routine_callback == nil) {
+	   len(name) == 0 || callback_data == nil || callback_count != 1 ||
+	   validator != nil && validator_with_context != nil {
 		if ctx != nil {
 			update_registration_failed(ctx.instance, "invalid Workflow Update handler")
 		}
@@ -2415,12 +2473,38 @@ set_update_handler_payload :: proc(
 			name = owned_name,
 			callback_data = callback_data,
 			validate = validator,
+			validate_with_context = validator_with_context,
 			invoke = callback,
+			invoke_with_context = callback_with_context,
 			invoke_routine = routine_callback,
+			invoke_routine_with_context = routine_callback_with_context,
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
 	return true
+}
+
+set_update_handler_payload :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	callback_data: rawptr,
+	validator: Update_Validate_Proc,
+	callback: Update_Invoke_Proc,
+	routine_callback: Update_Routine_Invoke_Proc = nil,
+	options := Update_Handler_Options{},
+) -> bool {
+	return set_update_handler_payload_internal(
+		ctx,
+		name,
+		callback_data,
+		validator,
+		nil,
+		callback,
+		nil,
+		routine_callback,
+		nil,
+		options,
+	)
 }
 
 // set_validated_update_routine_json registers an Update handler on its own
@@ -2487,6 +2571,103 @@ set_validated_update_routine_json :: proc(
 				)
 			}
 			output := owned.callback(routine_ctx, owned.state, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return payload_fail(
+					"could not encode Workflow Update result as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return payload_complete(payload)
+		},
+		options,
+	)
+}
+
+// set_validated_update_routine_json_with_context exposes the Update identity
+// and headers to both validation and the stackful handler. The context is
+// Workflow-run-owned and remains valid when the handler crosses activations.
+set_validated_update_routine_json_with_context :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	state: ^$State,
+	validator: proc(update: ^Update_Context, state: State, input: $Input) -> Update_Validation,
+	callback: proc(
+		ctx: ^Fiber_Context,
+		update: ^Update_Context,
+		state: ^State,
+		input: Input,
+	) -> $Output,
+	options := Update_Handler_Options{},
+) -> bool {
+	Validator :: #type proc(
+		update: ^Update_Context,
+		state: State,
+		input: Input,
+	) -> Update_Validation
+	Callback :: #type proc(
+		ctx: ^Fiber_Context,
+		update: ^Update_Context,
+		state: ^State,
+		input: Input,
+	) -> Output
+	Data :: struct {
+		state:     ^State,
+		validator: Validator,
+		callback:  Callback,
+	}
+	if ctx == nil || ctx.instance == nil || state == nil || validator == nil || callback == nil {
+		if ctx != nil {
+			update_registration_failed(ctx.instance, "invalid contextual Workflow Update routine")
+		}
+		return false
+	}
+	data, allocation_error := new(Data, ctx.instance.odin_context.allocator)
+	if allocation_error != nil {
+		update_registration_failed(ctx.instance, "could not allocate contextual Workflow Update routine")
+		return false
+	}
+	data.state = state
+	data.validator = validator
+	data.callback = callback
+	return set_update_handler_payload_internal(
+		ctx,
+		name,
+		data,
+		nil,
+		proc(
+			callback_data: rawptr,
+			update: ^Update_Context,
+			input: codec.Payload_View,
+		) -> Update_Validation {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return update_reject(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			return owned.validator(update, owned.state^, value)
+		},
+		nil,
+		nil,
+		nil,
+		proc(
+			callback_data: rawptr,
+			routine_ctx: ^Fiber_Context,
+			update: ^Update_Context,
+			input: codec.Payload_View,
+		) -> Payload_Result {
+			owned := cast(^Data)callback_data
+			value: Input
+			if codec.decode_json(input, &value) != .None {
+				return payload_fail(
+					"could not decode Workflow Update input as json/plain",
+					"OdinWorkflowUpdatePayloadConversionError",
+				)
+			}
+			output := owned.callback(routine_ctx, update, owned.state, value)
 			payload, encode_error := codec.encode_json(output)
 			if encode_error != .None {
 				return payload_fail(
@@ -2888,6 +3069,39 @@ signal_header_json :: proc(
 	value: ^$T,
 ) -> (found: bool, error: codec.Error) {
 	payload, payload_found := signal_header_payload(signal, key)
+	if !payload_found {
+		return false, .None
+	}
+	return true, codec.decode_json(payload, value)
+}
+
+current_update :: proc(ctx: ^Fiber_Context) -> (^Update_Context, bool) {
+	if ctx == nil || ctx.update_context == nil {
+		return nil, false
+	}
+	return ctx.update_context, true
+}
+
+update_header_payload :: proc(
+	update: ^Update_Context,
+	key: string,
+) -> (codec.Payload_View, bool) {
+	if update == nil {
+		return {}, false
+	}
+	entry, _, found := find_named_payload(&update.headers, key)
+	if !found {
+		return {}, false
+	}
+	return codec.payload_view(&entry.payload), true
+}
+
+update_header_json :: proc(
+	update: ^Update_Context,
+	key: string,
+	value: ^$T,
+) -> (found: bool, error: codec.Error) {
+	payload, payload_found := update_header_payload(update, key)
 	if !payload_found {
 		return false, .None
 	}
@@ -6750,9 +6964,12 @@ start_update_routine :: proc(
 	instance: ^Fiber_Instance,
 	handler: ^Fiber_Update_Handler,
 	protocol_instance_id: string,
+	update_context: ^Update_Context,
 	input: codec.Payload_View,
 ) -> (^Fiber_Update_Routine, Error) {
-	if instance == nil || handler == nil || handler.invoke_routine == nil ||
+	if instance == nil || handler == nil ||
+	   handler.invoke_routine == nil && handler.invoke_routine_with_context == nil ||
+	   update_context == nil ||
 	   len(protocol_instance_id) == 0 {
 		return nil, error_from_string("invalid Workflow Update routine")
 	}
@@ -6775,8 +6992,11 @@ start_update_routine :: proc(
 	routine.input = owned_input
 	routine.callback_data = handler.callback_data
 	routine.invoke = handler.invoke_routine
+	routine.invoke_with_context = handler.invoke_routine_with_context
+	routine.update_context = update_context^
 	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
+	routine.ctx.update_context = &routine.update_context
 	routine.phase = .Ready
 	create_result := fiber_raw.create(
 		&routine.fiber,
@@ -6903,6 +7123,50 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
 	return {}
 }
 
+clone_update_context :: proc(
+	instance: ^Fiber_Instance,
+	update: ^proto.Coresdk_Workflow_Activation_DoUpdate,
+) -> (result: Update_Context, ok: bool) {
+	if instance == nil || update == nil {
+		return {}, false
+	}
+	allocator := instance.odin_context.allocator
+	id, id_error := strings.clone(update.id, allocator)
+	name, name_error := strings.clone(update.name, allocator)
+	identity := ""
+	if id_error != nil || name_error != nil {
+		return {}, false
+	}
+	if update.meta != nil {
+		owned_identity, identity_error := strings.clone(update.meta.identity, allocator)
+		if identity_error != nil {
+			return {}, false
+		}
+		identity = owned_identity
+	}
+	result = {
+		id = id,
+		name = name,
+		identity = identity,
+		headers = make([dynamic]Fiber_Named_Payload, allocator),
+	}
+	for &entry in update.headers {
+		if len(entry.key) == 0 || entry.value == nil {
+			return {}, false
+		}
+		key, key_error := strings.clone(entry.key, allocator)
+		payload, payload_error := proto.clone_payload_view(
+			proto.payload_view(entry.value),
+			allocator,
+		)
+		if key_error != nil || payload_error != .None {
+			return {}, false
+		}
+		append(&result.headers, Fiber_Named_Payload{key = key, payload = payload})
+	}
+	return result, true
+}
+
 invoke_workflow_update :: proc(
 	instance: ^Fiber_Instance,
 	update: ^proto.Coresdk_Workflow_Activation_DoUpdate,
@@ -6946,10 +7210,32 @@ invoke_workflow_update :: proc(
 		return
 	}
 	defer codec.payload_free(&input)
+	update_context, context_ok := clone_update_context(instance, update)
+	if !context_ok {
+		append_pending_update_response(
+			responses,
+			protocol_instance_id,
+			.Rejected,
+			payload_fail(
+				"could not preserve Workflow Update context",
+				"OdinWorkflowUpdateContextError",
+			),
+		)
+		return
+	}
 
-	if update.run_validator && handler.validate != nil {
+	if update.run_validator && (handler.validate != nil || handler.validate_with_context != nil) {
 		command_state := workflow_command_state(instance)
-		validation := handler.validate(handler.callback_data, codec.payload_view(&input))
+		validation: Update_Validation
+		if handler.validate_with_context != nil {
+			validation = handler.validate_with_context(
+				handler.callback_data,
+				&update_context,
+				codec.payload_view(&input),
+			)
+		} else {
+			validation = handler.validate(handler.callback_data, codec.payload_view(&input))
+		}
 		if workflow_command_state_changed(instance, command_state) {
 			restore_workflow_command_state(instance, command_state)
 			append_pending_update_response(
@@ -6979,11 +7265,12 @@ invoke_workflow_update :: proc(
 	}
 
 	append_pending_update_response(responses, protocol_instance_id, .Accepted)
-	if handler.invoke_routine != nil {
+	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil {
 		routine, routine_error := start_update_routine(
 			instance,
 			handler,
 			protocol_instance_id,
+			&update_context,
 			codec.payload_view(&input),
 		)
 		if routine_error.message != nil {
@@ -7017,7 +7304,16 @@ invoke_workflow_update :: proc(
 		return
 	}
 	command_state := workflow_command_state(instance)
-	result := handler.invoke(handler.callback_data, codec.payload_view(&input))
+	result: Payload_Result
+	if handler.invoke_with_context != nil {
+		result = handler.invoke_with_context(
+			handler.callback_data,
+			&update_context,
+			codec.payload_view(&input),
+		)
+	} else {
+		result = handler.invoke(handler.callback_data, codec.payload_view(&input))
+	}
 	if workflow_command_state_changed(instance, command_state) {
 		codec.payload_free(&result.payload)
 		restore_workflow_command_state(instance, command_state)
