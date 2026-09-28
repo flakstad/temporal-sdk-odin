@@ -1346,9 +1346,9 @@ first complete chain: Worker-level interceptors wrap inbound callback execution
 and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
 start, Signal-With-Start, Signal, Query, Update start, cancellation, and
-termination. Workflow
-outbound now applies that same contract to remote and Local Activity scheduling,
-Child Workflow start/Signal,
+termination, plus the complete Workflow-result wait. Workflow outbound now
+applies that same contract to remote and Local Activity scheduling, Child
+Workflow start/Signal,
 external Workflow Signal/cancellation, Continue-As-New, durable sleep, and
 explicit Child Workflow cancellation. Workflow inbound interception now wraps
 the complete Workflow execution, Queries, Signals, Update validation, and
@@ -1387,10 +1387,12 @@ Cancellation provides mutable reason/request-ID fields, while termination
 provides a mutable reason and optional borrowed Payload view. Their terminal
 continuations encode only after the complete chain has run. The Client owns a
 copy of interceptor records, but callback `user_data` is borrowed. A 500-case
-property checks nested Signal/Signal-With-Start/cancel/terminate chains and
-arbitrary short-circuit depth. Live start, Signal-With-Start, Signal, Query,
-Update, cancellation, and termination paths cross Service/Core. Schedule and
-Visibility operations, result polling, and connection mutation are not yet
+property checks nested Signal/Signal-With-Start/result/cancel/terminate chains
+and arbitrary short-circuit depth. `get_result` surrounds the whole logical
+wait, including any Core history long polls and followed Continue-As-New/retry
+runs; its Payload result is owned. Live start, Signal-With-Start, Signal, Query,
+result, Update, cancellation, and termination paths cross Service/Core.
+Schedule and Visibility operations and connection mutation are not yet
 intercepted.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.

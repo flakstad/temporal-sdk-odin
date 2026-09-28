@@ -104,6 +104,27 @@ Client_Query_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Query_Workflow_Next,
 ) -> (activity_codec.Payload, Error)
 
+Client_Get_Result_Input :: struct {
+	handle:      ^Workflow_Handle,
+	follow_runs: bool,
+}
+
+Client_Get_Result_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Get_Result_Input,
+) -> (activity_codec.Payload, Error)
+
+Client_Get_Result_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Get_Result_Next_Proc,
+}
+
+Client_Get_Result_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Get_Result_Input,
+	next: Client_Get_Result_Next,
+) -> (activity_codec.Payload, Error)
+
 Client_Start_Update_Input :: struct {
 	handle:      ^Workflow_Handle,
 	update_name: string,
@@ -179,6 +200,7 @@ Client_Interceptor :: struct {
 	signal_with_start:  Client_Signal_With_Start_Interceptor_Proc,
 	signal_workflow:    Client_Signal_Workflow_Interceptor_Proc,
 	query_workflow:     Client_Query_Workflow_Interceptor_Proc,
+	get_result:         Client_Get_Result_Interceptor_Proc,
 	start_update:       Client_Start_Update_Interceptor_Proc,
 	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
@@ -220,6 +242,16 @@ client_query_workflow_next :: proc(
 ) -> (activity_codec.Payload, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Query interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_get_result_next :: proc(
+	next: Client_Get_Result_Next,
+	input: ^Client_Get_Result_Input,
+) -> (activity_codec.Payload, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow result interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -385,6 +417,27 @@ client_query_workflow_chain :: proc(
 		)
 	}
 	return query_workflow_payload_terminal(input)
+}
+
+client_get_result_chain :: proc(
+	data: rawptr,
+	input: ^Client_Get_Result_Input,
+) -> (activity_codec.Payload, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow result interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.get_result == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.get_result(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_get_result_chain},
+		)
+	}
+	return get_result_payload_terminal(input)
 }
 
 client_start_update_chain :: proc(

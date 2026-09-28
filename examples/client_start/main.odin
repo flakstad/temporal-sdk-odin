@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import temporal_client "../../temporal/client"
+import codec "../../temporal/codec"
 import temporal_failure "../../temporal/failure"
 
 Typed_Greeting_Input :: struct {
@@ -65,6 +66,19 @@ signal_with_start_interceptor :: proc(
 	return handle, result_error
 }
 
+get_result_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Get_Result_Input,
+	next: temporal_client.Client_Get_Result_Next,
+) -> (codec.Payload, temporal_client.Error) {
+	fmt.printf("Client result interceptor entered follow_runs=%v\n", input.follow_runs)
+	result, result_error := temporal_client.client_get_result_next(next, input)
+	if result_error.message == nil {
+		fmt.println("Client result interceptor exited after terminal Workflow result")
+	}
+	return result, result_error
+}
+
 run :: proc() -> int {
 	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
 		key = "x-odin-sdk",
@@ -93,6 +107,7 @@ run :: proc() -> int {
 	interceptors := [?]temporal_client.Client_Interceptor{{
 		start_workflow = start_workflow_interceptor,
 		signal_with_start = signal_with_start_interceptor,
+		get_result = get_result_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",

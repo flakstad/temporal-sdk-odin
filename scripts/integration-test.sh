@@ -116,6 +116,8 @@ grep -q "Odin Signal-With-Start created and reused workflow_id=$signal_with_star
 grep -q 'result="seed:first/first-client:second/second-client"' <<<"$signal_with_start_output"
 [[ "$(grep -c 'Client Signal-With-Start interceptor entered before Core' <<<"$signal_with_start_output")" -eq 2 ]]
 [[ "$(grep -c 'Client Signal-With-Start interceptor exited after Core' <<<"$signal_with_start_output")" -eq 2 ]]
+grep -q 'Client result interceptor entered follow_runs=true' <<<"$signal_with_start_output"
+grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$signal_with_start_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

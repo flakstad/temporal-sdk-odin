@@ -2700,7 +2700,7 @@ run_id_owner_free :: proc(owner: ^Run_Id_Owner) {
 	owner.value = ""
 }
 
-get_result_payload :: proc(
+get_result_payload_unintercepted :: proc(
 	handle: ^Workflow_Handle,
 	follow_runs := true,
 ) -> (payload: codec.Payload, error: Error) {
@@ -2788,6 +2788,27 @@ get_result_payload :: proc(
 		result_page_free(&page)
 		return {}, error
 	}
+}
+
+get_result_payload_terminal :: proc(
+	input: ^Client_Get_Result_Input,
+) -> (codec.Payload, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow result input is missing")
+	}
+	return get_result_payload_unintercepted(input.handle, input.follow_runs)
+}
+
+get_result_payload :: proc(
+	handle: ^Workflow_Handle,
+	follow_runs := true,
+) -> (payload: codec.Payload, error: Error) {
+	if !workflow_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	input := Client_Get_Result_Input{handle = handle, follow_runs = follow_runs}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_get_result_chain(&state, &input)
 }
 
 get_result_json :: proc(

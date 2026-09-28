@@ -29,6 +29,7 @@ Client_Interceptor_Test_State :: struct {
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
+	get_result_input_seen:   bool,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -96,6 +97,39 @@ client_interceptor_test_signal_with_start :: proc(
 		result_error = temporal_client.error_from_string(.Rpc, "Signal-With-Start short circuit")
 	} else {
 		result, result_error = temporal_client.client_signal_with_start_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_get_result :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Get_Result_Input,
+	next: temporal_client.Client_Get_Result_Next,
+) -> (codec.Payload, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.follow_runs = false
+	} else {
+		node.state.get_result_input_seen = !input.follow_runs && input.handle != nil &&
+		                                   input.handle.id == "workflow-id"
+	}
+	result: codec.Payload
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		encode_error: codec.Error
+		result, encode_error = codec.encode_json("intercepted result")
+		if encode_error != .None {
+			result_error = temporal_client.error_from_string(
+				.Payload_Conversion,
+				"could not encode intercepted result",
+			)
+		}
+	} else {
+		result, result_error = temporal_client.client_get_result_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -5371,6 +5405,47 @@ client_signal_with_start_interceptors_nest_and_isolate_signal_headers :: proc(t:
 	}
 	testing.expect_value(t, len(headers.entries), 1)
 	testing.expect_value(t, headers.entries[0].key, "caller")
+}
+
+@(test)
+client_result_interceptors_wrap_follow_run_operation_and_own_payload :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			get_result = client_interceptor_test_get_result,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			get_result = client_interceptor_test_get_result,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+
+	result, result_error := temporal_client.get_result_payload(&handle, true)
+	defer codec.payload_free(&result)
+	defer temporal_client.error_free(&result_error)
+	testing.expect(t, result_error.message == nil)
+	decoded: string
+	decode_error := codec.decode_json(codec.payload_view(&result), &decoded)
+	defer delete(decoded)
+	testing.expect(t, decode_error == .None)
+	testing.expect_value(t, decoded, "intercepted result")
+	testing.expect(t, state.get_result_input_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
 }
 
 @(test)

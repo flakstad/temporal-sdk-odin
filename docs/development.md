@@ -1184,8 +1184,9 @@ heartbeat-before/after across a real Core worker and CLI dev server.
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start,
-cancellation, and termination. Each operation has a dedicated mutable input
-and result-bearing `next`; no result passes through an untyped pointer.
+cancellation, termination, and Workflow result waiting. Each operation has a
+dedicated mutable input and result-bearing `next`; no result passes through an
+untyped pointer.
 Signal-With-Start exposes both user Payloads, mutable start options, and the
 single Header map the upstream RPC assigns to its Signal event. Cancellation
 exposes its reason and request ID. Termination exposes its reason plus an
@@ -1193,6 +1194,11 @@ optional codec-neutral details Payload. Registration order is outermost-first
 and unwind order is reversed. Skipping `next` deliberately short-circuits the
 RPC, so a successful start/update/query short circuit must return a valid
 operation-specific handle or Payload.
+
+`get_result` wraps the complete semantic wait rather than each internal history
+long poll. Its mutable `follow_runs` field controls whether the terminal follows
+Continue-As-New and retry runs. A successful continuation returns an owned
+Payload; an interceptor that replaces it must follow the same ownership rule.
 
 Before the chain runs, the SDK clones existing headers into a per-call owned
 `Headers` value. Workflow-start headers are adapted from `Start_Metadata`; the
@@ -1212,7 +1218,8 @@ interceptors; `client_control` does the same for Signal, Query, and Update. The
 full dev-server suite requires those headers to arrive in Workflow code,
 including Update context after Activity suspension, and requires
 Signal-With-Start, cancellation, and termination chains to unwind only after
-their real Core RPC succeeds.
+their real Core RPC succeeds. The result hook remains entered across the Core
+long poll and exits only after a terminal Workflow result is owned by Odin.
 
 ### Workflow outbound interceptor chain
 
