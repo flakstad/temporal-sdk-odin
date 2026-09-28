@@ -31,10 +31,12 @@ Error_Kind :: enum {
 }
 
 Error :: struct {
-	kind:        Error_Kind,
-	message:     []u8,
-	status_code: u32,
-	details:     []u8,
+	kind:                Error_Kind,
+	message:             []u8,
+	status_code:         u32,
+	details:             []u8,
+	workflow_status:     Workflow_Status,
+	has_workflow_status: bool,
 }
 
 error_free :: proc(error: ^Error) {
@@ -72,6 +74,8 @@ error_clone :: proc(error: ^Error) -> Error {
 		message = bytes.clone(error.message),
 		status_code = error.status_code,
 		details = bytes.clone(error.details),
+		workflow_status = error.workflow_status,
+		has_workflow_status = error.has_workflow_status,
 	}
 	if result.kind == .Workflow_Update_Failed && len(error.details) > 0 {
 		delete(result.message)
@@ -292,6 +296,10 @@ Start_Metadata :: struct {
 	headers:           [dynamic]Start_Metadata_Named_Payload,
 	memo:              [dynamic]Start_Metadata_Named_Payload,
 	search_attributes: [dynamic]Start_Metadata_Search_Attribute,
+	static_summary:    codec.Payload,
+	has_static_summary: bool,
+	static_details:    codec.Payload,
+	has_static_details: bool,
 	allocator:         mem.Allocator,
 }
 
@@ -329,10 +337,47 @@ start_metadata_free :: proc(metadata: ^Start_Metadata) {
 		delete(entry.key, allocator)
 		codec.payload_free(&entry.payload)
 	}
+	codec.payload_free(&metadata.static_summary)
+	codec.payload_free(&metadata.static_details)
 	delete(metadata.headers)
 	delete(metadata.memo)
 	delete(metadata.search_attributes)
 	metadata^ = {}
+}
+
+// Static summary/details are UI-facing strings stored as Temporal UserMetadata.
+// They are owned by Start_Metadata and encoded with the default JSON Payload
+// convention required by Temporal.
+start_metadata_set_static_summary :: proc(metadata: ^Start_Metadata, value: string) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, metadata.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow static summary")
+	}
+	if metadata.has_static_summary {
+		codec.payload_free(&metadata.static_summary)
+	}
+	metadata.static_summary = payload
+	metadata.has_static_summary = true
+	return {}
+}
+
+start_metadata_set_static_details :: proc(metadata: ^Start_Metadata, value: string) -> Error {
+	if metadata == nil || metadata.allocator.procedure == nil {
+		return error_from_string(.Invalid_Argument, "Workflow start metadata is not initialized")
+	}
+	payload, encode_error := codec.encode_json(value, metadata.allocator)
+	if encode_error != .None {
+		return error_from_string(.Payload_Conversion, "could not encode Workflow static details")
+	}
+	if metadata.has_static_details {
+		codec.payload_free(&metadata.static_details)
+	}
+	metadata.static_details = payload
+	metadata.has_static_details = true
+	return {}
 }
 
 start_metadata_put_named_owned :: proc(
@@ -498,6 +543,35 @@ Workflow_Handle :: struct {
 	id:                     string,
 	run_id:                 string,
 	first_execution_run_id: string,
+}
+
+// Query_Reject_Condition controls whether Temporal may deliver a Query for a
+// closed execution. Unspecified preserves the Service default.
+Query_Reject_Condition :: enum {
+	Unspecified,
+	None,
+	Not_Open,
+	Not_Completed_Cleanly,
+}
+
+Query_Workflow_Options :: struct {
+	reject_condition: Query_Reject_Condition,
+}
+
+query_reject_condition_to_proto :: proc(
+	condition: Query_Reject_Condition,
+) -> proto.Temporal_Api_Enums_V1_QueryRejectCondition {
+	switch condition {
+	case .Unspecified:
+		return .QUERY_REJECT_CONDITION_UNSPECIFIED
+	case .None:
+		return .QUERY_REJECT_CONDITION_NONE
+	case .Not_Open:
+		return .QUERY_REJECT_CONDITION_NOT_OPEN
+	case .Not_Completed_Cleanly:
+		return .QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY
+	}
+	return .QUERY_REJECT_CONDITION_UNSPECIFIED
 }
 
 // Update_Handle owns the stable server reference returned after an Update has
@@ -777,6 +851,9 @@ encode_start_workflow_request :: proc(
 	header := proto.Temporal_Api_Common_V1_Header{}
 	memo := proto.Temporal_Api_Common_V1_Memo{}
 	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	user_metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{}
+	static_summary := proto.Temporal_Api_Common_V1_Payload{}
+	static_details := proto.Temporal_Api_Common_V1_Payload{}
 	header_payloads: []proto.Temporal_Api_Common_V1_Payload
 	memo_payloads: []proto.Temporal_Api_Common_V1_Payload
 	search_payloads: []proto.Temporal_Api_Common_V1_Payload
@@ -786,8 +863,23 @@ encode_start_workflow_request :: proc(
 	defer free_start_proto_payloads(header_payloads)
 	defer free_start_proto_payloads(memo_payloads)
 	defer free_start_proto_payloads(search_payloads)
+	defer delete(static_summary.metadata)
+	defer delete(static_summary.external_payloads)
+	defer delete(static_details.metadata)
+	defer delete(static_details.external_payloads)
 	if options.metadata != nil {
 		metadata := options.metadata
+		if metadata.has_static_summary {
+			static_summary = proto.encode_payload(codec.payload_view(&metadata.static_summary))
+			user_metadata.summary = &static_summary
+		}
+		if metadata.has_static_details {
+			static_details = proto.encode_payload(codec.payload_view(&metadata.static_details))
+			user_metadata.details = &static_details
+		}
+		if metadata.has_static_summary || metadata.has_static_details {
+			request.user_metadata = &user_metadata
+		}
 		if len(metadata.headers) > 0 {
 			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.headers))
 			for &entry, index in metadata.headers {
@@ -1032,18 +1124,26 @@ signal_workflow_json :: proc(
 	)
 }
 
-query_workflow_payload :: proc(
-	handle: ^Workflow_Handle,
-	query_type: string,
+// encode_query_workflow_request is exposed for wire-contract testing. Returned
+// bytes are owned by the caller.
+encode_query_workflow_request :: proc(
+	namespace, workflow_id, run_id, query_type: string,
 	input: codec.Payload_View,
-) -> (payload: codec.Payload, error: Error) {
-	if !workflow_handle_valid(handle) {
-		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	options: Query_Workflow_Options = {},
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
+	}
+	if len(workflow_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow ID must not be empty")
 	}
 	if len(query_type) == 0 {
-		return {}, error_from_string(.Invalid_Argument, "Workflow query type must not be empty")
+		return nil, error_from_string(.Invalid_Argument, "Workflow query type must not be empty")
 	}
-	execution := workflow_execution(handle)
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
 	encoded_input := proto.encode_payload(input)
 	defer delete(encoded_input.metadata)
 	defer delete(encoded_input.external_payloads)
@@ -1055,11 +1155,34 @@ query_workflow_payload :: proc(
 		query_args = &arguments,
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{
-		namespace = handle.client.namespace,
+		namespace = namespace,
 		execution = &execution,
 		query = &query,
+		query_reject_condition = query_reject_condition_to_proto(options.reject_condition),
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(&request)
+	return proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(&request), {}
+}
+
+query_workflow_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: codec.Payload_View,
+	options: Query_Workflow_Options,
+) -> (payload: codec.Payload, error: Error) {
+	if !workflow_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	request_bytes, request_error := encode_query_workflow_request(
+		handle.client.namespace,
+		handle.id,
+		handle.run_id,
+		query_type,
+		input,
+		options,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
 	defer delete(request_bytes)
 	rpc_result := temporal_core.client_rpc_call(
 		handle.client.connection,
@@ -1071,7 +1194,12 @@ query_workflow_payload :: proc(
 	if rpc_result.error.message != nil {
 		return {}, error_from_core(&rpc_result.error)
 	}
+	return decode_query_workflow_response(rpc_result.protobuf)
+}
 
+// decode_query_workflow_response preserves the result Payload or returns a
+// typed rejection carrying the Workflow status that caused the rejection.
+decode_query_workflow_response :: proc(data: []u8) -> (payload: codec.Payload, error: Error) {
 	decode_arena: virtual.Arena
 	if virtual.arena_init_growing(&decode_arena) != nil {
 		return {}, error_from_string(.Malformed_Response, "could not initialize query response arena")
@@ -1081,7 +1209,7 @@ query_workflow_payload :: proc(
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	response := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowResponse{}
 	decoded := proto.decode_Temporal_Api_Workflowservice_V1_QueryWorkflowResponse(
-		rpc_result.protobuf,
+		data,
 		&response,
 	)
 	context.allocator = previous_allocator
@@ -1089,10 +1217,13 @@ query_workflow_payload :: proc(
 		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed query response")
 	}
 	if response.query_rejected != nil {
-		return {}, error_from_string(
+		rejection := error_from_string(
 			.Workflow_Query_Rejected,
 			"Temporal rejected the Workflow query for the current execution status",
 		)
+		rejection.workflow_status = Workflow_Status(response.query_rejected.status)
+		rejection.has_workflow_status = true
+		return {}, rejection
 	}
 	if response.query_result == nil || len(response.query_result.payloads) != 1 {
 		return {}, error_from_string(.Malformed_Response, "Workflow query response must contain one Payload")
@@ -1104,11 +1235,29 @@ query_workflow_payload :: proc(
 	return cloned_payload, {}
 }
 
+query_workflow_payload :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: codec.Payload_View,
+) -> (payload: codec.Payload, error: Error) {
+	return query_workflow_payload_with_options(handle, query_type, input, {})
+}
+
 query_workflow_json :: proc(
 	handle: ^Workflow_Handle,
 	query_type: string,
 	input: $Input,
 	value: ^$Output,
+) -> Error {
+	return query_workflow_json_with_options(handle, query_type, input, value, {})
+}
+
+query_workflow_json_with_options :: proc(
+	handle: ^Workflow_Handle,
+	query_type: string,
+	input: $Input,
+	value: ^$Output,
+	options: Query_Workflow_Options,
 ) -> Error {
 	if value == nil {
 		return error_from_string(.Invalid_Argument, "Workflow query output pointer is required")
@@ -1118,10 +1267,11 @@ query_workflow_json :: proc(
 		return error_from_string(.Payload_Conversion, "could not encode Workflow query input")
 	}
 	defer codec.payload_free(&payload)
-	result, query_error := query_workflow_payload(
+	result, query_error := query_workflow_payload_with_options(
 		handle,
 		query_type,
 		codec.payload_view(&payload),
+		options,
 	)
 	if query_error.message != nil {
 		return query_error

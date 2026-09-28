@@ -122,6 +122,10 @@ Workflow_Description :: struct {
 	external_payload_count:      i64,
 	cancel_requested:            bool,
 	priority:                    Workflow_Priority,
+	static_summary:              string,
+	has_static_summary:          bool,
+	static_details:              string,
+	has_static_details:          bool,
 	memo:                        [dynamic]Named_Payload,
 	search_attributes:           [dynamic]Named_Payload,
 	pending_activities:          [dynamic]Pending_Activity,
@@ -185,6 +189,29 @@ description_clone_payload :: proc(
 	return payload, clone_error == .None
 }
 
+description_decode_user_metadata_string :: proc(
+	value: ^proto.Temporal_Api_Common_V1_Payload,
+	allocator: mem.Allocator,
+) -> (result: string, present, ok: bool) {
+	if value == nil {
+		return "", false, true
+	}
+	payload, payload_ok := description_clone_payload(value, allocator)
+	if !payload_ok {
+		return "", true, false
+	}
+	defer codec.payload_free(&payload)
+	previous_allocator := context.allocator
+	context.allocator = allocator
+	decode_error := codec.decode_json(codec.payload_view(&payload), &result)
+	context.allocator = previous_allocator
+	if decode_error != .None {
+		delete(result, allocator)
+		return "", true, false
+	}
+	return result, true, true
+}
+
 description_clone_named_payload :: proc(
 	key: string,
 	value: ^proto.Temporal_Api_Common_V1_Payload,
@@ -230,6 +257,8 @@ workflow_description_free :: proc(description: ^Workflow_Description) {
 	delete(description.first_run_id, allocator)
 	delete(description.workflow_type, allocator)
 	delete(description.task_queue, allocator)
+	delete(description.static_summary, allocator)
+	delete(description.static_details, allocator)
 	delete(description.priority.fairness_key, allocator)
 	for &entry in description.memo {
 		delete(entry.key, allocator)
@@ -345,6 +374,29 @@ decode_workflow_description :: proc(
 	if !priority_ok {
 		failed = true
 		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow priority")
+	}
+	if config.user_metadata != nil {
+		metadata_ok: bool
+		description.static_summary,
+		description.has_static_summary,
+		metadata_ok = description_decode_user_metadata_string(
+			config.user_metadata.summary,
+			allocator,
+		)
+		if !metadata_ok {
+			failed = true
+			return {}, error_from_string(.Payload_Conversion, "could not decode Workflow static summary")
+		}
+		description.static_details,
+		description.has_static_details,
+		metadata_ok = description_decode_user_metadata_string(
+			config.user_metadata.details,
+			allocator,
+		)
+		if !metadata_ok {
+			failed = true
+			return {}, error_from_string(.Payload_Conversion, "could not decode Workflow static details")
+		}
 	}
 
 	if info.memo != nil {

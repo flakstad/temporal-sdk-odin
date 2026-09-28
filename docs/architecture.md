@@ -254,12 +254,16 @@ request rather than an exact event-count promise.
 Start requests now accept an explicitly owned `Start_Metadata` builder.
 Codec-neutral and JSON helpers clone named header, memo, and Search Attribute
 Payloads through the builder's recorded allocator; duplicate names replace the
-previous owned value. `Start_Workflow_Options` borrows the builder only while
+previous owned value. Dedicated string setters encode static summary/details
+through the same owned builder. Those values map
+to `temporal.api.sdk.v1.UserMetadata` on `StartWorkflowExecutionRequest` and
+use the default `json/plain` string representation expected by Temporal UIs.
+`Start_Workflow_Options` borrows the builder only while
 the blocking RPC request is encoded. Search Attribute typing shares the codec
 layer's canonical Temporal metadata mapping with the Workflow runtime. A wire
 unit test and 500 generated start-request cases decode the resulting
 `StartWorkflowExecutionRequest` and verify every key, byte, type label, policy,
-duration, retry field, and priority field.
+duration, retry field, priority field, and UserMetadata value.
 The same request boundary maps Odin-native ID reuse/conflict enums, a borrowed
 Retry Policy, cron schedule, start delay, and borrowed Priority onto the
 corresponding Temporal API fields. Zero-valued optional policy fields retain
@@ -1166,8 +1170,21 @@ query delivered alongside a signal-producing completion.
 Core reserves `legacy_query` as `LEGACY_QUERY_ID`: a legacy query completion
 may contain no other commands. The current runtime produces the correct
 query-only completion when Core sends such an activation, but it does not yet
-reject a malformed mixed legacy activation itself. Query headers and
-Client-side reject-condition selection are also not exposed yet.
+reject a malformed mixed legacy activation itself. Query headers are not yet
+exposed. Client-side reject-condition selection is exposed independently of
+Workflow delivery: Odin maps all four pinned conditions onto
+`QueryWorkflowRequest.query_reject_condition`. A `QueryRejected` response is a
+typed Client error that retains the rejecting Workflow execution status.
+
+Static summary/details illustrate a separate Core boundary. They are persisted
+by the Service and returned in
+`DescribeWorkflowExecutionResponse.execution_config.user_metadata`, so the
+Client exposes owned decoded strings on `Workflow_Description`. The pinned
+`InitializeWorkflow` activation has no UserMetadata field. Consequently the
+Workflow runtime cannot surface start static metadata through `workflow.info`
+without a future upstream activation change or an extra Service RPC, which
+would be the wrong determinism boundary. Odin therefore exposes these values
+only at Client start/Describe today.
 
 ### Workflow Update routines
 
@@ -1673,8 +1690,9 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
-   Visibility list/count are live-proven, but the public Client still lacks
-   query reject conditions, static summary/details, eager start, and a
+   Visibility list/count are live-proven. Query reject conditions and static
+   summary/details are now wire- and live-proven, but the public Client still
+   lacks eager start and a
    supported-server matrix for newer Schedule methods.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
@@ -1710,7 +1728,7 @@ Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
 command/replay cases, plus 500 Activity deadline combinations,
 500 Client close-event/result round trips, 500 recursive Failure chains,
-500 Client start request
+500 Client start request (including static UserMetadata)
 round trips, 500 paginated Visibility list/count round trips, 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow
@@ -1738,11 +1756,12 @@ and live-proven without new C symbols. Full replace-update with optimistic
 conflict tokens and matching-time queries are also live-proven; structured and
 excluded calendars, TZif data, and backfill have exact wire/property coverage.
 Recursive Client and Workflow failure inspection is now implemented and
-live-proven. The
-next smallest client-facing slice is query reject-condition/static
-summary/details support; backfill should gain a dedicated multi-execution live
-case without overloading the one-shot Schedule example. Remaining failure work
-is Activity-cancellation detail completeness and deciding whether start failures
+live-proven. Query reject conditions plus static summary/details are now
+implemented and live-proven against the CLI dev server, including the typed
+status on a rejected closed-execution query and persisted Describe metadata.
+The next smallest cross-cutting slice is Activity-cancellation detail
+completeness; backfill should gain a dedicated multi-execution live case without
+overloading the one-shot Schedule example. Remaining failure work also includes deciding whether start failures
 that only carry Core cause enums need a synthetic language-level Failure.
 
 Asynchronous Signal handlers are now implemented by generalizing the handler

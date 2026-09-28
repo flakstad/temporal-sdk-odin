@@ -4361,6 +4361,18 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	)
 	testing.expect(t, search_error.message == nil)
 	temporal_client.error_free(&search_error)
+	summary_error := temporal_client.start_metadata_set_static_summary(
+		&metadata,
+		"Order 42",
+	)
+	testing.expect(t, summary_error.message == nil)
+	temporal_client.error_free(&summary_error)
+	details_error := temporal_client.start_metadata_set_static_details(
+		&metadata,
+		"Created by the Odin SDK wire-contract test.",
+	)
+	testing.expect(t, details_error.message == nil)
+	temporal_client.error_free(&details_error)
 
 	input, input_error := codec.encode_json("start-input")
 	testing.expect(t, input_error == .None)
@@ -4491,6 +4503,29 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	type_metadata, type_found := codec.metadata_get(codec.payload_view(&owned_search), "type")
 	testing.expect(t, type_found)
 	testing.expect_value(t, string(type_metadata), "Keyword")
+	testing.expect(t, request.user_metadata != nil)
+	if request.user_metadata != nil {
+		owned_summary, summary_clone_error := proto.clone_payload(request.user_metadata.summary)
+		defer codec.payload_free(&owned_summary)
+		testing.expect(t, summary_clone_error == .None)
+		decoded_summary: string
+		defer delete(decoded_summary)
+		testing.expect(
+			t,
+			codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) == .None,
+		)
+		testing.expect_value(t, decoded_summary, "Order 42")
+		owned_details, details_clone_error := proto.clone_payload(request.user_metadata.details)
+		defer codec.payload_free(&owned_details)
+		testing.expect(t, details_clone_error == .None)
+		decoded_details: string
+		defer delete(decoded_details)
+		testing.expect(
+			t,
+			codec.decode_json(codec.payload_view(&owned_details), &decoded_details) == .None,
+		)
+		testing.expect_value(t, decoded_details, "Created by the Odin SDK wire-contract test.")
+	}
 
 	uninitialized := temporal_client.Start_Metadata{}
 	invalid_bytes, invalid_error := temporal_client.encode_start_workflow_request(
@@ -4502,6 +4537,70 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	defer delete(invalid_bytes)
 	defer temporal_client.error_free(&invalid_error)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+}
+
+@(test)
+client_query_reject_condition_round_trips_and_preserves_rejection_status :: proc(t: ^testing.T) {
+	input, input_error := codec.encode_json("query-input")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	cases := [?]struct {
+		condition: temporal_client.Query_Reject_Condition,
+		expected:  proto.Temporal_Api_Enums_V1_QueryRejectCondition,
+	}{
+		{.Unspecified, .QUERY_REJECT_CONDITION_UNSPECIFIED},
+		{.None, .QUERY_REJECT_CONDITION_NONE},
+		{.Not_Open, .QUERY_REJECT_CONDITION_NOT_OPEN},
+		{.Not_Completed_Cleanly, .QUERY_REJECT_CONDITION_NOT_COMPLETED_CLEANLY},
+	}
+	for test_case in cases {
+		request_bytes, request_error := temporal_client.encode_query_workflow_request(
+			"default",
+			"order-42",
+			"run-42",
+			"status",
+			codec.payload_view(&input),
+			{reject_condition = test_case.condition},
+		)
+		testing.expect(t, request_error.message == nil)
+		temporal_client.error_free(&request_error)
+
+		decode_arena: virtual.Arena
+		testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+		previous_allocator := context.allocator
+		context.allocator = virtual.arena_allocator(&decode_arena)
+		request := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowRequest{}
+		decoded := proto.decode_Temporal_Api_Workflowservice_V1_QueryWorkflowRequest(
+			request_bytes[:],
+			&request,
+		)
+		context.allocator = previous_allocator
+		testing.expect(t, decoded)
+		testing.expect_value(t, request.namespace, "default")
+		testing.expect_value(t, request.execution.workflow_id, "order-42")
+		testing.expect_value(t, request.execution.run_id, "run-42")
+		testing.expect_value(t, request.query.query_type, "status")
+		testing.expect(t, request.query.query_args != nil)
+		testing.expect_value(t, len(request.query.query_args.payloads), 1)
+		testing.expect(t, request.query_reject_condition == test_case.expected)
+		virtual.arena_destroy(&decode_arena)
+		delete(request_bytes)
+	}
+
+	rejected := proto.Temporal_Api_Query_V1_QueryRejected{
+		status = .WORKFLOW_EXECUTION_STATUS_FAILED,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_QueryWorkflowResponse{
+		query_rejected = &rejected,
+	}
+	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_QueryWorkflowResponse(&response)
+	defer delete(response_bytes)
+	result, rejection_error := temporal_client.decode_query_workflow_response(response_bytes[:])
+	defer codec.payload_free(&result)
+	defer temporal_client.error_free(&rejection_error)
+	testing.expect(t, rejection_error.kind == .Workflow_Query_Rejected)
+	testing.expect(t, rejection_error.has_workflow_status)
+	testing.expect(t, rejection_error.workflow_status == .Failed)
 }
 
 @(test)
@@ -11114,6 +11213,24 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		key = "Color",
 		value = &search_payload,
 	})
+	summary_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Order 42"`)}
+	defer delete(summary_payload.metadata)
+	append(&summary_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	details_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Created by Odin"`),
+	}
+	defer delete(details_payload.metadata)
+	append(&details_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	user_metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{
+		summary = &summary_payload,
+		details = &details_payload,
+	}
 	heartbeat := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`{"step":2}`)}
 	heartbeats := proto.Temporal_Api_Common_V1_Payloads{}
 	defer delete(heartbeats.payloads)
@@ -11162,6 +11279,7 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	config := proto.Temporal_Api_Workflow_V1_WorkflowExecutionConfig{
 		task_queue = &task_queue,
 		workflow_run_timeout = &run_timeout,
+		user_metadata = &user_metadata,
 	}
 	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{cancel_requested = true}
 	response := proto.Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse{
@@ -11191,6 +11309,10 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, description.history_size_bytes, i64(4096))
 	testing.expect(t, description.cancel_requested)
 	testing.expect_value(t, description.priority.fairness_key, "tenant-a")
+	testing.expect(t, description.has_static_summary)
+	testing.expect_value(t, description.static_summary, "Order 42")
+	testing.expect(t, description.has_static_details)
+	testing.expect_value(t, description.static_details, "Created by Odin")
 	testing.expect_value(t, len(description.memo), 1)
 	testing.expect_value(t, description.memo[0].key, "note")
 	testing.expect(t, bytes.equal(description.memo[0].payload.data, transmute([]u8)string(`"memo-value"`)))

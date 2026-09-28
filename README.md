@@ -264,6 +264,11 @@ err = temporal_client.start_metadata_add_search_attribute_json(
     .Keyword,
     "pending",
 )
+err = temporal_client.start_metadata_set_static_summary(&metadata, "Order 42")
+err = temporal_client.start_metadata_set_static_details(
+    &metadata,
+    "Tracks payment and fulfillment for order 42.",
+)
 
 retry := temporal_client.Retry_Policy{
     initial_interval = time.Second,
@@ -295,6 +300,7 @@ err = temporal_client.get_result_json(&handle, &result)
 
 description, err := temporal_client.describe_workflow(&handle)
 defer temporal_client.workflow_description_free(&description)
+// description.static_summary/static_details are owned strings when present.
 
 page, err := temporal_client.fetch_history_page(
     &handle,
@@ -383,8 +389,11 @@ owns its ID/run-ID strings but borrows the Client, so handles must be freed
 before `client.close`. An Update handle follows the same rule and owns the
 Workflow/run/Update IDs needed for later polling. The Payload variants expose the codec-neutral boundary;
 the JSON variants currently send and receive exactly one Payload.
-`Start_Metadata` explicitly owns cloned header, memo, and Search Attribute
-Payloads. Its `_payload` methods are codec-neutral; the JSON methods are
+`Start_Metadata` explicitly owns cloned header, memo, Search Attribute, and
+static summary/details Payloads. Static summary/details use Temporal's
+`UserMetadata` fields and the required default `json/plain` string convention;
+unlike ordinary user Payloads, Temporal defines these two UI fields as strings.
+Its other `_payload` methods are codec-neutral, while JSON methods are
 convenience adapters. Options borrow the builder only until the synchronous
 start call returns, so it may be freed immediately afterward. Reusing a key
 replaces its value, and custom Search Attribute names must already exist in the
@@ -417,6 +426,17 @@ err = temporal_client.query_workflow_json(
     Order_Status_Query{},
     &status,
 )
+// Closed executions can be rejected before handler delivery.
+err = temporal_client.query_workflow_json_with_options(
+    &handle,
+    "order_status",
+    Order_Status_Query{},
+    &status,
+    {reject_condition = .Not_Open},
+)
+if err.kind == .Workflow_Query_Rejected && err.has_workflow_status {
+    fmt.println("query rejected for", err.workflow_status)
+}
 updated: Rename_Result
 update, err := temporal_client.start_update_json(
     &handle,

@@ -368,6 +368,11 @@ _ = temporal_client.start_metadata_add_search_attribute_json(
     .Keyword,
     "pending",
 )
+_ = temporal_client.start_metadata_set_static_summary(&metadata, "Greeting 42")
+_ = temporal_client.start_metadata_set_static_details(
+    &metadata,
+    "Started by the Odin SDK development example.",
+)
 
 retry_policy := temporal_client.Retry_Policy{
     initial_interval = time.Second,
@@ -470,14 +475,24 @@ query_error := temporal_client.query_workflow_json(
     Greeting_Query_Input{include_name = true},
     &status,
 )
+
+closed_query_error := temporal_client.query_workflow_json_with_options(
+    &existing,
+    "greeting_status",
+    Greeting_Query_Input{},
+    &status,
+    {reject_condition = .Not_Open},
+)
 ```
 
 `query_workflow_payload` returns an owned Payload that the caller frees with
 `codec.payload_free`; the JSON helper owns that intermediate value and decodes
 it into the caller's output pointer. The request currently sends exactly one
 argument Payload. A server `QueryRejected` response maps to
-`.Workflow_Query_Rejected`; handler failures remain normal Core RPC failures
-with the server's gRPC status/details.
+`.Workflow_Query_Rejected` and sets `has_workflow_status` plus the typed
+`workflow_status` that caused rejection. The available conditions are
+`Unspecified`, `None`, `Not_Open`, and `Not_Completed_Cleanly`. Handler failures
+remain normal Core RPC failures with the server's gRPC status/details.
 
 Workflow code installs the matching typed handler with
 `workflow.set_query_handler_json`. Its state pointer is borrowed from the

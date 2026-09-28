@@ -256,6 +256,26 @@ run :: proc() -> int {
 			return 1
 		}
 		temporal_client.error_free(&search_error)
+		summary_error := temporal_client.start_metadata_set_static_summary(
+			&metadata,
+			"Odin workflow properties",
+		)
+		if summary_error.message != nil {
+			fmt.eprintf("Workflow static summary encoding failed: %s\n", string(summary_error.message))
+			temporal_client.error_free(&summary_error)
+			return 1
+		}
+		temporal_client.error_free(&summary_error)
+		details_error := temporal_client.start_metadata_set_static_details(
+			&metadata,
+			"Exercises Workflow metadata through the experimental Odin SDK.",
+		)
+		if details_error.message != nil {
+			fmt.eprintf("Workflow static details encoding failed: %s\n", string(details_error.message))
+			temporal_client.error_free(&details_error)
+			return 1
+		}
+		temporal_client.error_free(&details_error)
 		non_retryable_types := [?]string{"DoNotRetry"}
 		retry_policy := temporal_client.Retry_Policy{
 			initial_interval = 2 * time.Second,
@@ -346,6 +366,29 @@ run :: proc() -> int {
 			temporal_client.error_free(&result_error)
 			return 1
 		}
+		rejected_query_result: string
+		defer delete(rejected_query_result)
+		rejected_query_error := temporal_client.query_workflow_json_with_options(
+			&handle,
+			"not_delivered_after_close",
+			"query-input",
+			&rejected_query_result,
+			{reject_condition = .Not_Open},
+		)
+		if rejected_query_error.kind != .Workflow_Query_Rejected ||
+		   !rejected_query_error.has_workflow_status ||
+		   rejected_query_error.workflow_status != .Completed {
+			fmt.eprintf(
+				"Workflow-properties query was not rejected as completed: kind=%v has_status=%v status=%v message=%s\n",
+				rejected_query_error.kind,
+				rejected_query_error.has_workflow_status,
+				rejected_query_error.workflow_status,
+				string(rejected_query_error.message),
+			)
+			temporal_client.error_free(&rejected_query_error)
+			return 1
+		}
+		temporal_client.error_free(&rejected_query_error)
 		description, describe_error := temporal_client.describe_workflow(&handle)
 		defer temporal_client.workflow_description_free(&description)
 		if describe_error.message != nil {
@@ -362,6 +405,10 @@ run :: proc() -> int {
 		   description.workflow_type != "odin_workflow_properties" ||
 		   description.task_queue != "odin-hello-workflow" ||
 		   description.status != .Completed ||
+		   !description.has_static_summary ||
+		   description.static_summary != "Odin workflow properties" ||
+		   !description.has_static_details ||
+		   description.static_details != "Exercises Workflow metadata through the experimental Odin SDK." ||
 		   description.history_length <= 0 {
 			fmt.eprintf(
 				"Workflow-properties Describe returned unexpected identity/status: id=%s run=%s type=%s queue=%s status=%v history=%d\n",
@@ -498,9 +545,10 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true describe_status=%v visibility_listed=%v visibility_count=%d history_events=%d history_pages=%d result=%q\n",
+			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true query_rejected_status=%v static_metadata=true describe_status=%v visibility_listed=%v visibility_count=%d history_events=%d history_pages=%d result=%q\n",
 			workflow_id,
 			handle.run_id,
+			temporal_client.Workflow_Status.Completed,
 			description.status,
 			visibility_listed,
 			visibility_count.count,

@@ -318,6 +318,8 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	header_value := pbt.draw(t, pbt.string_ascii(0, 48))
 	memo_value := pbt.draw(t, pbt.string_ascii(0, 48))
 	search_value := pbt.draw(t, pbt.string_ascii(0, 48))
+	static_summary := pbt.draw(t, pbt.string_ascii(0, 80))
+	static_details := pbt.draw(t, pbt.string_ascii(0, 256))
 	type_case := pbt.draw(t, pbt.int_range(0, 6))
 	attribute_type := generated_search_attribute_type(type_case)
 	reuse_case := pbt.draw(t, pbt.int_range(0, 4))
@@ -379,13 +381,18 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 		attribute_type,
 		codec.payload_view(&search),
 	)
+	summary_error := temporal_client.start_metadata_set_static_summary(&metadata, static_summary)
+	details_error := temporal_client.start_metadata_set_static_details(&metadata, static_details)
 	codec.payload_free(&header)
 	codec.payload_free(&memo)
 	codec.payload_free(&search)
 	defer temporal_client.error_free(&header_error)
 	defer temporal_client.error_free(&memo_error)
 	defer temporal_client.error_free(&search_error)
-	if header_error.message != nil || memo_error.message != nil || search_error.message != nil {
+	defer temporal_client.error_free(&summary_error)
+	defer temporal_client.error_free(&details_error)
+	if header_error.message != nil || memo_error.message != nil || search_error.message != nil ||
+	   summary_error.message != nil || details_error.message != nil {
 		return pbt.error("could not add generated Client start metadata")
 	}
 
@@ -440,7 +447,8 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	)
 	context.allocator = previous_allocator
 	if !decoded || request.header == nil || request.memo == nil ||
-	   request.search_attributes == nil || len(request.header.fields) != 1 ||
+	   request.search_attributes == nil || request.user_metadata == nil ||
+	   len(request.header.fields) != 1 ||
 	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 ||
 	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil {
 		return pbt.fail("generated Client start metadata did not decode")
@@ -479,6 +487,25 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	if type_name != codec.search_attribute_type_name(attribute_type) {
 		return pbt.fail("generated Search Attribute type metadata changed")
+	}
+	if request.user_metadata.summary == nil || request.user_metadata.details == nil {
+		return pbt.fail("generated Workflow user metadata was omitted")
+	}
+	owned_summary, summary_clone_error := proto.clone_payload(request.user_metadata.summary)
+	owned_details, details_clone_error := proto.clone_payload(request.user_metadata.details)
+	defer codec.payload_free(&owned_summary)
+	defer codec.payload_free(&owned_details)
+	if summary_clone_error != .None || details_clone_error != .None {
+		return pbt.error("could not preserve generated Workflow user metadata")
+	}
+	decoded_summary: string
+	decoded_details: string
+	defer delete(decoded_summary)
+	defer delete(decoded_details)
+	if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None ||
+	   codec.decode_json(codec.payload_view(&owned_details), &decoded_details) != .None ||
+	   decoded_summary != static_summary || decoded_details != static_details {
+		return pbt.fail("generated Workflow user metadata changed across protobuf encoding")
 	}
 	return pbt.pass()
 }
