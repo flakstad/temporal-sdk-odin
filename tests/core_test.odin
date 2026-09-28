@@ -3640,6 +3640,73 @@ fiber_repeated_query_test_workflow :: proc(ctx: ^workflow.Fiber_Context, _: stri
 	return workflow.await_signal(ctx, "finish")
 }
 
+Repeated_Update_State :: struct {
+	completed: bool,
+}
+
+fiber_repeated_update_test_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Repeated_Update_State{}
+	registered := workflow.set_update_handler_payloads_with_context(
+		ctx,
+		"repeated_update",
+		&state,
+		proc(
+			_: rawptr,
+			update: ^workflow.Update_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Update_Validation {
+			if len(inputs) != 3 || update.id != "repeated-update-id" ||
+			   update.name != "repeated_update" || len(inputs[0].external_payloads) != 1 ||
+			   inputs[0].external_payloads[0].size_bytes != 5120 {
+				return workflow.update_reject("repeated Update shape mismatch", "RepeatedUpdateMismatch")
+			}
+			message_type, metadata_found := codec.metadata_get(inputs[0], "messageType")
+			caller: string
+			caller_found, caller_error := workflow.update_header_json(update, "caller", &caller)
+			defer delete(caller)
+			if !metadata_found || string(message_type) != "odin.RepeatedUpdate" ||
+			   !caller_found || caller_error != .None || caller != "repeated-client" {
+				return workflow.update_reject("repeated Update context mismatch", "RepeatedUpdateMismatch")
+			}
+			return workflow.update_accept()
+		},
+		proc(
+			callback_data: rawptr,
+			update: ^workflow.Update_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Payload_Result {
+			state := cast(^Repeated_Update_State)callback_data
+			name: string
+			count: int
+			enabled: bool
+			if len(inputs) != 3 || codec.decode_json(inputs[0], &name) != .None ||
+			   codec.decode_json(inputs[1], &count) != .None ||
+			   codec.decode_json(inputs[2], &enabled) != .None {
+				delete(name)
+				return workflow.payload_fail("repeated Update decoding failed", "RepeatedUpdateMismatch")
+			}
+			defer delete(name)
+			if name != "Odin" || count != 42 || !enabled || update.identity != "update-client" {
+				return workflow.payload_fail("repeated Update values changed", "RepeatedUpdateMismatch")
+			}
+			state.completed = true
+			payload, encode_error := codec.encode_json("repeated Update received")
+			if encode_error != .None {
+				return workflow.payload_fail("repeated Update output encoding failed")
+			}
+			return workflow.payload_complete(payload)
+		},
+	)
+	if !registered {
+		return "repeated Update registration failed"
+	}
+	finish := workflow.await_signal(ctx, "finish")
+	if !state.completed {
+		return "repeated Update did not complete"
+	}
+	return finish
+}
+
 fiber_buffered_signal_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	greeting := workflow.execute_activity(ctx, "hello", name)
 	approval := workflow.await_signal(ctx, "approval")
@@ -12469,6 +12536,42 @@ workflow_fiber_applies_validated_updates_and_replays_state :: proc(t: ^testing.T
 	update_response_inspection_free(&rejected_inspection)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
+
+	wrong_arity_update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "increment-wrong-arity",
+		protocol_instance_id = "update-protocol-wrong-arity",
+		name = "increment",
+		run_validator = true,
+	}
+	defer delete(wrong_arity_update.input)
+	append(&wrong_arity_update.input, update_input_proto, update_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &wrong_arity_update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.updates_accepted, 0)
+	testing.expect_value(t, processed.updates_rejected, 1)
+	wrong_arity_inspection := inspect_update_responses(
+		processed.completion[:],
+		"update-protocol-wrong-arity",
+	)
+	testing.expect_value(t, wrong_arity_inspection.rejected, 1)
+	testing.expect_value(
+		t,
+		string(wrong_arity_inspection.failure_type),
+		"OdinWorkflowUpdateArgumentCountError",
+	)
+	update_response_inspection_free(&wrong_arity_inspection)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
 }
 
 @(test)
@@ -12635,6 +12738,181 @@ workflow_repeated_query_arguments_preserve_order_details_and_replay_bytes :: pro
 	testing.expect(t, replayed.error.message == nil)
 	testing.expect(t, bytes.equal(query_completion[:], replayed.completion[:]))
 	delete(query_completion)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
+workflow_repeated_update_arguments_preserve_order_details_and_replay_bytes :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"repeated_update_workflow",
+		"test-queue",
+		fiber_repeated_update_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	proto_workflow_input := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(proto_workflow_input.metadata)
+	defer delete(proto_workflow_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "repeated_update_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_workflow_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "repeated-update-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	name, name_error := codec.encode_json("Odin")
+	count, count_error := codec.encode_json(42)
+	enabled, enabled_error := codec.encode_json(true)
+	testing.expect(t, name_error == .None && count_error == .None && enabled_error == .None)
+	defer codec.payload_free(&name)
+	defer codec.payload_free(&count)
+	defer codec.payload_free(&enabled)
+	testing.expect(
+		t,
+		codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedUpdate"),
+		) == .None,
+	)
+	testing.expect(t, codec.payload_add_external(&name, 5120) == .None)
+	proto_name := proto.encode_payload(codec.payload_view(&name))
+	proto_count := proto.encode_payload(codec.payload_view(&count))
+	proto_enabled := proto.encode_payload(codec.payload_view(&enabled))
+	defer delete(proto_name.metadata)
+	defer delete(proto_name.external_payloads)
+	defer delete(proto_count.metadata)
+	defer delete(proto_count.external_payloads)
+	defer delete(proto_enabled.metadata)
+	defer delete(proto_enabled.external_payloads)
+	header, header_error := codec.encode_json("repeated-client")
+	testing.expect(t, header_error == .None)
+	defer codec.payload_free(&header)
+	proto_header := proto.encode_payload(codec.payload_view(&header))
+	defer delete(proto_header.metadata)
+	defer delete(proto_header.external_payloads)
+	update_meta := proto.Temporal_Api_Update_V1_Meta{identity = "update-client"}
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "repeated-update-id",
+		protocol_instance_id = "repeated-update-protocol",
+		name = "repeated_update",
+		run_validator = true,
+		meta = &update_meta,
+	}
+	defer delete(update.input)
+	defer delete(update.headers)
+	append(&update.input, proto_name, proto_count, proto_enabled)
+	append(
+		&update.headers,
+		proto.Coresdk_Workflow_Activation_DoUpdate_HeadersEntry{
+			key = "caller",
+			value = &proto_header,
+		},
+	)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	updated := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, updated.error.message == nil, "repeated Update failed: %s", string(updated.error.message))
+	testing.expect(t, updated.waiting_signal && !updated.completed)
+	testing.expect_value(t, updated.updates_accepted, 1)
+	testing.expect_value(t, updated.updates_completed, 1)
+	testing.expect_value(t, updated.updates_rejected, 0)
+	inspection := inspect_update_responses(updated.completion[:], "repeated-update-protocol")
+	testing.expect_value(t, inspection.command_count, 2)
+	testing.expect_value(t, inspection.accepted, 1)
+	testing.expect_value(t, inspection.completed, 1)
+	output: string
+	testing.expect(t, codec.decode_json(codec.payload_view(&inspection.payload), &output) == .None)
+	testing.expect_value(t, output, "repeated Update received")
+	delete(output)
+	update_response_inspection_free(&inspection)
+	update_completion := updated.completion
+	workflow.error_free(&updated.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	update.run_validator = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, bytes.equal(update_completion[:], replayed.completion[:]))
+	delete(update_completion)
 	delete(replayed.completion)
 	workflow.error_free(&replayed.error)
 }

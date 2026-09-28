@@ -2110,12 +2110,12 @@ poll_update_result_payload :: proc(
 	}
 }
 
-// encode_update_workflow_request is exposed for wire-contract testing. The
-// returned request waits only for acceptance; result polling remains a separate
-// Client operation.
-encode_update_workflow_request :: proc(
+// encode_update_workflow_request_payloads is the codec-neutral repeated-input
+// Update boundary. The returned request waits only for acceptance; result
+// polling remains a separate Client operation.
+encode_update_workflow_request_payloads :: proc(
 	namespace, workflow_id, run_id, first_execution_run_id, update_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Update_Workflow_Options = {},
 	explicit_request_id := "",
 ) -> (request_bytes: [dynamic]u8, error: Error) {
@@ -2129,12 +2129,14 @@ encode_update_workflow_request :: proc(
 		workflow_id = workflow_id,
 		run_id = run_id,
 	}
-	encoded_input := proto.encode_payload(input)
-	defer delete(encoded_input.metadata)
-	defer delete(encoded_input.external_payloads)
+	encoded_inputs := make([]proto.Temporal_Api_Common_V1_Payload, len(inputs))
+	defer free_start_proto_payloads(encoded_inputs)
 	arguments := proto.Temporal_Api_Common_V1_Payloads{}
 	defer delete(arguments.payloads)
-	append(&arguments.payloads, encoded_input)
+	for input, index in inputs {
+		encoded_inputs[index] = proto.encode_payload(input)
+		append(&arguments.payloads, encoded_inputs[index])
+	}
 	update_id_buffer: [uuid.EXPECTED_LENGTH]u8
 	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
 	meta := proto.Temporal_Api_Update_V1_Meta{
@@ -2183,6 +2185,25 @@ encode_update_workflow_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(&request), {}
 }
 
+encode_update_workflow_request :: proc(
+	namespace, workflow_id, run_id, first_execution_run_id, update_name: string,
+	input: codec.Payload_View,
+	options: Update_Workflow_Options = {},
+	explicit_request_id := "",
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	inputs := [?]codec.Payload_View{input}
+	return encode_update_workflow_request_payloads(
+		namespace,
+		workflow_id,
+		run_id,
+		first_execution_run_id,
+		update_name,
+		inputs[:],
+		options,
+		explicit_request_id,
+	)
+}
+
 start_update_payload :: proc(
 	handle: ^Workflow_Handle,
 	update_name: string,
@@ -2197,10 +2218,10 @@ start_update_payload :: proc(
 	)
 }
 
-start_update_payload_unintercepted :: proc(
+start_update_payloads_unintercepted :: proc(
 	handle: ^Workflow_Handle,
 	update_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Update_Workflow_Options,
 ) -> (Update_Handle, Error) {
 	if !workflow_handle_valid(handle) {
@@ -2212,13 +2233,13 @@ start_update_payload_unintercepted :: proc(
 	if options.headers != nil && options.headers.allocator.procedure == nil {
 		return {}, error_from_string(.Invalid_Argument, "Workflow Update headers are not initialized")
 	}
-	request_bytes, request_error := encode_update_workflow_request(
+	request_bytes, request_error := encode_update_workflow_request_payloads(
 		handle.client.namespace,
 		handle.id,
 		handle.run_id,
 		handle.first_execution_run_id,
 		update_name,
-		input,
+		inputs,
 		options,
 	)
 	if request_error.message != nil {
@@ -2339,18 +2360,18 @@ start_update_payload_terminal :: proc(
 	}
 	options := input.options
 	options.headers = input.headers
-	return start_update_payload_unintercepted(
+	return start_update_payloads_unintercepted(
 		input.handle,
 		input.update_name,
-		input.input,
+		input.inputs,
 		options,
 	)
 }
 
-start_update_payload_with_options :: proc(
+start_update_payloads_with_options :: proc(
 	handle: ^Workflow_Handle,
 	update_name: string,
-	input: codec.Payload_View,
+	inputs: []codec.Payload_View,
 	options: Update_Workflow_Options,
 ) -> (Update_Handle, Error) {
 	headers := Headers{}
@@ -2362,7 +2383,7 @@ start_update_payload_with_options :: proc(
 	interceptor_input := Client_Start_Update_Input{
 		handle = handle,
 		update_name = update_name,
-		input = input,
+		inputs = inputs,
 		options = options,
 		headers = &headers,
 	}
@@ -2372,6 +2393,30 @@ start_update_payload_with_options :: proc(
 	}
 	state := Client_Interceptor_State{client = client}
 	return client_start_update_chain(&state, &interceptor_input)
+}
+
+start_update_payload_with_options :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	input: codec.Payload_View,
+	options: Update_Workflow_Options,
+) -> (Update_Handle, Error) {
+	inputs := [?]codec.Payload_View{input}
+	return start_update_payloads_with_options(handle, update_name, inputs[:], options)
+}
+
+start_update_payloads :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	inputs: []codec.Payload_View,
+	explicit_update_id := "",
+) -> (Update_Handle, Error) {
+	return start_update_payloads_with_options(
+		handle,
+		update_name,
+		inputs,
+		{update_id = explicit_update_id},
+	)
 }
 
 start_update_json :: proc(
@@ -2451,6 +2496,25 @@ execute_update_payload :: proc(
 	explicit_update_id := "",
 ) -> (codec.Payload, Error) {
 	update, start_error := start_update_payload(handle, update_name, input, explicit_update_id)
+	if start_error.message != nil {
+		return {}, start_error
+	}
+	defer update_handle_free(&update)
+	return wait_update_payload(&update)
+}
+
+execute_update_payloads :: proc(
+	handle: ^Workflow_Handle,
+	update_name: string,
+	inputs: []codec.Payload_View,
+	explicit_update_id := "",
+) -> (codec.Payload, Error) {
+	update, start_error := start_update_payloads(
+		handle,
+		update_name,
+		inputs,
+		explicit_update_id,
+	)
 	if start_error.message != nil {
 		return {}, start_error
 	}

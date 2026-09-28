@@ -109,6 +109,23 @@ query_workflow_interceptor :: proc(
 	return temporal_client.client_query_workflow_next(next, input)
 }
 
+start_update_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Start_Update_Input,
+	next: temporal_client.Client_Start_Update_Next,
+) -> (temporal_client.Update_Handle, temporal_client.Error) {
+	if input.update_name == "repeated_update" {
+		if len(input.inputs) != 3 {
+			return {}, temporal_client.error_from_string(
+				.Invalid_Argument,
+				"Client interceptor did not receive three Update arguments",
+			)
+		}
+		fmt.println("Client Update interceptor observed three Update arguments")
+	}
+	return temporal_client.client_start_update_next(next, input)
+}
+
 get_result_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Get_Result_Input,
@@ -152,6 +169,7 @@ run :: proc() -> int {
 		signal_with_start = signal_with_start_interceptor,
 		signal_workflow = signal_workflow_interceptor,
 		query_workflow = query_workflow_interceptor,
+		start_update = start_update_interceptor,
 		get_result = get_result_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -444,6 +462,119 @@ run :: proc() -> int {
 			workflow_id,
 			handle.run_id,
 			query_output,
+		)
+		return 0
+	}
+	if scenario == "multiple-update-arguments" {
+		handle, start_error := temporal_client.start_workflow_json(
+			&client,
+			"odin_repeated_update_workflow",
+			"start",
+			{
+				id = workflow_id,
+				task_queue = "odin-hello-workflow",
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf("Repeated-Update Workflow start failed: %s\n", string(start_error.message))
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		name, name_error := codec.encode_json("Odin")
+		count, count_error := codec.encode_json(42)
+		enabled, enabled_error := codec.encode_json(true)
+		if name_error != .None || count_error != .None || enabled_error != .None {
+			fmt.eprintln("Could not encode repeated Update arguments")
+			codec.payload_free(&name)
+			codec.payload_free(&count)
+			codec.payload_free(&enabled)
+			return 1
+		}
+		defer codec.payload_free(&name)
+		defer codec.payload_free(&count)
+		defer codec.payload_free(&enabled)
+		if codec.payload_add_metadata(
+			&name,
+			"messageType",
+			transmute([]u8)string("odin.RepeatedUpdate"),
+		) != .None || codec.payload_add_external(&name, 5120) != .None {
+			fmt.eprintln("Could not decorate repeated Update argument")
+			return 1
+		}
+		inputs := [3]codec.Payload_View{
+			codec.payload_view(&name),
+			codec.payload_view(&count),
+			codec.payload_view(&enabled),
+		}
+		headers := temporal_client.Headers{}
+		headers_error := temporal_client.headers_init(&headers)
+		if headers_error.message != nil {
+			fmt.eprintf("Update headers initialization failed: %s\n", string(headers_error.message))
+			temporal_client.error_free(&headers_error)
+			return 1
+		}
+		temporal_client.error_free(&headers_error)
+		defer temporal_client.headers_free(&headers)
+		header_error := temporal_client.headers_add_json(&headers, "caller", "repeated-client")
+		if header_error.message != nil {
+			fmt.eprintf("Update header encoding failed: %s\n", string(header_error.message))
+			temporal_client.error_free(&header_error)
+			return 1
+		}
+		temporal_client.error_free(&header_error)
+		update, update_error := temporal_client.start_update_payloads_with_options(
+			&handle,
+			"repeated_update",
+			inputs[:],
+			{headers = &headers},
+		)
+		if update_error.message != nil {
+			fmt.eprintf("Repeated Update start failed: %s\n", string(update_error.message))
+			temporal_client.error_free(&update_error)
+			return 1
+		}
+		defer temporal_client.update_handle_free(&update)
+		update_result, wait_error := temporal_client.wait_update_payload(&update)
+		defer codec.payload_free(&update_result)
+		if wait_error.message != nil {
+			fmt.eprintf("Repeated Update result failed: %s\n", string(wait_error.message))
+			temporal_client.error_free(&wait_error)
+			return 1
+		}
+		update_output: string
+		defer delete(update_output)
+		if codec.decode_json(codec.payload_view(&update_result), &update_output) != .None ||
+		   update_output != "Odin:42:true" {
+			fmt.eprintf("Repeated Update returned unexpected result: %q\n", update_output)
+			return 1
+		}
+		signal_error := temporal_client.signal_workflow_json(&handle, "finish", "update finished")
+		if signal_error.message != nil {
+			fmt.eprintf("Repeated-Update finish Signal failed: %s\n", string(signal_error.message))
+			temporal_client.error_free(&signal_error)
+			return 1
+		}
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf("Repeated-Update Workflow result failed: %s\n", string(result_error.message))
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "update finished" {
+			fmt.eprintf("Repeated-Update Workflow returned unexpected result: %q\n", result)
+			return 1
+		}
+		fmt.printf(
+			"Odin client completed repeated-Update workflow_id=%s run_id=%s update=%q\n",
+			workflow_id,
+			handle.run_id,
+			update_output,
 		)
 		return 0
 	}

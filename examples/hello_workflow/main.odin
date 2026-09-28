@@ -23,6 +23,7 @@ WORKFLOW_PROPERTIES_TYPE :: "odin_workflow_properties"
 SIGNAL_WITH_START_WORKFLOW_TYPE :: "odin_signal_with_start_workflow"
 REPEATED_SIGNAL_WORKFLOW_TYPE :: "odin_repeated_signal_workflow"
 REPEATED_QUERY_WORKFLOW_TYPE :: "odin_repeated_query_workflow"
+REPEATED_UPDATE_WORKFLOW_TYPE :: "odin_repeated_update_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
 
 Typed_Greeting_Input :: struct {
@@ -477,6 +478,75 @@ repeated_query_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> stri
 		return "repeated Query registration failed"
 	}
 	return workflow.await_signal(ctx, "finish")
+}
+
+Repeated_Update_State :: struct {
+	completed: bool,
+}
+
+repeated_update_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Repeated_Update_State{}
+	registered := workflow.set_update_handler_payloads_with_context(
+		ctx,
+		"repeated_update",
+		&state,
+		proc(
+			_: rawptr,
+			update: ^workflow.Update_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Update_Validation {
+			caller: string
+			found, decode_error := workflow.update_header_json(update, "caller", &caller)
+			defer delete(caller)
+			message_type: []u8
+			metadata_found := false
+			if len(inputs) > 0 {
+				message_type, metadata_found = codec.metadata_get(inputs[0], "messageType")
+			}
+			if len(inputs) != 3 || !metadata_found || string(message_type) != "odin.RepeatedUpdate" ||
+			   len(inputs[0].external_payloads) != 1 ||
+			   inputs[0].external_payloads[0].size_bytes != 5120 || !found ||
+			   decode_error != .None || caller != "repeated-client" {
+				return workflow.update_reject("repeated Update shape mismatch", "RepeatedUpdateMismatch")
+			}
+			return workflow.update_accept()
+		},
+		nil,
+		proc(
+			callback_data: rawptr,
+			_: ^workflow.Fiber_Context,
+			_: ^workflow.Update_Context,
+			inputs: []codec.Payload_View,
+		) -> workflow.Payload_Result {
+			state := cast(^Repeated_Update_State)callback_data
+			name: string
+			count: int
+			enabled: bool
+			if len(inputs) != 3 || codec.decode_json(inputs[0], &name) != .None ||
+			   codec.decode_json(inputs[1], &count) != .None ||
+			   codec.decode_json(inputs[2], &enabled) != .None {
+				delete(name)
+				return workflow.payload_fail("repeated Update decoding failed", "RepeatedUpdateMismatch")
+			}
+			defer delete(name)
+			state.completed = true
+			output := fmt.aprintf("%s:%d:%v", name, count, enabled)
+			defer delete(output)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return workflow.payload_fail("repeated Update output encoding failed")
+			}
+			return workflow.payload_complete(payload)
+		},
+	)
+	if !registered {
+		return "repeated Update registration failed"
+	}
+	result := workflow.await_signal(ctx, "finish")
+	if !state.completed {
+		return "repeated Update did not complete"
+	}
+	return result
 }
 
 workflow_query_interceptor :: proc(
@@ -1383,6 +1453,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	repeated_update_register_error := worker.register_workflow(
+		&activity_worker,
+		REPEATED_UPDATE_WORKFLOW_TYPE,
+		repeated_update_workflow,
+	)
+	if repeated_update_register_error.message != nil {
+		fmt.eprintf(
+			"Repeated-Update Workflow registration failed: %s\n",
+			string(repeated_update_register_error.message),
+		)
+		worker.error_free(&repeated_update_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	local_activity_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		LOCAL_ACTIVITY_WORKFLOW_TYPE,
@@ -1507,14 +1593,15 @@ main :: proc() {
 	expect_multiple_workflow_arguments := scenario == "multiple-workflow-arguments"
 	expect_multiple_signal_arguments := scenario == "multiple-signal-arguments"
 	expect_multiple_query_arguments := scenario == "multiple-query-arguments"
+	expect_multiple_update_arguments := scenario == "multiple-update-arguments"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1549,16 +1636,20 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments {
+		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
-			} else if expect_multiple_signal_arguments || expect_multiple_query_arguments {
+			} else if expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
 				expected_signals = 1
 			}
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != expected_signals ||
 			   run_stats.timers_canceled != 0 ||
-			   (expect_multiple_query_arguments && run_stats.workflow_queries_answered != 1) {
+			   (expect_multiple_query_arguments && run_stats.workflow_queries_answered != 1) ||
+			   (expect_multiple_update_arguments &&
+			    (run_stats.workflow_updates_accepted != 1 ||
+			     run_stats.workflow_updates_completed != 1 ||
+			     run_stats.workflow_updates_rejected != 0)) {
 				fmt.eprintln("Command-only Workflow path produced unexpected worker stats")
 				failed = true
 			}
@@ -1660,6 +1751,8 @@ main :: proc() {
 		fmt.println("multiple Signal arguments completed end-to-end through Core")
 	} else if expect_multiple_query_arguments {
 		fmt.println("multiple Query arguments completed end-to-end through Core")
+	} else if expect_multiple_update_arguments {
+		fmt.println("multiple Update arguments completed end-to-end through Core")
 	} else if expect_local_activity {
 		fmt.println("Local Activity completed through Core in the Workflow Worker")
 	} else if expect_local_activity_retry {

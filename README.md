@@ -672,12 +672,26 @@ update, err := temporal_client.start_update_json_with_options(
 )
 defer temporal_client.update_handle_free(&update)
 err = temporal_client.wait_update_json(&update, &updated)
+update_args := [?]codec.Payload_View{
+    codec.payload_view(&name),
+    codec.payload_view(&options),
+}
+raw_update, err := temporal_client.start_update_payloads_with_options(
+    &handle,
+    "rename_order_raw",
+    update_args[:],
+    {headers = &update_headers},
+)
+defer temporal_client.update_handle_free(&raw_update)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 ```
 
 `execute_update_json` remains the one-call convenience wrapper around
 `start_update_json` plus `wait_update_json`; the codec-neutral and option-aware
 variants are available when callers need custom Payloads or propagation headers.
+The plural `start_update_payloads[_with_options]` and
+`execute_update_payloads` forms preserve Temporal's complete ordered argument
+list.
 
 Terminal Workflow and Update errors may carry a complete Temporal Failure:
 
@@ -1039,6 +1053,12 @@ _ = workflow.set_validated_update_routine_json_with_context(
     rename,
 )
 ```
+
+Codec-neutral Updates may instead use
+`set_update_handler_payloads[_with_context]`; validator, synchronous handler,
+and optional stackful routine callback all receive the same ordered Payload
+slice. Singular Payload/JSON registrations reject any arity other than one with
+`OdinWorkflowUpdateArgumentCountError`.
 
 `Update_Context` exposes the server Update ID, name, client identity, and
 headers. Its run-arena-owned values survive handler suspension, and

@@ -589,8 +589,9 @@ defer temporal_client.update_handle_free(&update)
 update_error = temporal_client.wait_update_json(&update, &result)
 ```
 
-`start_update_payload` and `wait_update_payload` are the codec-neutral forms;
-`execute_update_payload` composes them as a convenience. Start creates UUIDv4
+`start_update_payloads[_with_options]` and `wait_update_payload` are the
+codec-neutral forms; `execute_update_payloads` composes them as a convenience.
+The singular Payload and JSON APIs remain one-argument adapters. Start creates UUIDv4
 Update and request IDs unless an explicit Update ID is supplied, asks
 `UpdateWorkflowExecution` to wait for `ACCEPTED`, and returns an owned handle.
 Wait long-polls `PollWorkflowExecutionUpdate` for `COMPLETED`. The successful
@@ -612,6 +613,14 @@ return `update_accept()` or `update_reject(message, type)`. Handlers receive
 handler input is decoded in the Workflow arena so strings/slices retained in
 state survive the activation; validator and query inputs retain their shorter
 activation lifetime.
+
+For codec-neutral multi-argument Updates,
+`set_update_handler_payloads[_with_context]` exposes the complete ordered slice
+to validation and handling, including the optional stackful routine callback.
+The runtime clones every Core `DoUpdate.input` Payload before invocation and
+keeps routine arguments in the Workflow arena across suspension. Singular
+registrations reject zero or multiple arguments with
+`OdinWorkflowUpdateArgumentCountError`.
 
 Each accepted routine has its own stack, wait state, and protocol ID, but shares
 the Workflow instance's deterministic operation tables and sequence numbers.
@@ -811,8 +820,11 @@ frees each source Payload before request encoding, then decodes the complete
 `StartWorkflowExecutionRequest` to prove builder ownership and wire fidelity.
 An additional 500 cases generate zero to twelve ordered Query arguments with
 arbitrary Payload bytes, per-argument metadata and external payload details,
-plus query headers, query types, and reject conditions. Every source Payload is
-freed before request encoding, and repeated encoding must remain byte-identical.
+plus query headers, query types, and reject conditions. The source Payloads
+remain caller-owned, and repeated encoding must remain byte-identical.
+Another 500 cases do the same for zero to twelve ordered Update arguments while
+also checking Workflow/run identity, Update/request IDs, headers, and
+byte-identical request encoding.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
@@ -1157,7 +1169,8 @@ Payloads, metadata, and external-payload details. Workflow code receives them
 through `await_signal_payloads[_with_context]` or
 `set_signal_handler_payloads`; singular adapters reject zero or multiple
 arguments with `OdinWorkflowSignalArgumentCountError`. Client Updates use
-`start_update_json_with_options`/`start_update_payload_with_options` with
+`start_update_json_with_options`, `start_update_payload_with_options`, or
+`start_update_payloads_with_options` with
 `Update_Workflow_Options.headers`. Workflow Activity,
 Local Activity, Child Workflow, and child/external Signal options expose the
 same `workflow.Headers` alias. Incoming values are borrowed: use

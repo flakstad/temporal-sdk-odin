@@ -283,15 +283,15 @@ signal_requests_preserve_generated_headers :: proc(t: ^testing.T) {
 }
 
 update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
-	input_value := pbt.draw(t, pbt.string_ascii(0, 96))
 	header_value := pbt.draw(t, pbt.string_ascii(0, 64))
 	run_id := pbt.draw(t, pbt.string_ascii(0, 48))
-	pbt.cover(t, len(input_value) == 0, 0.2, "empty Update input")
+	argument_count := pbt.draw(t, pbt.int_range(0, 12))
 	pbt.cover(t, len(header_value) == 0, 0.5, "empty Update header value")
 	pbt.cover(t, len(run_id) == 0, 0.5, "current-run Update target")
+	pbt.cover(t, argument_count == 0, 2.0, "zero Update arguments")
+	pbt.cover(t, argument_count == 1, 2.0, "one Update argument")
+	pbt.cover(t, argument_count >= 8, 20.0, "many Update arguments")
 
-	input := codec.payload_create(transmute([]u8)input_value)
-	defer codec.payload_free(&input)
 	headers := temporal_client.Headers{}
 	init_error := temporal_client.headers_init(&headers)
 	defer temporal_client.error_free(&init_error)
@@ -304,14 +304,36 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if header_error.message != nil {
 		return pbt.error("could not encode generated Update header")
 	}
+	input_values: [12]string
+	inputs: [12]codec.Payload
+	input_views: [12]codec.Payload_View
+	external_sizes: [12]i64
+	defer {
+		for index in 0..<argument_count {
+			codec.payload_free(&inputs[index])
+		}
+	}
+	for index in 0..<argument_count {
+		input_values[index] = pbt.draw(t, pbt.string_ascii(0, 96))
+		external_sizes[index] = i64(pbt.draw(t, pbt.int_range(0, 1_000_000)))
+		inputs[index] = codec.payload_create(transmute([]u8)input_values[index])
+		if codec.payload_add_metadata(
+			&inputs[index],
+			"argument",
+			transmute([]u8)input_values[index],
+		) != .None || codec.payload_add_external(&inputs[index], external_sizes[index]) != .None {
+			return pbt.error("could not decorate generated Update argument")
+		}
+		input_views[index] = codec.payload_view(&inputs[index])
+	}
 
-	encoded, encode_error := temporal_client.encode_update_workflow_request(
+	encoded, encode_error := temporal_client.encode_update_workflow_request_payloads(
 		"property-namespace",
 		"property-workflow-id",
 		run_id,
 		"property-first-run-id",
 		"property-update",
-		codec.payload_view(&input),
+		input_views[:argument_count],
 		{update_id = "property-update-id", headers = &headers},
 		"property-request-id",
 	)
@@ -336,7 +358,8 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	context.allocator = previous_allocator
 	if !decoded || request.workflow_execution == nil || request.request == nil ||
 	   request.request.meta == nil || request.request.input == nil ||
-	   request.request.input.args == nil || len(request.request.input.args.payloads) != 1 ||
+	   request.request.input.args == nil ||
+	   len(request.request.input.args.payloads) != argument_count ||
 	   request.request.input.header == nil || len(request.request.input.header.fields) != 1 ||
 	   request.request.input.header.fields[0].value == nil {
 		return pbt.fail("generated Update request did not decode")
@@ -348,9 +371,26 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.request.meta.update_id != "property-update-id" ||
 	   request.request.request_id != "property-request-id" ||
 	   request.request.input.name != "property-update" ||
-	   request.request.input.header.fields[0].key != "property-header" ||
-	   !bytes.equal(request.request.input.args.payloads[0].data, transmute([]u8)input_value) {
+	   request.request.input.header.fields[0].key != "property-header" {
 		return pbt.fail("generated Update fields changed during round trip")
+	}
+	for index in 0..<argument_count {
+		argument := &request.request.input.args.payloads[index]
+		if !bytes.equal(argument.data, transmute([]u8)input_values[index]) ||
+		   len(argument.external_payloads) != 1 ||
+		   argument.external_payloads[0].size_bytes != external_sizes[index] {
+			return pbt.fail("generated Update argument order or external details changed")
+		}
+		metadata_value: []u8
+		for entry in argument.metadata {
+			if entry.key == "argument" {
+				metadata_value = entry.value
+				break
+			}
+		}
+		if !bytes.equal(metadata_value, transmute([]u8)input_values[index]) {
+			return pbt.fail("generated Update argument metadata changed")
+		}
 	}
 	owned_header, clone_error := proto.clone_payload(
 		request.request.input.header.fields[0].value,
@@ -365,13 +405,28 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   decoded_header != header_value {
 		return pbt.fail("generated Update header changed during round trip")
 	}
+	reencoded, reencode_error := temporal_client.encode_update_workflow_request_payloads(
+		"property-namespace",
+		"property-workflow-id",
+		run_id,
+		"property-first-run-id",
+		"property-update",
+		input_views[:argument_count],
+		{update_id = "property-update-id", headers = &headers},
+		"property-request-id",
+	)
+	defer delete(reencoded)
+	defer temporal_client.error_free(&reencode_error)
+	if reencode_error.message != nil || !bytes.equal(encoded[:], reencoded[:]) {
+		return pbt.fail("generated Update request bytes were not deterministic")
+	}
 	return pbt.pass()
 }
 
 @(test)
 update_requests_preserve_generated_headers :: proc(t: ^testing.T) {
 	result := pbt.check(
-		"Update requests preserve identity, payload, and headers",
+		"Update requests preserve ordered arguments, details, identity, and headers",
 		update_request_property,
 		{num_tests = 500, seed = 0x5550_4441_5445_4844},
 	)

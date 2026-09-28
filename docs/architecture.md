@@ -1345,12 +1345,23 @@ in the instance arena, their backing storage is reclaimed in bulk at eviction.
 Replay then constructs a new arena and reapplies accepted Updates to rebuild
 state.
 
+The protocol boundary itself is not singular: Service `Input.args` and Core
+`DoUpdate.input` are repeated Payload fields. Odin therefore carries 0..N
+ordered Payloads through Client interceptors, protobuf encoding, validation,
+handler interceptors, synchronous handlers, and stackful routines. The
+codec-neutral `set_update_handler_payloads[_with_context]` registrations accept
+that full slice; singular Payload/JSON adapters require exactly one and return
+`OdinWorkflowUpdateArgumentCountError` otherwise. Routine-owned clones and
+views live in the Workflow arena, so suspension does not retain activation
+decode memory.
+
 The public Client uses the C bridge's existing generic RPC symbol for
 `UpdateWorkflowExecution`. `start_update_payload/json` requests lifecycle stage
 `ACCEPTED` and returns an owned `Update_Handle` containing the server's Workflow,
 run, and Update IDs. `wait_update_payload/json` uses
 `PollWorkflowExecutionUpdate` with lifecycle stage `COMPLETED`.
-`execute_update_payload/json` composes those operations for callers that prefer
+`execute_update_payloads` and the singular `execute_update_payload/json`
+adapters compose those operations for callers that prefer
 a blocking one-call API.
 Successful outcomes are cloned out of the protobuf decode arena. Failure
 outcomes become `.Workflow_Update_Failed`, with an owned message and encoded
@@ -1992,8 +2003,7 @@ command/replay cases, plus 500 Activity deadline combinations,
 round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
 Signal request/header round trips over 0–12 arguments, 500 paginated Visibility
 list/count round trips, 500 repeated Query request/header round trips over 0–12
-arguments, 500 Update
-request/header round trips,
+arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/signal/replay cases, 500 external Workflow

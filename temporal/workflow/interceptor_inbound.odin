@@ -77,7 +77,7 @@ Inbound_Handle_Update_Input :: struct {
 	ctx:           ^Fiber_Context,
 	workflow_type: string,
 	update:        ^Update_Context,
-	input:         codec.Payload_View,
+	inputs:        []codec.Payload_View,
 }
 
 Inbound_Handle_Update_Validator_Next_Proc :: #type proc(
@@ -416,14 +416,30 @@ inbound_handle_update_validator_chain :: proc(
 			{data = &next_state, invoke = inbound_handle_update_validator_chain},
 		)
 	}
+	if state.handler.validate_payloads_with_context != nil {
+		return state.handler.validate_payloads_with_context(
+			state.handler.callback_data,
+			input.update,
+			input.inputs,
+		)
+	}
+	if state.handler.validate_payloads != nil {
+		return state.handler.validate_payloads(state.handler.callback_data, input.inputs)
+	}
+	if len(input.inputs) != 1 {
+		return update_reject(
+			"single-Payload Workflow Update validator requires exactly one argument",
+			"OdinWorkflowUpdateArgumentCountError",
+		)
+	}
 	if state.handler.validate_with_context != nil {
 		return state.handler.validate_with_context(
 			state.handler.callback_data,
 			input.update,
-			input.input,
+			input.inputs[0],
 		)
 	}
-	return state.handler.validate(state.handler.callback_data, input.input)
+	return state.handler.validate(state.handler.callback_data, input.inputs[0])
 }
 
 Inbound_Handle_Update_Handler_State :: struct {
@@ -461,26 +477,63 @@ inbound_handle_update_handler_chain :: proc(
 		)
 	}
 	if state.routine != nil {
+		if state.routine.invoke_payloads_with_context != nil {
+			return state.routine.invoke_payloads_with_context(
+				state.routine.callback_data,
+				input.ctx,
+				input.update,
+				input.inputs,
+			)
+		}
+		if state.routine.invoke_payloads != nil {
+			return state.routine.invoke_payloads(
+				state.routine.callback_data,
+				input.ctx,
+				input.inputs,
+			)
+		}
+		if len(input.inputs) != 1 {
+			return payload_fail(
+				"single-Payload Workflow Update routine requires exactly one argument",
+				"OdinWorkflowUpdateArgumentCountError",
+			)
+		}
 		if state.routine.invoke_with_context != nil {
 			return state.routine.invoke_with_context(
 				state.routine.callback_data,
 				input.ctx,
 				input.update,
-				input.input,
+				input.inputs[0],
 			)
 		}
 		return state.routine.invoke(
 			state.routine.callback_data,
 			input.ctx,
-			input.input,
+			input.inputs[0],
+		)
+	}
+	if state.handler.invoke_payloads_with_context != nil {
+		return state.handler.invoke_payloads_with_context(
+			state.handler.callback_data,
+			input.update,
+			input.inputs,
+		)
+	}
+	if state.handler.invoke_payloads != nil {
+		return state.handler.invoke_payloads(state.handler.callback_data, input.inputs)
+	}
+	if len(input.inputs) != 1 {
+		return payload_fail(
+			"single-Payload Workflow Update handler requires exactly one argument",
+			"OdinWorkflowUpdateArgumentCountError",
 		)
 	}
 	if state.handler.invoke_with_context != nil {
 		return state.handler.invoke_with_context(
 			state.handler.callback_data,
 			input.update,
-			input.input,
+			input.inputs[0],
 		)
 	}
-	return state.handler.invoke(state.handler.callback_data, input.input)
+	return state.handler.invoke(state.handler.callback_data, input.inputs[0])
 }

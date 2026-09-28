@@ -127,7 +127,7 @@ Client_Get_Result_Interceptor_Proc :: #type proc(
 Client_Start_Update_Input :: struct {
 	handle:      ^Workflow_Handle,
 	update_name: string,
-	input:       activity_codec.Payload_View,
+	inputs:      []activity_codec.Payload_View,
 	options:     Update_Workflow_Options,
 	headers:     ^Headers,
 }
