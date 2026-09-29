@@ -202,10 +202,29 @@ client_interceptor_property_matching_times :: proc(user_data: rawptr, input: ^te
 	return
 }
 
+client_interceptor_property_create_schedule :: proc(user_data: rawptr, input: ^temporal_client.Client_Create_Schedule_Input, next: temporal_client.Client_Create_Schedule_Next) -> (result: temporal_client.Schedule_Handle, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result, error = temporal_client.client_create_schedule_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_schedule_mutation :: proc(user_data: rawptr, input: ^temporal_client.Client_Schedule_Mutation_Input, next: temporal_client.Client_Schedule_Mutation_Next) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	result: temporal_client.Error
+	if node.short_circuit do result = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result = temporal_client.client_schedule_mutation_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return result
+}
+
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 10))
+	operation := pbt.draw(t, pbt.int_range(0, 12))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -217,6 +236,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 5, 5.0, "Workflow Visibility list")
 	pbt.cover(t, operation == 6, 5.0, "Workflow Visibility count")
 	pbt.cover(t, operation >= 7, 20.0, "Schedule read operation")
+	pbt.cover(t, operation >= 11, 10.0, "Schedule mutation operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -256,6 +276,10 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.count_schedules = client_interceptor_property_count_schedules
 		case 10:
 			interceptor.list_schedule_matching_times = client_interceptor_property_matching_times
+		case 11:
+			interceptor.create_schedule = client_interceptor_property_create_schedule
+		case 12:
+			interceptor.schedule_mutation = client_interceptor_property_schedule_mutation
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -336,6 +360,18 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			time.time_add(start, time.Hour),
 		)
 		temporal_client.schedule_matching_times_free(&matching)
+	case 11:
+		created: temporal_client.Schedule_Handle
+		created, operation_error = temporal_client.create_schedule_payload(
+			&client,
+			"property-schedule",
+			"property-workflow",
+			{},
+			{},
+		)
+		temporal_client.schedule_handle_free(&created)
+	case 12:
+		operation_error = temporal_client.pause_schedule(&schedule_handle, "property pause")
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

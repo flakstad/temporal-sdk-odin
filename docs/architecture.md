@@ -1533,18 +1533,19 @@ one isolated Header builder: the pinned Service RPC assigns that map to the
 Signal event and cannot represent an independent Workflow-start Header.
 Cancellation provides mutable reason/request-ID fields, while termination
 provides a mutable reason and optional borrowed Payload view. Visibility
-list/count and Schedule Describe/List/Count/Matching-Times expose their semantic
-inputs and preserve the existing allocator-owned result contract through typed
-continuations.
+list/count and the complete Schedule surface expose their semantic inputs and
+preserve the existing allocator-owned result contract through typed
+continuations. Schedule Create returns its owned handle directly; the six
+Error-returning mutations share a discriminated semantic input while retaining
+operation-specific fields.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks eleven nested operation families and arbitrary
+A 500-case property checks thirteen nested operation families and arbitrary
 short-circuit depth. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. Live start, Signal-With-Start, Signal, Query,
-result, Update, cancellation, termination, Visibility list/count, and Schedule
-read paths cross Service/Core. Schedule create/mutation operations and
-connection mutation are not yet intercepted.
+result, Update, cancellation, termination, Visibility list/count, and every
+Schedule path cross Service/Core. Connection mutation is not yet intercepted.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.
 The Worker copies configured `workflow.Outbound_Interceptor` records into every

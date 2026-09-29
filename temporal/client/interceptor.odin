@@ -271,6 +271,27 @@ Client_List_Schedule_Matching_Times_Next_Proc :: #type proc(data: rawptr, input:
 Client_List_Schedule_Matching_Times_Next :: struct { data: rawptr, invoke: Client_List_Schedule_Matching_Times_Next_Proc }
 Client_List_Schedule_Matching_Times_Interceptor_Proc :: #type proc(user_data: rawptr, input: ^Client_List_Schedule_Matching_Times_Input, next: Client_List_Schedule_Matching_Times_Next) -> (Schedule_Matching_Times, Error)
 
+Client_Create_Schedule_Input :: struct { client: ^Client, schedule_id: string, workflow_type: string, input: activity_codec.Payload_View, options: Schedule_Create_Options }
+Client_Create_Schedule_Next_Proc :: #type proc(data: rawptr, input: ^Client_Create_Schedule_Input) -> (Schedule_Handle, Error)
+Client_Create_Schedule_Next :: struct { data: rawptr, invoke: Client_Create_Schedule_Next_Proc }
+Client_Create_Schedule_Interceptor_Proc :: #type proc(user_data: rawptr, input: ^Client_Create_Schedule_Input, next: Client_Create_Schedule_Next) -> (Schedule_Handle, Error)
+
+Schedule_Mutation_Kind :: enum { Update, Backfill, Pause, Unpause, Trigger, Delete }
+Client_Schedule_Mutation_Input :: struct {
+	handle: ^Schedule_Handle,
+	kind: Schedule_Mutation_Kind,
+	workflow_type: string,
+	input: activity_codec.Payload_View,
+	options: Schedule_Create_Options,
+	conflict_token: []u8,
+	backfills: []Schedule_Backfill,
+	note: string,
+	overlap_policy: Schedule_Overlap_Policy,
+}
+Client_Schedule_Mutation_Next_Proc :: #type proc(data: rawptr, input: ^Client_Schedule_Mutation_Input) -> Error
+Client_Schedule_Mutation_Next :: struct { data: rawptr, invoke: Client_Schedule_Mutation_Next_Proc }
+Client_Schedule_Mutation_Interceptor_Proc :: #type proc(user_data: rawptr, input: ^Client_Schedule_Mutation_Input, next: Client_Schedule_Mutation_Next) -> Error
+
 Client_Interceptor :: struct {
 	user_data:          rawptr,
 	start_workflow:     Client_Start_Workflow_Interceptor_Proc,
@@ -287,6 +308,8 @@ Client_Interceptor :: struct {
 	list_schedules:     Client_List_Schedules_Interceptor_Proc,
 	count_schedules:    Client_Count_Schedules_Interceptor_Proc,
 	list_schedule_matching_times: Client_List_Schedule_Matching_Times_Interceptor_Proc,
+	create_schedule:     Client_Create_Schedule_Interceptor_Proc,
+	schedule_mutation:   Client_Schedule_Mutation_Interceptor_Proc,
 }
 
 client_start_workflow_next :: proc(
@@ -406,6 +429,16 @@ client_count_schedules_next :: proc(next: Client_Count_Schedules_Next, input: ^C
 
 client_list_schedule_matching_times_next :: proc(next: Client_List_Schedule_Matching_Times_Next, input: ^Client_List_Schedule_Matching_Times_Input) -> (Schedule_Matching_Times, Error) {
 	if next.invoke == nil || input == nil do return {}, error_from_string(.Invalid_Argument, "invalid Schedule matching-times interceptor continuation")
+	return next.invoke(next.data, input)
+}
+
+client_create_schedule_next :: proc(next: Client_Create_Schedule_Next, input: ^Client_Create_Schedule_Input) -> (Schedule_Handle, Error) {
+	if next.invoke == nil || input == nil do return {}, error_from_string(.Invalid_Argument, "invalid Schedule Create interceptor continuation")
+	return next.invoke(next.data, input)
+}
+
+client_schedule_mutation_next :: proc(next: Client_Schedule_Mutation_Next, input: ^Client_Schedule_Mutation_Input) -> Error {
+	if next.invoke == nil || input == nil do return error_from_string(.Invalid_Argument, "invalid Schedule mutation interceptor continuation")
 	return next.invoke(next.data, input)
 }
 
@@ -714,4 +747,28 @@ client_list_schedule_matching_times_chain :: proc(data: rawptr, input: ^Client_L
 		return entry.list_schedule_matching_times(entry.user_data, input, {data = &next_state, invoke = client_list_schedule_matching_times_chain})
 	}
 	return list_schedule_matching_times_terminal(input)
+}
+
+client_create_schedule_chain :: proc(data: rawptr, input: ^Client_Create_Schedule_Input) -> (Schedule_Handle, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil do return {}, error_from_string(.Invalid_Argument, "invalid Schedule Create interceptor state")
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.create_schedule == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.create_schedule(entry.user_data, input, {data = &next_state, invoke = client_create_schedule_chain})
+	}
+	return create_schedule_payload_terminal(input)
+}
+
+client_schedule_mutation_chain :: proc(data: rawptr, input: ^Client_Schedule_Mutation_Input) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil do return error_from_string(.Invalid_Argument, "invalid Schedule mutation interceptor state")
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.schedule_mutation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.schedule_mutation(entry.user_data, input, {data = &next_state, invoke = client_schedule_mutation_chain})
+	}
+	return schedule_mutation_terminal(input)
 }

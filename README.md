@@ -262,7 +262,9 @@ Client connections accept an ordered `[]Client_Interceptor`. The current
 typesafe outbound surface wraps Workflow start, Signal-With-Start, Signal,
 Query, result waiting, Update start, cancellation, termination, and Workflow
 Visibility list/count plus Schedule Describe/List/Count/Matching-Times; each
-operation has its own input, result, and `next` type:
+operation has its own input, result, and `next` type. Schedule Create has a
+handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
+Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`:
 
 ```odin
 propagate_signal :: proc(

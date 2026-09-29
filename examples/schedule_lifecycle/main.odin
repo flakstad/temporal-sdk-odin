@@ -12,6 +12,8 @@ Schedule_Read_Interceptor_State :: struct {
 	listed:    bool,
 	counted:   bool,
 	matched:   bool,
+	created:   bool,
+	mutations: u32,
 }
 
 describe_schedule_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_Describe_Schedule_Input, next: temporal_client.Client_Describe_Schedule_Next) -> (temporal_client.Schedule_Description, temporal_client.Error) {
@@ -39,6 +41,18 @@ matching_times_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Cl
 	return temporal_client.client_list_schedule_matching_times_next(next, input)
 }
 
+create_schedule_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_Create_Schedule_Input, next: temporal_client.Client_Create_Schedule_Next) -> (temporal_client.Schedule_Handle, temporal_client.Error) {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.created = true
+	return temporal_client.client_create_schedule_next(next, input)
+}
+
+schedule_mutation_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_Schedule_Mutation_Input, next: temporal_client.Client_Schedule_Mutation_Next) -> temporal_client.Error {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.mutations |= 1 << u32(input.kind)
+	return temporal_client.client_schedule_mutation_next(next, input)
+}
+
 fail_error :: proc(label: string, error: ^temporal_client.Error) -> int {
 	fmt.eprintf("%s (status=%d): %s\n", label, error.status_code, string(error.message))
 	temporal_client.error_free(error)
@@ -53,6 +67,8 @@ run :: proc() -> int {
 		list_schedules = list_schedules_interceptor,
 		count_schedules = count_schedules_interceptor,
 		list_schedule_matching_times = matching_times_interceptor,
+		create_schedule = create_schedule_interceptor,
+		schedule_mutation = schedule_mutation_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",
@@ -361,8 +377,12 @@ run :: proc() -> int {
 		return fail_error("Delete Schedule failed", &delete_error)
 	}
 	deleted = true
+	if !interceptor_state.created || interceptor_state.mutations != 0x3f {
+		fmt.eprintf("Schedule mutation interceptors were incomplete: created=%v mutations=0x%x\n", interceptor_state.created, interceptor_state.mutations)
+		return 1
+	}
 	fmt.printf(
-		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d read_interceptors=true paused_unpaused=true backfill_actions=%d workflow_id=%s result=%q deleted=true\n",
+		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d schedule_interceptors=true paused_unpaused=true backfill_actions=%d workflow_id=%s result=%q deleted=true\n",
 		schedule_id,
 		conflict_token_rotated,
 		stale_conflict_guarded,

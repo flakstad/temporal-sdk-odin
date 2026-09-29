@@ -682,13 +682,13 @@ encode_create_schedule_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_CreateScheduleRequest(&request), {}
 }
 
-create_schedule_payload :: proc(
-	client: ^Client,
-	schedule_id: string,
-	workflow_type: string,
-	input: codec.Payload_View,
-	options: Schedule_Create_Options,
-) -> (handle: Schedule_Handle, error: Error) {
+create_schedule_payload_terminal :: proc(interceptor_input: ^Client_Create_Schedule_Input) -> (handle: Schedule_Handle, error: Error) {
+	if interceptor_input == nil do return {}, error_from_string(.Invalid_Argument, "Schedule Create interceptor input is missing")
+	client := interceptor_input.client
+	schedule_id := interceptor_input.schedule_id
+	workflow_type := interceptor_input.workflow_type
+	input := interceptor_input.input
+	options := interceptor_input.options
 	if client == nil || client.connection == nil || client.runtime == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -724,6 +724,12 @@ create_schedule_payload :: proc(
 	heap := allocator_runtime.heap_allocator()
 	created_handle.conflict_token = bytes.clone(response.conflict_token, heap)
 	return created_handle, {}
+}
+
+create_schedule_payload :: proc(client: ^Client, schedule_id, workflow_type: string, input: codec.Payload_View, options: Schedule_Create_Options) -> (Schedule_Handle, Error) {
+	interceptor_input := Client_Create_Schedule_Input{client = client, schedule_id = schedule_id, workflow_type = workflow_type, input = input, options = options}
+	state := Client_Interceptor_State{client = client}
+	return client_create_schedule_chain(&state, &interceptor_input)
 }
 
 create_schedule_json :: proc(
@@ -812,7 +818,7 @@ encode_update_schedule_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_UpdateScheduleRequest(&request), {}
 }
 
-update_schedule_payload :: proc(
+update_schedule_payload_unintercepted :: proc(
 	handle: ^Schedule_Handle,
 	workflow_type: string,
 	input: codec.Payload_View,
@@ -845,6 +851,13 @@ update_schedule_payload :: proc(
 		return error_from_string(.Malformed_Response, "Temporal returned a malformed Update Schedule response")
 	}
 	return {}
+}
+
+update_schedule_payload :: proc(handle: ^Schedule_Handle, workflow_type: string, input: codec.Payload_View, options: Schedule_Create_Options, conflict_token: []u8 = nil) -> Error {
+	interceptor_input := Client_Schedule_Mutation_Input{handle = handle, kind = .Update, workflow_type = workflow_type, input = input, options = options, conflict_token = conflict_token}
+	client: ^Client; if handle != nil do client = handle.client
+	state := Client_Interceptor_State{client = client}
+	return client_schedule_mutation_chain(&state, &interceptor_input)
 }
 
 update_schedule_json :: proc(
@@ -1565,7 +1578,7 @@ encode_backfill_schedule_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(&request), {}
 }
 
-backfill_schedule :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfill) -> Error {
+backfill_schedule_unintercepted :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfill) -> Error {
 	if !schedule_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
@@ -1585,6 +1598,13 @@ backfill_schedule :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfi
 	defer delete(rpc_result.protobuf)
 	if rpc_result.error.message != nil { return error_from_core(&rpc_result.error) }
 	return {}
+}
+
+backfill_schedule :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfill) -> Error {
+	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Backfill, backfills = backfills}
+	client: ^Client; if handle != nil do client = handle.client
+	state := Client_Interceptor_State{client = client}
+	return client_schedule_mutation_chain(&state, &input)
 }
 
 schedule_matching_times_free :: proc(result: ^Schedule_Matching_Times) {
@@ -1664,7 +1684,7 @@ list_schedule_matching_times :: proc(handle: ^Schedule_Handle, start_time, end_t
 	return client_list_schedule_matching_times_chain(&state, &input)
 }
 
-schedule_patch :: proc(
+schedule_patch_unintercepted :: proc(
 	handle: ^Schedule_Handle,
 	patch: ^proto.Temporal_Api_Schedule_V1_SchedulePatch,
 ) -> Error {
@@ -1698,33 +1718,27 @@ schedule_patch :: proc(
 }
 
 pause_schedule :: proc(handle: ^Schedule_Handle, note := "Paused by temporal-sdk-odin") -> Error {
-	if len(note) == 0 {
-		return error_from_string(.Invalid_Argument, "Schedule pause note must not be empty")
-	}
-	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{pause = note}
-	return schedule_patch(handle, &patch)
+	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Pause, note = note}
+	client: ^Client; if handle != nil do client = handle.client
+	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
 }
 
 unpause_schedule :: proc(handle: ^Schedule_Handle, note := "Unpaused by temporal-sdk-odin") -> Error {
-	if len(note) == 0 {
-		return error_from_string(.Invalid_Argument, "Schedule unpause note must not be empty")
-	}
-	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{unpause = note}
-	return schedule_patch(handle, &patch)
+	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Unpause, note = note}
+	client: ^Client; if handle != nil do client = handle.client
+	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
 }
 
 trigger_schedule :: proc(
 	handle: ^Schedule_Handle,
 	overlap_policy := Schedule_Overlap_Policy.Unspecified,
 ) -> Error {
-	trigger := proto.Temporal_Api_Schedule_V1_TriggerImmediatelyRequest{
-		overlap_policy = schedule_overlap_to_proto(overlap_policy),
-	}
-	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{trigger_immediately = &trigger}
-	return schedule_patch(handle, &patch)
+	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Trigger, overlap_policy = overlap_policy}
+	client: ^Client; if handle != nil do client = handle.client
+	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
 }
 
-delete_schedule :: proc(handle: ^Schedule_Handle) -> Error {
+delete_schedule_unintercepted :: proc(handle: ^Schedule_Handle) -> Error {
 	if !schedule_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
@@ -1746,4 +1760,35 @@ delete_schedule :: proc(handle: ^Schedule_Handle) -> Error {
 		return error_from_core(&rpc_result.error)
 	}
 	return {}
+}
+
+delete_schedule :: proc(handle: ^Schedule_Handle) -> Error {
+	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Delete}
+	client: ^Client; if handle != nil do client = handle.client
+	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+}
+
+schedule_mutation_terminal :: proc(input: ^Client_Schedule_Mutation_Input) -> Error {
+	if input == nil do return error_from_string(.Invalid_Argument, "Schedule mutation interceptor input is missing")
+	switch input.kind {
+	case .Update:
+		return update_schedule_payload_unintercepted(input.handle, input.workflow_type, input.input, input.options, input.conflict_token)
+	case .Backfill:
+		return backfill_schedule_unintercepted(input.handle, input.backfills)
+	case .Pause:
+		if len(input.note) == 0 do return error_from_string(.Invalid_Argument, "Schedule pause note must not be empty")
+		patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{pause = input.note}
+		return schedule_patch_unintercepted(input.handle, &patch)
+	case .Unpause:
+		if len(input.note) == 0 do return error_from_string(.Invalid_Argument, "Schedule unpause note must not be empty")
+		patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{unpause = input.note}
+		return schedule_patch_unintercepted(input.handle, &patch)
+	case .Trigger:
+		trigger := proto.Temporal_Api_Schedule_V1_TriggerImmediatelyRequest{overlap_policy = schedule_overlap_to_proto(input.overlap_policy)}
+		patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{trigger_immediately = &trigger}
+		return schedule_patch_unintercepted(input.handle, &patch)
+	case .Delete:
+		return delete_schedule_unintercepted(input.handle)
+	}
+	return error_from_string(.Invalid_Argument, "unknown Schedule mutation kind")
 }

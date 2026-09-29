@@ -1439,7 +1439,10 @@ mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time
 range. Every read continuation returns its allocator-owned public result type
-under the same free-procedure contract as the direct call.
+under the same free-procedure contract as the direct call. Schedule Create has
+its own handle-returning continuation. The six Error-returning mutations share
+one semantic input with a `Schedule_Mutation_Kind`; operation-specific fields
+remain borrowed for the synchronous chain.
 Signal-With-Start exposes both user Payloads, mutable start options, and the
 single Header map the upstream RPC assigns to its Signal event. Cancellation
 exposes its reason and request ID. Termination exposes its reason plus an
@@ -1466,10 +1469,10 @@ application-level synchronization.
 
 The unit and 500-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
-Visibility queries, and all four Schedule read operations. The generative chain
-now varies eleven operation families. The `workflow-properties` live scenario
+Visibility queries, and the complete Schedule surface. The generative chain
+now varies thirteen operation families. The `workflow-properties` live scenario
 wraps both Visibility RPCs; the Schedule lifecycle wraps every read RPC and
-requires all continuations to return owned results through Core.
+all seven create/mutation paths through Core.
 `client_start` injects start and Signal-With-Start headers solely through its
 interceptors; `client_control` does the same for Signal, Query, and Update. The
 full dev-server suite requires those headers to arrive in Workflow code,
