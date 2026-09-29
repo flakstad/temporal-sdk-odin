@@ -29,6 +29,32 @@ Worker :: struct {
 	remote_activities_enabled: bool,
 }
 
+DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
+
+Worker_Versioning_Mode :: enum {
+	Unversioned,
+	Deployment_Based,
+	Legacy_Build_Id_Based,
+}
+
+Worker_Versioning_Behavior :: enum i32 {
+	Unspecified = 0,
+	Pinned = 1,
+	Auto_Upgrade = 2,
+}
+
+// Worker_Versioning_Options is borrowed only for worker_create. Unversioned
+// workers use DEFAULT_WORKER_BUILD_ID when build_id is empty. Deployment-based
+// routing is experimental upstream and requires both identity fields when
+// use_worker_versioning is true.
+Worker_Versioning_Options :: struct {
+	mode:                        Worker_Versioning_Mode,
+	build_id:                    string,
+	deployment_name:             string,
+	use_worker_versioning:       bool,
+	default_versioning_behavior: Worker_Versioning_Behavior,
+}
+
 Get_System_Info_Result :: struct {
 	protobuf: []u8,
 	error:    Error,
@@ -200,6 +226,89 @@ fixed_slot_supplier :: proc(count: uintptr) -> raw.Slot_Supplier {
 	}
 }
 
+worker_versioning_options_validate :: proc(options: Worker_Versioning_Options) -> Error {
+	if int(options.mode) < int(Worker_Versioning_Mode.Unversioned) ||
+	   int(options.mode) > int(Worker_Versioning_Mode.Legacy_Build_Id_Based) {
+		return client_option_error("worker versioning mode is invalid")
+	}
+	if int(options.default_versioning_behavior) <
+	     int(Worker_Versioning_Behavior.Unspecified) ||
+	   int(options.default_versioning_behavior) >
+	     int(Worker_Versioning_Behavior.Auto_Upgrade) {
+		return client_option_error("worker default versioning behavior is invalid")
+	}
+	switch options.mode {
+	case .Unversioned:
+		if len(options.deployment_name) > 0 || options.use_worker_versioning ||
+		   options.default_versioning_behavior != .Unspecified {
+			return client_option_error(
+				"unversioned workers cannot set deployment routing options",
+			)
+		}
+	case .Deployment_Based:
+		if len(options.build_id) == 0 {
+			return client_option_error("deployment-based workers require a build ID")
+		}
+		if options.use_worker_versioning && len(options.deployment_name) == 0 {
+			return client_option_error(
+				"deployment-based routing requires a deployment name",
+			)
+		}
+		if !options.use_worker_versioning &&
+		   options.default_versioning_behavior != .Unspecified {
+			return client_option_error(
+				"default versioning behavior requires deployment-based routing",
+			)
+		}
+	case .Legacy_Build_Id_Based:
+		if len(options.build_id) == 0 {
+			return client_option_error("legacy worker versioning requires a build ID")
+		}
+		if len(options.deployment_name) > 0 || options.use_worker_versioning ||
+		   options.default_versioning_behavior != .Unspecified {
+			return client_option_error(
+				"legacy worker versioning cannot set deployment routing options",
+			)
+		}
+	}
+	return {}
+}
+
+worker_versioning_strategy_raw :: proc(
+	options: Worker_Versioning_Options,
+) -> raw.Worker_Versioning_Strategy {
+	switch options.mode {
+	case .Deployment_Based:
+		return raw.Worker_Versioning_Strategy{
+			tag = .Deployment_Based,
+			deployment_based = raw.Worker_Deployment_Options{
+				version = raw.Worker_Deployment_Version{
+					deployment_name = byte_ref(options.deployment_name),
+					build_id = byte_ref(options.build_id),
+				},
+				use_worker_versioning = options.use_worker_versioning,
+				default_versioning_behavior = i32(options.default_versioning_behavior),
+			},
+		}
+	case .Legacy_Build_Id_Based:
+		return raw.Worker_Versioning_Strategy{
+			tag = .Legacy_Build_Id_Based,
+			legacy_build_id_based = raw.Legacy_Build_Id_Based_Strategy{
+				build_id = byte_ref(options.build_id),
+			},
+		}
+	case .Unversioned:
+	}
+	build_id := options.build_id
+	if len(build_id) == 0 {
+		build_id = DEFAULT_WORKER_BUILD_ID
+	}
+	return raw.Worker_Versioning_Strategy{
+		tag = .None,
+		none = raw.Worker_Versioning_None{build_id = byte_ref(build_id)},
+	}
+}
+
 worker_create :: proc(
 	client: ^Client,
 	task_queue: string,
@@ -208,6 +317,7 @@ worker_create :: proc(
 	enable_local_activities := false,
 	enable_remote_activities := true,
 	max_activity_slots := 10,
+	versioning := Worker_Versioning_Options{},
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
@@ -221,14 +331,15 @@ worker_create :: proc(
 		error.message = bytes.clone(transmute([]u8)string("max activity slots must be positive"))
 		return
 	}
+	versioning_error := worker_versioning_options_validate(versioning)
+	if versioning_error.message != nil {
+		return {}, versioning_error
+	}
 
 	options := raw.Worker_Options{
 		namespace = byte_ref(namespace),
 		task_queue = byte_ref(task_queue),
-		versioning_strategy = raw.Worker_Versioning_Strategy{
-			tag = .None,
-			none = raw.Worker_Versioning_None{build_id = byte_ref("temporal-sdk-odin-experimental")},
-		},
+		versioning_strategy = worker_versioning_strategy_raw(versioning),
 		tuner = raw.Tuner_Holder{
 			workflow_slot_supplier       = fixed_slot_supplier(1),
 			activity_slot_supplier       = fixed_slot_supplier(uintptr(max_activity_slots)),

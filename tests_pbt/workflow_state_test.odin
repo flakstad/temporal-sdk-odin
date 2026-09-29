@@ -10,13 +10,22 @@ import pbt "pbt:pbt"
 import activity "../temporal/activity"
 import temporal_client "../temporal/client"
 import codec "../temporal/codec"
+import temporal_core "../temporal/core"
 import proto "../temporal/core/proto"
+import raw "../temporal/core/raw"
 import temporal_failure "../temporal/failure"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 
 Activity_Heartbeat_Capture :: struct {
 	calls: int,
+}
+
+pbt_raw_byte_ref_string :: proc(value: raw.Byte_Array_Ref) -> string {
+	if value.data == nil || value.size == 0 {
+		return ""
+	}
+	return string(([^]u8)(value.data)[:int(value.size)])
 }
 
 capture_activity_heartbeat :: proc(
@@ -4679,6 +4688,81 @@ activity_cancel_routing_is_token_local :: proc(t: ^testing.T) {
 		"Activity cancellation remains local to its task token",
 		activity_token_routing_preserves_cancellation,
 		{num_tests = 500, seed = 0x4143_5449_5649_5459},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+worker_versioning_abi_property :: proc(t: ^pbt.T) -> pbt.Result {
+	mode := pbt.draw(t, pbt.int_range(0, 2))
+	build_id := pbt.draw(t, pbt.string_ascii(1, 48))
+	deployment_name := pbt.draw(t, pbt.string_ascii(1, 48))
+	use_worker_versioning := pbt.draw(t, pbt.boolean())
+	behavior := pbt.draw(t, pbt.int_range(0, 2))
+	default_behavior := temporal_core.Worker_Versioning_Behavior.Unspecified
+	if use_worker_versioning {
+		default_behavior = temporal_core.Worker_Versioning_Behavior(behavior)
+	}
+	options := temporal_core.Worker_Versioning_Options{}
+	switch mode {
+	case 0:
+		options.build_id = build_id
+	case 1:
+		options = {
+			mode = .Deployment_Based,
+			build_id = build_id,
+			deployment_name = use_worker_versioning ? deployment_name : "",
+			use_worker_versioning = use_worker_versioning,
+			default_versioning_behavior = default_behavior,
+		}
+	case 2:
+		options = {
+			mode = .Legacy_Build_Id_Based,
+			build_id = build_id,
+		}
+	}
+	validation_error := temporal_core.worker_versioning_options_validate(options)
+	defer temporal_core.error_free(&validation_error)
+	if validation_error.message != nil {
+		return pbt.fail("generated valid Worker versioning options were rejected")
+	}
+	strategy := temporal_core.worker_versioning_strategy_raw(options)
+	switch mode {
+	case 0:
+		pbt.cover(t, true, 20.0, "unversioned worker")
+		if strategy.tag != .None ||
+		   pbt_raw_byte_ref_string(strategy.none.build_id) != build_id {
+			return pbt.fail("unversioned Worker strategy changed across the C ABI mapping")
+		}
+	case 1:
+		pbt.cover(t, use_worker_versioning, 10.0, "deployment routing enabled")
+		pbt.cover(t, behavior == 1, 5.0, "pinned default behavior")
+		pbt.cover(t, behavior == 2, 5.0, "auto-upgrade default behavior")
+		if strategy.tag != .Deployment_Based ||
+		   pbt_raw_byte_ref_string(strategy.deployment_based.version.build_id) != build_id ||
+		   pbt_raw_byte_ref_string(strategy.deployment_based.version.deployment_name) !=
+			options.deployment_name ||
+		   strategy.deployment_based.use_worker_versioning != use_worker_versioning ||
+		   strategy.deployment_based.default_versioning_behavior !=
+			i32(options.default_versioning_behavior) {
+			return pbt.fail("deployment Worker strategy changed across the C ABI mapping")
+		}
+	case 2:
+		pbt.cover(t, true, 20.0, "legacy Build ID worker")
+		if strategy.tag != .Legacy_Build_Id_Based ||
+		   pbt_raw_byte_ref_string(strategy.legacy_build_id_based.build_id) != build_id {
+			return pbt.fail("legacy Worker strategy changed across the C ABI mapping")
+		}
+	}
+	return pbt.pass()
+}
+
+@(test)
+worker_versioning_options_preserve_generated_abi_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Worker versioning options preserve generated C ABI values",
+		worker_versioning_abi_property,
+		{num_tests = 500, seed = 0x5645_5253_494f_4e47},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

@@ -87,6 +87,9 @@ Workflow runtime now implements Core's patch protocol through
 `NotifyHasPatch` jobs, memoizes each decision per run, emits at most one
 `SetPatchMarker`, and takes the legacy branch when replay encounters no marker.
 The CLI-devserver suite verifies the resulting `core_patch` history marker. The
+Worker API also exposes Core's unversioned, deployment-based, and legacy Build
+ID strategies. A live `Pinned` deployment test sets an Odin Worker version as
+Current and proves the Service routes a Workflow to it. The
 same activation-context layer now exposes `workflow.now`, `history_length`,
 `is_replaying`, deterministic `random_u64`/`random_f64`, and `uuid_v4` without
 consulting host time or OS entropy. Core-provided start/reset seeds are applied
@@ -961,8 +964,30 @@ replay it returns `true` only when Core supplied `NotifyHasPatch`. After all old
 executions have passed the migration window, replace the branch with
 `workflow.deprecate_patch(ctx, "orders-use-v2")` before eventually removing the
 call. Patch IDs are part of durable history and must not be reused for a
-different change. This is Workflow code versioning, not Worker Deployment
-Versioning; deployment routing is not exposed yet.
+different change. This Workflow code versioning is separate from Worker
+Deployment Versioning, which is configured when the Worker is created:
+
+```odin
+sdk_worker, create_error := worker.create(
+    &client,
+    "orders",
+    versioning = {
+        mode = .Deployment_Based,
+        deployment_name = "orders-service",
+        build_id = "2026-09-29.1",
+        use_worker_versioning = true,
+        default_versioning_behavior = .Pinned,
+    },
+)
+```
+
+The zero value remains an unversioned Worker with the SDK's experimental
+default Build ID. Deployment routing requires non-empty deployment/build IDs;
+its default behavior may be `.Pinned`, `.Auto_Upgrade`, or `.Unspecified`.
+Current/ramping version administration remains a Temporal Service operation,
+normally performed with `temporal worker deployment` or deployment APIs. The
+legacy Build-ID strategy is exposed for existing installations but should not
+be selected for new deployments.
 
 Workflow time and random values must use Temporal-aware primitives:
 

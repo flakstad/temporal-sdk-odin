@@ -2004,6 +2004,7 @@ round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
 Signal request/header round trips over 0–12 arguments, 500 paginated Visibility
 list/count round trips, 500 repeated Query request/header round trips over 0–12
 arguments, 500 repeated Update request/header round trips over 0–12 arguments,
+500 Worker versioning mappings across every C-union strategy,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
@@ -2327,8 +2328,39 @@ Core's initialize-then-notify order, duplicate calls, and deprecated markers.
 A 500-case property generates the replay/notified/deprecated truth table. The
 CLI-devserver test executes the new branch, observes one emitted marker, and
 requires `core_patch` in server history. This API concerns deterministic code
-changes inside a Workflow. Worker Deployment Versioning, build-ID routing, and
-Core's experimental rollout callback remain separate and unimplemented.
+changes inside a Workflow and remains separate from Worker Deployment
+Versioning.
+
+### Worker Deployment Versioning boundary
+
+The pinned C bridge already exposes `TemporalCoreWorkerVersioningStrategy` as
+a tagged union with `None`, `DeploymentBased`, and `LegacyBuildIdBased`
+variants. Odin mirrors it with `Worker_Versioning_Mode` and maps the Service's
+`VersioningBehavior` values to `.Unspecified`, `.Pinned`, and `.Auto_Upgrade`.
+No new C symbol or protobuf graph is involved; these options are inputs to the
+existing `temporal_core_worker_new` call.
+
+`worker.create` remains language-only and therefore clones deployment/build
+identity together with namespace/task queue. `worker.run` later passes borrowed
+byte references to `core.worker_create`; the C bridge synchronously converts
+them to Rust-owned `String` values while constructing `WorkerConfig`. The Odin
+copies remain valid until `worker.close`, making delayed Core creation explicit
+and safe.
+
+The modern deployment mode validates the same important invariants as Core:
+Build ID is required, deployment name is required when routing is enabled, and
+a default behavior is invalid when routing is disabled. Unversioned mode keeps
+the prior default Build ID and rejects deployment-only fields. Legacy mode
+requires its Build ID and rejects modern routing fields.
+
+The CLI-devserver acceptance test starts a `.Pinned` Odin Worker, makes its
+deployment version Current, starts a Workflow on an isolated task queue, and
+requires Describe output to contain the exact deployment name and Build ID.
+This proves Service -> matching -> Core -> Odin routing rather than only C-union
+encoding. CLI 1.5.1 exposes `--unversioned` cleanup, but bundled Server 1.29.1
+rejects that transition with `BuildID cannot be empty`; cleanup is consequently
+best-effort and uniquely names every test deployment. Core's experimental
+rollout callback remains unexposed.
 
 ### Workflow time and randomness boundary
 

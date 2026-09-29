@@ -7,6 +7,8 @@ worker_pid=""
 workflow_cli_pid=""
 slow_update_pid=""
 unknown_workflow_id=""
+deployment_name=""
+deployment_build_id=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
 worker_log="${TMPDIR:-/tmp}/temporal-sdk-odin-activity-worker.log"
 workflow_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workflow-output.XXXXXX")"
@@ -34,6 +36,26 @@ cleanup() {
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
     wait "$worker_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$deployment_name" ]]; then
+    temporal worker deployment set-current-version \
+      --deployment-name "$deployment_name" \
+      --unversioned \
+      --allow-no-pollers \
+      --ignore-missing-task-queues \
+      --yes \
+      --command-timeout 5s \
+      --output none >/dev/null 2>&1 || true
+    temporal worker deployment delete-version \
+      --deployment-name "$deployment_name" \
+      --build-id "$deployment_build_id" \
+      --skip-drainage \
+      --command-timeout 5s \
+      --output none >/dev/null 2>&1 || true
+    temporal worker deployment delete \
+      --name "$deployment_name" \
+      --command-timeout 5s \
+      --output none >/dev/null 2>&1 || true
   fi
   if [[ -n "$server_pid" ]]; then
     kill "$server_pid" 2>/dev/null || true
@@ -1839,3 +1861,81 @@ grep -q 'continued_as_new=true' "$worker_log"
 grep -q 'continued_as_new=false completed=true' "$worker_log"
 grep -q 'Workflow Continue-As-New interceptor entered' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+# Keep this scenario last because cleanup is best-effort. Its unique task queue
+# also prevents persisted routing state from affecting the normal example queue.
+deployment_name="odin-sdk-deployment-$$-$(date +%s)"
+deployment_build_id="odin-sdk-build-v1"
+deployment_task_queue="odin-sdk-deployment-queue-$$-$(date +%s)"
+TEMPORAL_ODIN_SCENARIO=deployment-versioning \
+  TEMPORAL_ODIN_DEPLOYMENT_NAME="$deployment_name" \
+  TEMPORAL_ODIN_DEPLOYMENT_BUILD_ID="$deployment_build_id" \
+  TEMPORAL_ODIN_TASK_QUEUE="$deployment_task_queue" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Deployment-versioned Odin Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+sleep 1
+
+temporal worker deployment set-current-version \
+  --deployment-name "$deployment_name" \
+  --build-id "$deployment_build_id" \
+  --allow-no-pollers \
+  --ignore-missing-task-queues \
+  --yes \
+  --command-timeout 10s \
+  --output none
+
+deployment_workflow_id="odin-sdk-deployment-workflow-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$deployment_workflow_id" \
+  --type odin_patch_workflow \
+  --task-queue "$deployment_task_queue" \
+  --input '"Versioned"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+deployment_workflow_output="$(<"$workflow_output_file")"
+echo "$deployment_workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$deployment_workflow_output"
+grep -q 'Patched Versioned' <<<"$deployment_workflow_output"
+temporal workflow describe \
+  --workflow-id "$deployment_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q "$deployment_name" "$typed_history_file"
+grep -q "$deployment_build_id" "$typed_history_file"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Worker Deployment Versioning routed a Workflow through Core and Temporal Server" "$worker_log"
+
+temporal worker deployment set-current-version \
+  --deployment-name "$deployment_name" \
+  --unversioned \
+  --allow-no-pollers \
+  --ignore-missing-task-queues \
+  --yes \
+  --command-timeout 10s \
+  --output none >/dev/null 2>&1 || true
+temporal worker deployment delete-version \
+  --deployment-name "$deployment_name" \
+  --build-id "$deployment_build_id" \
+  --skip-drainage \
+  --command-timeout 10s \
+  --output none >/dev/null 2>&1 || true
+temporal worker deployment delete \
+  --name "$deployment_name" \
+  --command-timeout 10s \
+  --output none >/dev/null 2>&1 || true
+deployment_name=""
+deployment_build_id=""

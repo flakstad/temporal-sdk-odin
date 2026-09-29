@@ -1232,9 +1232,38 @@ main :: proc() {
 		os.exit(1)
 	}
 
+	versioning := worker.Worker_Versioning_Options{}
+	create_scenario_buffer: [64]u8
+	create_scenario := os.get_env(
+		create_scenario_buffer[:],
+		"TEMPORAL_ODIN_SCENARIO",
+	)
+	task_queue_buffer: [128]u8
+	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
+	if len(task_queue) == 0 {
+		task_queue = TASK_QUEUE
+	}
+	deployment_name_buffer: [128]u8
+	deployment_build_id_buffer: [128]u8
+	if create_scenario == "deployment-versioning" {
+		versioning = {
+			mode = .Deployment_Based,
+			deployment_name = os.get_env(
+				deployment_name_buffer[:],
+				"TEMPORAL_ODIN_DEPLOYMENT_NAME",
+			),
+			build_id = os.get_env(
+				deployment_build_id_buffer[:],
+				"TEMPORAL_ODIN_DEPLOYMENT_BUILD_ID",
+			),
+			use_worker_versioning = true,
+			default_versioning_behavior = .Pinned,
+		}
+	}
 	activity_worker, create_error := worker.create(
 		&client,
-		TASK_QUEUE,
+		task_queue,
+		versioning = versioning,
 	)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
@@ -1567,7 +1596,7 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	fmt.printf("Odin Workflow Worker is polling task queue %s\n", TASK_QUEUE)
+	fmt.printf("Odin Workflow Worker is polling task queue %s\n", task_queue)
 	env_buffer: [64]u8
 	scenario := os.get_env(env_buffer[:], "TEMPORAL_ODIN_SCENARIO")
 	expect_cancel_timer := scenario == "cancel-timer"
@@ -1584,6 +1613,7 @@ main :: proc() {
 	expect_failure_details := scenario == "failure-details"
 	expect_terminal_failure := scenario == "terminal-failure"
 	expect_patch := scenario == "patch"
+	expect_deployment_versioning := scenario == "deployment-versioning"
 	expect_properties := scenario == "workflow-properties"
 	expect_signal_with_start := scenario == "signal-with-start"
 	expect_activity_cancel_details := scenario == "activity-cancel-details"
@@ -1601,7 +1631,7 @@ main :: proc() {
 		{
 			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_deployment_versioning || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1636,7 +1666,7 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
+		} else if expect_patch || expect_deployment_versioning || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
@@ -1767,6 +1797,8 @@ main :: proc() {
 		fmt.println("Activity header crossed Workflow command, Core, and Activity Context")
 	} else if expect_patch {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
+	} else if expect_deployment_versioning {
+		fmt.println("Worker Deployment Versioning routed a Workflow through Core and Temporal Server")
 	} else if expect_properties {
 		fmt.println("Workflow info, memo, and Search Attributes completed through Core and Temporal Server")
 	} else if expect_signal_with_start {

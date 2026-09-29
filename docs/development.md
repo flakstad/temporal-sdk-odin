@@ -105,6 +105,9 @@ presence, all typed Search Attribute metadata variants, and both versioning
 enum families with exact replay. A patch property
 generates another 500 replay/notified/deprecated combinations, checks Core's
 truth table, and requires duplicate calls to emit at most one marker. Another
+500 cases generate all three Worker versioning strategies and require exact
+preservation of deployment/build identity, routing intent, and default behavior
+across the Odin-to-C ABI mapping. Another
 500 activation contexts vary initial/reset seeds, timestamps, and history
 lengths, then require exact random values and byte-identical fresh-stack replay.
 PBT is a
@@ -145,14 +148,24 @@ activations are routed by Workflow type; subsequent activations are routed by
 run ID until Core sends `RemoveFromCache`. Eviction destroys the corresponding
 fiber and removes that route.
 
-`worker.create` clones the namespace and task-queue strings and initializes the
-language registries, but deliberately does not create a Core worker. On the
-first `run`, the registration set selects Core's `enable_workflows` and
+`worker.create` clones the namespace, task queue, deployment name, and Build ID
+strings and initializes the language registries, but deliberately does not
+create a Core worker. On the first `run`, the registration set selects Core's
+`enable_workflows` and
 `enable_remote_activities` task types; `disable_activity_polling` can suppress
 the Activity type for that bounded run. This avoids polling unused streams and
 removes task-type switches from the public construction API. The worker borrows
 the client passed to `create`, so the stable client value, its connection, and
 the Core runtime must outlive `worker.close`.
+
+The optional `versioning` argument maps one-to-one onto the pinned C bridge's
+`TemporalCoreWorkerVersioningStrategy` union. The zero value selects
+unversioned operation. `.Deployment_Based` supports the modern experimental
+deployment model with `.Pinned` or `.Auto_Upgrade` defaults;
+`.Legacy_Build_Id_Based` exists for migration compatibility. Odin owns cloned
+identity strings until `worker.close`; the C bridge converts their borrowed
+byte references into Rust-owned strings synchronously during `worker_new`.
+Validation rejects ambiguous combinations before the Core worker is created.
 
 The C wrapper currently presents blocking poll calls. When both task types are
 registered, `worker.run` creates one Workflow poll thread and one Activity poll
@@ -688,6 +701,13 @@ application failure reaches the Workflow. The driver is test infrastructure,
 not part of the distributed Odin SDK and not an Odin workflow runtime. This is
 also the protobuf interoperability test: the Rust/Core side uses `prost` to
 encode Activity Tasks and decode Odin's success/failure completions.
+
+The Workflow sequence also creates a uniquely named deployment-based Worker on
+an isolated task queue,
+marks its `.Pinned` version Current through Temporal CLI, and executes a real
+Workflow through it. Describe output must report the exact deployment name and
+Build ID. Cleanup is best-effort because CLI 1.5.1 exposes an unversioned
+transition that its bundled dev Server 1.29.1 currently rejects.
 
 The typed retry case returns a retryable `TransientGreetingError` with JSON
 details and `next_retry_delay = 10 ms` on attempt 1. Core and the dev server

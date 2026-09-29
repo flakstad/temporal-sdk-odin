@@ -5473,6 +5473,135 @@ runtime_init_and_shutdown :: proc(t: ^testing.T) {
 	temporal_core.runtime_close(&runtime)
 }
 
+raw_byte_ref_string :: proc(value: raw.Byte_Array_Ref) -> string {
+	if value.data == nil || value.size == 0 {
+		return ""
+	}
+	return string(([^]u8)(value.data)[:int(value.size)])
+}
+
+@(test)
+worker_versioning_options_map_to_the_pinned_core_abi :: proc(t: ^testing.T) {
+	unversioned := temporal_core.worker_versioning_strategy_raw({})
+	testing.expect_value(t, unversioned.tag, raw.Worker_Versioning_Strategy_Tag.None)
+	testing.expect_value(
+		t,
+		raw_byte_ref_string(unversioned.none.build_id),
+		temporal_core.DEFAULT_WORKER_BUILD_ID,
+	)
+
+	deployment := temporal_core.Worker_Versioning_Options{
+		mode = .Deployment_Based,
+		deployment_name = "orders",
+		build_id = "orders-v2",
+		use_worker_versioning = true,
+		default_versioning_behavior = .Auto_Upgrade,
+	}
+	validation_error := temporal_core.worker_versioning_options_validate(deployment)
+	testing.expect(t, validation_error.message == nil)
+	temporal_core.error_free(&validation_error)
+	deployment_raw := temporal_core.worker_versioning_strategy_raw(deployment)
+	testing.expect_value(
+		t,
+		deployment_raw.tag,
+		raw.Worker_Versioning_Strategy_Tag.Deployment_Based,
+	)
+	testing.expect_value(
+		t,
+		raw_byte_ref_string(deployment_raw.deployment_based.version.deployment_name),
+		"orders",
+	)
+	testing.expect_value(
+		t,
+		raw_byte_ref_string(deployment_raw.deployment_based.version.build_id),
+		"orders-v2",
+	)
+	testing.expect(t, deployment_raw.deployment_based.use_worker_versioning)
+	testing.expect_value(
+		t,
+		deployment_raw.deployment_based.default_versioning_behavior,
+		i32(temporal_core.Worker_Versioning_Behavior.Auto_Upgrade),
+	)
+
+	legacy := temporal_core.worker_versioning_strategy_raw({
+		mode = .Legacy_Build_Id_Based,
+		build_id = "legacy-v1",
+	})
+	testing.expect_value(
+		t,
+		legacy.tag,
+		raw.Worker_Versioning_Strategy_Tag.Legacy_Build_Id_Based,
+	)
+	testing.expect_value(
+		t,
+		raw_byte_ref_string(legacy.legacy_build_id_based.build_id),
+		"legacy-v1",
+	)
+
+	invalid_cases := [?]temporal_core.Worker_Versioning_Options{
+		{mode = .Deployment_Based},
+		{
+			mode = .Deployment_Based,
+			build_id = "v1",
+			use_worker_versioning = true,
+		},
+		{
+			mode = .Deployment_Based,
+			build_id = "v1",
+			default_versioning_behavior = .Pinned,
+		},
+		{mode = .Legacy_Build_Id_Based},
+		{deployment_name = "not-valid-for-unversioned"},
+	}
+	for options in invalid_cases {
+		options_error := temporal_core.worker_versioning_options_validate(options)
+		testing.expect(t, options_error.message != nil)
+		temporal_core.error_free(&options_error)
+	}
+}
+
+@(test)
+language_worker_owns_versioning_identity_until_close :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	deployment_name, deployment_error := strings.clone("owned-deployment")
+	build_id, build_error := strings.clone("owned-build")
+	testing.expect(t, deployment_error == nil)
+	testing.expect(t, build_error == nil)
+
+	sdk_worker, create_error := worker.create(
+		&client,
+		"versioned-worker",
+		versioning = {
+			mode = .Deployment_Based,
+			deployment_name = deployment_name,
+			build_id = build_id,
+			use_worker_versioning = true,
+			default_versioning_behavior = .Pinned,
+		},
+	)
+	delete(deployment_name)
+	delete(build_id)
+	testing.expectf(t, create_error.message == nil, "worker.create failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	testing.expect_value(t, sdk_worker.versioning.deployment_name, "owned-deployment")
+	testing.expect_value(t, sdk_worker.versioning.build_id, "owned-build")
+	testing.expect(t, sdk_worker.versioning.use_worker_versioning)
+	testing.expect_value(
+		t,
+		sdk_worker.versioning.default_versioning_behavior,
+		worker.Worker_Versioning_Behavior.Pinned,
+	)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+	testing.expect(t, sdk_worker.versioning.build_id == "")
+	testing.expect(t, sdk_worker.versioning.deployment_name == "")
+}
+
 @(test)
 language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	raw_runtime := raw.Runtime{}

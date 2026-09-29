@@ -179,6 +179,10 @@ Lifecycle :: enum {
 	Closed,
 }
 
+Worker_Versioning_Mode :: temporal_core.Worker_Versioning_Mode
+Worker_Versioning_Behavior :: temporal_core.Worker_Versioning_Behavior
+Worker_Versioning_Options :: temporal_core.Worker_Versioning_Options
+
 Worker :: struct {
 	core:                   temporal_core.Worker,
 	client:                 ^temporal_core.Client,
@@ -193,6 +197,7 @@ Worker :: struct {
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
+	versioning:             Worker_Versioning_Options,
 }
 
 Error :: struct {
@@ -225,6 +230,7 @@ create :: proc(
 	task_queue: string,
 	namespace := "default",
 	max_concurrent_activities := 10,
+	versioning := Worker_Versioning_Options{},
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		return {}, error_from_string("client is not initialized")
@@ -238,6 +244,10 @@ create :: proc(
 	if max_concurrent_activities <= 0 {
 		return {}, error_from_string("max concurrent activities must be positive")
 	}
+	versioning_error := temporal_core.worker_versioning_options_validate(versioning)
+	if versioning_error.message != nil {
+		return {}, error_from_core(&versioning_error)
+	}
 	owned_task_queue, allocation_error := strings.clone(task_queue)
 	if allocation_error != nil {
 		return {}, error_from_string("could not allocate worker task queue")
@@ -247,11 +257,29 @@ create :: proc(
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate worker namespace")
 	}
+	owned_build_id, build_id_allocation_error := strings.clone(versioning.build_id)
+	if build_id_allocation_error != nil {
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate worker Build ID")
+	}
+	owned_deployment_name, deployment_name_allocation_error := strings.clone(
+		versioning.deployment_name,
+	)
+	if deployment_name_allocation_error != nil {
+		delete(owned_build_id)
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate worker deployment name")
+	}
 	worker.client = client
 	worker.namespace = owned_namespace
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = max_concurrent_activities
+	worker.versioning = versioning
+	worker.versioning.build_id = owned_build_id
+	worker.versioning.deployment_name = owned_deployment_name
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
@@ -1805,6 +1833,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		enable_local_activities = poll_local_activities,
 		enable_remote_activities = poll_remote_activities,
 		max_activity_slots = worker.max_concurrent_activities,
+		versioning = worker.versioning,
 	)
 	if create_error.message != nil {
 		return {}, error_from_core(&create_error)
@@ -1917,6 +1946,8 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.rejected_workflow_runs)
 	delete(worker.namespace)
 	delete(worker.task_queue)
+	delete(worker.versioning.build_id)
+	delete(worker.versioning.deployment_name)
 	worker.activity_registrations = nil
 	worker.activity_interceptors = nil
 	worker.workflow_inbound_interceptors = nil
@@ -1929,5 +1960,6 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.task_queue = ""
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
+	worker.versioning = {}
 	return error_from_core(&core_error)
 }
