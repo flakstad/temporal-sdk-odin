@@ -220,6 +220,35 @@ run :: proc() -> int {
 	if pause_error.message != nil {
 		return fail_error("Pause Schedule failed", &pause_error)
 	}
+	backfill_end := time.time_add(time.now(), -time.Minute)
+	backfill_start := time.time_add(backfill_end, -24 * time.Hour)
+	backfills := [?]temporal_client.Schedule_Backfill{{
+		start_time = backfill_start,
+		end_time = backfill_end,
+		overlap_policy = .Buffer_All,
+	}}
+	backfill_error := temporal_client.backfill_schedule(&handle, backfills[:])
+	if backfill_error.message != nil {
+		return fail_error("Backfill Schedule failed", &backfill_error)
+	}
+	backfill_action_count: i64
+	for _ in 0 ..< 200 {
+		description, describe_error = temporal_client.describe_schedule(&handle)
+		if describe_error.message != nil {
+			return fail_error("Describe backfilled Schedule failed", &describe_error)
+		}
+		backfill_action_count = description.action_count
+		backfill_finished := backfill_action_count >= 2 && len(description.running_workflows) == 0
+		temporal_client.schedule_description_free(&description)
+		if backfill_finished {
+			break
+		}
+		time.sleep(100 * time.Millisecond)
+	}
+	if backfill_action_count != 2 {
+		fmt.eprintf("expected exactly two backfilled Schedule actions, got %d\n", backfill_action_count)
+		return 1
+	}
 	trigger_error := temporal_client.trigger_schedule(&handle)
 	if trigger_error.message != nil {
 		return fail_error("Trigger Schedule failed", &trigger_error)
@@ -234,7 +263,7 @@ run :: proc() -> int {
 		if describe_error.message != nil {
 			return fail_error("Describe triggered Schedule failed", &describe_error)
 		}
-		if len(description.recent_actions) > 0 {
+		if description.action_count >= backfill_action_count + 1 && len(description.recent_actions) > 0 {
 			recent := description.recent_actions[len(description.recent_actions) - 1]
 			if len(recent.workflow_id) > 0 && len(recent.run_id) > 0 {
 				workflow_id_copy, workflow_id_error := strings.clone(recent.workflow_id)
@@ -284,7 +313,7 @@ run :: proc() -> int {
 	}
 	deleted = true
 	fmt.printf(
-		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d paused_unpaused=true workflow_id=%s result=%q deleted=true\n",
+		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d paused_unpaused=true backfill_actions=%d workflow_id=%s result=%q deleted=true\n",
 		schedule_id,
 		conflict_token_rotated,
 		stale_conflict_guarded,
@@ -293,6 +322,7 @@ run :: proc() -> int {
 		listed,
 		count_supported,
 		schedule_count,
+		backfill_action_count,
 		started_workflow_id,
 		result,
 	)

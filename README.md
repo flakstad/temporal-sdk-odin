@@ -40,8 +40,9 @@ cron/interval/structured-calendar Schedule with exclusions and optional TZif
 data, replace it with an optimistic conflict token, describe/list/count it,
 query matching times, backfill, pause/unpause, trigger it immediately, and
 delete it. The CLI-devserver suite proves replacement, conflict-token rotation
-and guarding, matching-time queries, and waits for the triggered Odin Workflow
-result. On CLI Server 1.29.1 a stale guarded update is ignored by the legacy
+and guarding plus matching-time queries, then waits for two buffered backfill
+executions and one manual trigger. On CLI Server 1.29.1 a stale guarded update
+is ignored by the legacy
 scheduler even though the RPC itself succeeds; callers that require observed
 application must Describe and verify the resulting definition.
 `CountSchedules` is generated

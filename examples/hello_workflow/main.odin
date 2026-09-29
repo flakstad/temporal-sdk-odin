@@ -1812,7 +1812,8 @@ main :: proc() {
 	expect_local_activity_retry := scenario == "local-activity-retry"
 	expect_failure_details := scenario == "failure-details"
 	expect_terminal_failure := scenario == "terminal-failure"
-	expect_patch := scenario == "patch"
+	expect_schedule_backfill := scenario == "schedule-backfill"
+	expect_patch := scenario == "patch" || expect_schedule_backfill
 	expect_deployment_versioning := scenario == "deployment-versioning"
 	expect_nondeterminism_fail := scenario == "nondeterminism-fail"
 	expect_properties := scenario == "workflow-properties"
@@ -1831,7 +1832,7 @@ main :: proc() {
 		&activity_worker,
 		{
 			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
-			max_workflow_executions = 1,
+			max_workflow_executions = expect_schedule_backfill ? 3 : 1,
 			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
@@ -1843,8 +1844,13 @@ main :: proc() {
 		worker.error_free(&run_error)
 		failed = true
 	}
-	if !failed && run_stats.workflow_executions_completed != 1 {
-		fmt.eprintln("Workflow worker did not complete exactly one Workflow Execution")
+	expected_workflow_executions := expect_schedule_backfill ? 3 : 1
+	if !failed && run_stats.workflow_executions_completed != expected_workflow_executions {
+		fmt.eprintf(
+			"Workflow worker completed %d Workflow Executions; expected %d\n",
+			run_stats.workflow_executions_completed,
+			expected_workflow_executions,
+		)
 		failed = true
 	}
 	if !failed && run_stats.workflow_evictions < 1 {

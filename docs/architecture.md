@@ -2239,8 +2239,10 @@ priority, delay, and cron) is now implemented and live-proven, including
 `Use_Existing`. Typed Describe, paginated history, Visibility list/count, and
 Schedule create/describe/list/pause/unpause/trigger/delete are now implemented
 and live-proven without new C symbols. Full replace-update with optimistic
-conflict tokens and matching-time queries are also live-proven; structured and
-excluded calendars, TZif data, and backfill have exact wire/property coverage.
+conflict tokens and matching-time queries are also live-proven. Backfill now has
+an additional live `BUFFER_ALL` slice that executes two historical actions plus
+one manual trigger on the bounded Odin Worker; structured/excluded calendars
+and TZif data retain exact wire/property coverage.
 Recursive Client and Workflow failure inspection is now implemented and
 live-proven. Query reject conditions plus static summary/details are now
 implemented and live-proven against the CLI dev server, including the typed

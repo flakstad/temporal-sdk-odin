@@ -863,7 +863,7 @@ cat "$worker_log"
 grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
 grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
 
-TEMPORAL_ODIN_SCENARIO=patch \
+TEMPORAL_ODIN_SCENARIO=schedule-backfill \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
@@ -892,12 +892,17 @@ grep -q 'stale_conflict_guarded=true' <<<"$schedule_output"
 grep -Eq 'matching_times=[3-9][0-9]*' <<<"$schedule_output"
 grep -q 'listed=true' <<<"$schedule_output"
 grep -q 'paused_unpaused=true' <<<"$schedule_output"
+grep -q 'backfill_actions=2' <<<"$schedule_output"
 grep -q 'Patched Scheduled' <<<"$schedule_output"
 grep -q 'deleted=true' <<<"$schedule_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log"
+patch_completion_count="$(grep -Ec 'replay=false .*patches=1 deprecated_patches=0 .*completed=true' "$worker_log")"
+if [[ "$patch_completion_count" -ne 3 ]]; then
+  echo "Expected three Schedule-driven Workflow completions, got $patch_completion_count" >&2
+  exit 1
+fi
 grep -q "Workflow patch marker completed through Core and Temporal Server" "$worker_log"
 
 if ! temporal operator search-attribute list \

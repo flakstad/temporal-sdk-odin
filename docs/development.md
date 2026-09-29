@@ -1262,7 +1262,7 @@ for the synchronous RPC.
 Run the Schedule client against the patch Workflow worker:
 
 ```bash
-TEMPORAL_ODIN_SCENARIO=patch ./scripts/run-hello-workflow.sh
+TEMPORAL_ODIN_SCENARIO=schedule-backfill ./scripts/run-hello-workflow.sh
 
 TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
 ./scripts/run-schedule-lifecycle.sh
@@ -1271,12 +1271,14 @@ TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
 The client creates a paused 24-hour interval Schedule, describes it, replaces it
 with a 12-hour Schedule using the Describe conflict token, proves that a
 deliberately different update using a stale token is not applied, queries the
-next two days of matching times, lists
-it, unpauses and pauses it through `PatchSchedule`, triggers it manually, waits
-for the scheduled Odin Workflow result, and deletes the Schedule. This exercises
-Create/Describe/Update/List/ListScheduleMatchingTimes/Patch/Delete through SDK
-Core and the CLI dev server. Backfill is wire/property-tested separately because
-adding several executions would make this one-shot worker example ambiguous.
+next two days of matching times, lists it, and unpauses and pauses it through
+`PatchSchedule`. It then backfills the previous 24-hour window with
+`BUFFER_ALL`, waits for exactly two Workflow executions, triggers a third
+execution manually, waits for its result, and deletes the Schedule. This
+exercises Create/Describe/Update/List/ListScheduleMatchingTimes/Patch,
+multi-execution backfill, Trigger, and Delete through SDK Core and the CLI dev
+server. The dedicated worker scenario has a three-execution bound so shutdown
+also proves that all backfill and trigger work was dispatched.
 CLI Server 1.29.1's legacy scheduler acknowledges the stale update RPC before it
 checks and ignores the conflict asynchronously, so the example reports both
 `stale_conflict_guarded=true` and `stale_rpc_rejected=false`.
