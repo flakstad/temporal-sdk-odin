@@ -128,6 +128,7 @@ Client :: struct {
 	runtime:      ^temporal_core.Runtime,
 	connection:   ^temporal_core.Client,
 	namespace:    string,
+	identity:     string,
 	interceptors: [dynamic]Client_Interceptor,
 }
 
@@ -172,10 +173,17 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 	if allocation_error != nil {
 		return {}, error_from_string(.Connection, "could not allocate Temporal namespace")
 	}
+	owned_identity, identity_allocation_error := strings.clone(identity, heap)
+	if identity_allocation_error != nil {
+		delete(owned_namespace, heap)
+		return {}, error_from_string(.Connection, "could not allocate Temporal Client identity")
+	}
+	core_options.identity = owned_identity
 
 	runtime := new(temporal_core.Runtime, heap)
 	created_runtime, core_error := temporal_core.runtime_create()
 	if core_error.message != nil {
+		delete(owned_identity, heap)
 		delete(owned_namespace, heap)
 		free(runtime, heap)
 		return {}, error_from_core(&core_error, .Connection)
@@ -188,6 +196,7 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 		free(connection, heap)
 		free(runtime, heap)
 		delete(owned_namespace, heap)
+		delete(owned_identity, heap)
 		return {}, error_from_core(&connect_error, .Connection)
 	}
 	connection^ = created_connection
@@ -197,6 +206,7 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 		runtime = runtime,
 		connection = connection,
 		namespace = owned_namespace,
+		identity = owned_identity,
 		interceptors = interceptors,
 	}, {}
 }
@@ -215,6 +225,7 @@ close :: proc(client: ^Client) {
 		free(client.runtime, heap)
 	}
 	delete(client.namespace, heap)
+	delete(client.identity, heap)
 	delete(client.interceptors)
 	client^ = {}
 }

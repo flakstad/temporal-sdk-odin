@@ -1,16 +1,20 @@
 package main
 
+import allocator_runtime "base:runtime"
+import "core:bytes"
 import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:time"
 import activity "../../temporal/activity"
+import temporal_client "../../temporal/client"
 import temporal_core "../../temporal/core"
 import worker "../../temporal/worker"
 
 concurrent_activities: int
 concurrent_overlap_observed: bool
+async_task_token: []u8
 
 Greeting_Input :: struct {
 	name:       string,
@@ -130,6 +134,36 @@ retry_greeting :: proc(
 	)
 }
 
+async_hello :: proc(ctx: ^activity.Context, name: string) -> activity.Result(string) {
+	if name != "Odin" {
+		return activity.result_failure(
+			string,
+			"async hello expected Odin",
+			failure_type = "OdinAsyncActivityInputError",
+			non_retryable = true,
+		)
+	}
+	info := activity.info(ctx)
+	if len(info.task_token) == 0 {
+		return activity.result_failure(
+			string,
+			"async Activity task token is missing",
+			failure_type = "OdinAsyncActivityTokenError",
+			non_retryable = true,
+		)
+	}
+	async_task_token = bytes.clone(info.task_token, allocator_runtime.heap_allocator())
+	if len(async_task_token) == 0 {
+		return activity.result_failure(
+			string,
+			"could not preserve async Activity task token",
+			failure_type = "OdinAllocationError",
+			non_retryable = true,
+		)
+	}
+	return activity.result_will_complete_async(string)
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -183,6 +217,17 @@ main :: proc() {
 		_ = worker.close(&activity_worker)
 		os.exit(1)
 	}
+	register_async_error := worker.register_json_activity_result(
+		&activity_worker,
+		"async_hello",
+		async_hello,
+	)
+	if register_async_error.message != nil {
+		fmt.eprintf("Async Activity registration failed: %s\n", string(register_async_error.message))
+		worker.error_free(&register_async_error)
+		_ = worker.close(&activity_worker)
+		os.exit(1)
+	}
 
 	fmt.println("Odin Activity Worker is polling task queue odin-hello-activity")
 	env_buffer: [64]u8
@@ -190,6 +235,8 @@ main :: proc() {
 	concurrency_case := concurrency_value != ""
 	retry_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_RETRY")
 	retry_case := retry_value != ""
+	async_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_ASYNC")
+	async_case := async_value != ""
 	max_tasks := 1
 	if concurrency_case || retry_case {
 		max_tasks = 2
@@ -210,10 +257,43 @@ main :: proc() {
 		worker.error_free(&close_error)
 		os.exit(1)
 	}
+	if async_case {
+		defer delete(async_task_token, allocator_runtime.heap_allocator())
+		if len(async_task_token) == 0 {
+			fmt.eprintln("Async Activity did not preserve its task token")
+			os.exit(1)
+		}
+		completion_client, completion_connect_error := temporal_client.connect()
+		if completion_connect_error.message != nil {
+			fmt.eprintf(
+				"Async Activity Client connection failed: %s\n",
+				string(completion_connect_error.message),
+			)
+			temporal_client.error_free(&completion_connect_error)
+			os.exit(1)
+		}
+		defer temporal_client.close(&completion_client)
+		identifier := temporal_client.async_activity_from_task_token(async_task_token)
+		completion_error := temporal_client.complete_async_activity_json(
+			&completion_client,
+			identifier,
+			"Hello async Odin",
+		)
+		if completion_error.message != nil {
+			fmt.eprintf(
+				"Async Activity completion failed: %s\n",
+				string(completion_error.message),
+			)
+			temporal_client.error_free(&completion_error)
+			os.exit(1)
+		}
+	}
 	if concurrency_case {
 		fmt.println("two Activity callbacks overlapped and worker shut down cleanly")
 	} else if retry_case {
 		fmt.println("retryable Activity failed once, then completed and worker shut down cleanly")
+	} else if async_case {
+		fmt.println("Activity deferred completion and Odin Client completed it by task token")
 	} else {
 		fmt.println("one Activity Task completed and worker shut down cleanly")
 	}

@@ -81,6 +81,16 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.UpdateWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateRequest \
   temporal.api.workflowservice.v1.PollWorkflowExecutionUpdateResponse \
+  temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatRequest \
+  temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatResponse \
+  temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdRequest \
+  temporal.api.workflowservice.v1.RecordActivityTaskHeartbeatByIdResponse \
+  temporal.api.workflowservice.v1.RespondActivityTaskCompletedRequest \
+  temporal.api.workflowservice.v1.RespondActivityTaskCompletedByIdRequest \
+  temporal.api.workflowservice.v1.RespondActivityTaskFailedRequest \
+  temporal.api.workflowservice.v1.RespondActivityTaskFailedByIdRequest \
+  temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest \
+  temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest \
   temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest
 

@@ -199,7 +199,14 @@ recovers typed heartbeat progress on attempt 2. Workers can register ordered
 Activity interceptors that wrap both callback execution and heartbeat calls
 with real `next` continuations. The first registered interceptor is outermost;
 it may inspect or replace inputs/results or deliberately skip `next`. Interceptor
-user data is borrowed until `worker.close`. Workers can also register deterministic
+user data is borrowed until `worker.close`. Remote Activities may now return
+`activity.result_will_complete_async(T)` (or the Payload equivalent). A public
+Odin Client can subsequently complete, fail, report cancellation, or heartbeat
+the Activity by copied task token, Workflow/Activity ID, or standalone Activity
+ID. The live dev-server case defers in the worker and completes through Core's
+generic WorkflowService RPC bridge from a separate Client. Local Activities
+reject asynchronous completion because they have no server-side pending task.
+Workers can also register deterministic
 Workflow outbound interceptors for remote and Local Activity scheduling, Child
 Workflow start/Signal, external Workflow Signal/cancellation, and
 Continue-As-New, durable sleep, and explicit Child Workflow cancellation.
@@ -220,9 +227,10 @@ now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
-**not** yet provide guard-page/growable stack protection, client
-cancellation of an accepted Update,
-in-process panic containment, or a stable public API.
+**not** yet provide guard-page/growable stack protection, bounded or
+client-cancellable Update-result polling, in-process panic containment, or a
+stable public API. Canceling a Client wait would not cancel an already accepted
+durable Update; the current Temporal Service exposes no such operation.
 Do not use it in production.
 
 ```odin

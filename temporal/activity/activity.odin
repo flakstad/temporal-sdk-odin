@@ -69,6 +69,7 @@ Result_Status :: enum {
 	Completed,
 	Failed,
 	Canceled,
+	Will_Complete_Async,
 }
 
 Application_Failure :: struct {
@@ -123,6 +124,14 @@ result_canceled_json :: proc(
 
 result_success :: proc(value: $T) -> Result(T) {
 	return {status = .Completed, value = value}
+}
+
+// result_will_complete_async tells Core that another client process will
+// heartbeat and eventually complete this Activity using its task token or IDs.
+// The callback must copy activity.info(ctx).task_token before returning when it
+// intends to use token-based completion.
+result_will_complete_async :: proc($T: typeid) -> Result(T) {
+	return {status = .Will_Complete_Async}
 }
 
 result_failure :: proc(
@@ -282,6 +291,10 @@ Info :: struct {
 
 payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
 	return {status = .Completed, payload = payload}
+}
+
+payload_will_complete_async :: proc() -> Payload_Result {
+	return {status = .Will_Complete_Async}
 }
 
 payload_fail :: proc(

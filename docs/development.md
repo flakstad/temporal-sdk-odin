@@ -324,6 +324,26 @@ executor has built the completion. A negative retry delay is rejected as a
 non-retryable `OdinActivityFailureContractError` rather than emitting an
 invalid protobuf duration.
 
+For remote Activities, `activity.result_will_complete_async(T)` and
+`activity.payload_will_complete_async()` emit Core's `WillCompleteAsync`
+completion. The callback must copy `activity.info(ctx).task_token` before it
+returns if another process will address the Activity by token; all `Info` data
+is callback-borrowed. `temporal/client/async_activity.odin` then exposes
+completion, Application Failure, cancellation, and heartbeat RPCs by task token
+or by IDs. Heartbeats return all three current Service flags: cancellation,
+pause, and reset. ID forms also cover standalone Activities by leaving Workflow
+ID empty. Local Activities convert an attempted asynchronous result into a
+non-retryable contract failure.
+
+The live dev-server case schedules `async_hello`, lets the Odin worker emit
+`WillCompleteAsync` and stop after one task, then uses a separately connected
+Odin Client to call `RespondActivityTaskCompleted` with the copied task token.
+The Rust workflow driver observes `Hello async Odin` from the Service. The
+remaining by-ID, failure, cancellation, and heartbeat variants share the same
+generated WorkflowService boundary and currently have wire/unit coverage; add
+live cases before declaring each operationally proven against every Server
+version.
+
 Activity panics are not caught in-process. In the tested Odin toolchain,
 `panic` delegates to `context.assertion_failure_proc`, whose type returns `!`;
 there is no supported unwind/recover boundary. A `setjmp`/`longjmp` shim would

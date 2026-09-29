@@ -352,6 +352,20 @@ encode_activity_success :: proc(task_token, result_data: []u8) -> [dynamic]u8 {
 	)
 }
 
+encode_activity_will_complete_async :: proc(task_token: []u8) -> [dynamic]u8 {
+	async := Coresdk_Activity_Result_WillCompleteAsync{}
+	execution_result := Coresdk_Activity_Result_ActivityExecutionResult{
+		status = Coresdk_Activity_Result_ActivityExecutionResult_Status_Will_Complete_Async{
+			value = &async,
+		},
+	}
+	completion := Coresdk_ActivityTaskCompletion{
+		task_token = task_token,
+		result = &execution_result,
+	}
+	return encode_Coresdk_ActivityTaskCompletion(&completion)
+}
+
 encode_activity_failure :: proc(
 	task_token: []u8,
 	message: string,

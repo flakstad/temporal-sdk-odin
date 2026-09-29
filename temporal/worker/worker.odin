@@ -742,6 +742,9 @@ register_json_activity_result :: proc(
 					cancellation = result.cancellation,
 				}
 			}
+			if result.status == .Will_Complete_Async {
+				return activity.payload_will_complete_async()
+			}
 			payload, encode_error := codec.encode_json(result.value)
 			if encode_error != .None {
 				return activity.payload_fail(
@@ -1396,7 +1399,18 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	defer activity.cancellation_free(&result.cancellation)
 
 	completion: [dynamic]u8
-	if result.status == .Canceled || activity.is_cancellation_requested(&execution.ctx) {
+	if result.status == .Will_Complete_Async {
+		if execution.info_owner.info.is_local {
+			completion = proto.encode_activity_failure(
+				execution.task_token,
+				"Local Activities cannot complete asynchronously",
+				"OdinActivityFailureContractError",
+				true,
+			)
+		} else {
+			completion = proto.encode_activity_will_complete_async(execution.task_token)
+		}
+	} else if result.status == .Canceled || activity.is_cancellation_requested(&execution.ctx) {
 		message := result.cancellation.message
 		if len(message) == 0 {
 			message = "Activity canceled"

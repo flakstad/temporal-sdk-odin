@@ -56,6 +56,17 @@ impl ActivityDefinition for RetryGreetingActivity {
     }
 }
 
+struct AsyncHelloActivity;
+
+impl ActivityDefinition for AsyncHelloActivity {
+    type Input = String;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "async_hello"
+    }
+}
+
 #[workflow]
 #[derive(Default)]
 struct ActivityDriverWorkflow;
@@ -165,6 +176,25 @@ impl RetryActivityDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct AsyncActivityDriverWorkflow;
+
+#[workflow_methods]
+impl AsyncActivityDriverWorkflow {
+    #[run(name = "odin_async_activity_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
+        let result = ctx
+            .execute_activity(
+                AsyncHelloActivity,
+                name,
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+            .await?;
+        Ok(result)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -176,6 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
+    let async_completion = std::env::var_os("ACTIVITY_ASYNC").is_some();
     let expected = if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
     } else {
@@ -192,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<ConcurrentActivityDriverWorkflow>()?
         .register_workflow::<TypedActivityDriverWorkflow>()?
         .register_workflow::<RetryActivityDriverWorkflow>()?
+        .register_workflow::<AsyncActivityDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -199,6 +231,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let workflow_id = format!("odin-sdk-activity-spike-{}-{unique}", std::process::id());
     let driver = async move {
+        if async_completion {
+            let handle = client
+                .start_workflow(
+                    AsyncActivityDriverWorkflow::run,
+                    input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != "Hello async Odin" {
+                return Err(format!("unexpected async Activity result: {result}").into());
+            }
+            println!("Workflow observed asynchronously completed Odin Activity result: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if retry {
             let retry_input = serde_json::json!({"name": "Odin"});
             let expected = serde_json::json!({

@@ -10857,6 +10857,106 @@ activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 }
 
 @(test)
+async_activity_marker_and_service_messages_round_trip :: proc(t: ^testing.T) {
+	typed := activity.result_will_complete_async(string)
+	payload_result := activity.payload_will_complete_async()
+	testing.expect(t, typed.status == .Will_Complete_Async)
+	testing.expect(t, payload_result.status == .Will_Complete_Async)
+
+	completion := proto.encode_activity_will_complete_async(
+		transmute([]u8)string("async-token"),
+	)
+	defer delete(completion)
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded_completion := proto.Coresdk_ActivityTaskCompletion{}
+	completion_ok := proto.decode_Coresdk_ActivityTaskCompletion(
+		completion[:],
+		&decoded_completion,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, completion_ok)
+	testing.expect_value(t, string(decoded_completion.task_token), "async-token")
+	found_async := false
+	if decoded_completion.result != nil {
+		#partial switch status in decoded_completion.result.status {
+		case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Will_Complete_Async:
+			// WillCompleteAsync is an empty protobuf message. Odin's zero-sized
+			// allocation may decode its pointer as nil; the oneof variant is the
+			// complete semantic value.
+			found_async = true
+		}
+	}
+	testing.expect(t, found_async)
+
+	result_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"completed elsewhere"`),
+	}
+	result_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(result_payloads.payloads)
+	append(&result_payloads.payloads, result_payload)
+	complete_request := proto.Temporal_Api_Workflowservice_V1_RespondActivityTaskCompletedRequest{
+		task_token = transmute([]u8)string("async-token"),
+		result = &result_payloads,
+		identity = "odin-test",
+		namespace = "default",
+	}
+	encoded_request := proto.encode_Temporal_Api_Workflowservice_V1_RespondActivityTaskCompletedRequest(
+		&complete_request,
+	)
+	defer delete(encoded_request)
+	decoded_request := proto.Temporal_Api_Workflowservice_V1_RespondActivityTaskCompletedRequest{}
+	context.allocator = virtual.arena_allocator(&arena)
+	request_ok := proto.decode_Temporal_Api_Workflowservice_V1_RespondActivityTaskCompletedRequest(
+		encoded_request[:],
+		&decoded_request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, request_ok)
+	testing.expect_value(t, string(decoded_request.task_token), "async-token")
+	testing.expect_value(t, decoded_request.namespace, "default")
+	testing.expect(t, decoded_request.result != nil)
+	if decoded_request.result != nil {
+		testing.expect_value(t, len(decoded_request.result.payloads), 1)
+	}
+
+	heartbeat_response := proto.Temporal_Api_Workflowservice_V1_RecordActivityTaskHeartbeatByIdResponse{
+		cancel_requested = true,
+		activity_paused = true,
+		activity_reset = false,
+	}
+	encoded_response := proto.encode_Temporal_Api_Workflowservice_V1_RecordActivityTaskHeartbeatByIdResponse(
+		&heartbeat_response,
+	)
+	defer delete(encoded_response)
+	decoded_response := proto.Temporal_Api_Workflowservice_V1_RecordActivityTaskHeartbeatByIdResponse{}
+	context.allocator = virtual.arena_allocator(&arena)
+	response_ok := proto.decode_Temporal_Api_Workflowservice_V1_RecordActivityTaskHeartbeatByIdResponse(
+		encoded_response[:],
+		&decoded_response,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, response_ok)
+	testing.expect(t, decoded_response.cancel_requested)
+	testing.expect(t, decoded_response.activity_paused)
+	testing.expect(t, !decoded_response.activity_reset)
+
+	invalid_client := temporal_client.Client{}
+	identifier := temporal_client.async_activity_from_task_token(
+		transmute([]u8)string("async-token"),
+	)
+	invalid_error := temporal_client.complete_async_activity_payload(
+		&invalid_client,
+		identifier,
+	)
+	defer temporal_client.error_free(&invalid_error)
+	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+}
+
+@(test)
 activity_application_failure_protobuf_preserves_retry_contract :: proc(t: ^testing.T) {
 	details, details_error := codec.encode_json(
 		Activity_Failure_Details{dependency = "payments", attempt = 3},

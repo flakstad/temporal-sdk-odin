@@ -382,6 +382,25 @@ protobuf call. Core sends the correct server RPC and manages server-facing
 activity mechanics; Odin owns procedure invocation, cancellation delivery,
 heartbeat API surface, payload conversion, failures, and activity concurrency.
 
+Odin now implements the fourth result variant for remote Activities. A callback
+returning `WillCompleteAsync` releases the worker task without resolving the
+server-side Activity. The callback's task token is borrowed, so the application
+must copy it before returning. The public Client addresses the pending Activity
+by task token, Workflow/Activity ID, or standalone Activity ID and calls the
+pinned bridge's generic WorkflowService dispatcher with:
+
+- `RespondActivityTaskCompleted[ById]`;
+- `RespondActivityTaskFailed[ById]`;
+- `RespondActivityTaskCanceled[ById]`;
+- `RecordActivityTaskHeartbeat[ById]`.
+
+This adds no C ABI symbol. It adds the exact WorkflowService request/heartbeat
+response schemas to the generated Odin protobuf roots. The live token path is
+Odin worker → Core `WillCompleteAsync` → Service pending Activity → separate
+Odin Client → Core RPC bridge → Service completion → waiting Workflow. Local
+Activities explicitly reject this result because no server task remains to
+complete.
+
 ### Activity execution context boundary
 
 Core's `coresdk.activity_task.Start` is also the source of Activity execution
@@ -1613,8 +1632,9 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are client cancellation of an accepted Update,
-shared-state races between handlers,
+The remaining Update-runtime risks are bounded/client-cancellable result polling
+(which must not be presented as cancellation of an already accepted durable
+Update), shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
 
@@ -2102,7 +2122,7 @@ Workflows are enabled.
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It
    now proves downward-only nested cancellation-token trees across Activities,
    timers, Signal waits, main/Signal/Update fibers, propagated durable
-   deadlines, and replay. It does not yet prove client cancellation of accepted Updates,
+   deadlines, and replay. It does not yet prove bounded/client-cancellable Update result waits,
    panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, guard-page/growable stack protection, or
    a production deterministic scheduler.

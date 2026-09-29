@@ -468,6 +468,10 @@ run_activity_case() {
     ACTIVITY_EXPECT_RETRY=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  elif [[ "$mode" == "async" ]]; then
+    ACTIVITY_EXPECT_ASYNC=1 \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   else
     TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
@@ -502,6 +506,10 @@ run_activity_case() {
     ACTIVITY_RETRY=1 cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
+  elif [[ "$mode" == "async" ]]; then
+    ACTIVITY_ASYNC=1 cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
   else
     cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
@@ -513,6 +521,8 @@ run_activity_case() {
   cat "$worker_log"
   if [[ "$mode" == "retry" ]]; then
     grep -q "retryable Activity failed once, then completed and worker shut down cleanly" "$worker_log"
+  elif [[ "$mode" == "async" ]]; then
+    grep -q "Activity deferred completion and Odin Client completed it by task token" "$worker_log"
   else
     grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
   fi
@@ -522,6 +532,7 @@ run_activity_case string
 run_activity_case failure
 run_activity_case typed
 run_activity_case retry
+run_activity_case async
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
