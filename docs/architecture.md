@@ -192,6 +192,16 @@ compression, and cancellation mechanics. The Odin layer must still provide
 typed client methods, generate request IDs where required, encode the Temporal
 API protobuf messages, convert user payloads, and map errors into an Odin API.
 
+Core normally also classifies and retries retryable tonic transport failures.
+The pinned bridge can lose tonic's nested transport-error source while turning
+one HTTP/2 failure into a gRPC `Cancelled` status; in that form Core's retry
+classifier no longer recognizes it. The Odin generic-RPC wrapper has one narrow
+fallback for the observed `status = 1` plus `h2 protocol error` shape. It waits
+100 ms and retries once, only when the caller already enabled Core retries. It
+does not match explicit no-retry calls, ordinary application cancellation,
+deadlines, other status codes, or a second failure. Every Core success/failure
+buffer is still copied and freed before retrying or returning.
+
 `client.Connect_Options` now maps the complete stable connection subset exposed
 by the pinned C bridge: TLS/mTLS byte material and domain override, API key,
 ASCII and binary gRPC metadata, retry and keepalive timing, HTTP CONNECT proxy,
@@ -2743,6 +2753,39 @@ the real CLI dev server. Named isolated streams and richer numeric/range helpers
 are still pending. All information fields in the pinned `InitializeWorkflow`
 schema are now preserved; its user argument surface remains intentionally
 single-Payload pending a separate API design.
+
+### Per-activation metadata and current details
+
+Core's `WorkflowActivation` also carries `history_size_bytes`,
+`continue_as_new_suggested`, `deployment_version_for_current_task`, and the
+experimental `target_worker_deployment_version_changed` flag. Odin copies the
+scalars before dispatch and preserves deployment/build strings in the run
+arena only when their value changes. Public accessors therefore borrow stable
+run-owned strings without retaining pointers into the short-lived protobuf
+decode arena. `history_size_bytes` is a Core estimate and may be zero on the
+initial activation; callers must not interpret zero as a missing field.
+For `WorkerVersioningStrategy::None`, Core may still expose a version with an
+empty deployment name and the worker Build ID; the optional is absent only
+when Core's computed version is empty. Odin preserves that distinction rather
+than equating an empty deployment name with no version.
+
+`is_replaying_history_events` is derived exactly like the pinned Rust runtime:
+it is true only when `is_replaying` is true and the activation contains at
+least one non-Query job. Query-only replay can consequently expose live
+diagnostics without being mistaken for replay of history events.
+
+`set_current_details` is not a Core command. It replaces one heap-owned string
+on the Workflow instance, and the reserved
+`__temporal_workflow_metadata` Query serializes it as proto-JSON-compatible
+`currentDetails`. Repeated updates free the prior string; eviction frees the
+last value, and replay reconstructs it by rerunning Workflow code. The query is
+handled before the user registry, and registration rejects its reserved name.
+No C symbol or generated protobuf change is involved. Unit coverage verifies
+all activation fields, query encoding, ownership through eviction, query-only
+replay classification, and byte-identical fresh-stack replay. The live
+properties Workflow queries `currentDetails` before a Signal permits it to
+close; the deployment acceptance Workflow also requires a non-empty version
+delivered by Core.
 
 ### Local Activity boundary
 

@@ -1004,6 +1004,7 @@ grep -q "Odin client completed workflow-properties workflow_id=$properties_workf
 grep -q 'use_existing=true' <<<"$properties_workflow_output"
 grep -q 'query_rejected_status=Completed' <<<"$properties_workflow_output"
 grep -q 'static_metadata=true' <<<"$properties_workflow_output"
+grep -q 'current_details=true' <<<"$properties_workflow_output"
 grep -q 'describe_status=Completed' <<<"$properties_workflow_output"
 grep -q 'visibility_listed=true' <<<"$properties_workflow_output"
 grep -Eq 'visibility_count=[1-9][0-9]*' <<<"$properties_workflow_output"
@@ -1026,8 +1027,9 @@ grep -q 'firstWorkflowTaskBackoff' "$typed_history_file"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq 'replay=false .*memo_upserts=2 search_upserts=1 .*completed=true' "$worker_log"
-grep -q "Workflow info, memo, and Search Attributes completed through Core and Temporal Server" "$worker_log"
+grep -Eq 'replay=false .*memo_upserts=2 search_upserts=1 .*waiting_signal=true .*completed=false' "$worker_log"
+grep -Eq 'replay=false .*signal=true .*waiting_signal=false .*completed=true' "$worker_log"
+grep -q "Workflow info, mutable properties, runtime metadata, and current details completed through Core and Temporal Server" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

@@ -302,6 +302,13 @@ Continue_Initiator :: enum {
 	Cron_Schedule,
 }
 
+// Worker_Deployment_Version borrows its strings from the Workflow run. The
+// value remains valid until the run is evicted from the Worker cache.
+Worker_Deployment_Version :: struct {
+	deployment_name: string,
+	build_id:        string,
+}
+
 // Info borrows all strings and slices from the current Workflow run. It is
 // valid until the run is evicted from the Worker cache.
 Info :: struct {
@@ -1195,9 +1202,16 @@ Fiber_Instance :: struct {
 	next_external_cancel_seq: u32,
 	next_timer_seq:    u32,
 	activation_is_replaying: bool,
+	activation_is_replaying_history_events: bool,
 	activation_history_length: u32,
+	activation_history_size_bytes: u64,
+	activation_continue_as_new_suggested: bool,
+	activation_target_worker_deployment_version_changed: bool,
+	current_deployment_version: Worker_Deployment_Version,
+	has_current_deployment_version: bool,
 	activation_time:         time.Time,
 	has_activation_time:     bool,
+	current_details:         string,
 	activation_result:       ^Process_Result,
 	activation_error_message: string,
 	random_state:            u64,
@@ -1846,6 +1860,7 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 			codec.payload_free(&entry.payload)
 		}
 	}
+	delete(instance.current_details, instance.owner_allocator)
 	virtual.arena_destroy(&instance.arena)
 	free(instance, instance.owner_allocator)
 	return {}
@@ -2483,6 +2498,12 @@ find_query_handler :: proc(
 	return nil, false
 }
 
+WORKFLOW_METADATA_QUERY_TYPE :: "__temporal_workflow_metadata"
+
+workflow_query_name_reserved :: proc(name: string) -> bool {
+	return name == WORKFLOW_METADATA_QUERY_TYPE
+}
+
 query_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
 	if instance == nil {
 		return
@@ -2499,7 +2520,8 @@ set_query_handler_payload :: proc(
 	callback: Query_Invoke_Proc,
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || callback == nil {
+	   len(name) == 0 || workflow_query_name_reserved(name) ||
+	   callback_data == nil || callback == nil {
 		if ctx != nil {
 			query_registration_failed(ctx.instance, "invalid Workflow query handler")
 		}
@@ -2536,7 +2558,8 @@ set_query_handler_payloads :: proc(
 	callback: Query_Payloads_Invoke_Proc,
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || callback == nil {
+	   len(name) == 0 || workflow_query_name_reserved(name) ||
+	   callback_data == nil || callback == nil {
 		if ctx != nil {
 			query_registration_failed(ctx.instance, "invalid repeated-input Workflow query handler")
 		}
@@ -2571,7 +2594,8 @@ set_query_handler_payload_with_context :: proc(
 	callback: Query_Context_Invoke_Proc,
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || callback == nil {
+	   len(name) == 0 || workflow_query_name_reserved(name) ||
+	   callback_data == nil || callback == nil {
 		if ctx != nil {
 			query_registration_failed(ctx.instance, "invalid contextual Workflow query handler")
 		}
@@ -2606,7 +2630,8 @@ set_query_handler_payloads_with_context :: proc(
 	callback: Query_Context_Payloads_Invoke_Proc,
 ) -> bool {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(name) == 0 || callback_data == nil || callback == nil {
+	   len(name) == 0 || workflow_query_name_reserved(name) ||
+	   callback_data == nil || callback == nil {
 		if ctx != nil {
 			query_registration_failed(
 				ctx.instance,
@@ -4053,11 +4078,71 @@ is_replaying :: proc(ctx: ^Fiber_Context) -> bool {
 	return ctx != nil && ctx.instance != nil && ctx.instance.activation_is_replaying
 }
 
+// is_replaying_history_events excludes replay activations which contain only
+// Queries. It is the appropriate guard for suppressing duplicate external
+// logging while still allowing query-time diagnostics.
+is_replaying_history_events :: proc(ctx: ^Fiber_Context) -> bool {
+	return ctx != nil && ctx.instance != nil &&
+	       ctx.instance.activation_is_replaying_history_events
+}
+
 history_length :: proc(ctx: ^Fiber_Context) -> u32 {
 	if ctx == nil || ctx.instance == nil {
 		return 0
 	}
 	return ctx.instance.activation_history_length
+}
+
+history_size_bytes :: proc(ctx: ^Fiber_Context) -> u64 {
+	if ctx == nil || ctx.instance == nil {
+		return 0
+	}
+	return ctx.instance.activation_history_size_bytes
+}
+
+continue_as_new_suggested :: proc(ctx: ^Fiber_Context) -> bool {
+	return ctx != nil && ctx.instance != nil &&
+	       ctx.instance.activation_continue_as_new_suggested
+}
+
+target_worker_deployment_version_changed :: proc(ctx: ^Fiber_Context) -> bool {
+	return ctx != nil && ctx.instance != nil &&
+	       ctx.instance.activation_target_worker_deployment_version_changed
+}
+
+current_deployment_version :: proc(
+	ctx: ^Fiber_Context,
+) -> (Worker_Deployment_Version, bool) {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.has_current_deployment_version {
+		return {}, false
+	}
+	return ctx.instance.current_deployment_version, true
+}
+
+// current_details returns a borrowed value which remains valid until the next
+// successful set_current_details call or run eviction.
+current_details :: proc(ctx: ^Fiber_Context) -> string {
+	if ctx == nil || ctx.instance == nil {
+		return ""
+	}
+	return ctx.instance.current_details
+}
+
+// set_current_details updates the value returned by Temporal's reserved
+// __temporal_workflow_metadata Query. It is language-runtime metadata and does
+// not emit a Workflow command or add an event to history.
+set_current_details :: proc(ctx: ^Fiber_Context, details: string) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		return false
+	}
+	instance := ctx.instance
+	owned, allocation_error := strings.clone(details, instance.owner_allocator)
+	if allocation_error != nil {
+		return false
+	}
+	delete(instance.current_details, instance.owner_allocator)
+	instance.current_details = owned
+	return true
 }
 
 info :: proc(ctx: ^Fiber_Context) -> (value: Info, present: bool) {
@@ -8793,12 +8878,38 @@ restore_workflow_command_state :: proc(
 	}
 }
 
+Workflow_Metadata_Query_Response :: struct {
+	current_details: string `json:"currentDetails,omitempty"`,
+}
+
+invoke_workflow_metadata_query :: proc(instance: ^Fiber_Instance) -> Payload_Result {
+	if instance == nil {
+		return payload_fail(
+			"Workflow metadata query has no active Workflow",
+			"OdinWorkflowQueryError",
+		)
+	}
+	payload, encode_error := codec.encode_json(
+		Workflow_Metadata_Query_Response{current_details = instance.current_details},
+	)
+	if encode_error != .None {
+		return payload_fail(
+			"could not encode Workflow metadata query result",
+			"OdinWorkflowQueryPayloadConversionError",
+		)
+	}
+	return payload_complete(payload)
+}
+
 invoke_workflow_query :: proc(
 	instance: ^Fiber_Instance,
 	query: ^proto.Coresdk_Workflow_Activation_QueryWorkflow,
 ) -> Payload_Result {
 	if instance == nil || query == nil || len(query.query_id) == 0 || len(query.query_type) == 0 {
 		return payload_fail("Workflow query is malformed", "OdinWorkflowQueryError")
+	}
+	if query.query_type == WORKFLOW_METADATA_QUERY_TYPE {
+		return invoke_workflow_metadata_query(instance)
 	}
 	handler, found := find_query_handler(instance, query.query_type)
 	if !found {
@@ -10369,6 +10480,60 @@ apply_activation_patch_notifications :: proc(
 	return {}
 }
 
+apply_current_deployment_version :: proc(
+	instance: ^Fiber_Instance,
+	source: ^proto.Coresdk_Common_WorkerDeploymentVersion,
+) -> bool {
+	if instance == nil {
+		return false
+	}
+	if source == nil {
+		instance.has_current_deployment_version = false
+		return true
+	}
+	if instance.has_current_deployment_version &&
+	   instance.current_deployment_version.deployment_name == source.deployment_name &&
+	   instance.current_deployment_version.build_id == source.build_id {
+		return true
+	}
+	deployment_name, deployment_name_error := strings.clone(
+		source.deployment_name,
+		instance.odin_context.allocator,
+	)
+	build_id, build_id_error := strings.clone(
+		source.build_id,
+		instance.odin_context.allocator,
+	)
+	if deployment_name_error != nil || build_id_error != nil {
+		return false
+	}
+	instance.current_deployment_version = {
+		deployment_name = deployment_name,
+		build_id = build_id,
+	}
+	instance.has_current_deployment_version = true
+	return true
+}
+
+activation_replays_history_events :: proc(
+	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
+) -> bool {
+	if activation == nil || !activation.is_replaying {
+		return false
+	}
+	for job in activation.jobs {
+		is_query := false
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow:
+			is_query = true
+		}
+		if !is_query {
+			return true
+		}
+	}
+	return false
+}
+
 apply_activation_metadata :: proc(
 	instance: ^Fiber_Instance,
 	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
@@ -10377,7 +10542,15 @@ apply_activation_metadata :: proc(
 		return error_from_string("Workflow activation metadata has no active fiber")
 	}
 	instance.activation_is_replaying = activation.is_replaying
+	instance.activation_is_replaying_history_events = activation_replays_history_events(activation)
 	instance.activation_history_length = activation.history_length
+	instance.activation_history_size_bytes = activation.history_size_bytes
+	instance.activation_continue_as_new_suggested = activation.continue_as_new_suggested
+	instance.activation_target_worker_deployment_version_changed =
+		activation.target_worker_deployment_version_changed
+	if !apply_current_deployment_version(instance, activation.deployment_version_for_current_task) {
+		return error_from_string("could not preserve Workflow deployment version")
+	}
 	instance.has_activation_time = activation.timestamp != nil
 	if activation.timestamp != nil {
 		if activation.timestamp.nanos < 0 || activation.timestamp.nanos >= 1_000_000_000 {

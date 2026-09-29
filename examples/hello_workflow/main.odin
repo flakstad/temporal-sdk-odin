@@ -865,7 +865,10 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 			{
 				activity_id = "activity-cancel-details",
 				start_to_close_timeout = 10 * time.Second,
-				heartbeat_timeout = time.Second,
+				// Leave enough headroom for the dev server to deliver the cancel
+				// task even when the preceding integration matrix has churned its
+				// HTTP/2 connections. The Workflow requests cancellation at 250 ms.
+				heartbeat_timeout = 5 * time.Second,
 				retry_policy = &retry_policy,
 				cancellation_type = .Wait_Cancellation_Completed,
 			},
@@ -1237,6 +1240,12 @@ terminal_failure_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) ->
 }
 
 patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "Versioned" {
+		deployment, present := workflow.current_deployment_version(ctx)
+		if !present || len(deployment.deployment_name) == 0 || len(deployment.build_id) == 0 {
+			return "missing Worker Deployment Version"
+		}
+	}
 	if workflow.patched(ctx, PATCH_ID) {
 		activation_time, has_time := workflow.now(ctx)
 		_ = activation_time
@@ -1341,6 +1350,27 @@ workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: 
 	   removed_memo_found || !updated_search_found || updated_search_error != .None ||
 	   updated_search != "after" {
 		return "Local Workflow property view mismatch"
+	}
+	if !workflow.set_current_details(ctx, "Odin workflow properties are ready") ||
+	   workflow.current_details(ctx) != "Odin workflow properties are ready" ||
+	   workflow.is_replaying_history_events(ctx) != workflow.is_replaying(ctx) ||
+	   workflow.continue_as_new_suggested(ctx) ||
+	   workflow.target_worker_deployment_version_changed(ctx) {
+		return "Workflow runtime metadata mismatch"
+	}
+	initial_deployment, initial_deployment_present := workflow.current_deployment_version(ctx)
+	if initial_deployment_present &&
+	   (initial_deployment.deployment_name != "" || len(initial_deployment.build_id) == 0) {
+		return "Unversioned Workflow had invalid initial Build ID metadata"
+	}
+	_ = workflow.await_signal(ctx, "complete_properties")
+	// Core may report zero bytes on the initial activation. The Signal
+	// activation includes committed history and has the Worker build ID that
+	// Core represents as a deployment version with an empty deployment name.
+	current_deployment, current_deployment_present := workflow.current_deployment_version(ctx)
+	if workflow.history_size_bytes(ctx) == 0 || !current_deployment_present ||
+	   current_deployment.deployment_name != "" || len(current_deployment.build_id) == 0 {
+		return "Workflow activation metadata was not updated"
 	}
 	return "Workflow properties updated"
 }
@@ -1990,12 +2020,13 @@ main :: proc() {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
-			} else if expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition {
+			} else if expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition || expect_properties {
 				expected_signals = 1
 			}
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != expected_signals ||
 			   run_stats.timers_canceled != 0 ||
 			   (expect_multiple_query_arguments && run_stats.workflow_queries_answered != 1) ||
+			   (expect_properties && run_stats.workflow_queries_answered != 1) ||
 			   (expect_multiple_update_arguments &&
 			    (run_stats.workflow_updates_accepted != 1 ||
 			     run_stats.workflow_updates_completed != 1 ||
@@ -2128,7 +2159,7 @@ main :: proc() {
 	} else if expect_nondeterminism_fail {
 		fmt.println("Core converted selected Workflow nondeterminism into terminal failure")
 	} else if expect_properties {
-		fmt.println("Workflow info, memo, and Search Attributes completed through Core and Temporal Server")
+		fmt.println("Workflow info, mutable properties, runtime metadata, and current details completed through Core and Temporal Server")
 	} else if expect_signal_with_start {
 		fmt.println("Signal-With-Start created once, reused the execution, and delivered both Signal headers")
 	} else if expect_abandon_update {

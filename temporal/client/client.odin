@@ -2113,6 +2113,24 @@ update_outcome_payload :: proc(
 	return {}, error_from_string(.Malformed_Response, "Workflow Update outcome has no value")
 }
 
+// A request deadline can close tonic's HTTP/2 stream before tonic preserves a
+// DeadlineExceeded status. Treat that transport shape as the configured local
+// timeout only after the monotonic deadline has actually elapsed.
+update_poll_failure_is_timeout :: proc(
+	status_code: u32,
+	message: string,
+	deadline_reached: bool,
+) -> bool {
+	if status_code == 4 {
+		return true
+	}
+	if status_code != 1 {
+		return false
+	}
+	return message == "Timeout expired" ||
+	       (deadline_reached && strings.contains(message, "h2 protocol error"))
+}
+
 poll_update_result_payload :: proc(
 	client: ^Client,
 	workflow_id, run_id, update_id: string,
@@ -2167,9 +2185,12 @@ poll_update_result_payload :: proc(
 		delete(request_bytes)
 		if rpc_result.error.message != nil {
 			delete(rpc_result.protobuf)
-			if options.timeout > 0 &&
-			   (rpc_result.error.status_code == 4 ||
-			    (rpc_result.error.status_code == 1 && string(rpc_result.error.message) == "Timeout expired")) {
+			deadline_reached := options.timeout > 0 && time.tick_since(started) >= options.timeout
+			if options.timeout > 0 && update_poll_failure_is_timeout(
+				rpc_result.error.status_code,
+				string(rpc_result.error.message),
+				deadline_reached,
+			) {
 				return {}, error_from_core(&rpc_result.error, .Wait_Timed_Out)
 			}
 			if options.cancellation_token != nil && rpc_result.error.status_code == 0 &&

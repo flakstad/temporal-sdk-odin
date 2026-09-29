@@ -10,9 +10,12 @@ initialize -> schedule hello Activity -> resolve Activity -> complete
 handled Activity failures, buffered signals, a durable signal/timer race, and
 Activity-awaiting Workflow Update routines through stackful coroutines. It also
 implements Core's `NotifyHasPatch`/`SetPatchMarker` replay protocol through
-`patched` and `deprecate_patch`. Workflow time, history length, replay status,
-deterministic random values, and UUID v4 values come only from activation
-metadata and Core-provided seeds. The
+`patched` and `deprecate_patch`. Workflow time, history length/size, replay and
+history-replay status, Continue-As-New suggestions, the current Worker
+Deployment Version, deterministic random values, and UUID v4 values come only
+from activation metadata and Core-provided seeds. `set_current_details` updates
+the response to Temporal's reserved Workflow metadata Query without emitting a
+command. The
 current live Workflow includes:
 
 ```odin

@@ -29,6 +29,10 @@ Typed_Greeting_Output :: struct {
 	heartbeat_timeout_milliseconds: i64,
 }
 
+Workflow_Metadata_Query_Output :: struct {
+	current_details: string `json:"currentDetails"`,
+}
+
 Connection_Interceptor_State :: struct {
 	metadata_updates: u32,
 	api_key_updates:  u32,
@@ -1028,6 +1032,42 @@ run :: proc() -> int {
 			)
 			return 1
 		}
+		metadata_query: Workflow_Metadata_Query_Output
+		metadata_query_error := temporal_client.query_workflow_json(
+			&handle,
+			"__temporal_workflow_metadata",
+			"",
+			&metadata_query,
+		)
+		defer delete(metadata_query.current_details)
+		if metadata_query_error.message != nil ||
+		   metadata_query.current_details != "Odin workflow properties are ready" {
+			fmt.eprintf(
+				"Workflow metadata query failed (kind=%v status=%d details=%q): %s\n",
+				metadata_query_error.kind,
+				metadata_query_error.status_code,
+				metadata_query.current_details,
+				string(metadata_query_error.message),
+			)
+			temporal_client.error_free(&metadata_query_error)
+			return 1
+		}
+		temporal_client.error_free(&metadata_query_error)
+		signal_error := temporal_client.signal_workflow_json(
+			&handle,
+			"complete_properties",
+			"complete",
+		)
+		if signal_error.message != nil {
+			fmt.eprintf(
+				"Workflow-properties completion Signal failed (status=%d): %s\n",
+				signal_error.status_code,
+				string(signal_error.message),
+			)
+			temporal_client.error_free(&signal_error)
+			return 1
+		}
+		temporal_client.error_free(&signal_error)
 		result: string
 		result_error := temporal_client.get_result_json(&handle, &result)
 		defer delete(result)
@@ -1220,7 +1260,7 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true query_rejected_status=%v static_metadata=true describe_status=%v visibility_listed=%v visibility_count=%d history_events=%d history_pages=%d result=%q\n",
+			"Odin client completed workflow-properties workflow_id=%s run_id=%s use_existing=true query_rejected_status=%v static_metadata=true current_details=true describe_status=%v visibility_listed=%v visibility_count=%d history_events=%d history_pages=%d result=%q\n",
 			workflow_id,
 			handle.run_id,
 			temporal_client.Workflow_Status.Completed,

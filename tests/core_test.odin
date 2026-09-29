@@ -3,6 +3,7 @@ package tests
 import allocator_runtime "base:runtime"
 import "core:testing"
 import "core:bytes"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
@@ -3923,6 +3924,33 @@ fiber_workflow_condition_test_workflow :: proc(
 		return "ready"
 	}
 	return "canceled"
+}
+
+Workflow_Metadata_Query_Test_Response :: struct {
+	current_details: string `json:"currentDetails"`,
+}
+
+fiber_workflow_metadata_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	if !workflow.set_current_details(ctx, "Order is waiting for approval") ||
+	   workflow.current_details(ctx) != "Order is waiting for approval" {
+		return "current-details-failed"
+	}
+	_ = workflow.await_signal(ctx, "finish")
+	deployment, deployment_present := workflow.current_deployment_version(ctx)
+	return fmt.aprintf(
+		"%d:%t:%t:%t:%t:%s:%s:%s",
+		workflow.history_size_bytes(ctx),
+		workflow.continue_as_new_suggested(ctx),
+		workflow.target_worker_deployment_version_changed(ctx),
+		workflow.is_replaying(ctx),
+		workflow.is_replaying_history_events(ctx),
+		deployment_present ? deployment.deployment_name : "missing",
+		deployment_present ? deployment.build_id : "missing",
+		workflow.current_details(ctx),
+	)
 }
 
 workflow_mutex_signal_routine :: proc(
@@ -8481,6 +8509,87 @@ client_update_handle_attachment_owns_identifiers :: proc(t: ^testing.T) {
 }
 
 @(test)
+core_rpc_h2_fallback_is_narrow_and_single_attempt :: proc(t: ^testing.T) {
+	testing.expect(
+		t,
+		temporal_core.rpc_should_retry_lost_h2_transport(
+			true,
+			1,
+			"h2 protocol error: http2 error",
+			0,
+		),
+	)
+	testing.expect(
+		t,
+		!temporal_core.rpc_should_retry_lost_h2_transport(
+			false,
+			1,
+			"h2 protocol error: http2 error",
+			0,
+		),
+	)
+	testing.expect(
+		t,
+		!temporal_core.rpc_should_retry_lost_h2_transport(
+			true,
+			1,
+			"h2 protocol error: http2 error",
+			1,
+		),
+	)
+	testing.expect(
+		t,
+		!temporal_core.rpc_should_retry_lost_h2_transport(
+			true,
+			14,
+			"h2 protocol error: http2 error",
+			0,
+		),
+	)
+	testing.expect(
+		t,
+		!temporal_core.rpc_should_retry_lost_h2_transport(
+			true,
+			1,
+			"application canceled",
+			0,
+		),
+	)
+}
+
+@(test)
+update_poll_h2_failure_is_timeout_only_after_deadline :: proc(t: ^testing.T) {
+	testing.expect(
+		t,
+		temporal_client.update_poll_failure_is_timeout(4, "deadline exceeded", false),
+	)
+	testing.expect(
+		t,
+		temporal_client.update_poll_failure_is_timeout(1, "Timeout expired", false),
+	)
+	testing.expect(
+		t,
+		!temporal_client.update_poll_failure_is_timeout(
+			1,
+			"h2 protocol error: http2 error",
+			false,
+		),
+	)
+	testing.expect(
+		t,
+		temporal_client.update_poll_failure_is_timeout(
+			1,
+			"h2 protocol error: http2 error",
+			true,
+		),
+	)
+	testing.expect(
+		t,
+		!temporal_client.update_poll_failure_is_timeout(14, "h2 protocol error", true),
+	)
+}
+
+@(test)
 client_rpc_cancellation_token_lifecycle_and_wait_validation :: proc(t: ^testing.T) {
 	token := temporal_client.client_cancellation_token_create()
 	testing.expect(t, token.handle != nil)
@@ -12905,6 +13014,224 @@ workflow_condition_wait_is_deterministic_cancellable_and_condition_first :: proc
 	testing.expect_value(t, string(completion.completion_result), `"canceled"`)
 	delete(completion.failure_message)
 	delete(completion.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_activation_metadata_and_reserved_query_replay :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_workflow_metadata_test",
+		"test-queue",
+		fiber_workflow_metadata_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("start")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_workflow_metadata_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	initial_deployment := proto.Coresdk_Common_WorkerDeploymentVersion{
+		deployment_name = "orders",
+		build_id = "build-initial",
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-metadata-run",
+		history_length = 3,
+		history_size_bytes = 128,
+		deployment_version_for_current_task = &initial_deployment,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = "workflow-metadata-query",
+		query_type = "__temporal_workflow_metadata",
+	}
+	defer delete(query.arguments)
+	defer delete(query.headers)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	activation.history_size_bytes = 256
+	activation.continue_as_new_suggested = false
+	activation.target_worker_deployment_version_changed = false
+	activation.deployment_version_for_current_task = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.queries_answered, 1)
+	query_inspection := inspect_query_response(processed.completion[:], query.query_id)
+	testing.expect(t, query_inspection.found)
+	testing.expect(t, !query_inspection.failed)
+	metadata_response: Workflow_Metadata_Query_Test_Response
+	metadata_decode_error := codec.decode_json(
+		codec.payload_view(&query_inspection.payload),
+		&metadata_response,
+	)
+	testing.expect_value(t, metadata_decode_error, codec.Error.None)
+	testing.expect_value(t, metadata_response.current_details, "Order is waiting for approval")
+	delete(metadata_response.current_details)
+	codec.payload_free(&query_inspection.payload)
+	delete(query_inspection.failure_message)
+	delete(query_inspection.failure_type)
+	query_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	signal_input, signal_input_error := codec.encode_json("done")
+	testing.expect_value(t, signal_input_error, codec.Error.None)
+	defer codec.payload_free(&signal_input)
+	proto_signal_input := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(proto_signal_input.metadata)
+	defer delete(proto_signal_input.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "finish",
+	}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, proto_signal_input)
+	current_deployment := proto.Coresdk_Common_WorkerDeploymentVersion{
+		deployment_name = "orders",
+		build_id = "build-current",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	activation.history_size_bytes = 4096
+	activation.continue_as_new_suggested = true
+	activation.target_worker_deployment_version_changed = true
+	activation.deployment_version_for_current_task = &current_deployment
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	completion := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(
+		t,
+		string(completion.completion_result),
+		`"4096:true:true:true:true:orders:build-current:Order is waiting for approval"`,
+	)
+	delete(completion.failure_message)
+	delete(completion.completion_result)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	activation.history_size_bytes = 128
+	activation.continue_as_new_suggested = false
+	activation.target_worker_deployment_version_changed = false
+	activation.deployment_version_for_current_task = &initial_deployment
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_size_bytes = 256
+	activation.deployment_version_for_current_task = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &query,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(query_completion[:], processed.completion[:]))
+	delete(query_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	activation.history_size_bytes = 4096
+	activation.continue_as_new_suggested = true
+	activation.target_worker_deployment_version_changed = true
+	activation.deployment_version_for_current_task = &current_deployment
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

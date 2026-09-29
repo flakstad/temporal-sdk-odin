@@ -186,6 +186,13 @@ in the same scheduler pass.
 The CLI-devserver suite also starts `odin_condition_workflow`, waits until the
 Worker reports `waiting_condition=true`, sends an `approve` Signal through the
 Temporal CLI, and requires the predicate-resumed result plus clean eviction.
+The activation-metadata unit test varies history size, Continue-As-New and
+target-version flags, deployment/build identity, full replay, and query-only
+replay. It queries `__temporal_workflow_metadata`, evicts the run, and requires
+initialize, metadata-query, and terminal completions to be byte-identical on a
+fresh stack. The CLI-devserver properties scenario additionally queries live
+`currentDetails` before signaling the Workflow to finish, while the pinned
+deployment scenario requires Core to expose its routed Worker version.
 PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
@@ -638,6 +645,20 @@ maps every terminal Workflow event, and follows retry/cron/Continue-As-New run
 IDs by default. Set `follow_runs = false` to receive
 `Workflow_Continued_As_New` instead. RPC failures retain the gRPC status code
 and binary status-details protobuf.
+
+The generic Core RPC adapter has a deliberately bounded workaround for a
+transport edge observed under the live suite: tonic can surface a lost HTTP/2
+connection as status 1 with `h2 protocol error` after its nested transport
+cause has disappeared, preventing Core's own retry classifier from recognizing
+it. Retry-enabled calls repeat that exact failure once after 100 ms. No-retry
+deadline probes, ordinary cancellation, different status/message combinations,
+and the second attempt return normally to the caller. The unit predicate test
+keeps this fallback from expanding into a general application-level retry loop.
+Bounded Update result waits deliberately disable retries. If their monotonic
+deadline has actually elapsed and tonic reports that same status-1 HTTP/2
+shape, the Update client maps it to `Wait_Timed_Out`; an identical early
+transport failure remains an RPC error. This preserves the local-wait contract
+without issuing a second long poll or affecting the durable Update.
 
 Failed Workflow close events and failed Update outcomes retain the encoded
 Temporal `Failure` in `Error.details`. Decode it through the shared owned model:

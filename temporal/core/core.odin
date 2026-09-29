@@ -3,7 +3,9 @@ package core
 
 import "core:c"
 import "core:bytes"
+import "core:strings"
 import "core:sync"
+import "core:time"
 import raw "./raw"
 
 Error :: struct {
@@ -807,6 +809,22 @@ rpc_callback :: proc "c" (
 	sync.one_shot_event_signal(&state.done)
 }
 
+// Core normally retries transport failures internally. Some tonic/h2
+// cancellations lose their transport error source chain before Core's retry
+// classifier sees them and arrive as gRPC Cancelled instead. Retry exactly once
+// at the bridge boundary, and only when the caller already opted into Core
+// retries. Caller cancellation and explicit no-retry/deadline probes do not
+// match this predicate.
+rpc_should_retry_lost_h2_transport :: proc(
+	retry: bool,
+	status_code: u32,
+	message: string,
+	attempt: int,
+) -> bool {
+	return retry && attempt == 0 && status_code == 1 &&
+	       strings.contains(message, "h2 protocol error")
+}
+
 client_get_system_info :: proc(client: ^Client) -> Get_System_Info_Result {
 	rpc_result := client_rpc_call(
 		client,
@@ -846,27 +864,44 @@ client_rpc_call :: proc(
 		timeout_millis = timeout_millis,
 		cancellation_token = cancellation_token != nil ? cancellation_token.handle : nil,
 	}
-	state := Rpc_State{}
-	raw.client_rpc_call(client.handle, &options, &state, rpc_callback)
-	wait_until(&state.done)
-
 	runtime := client.runtime.handle
-	if state.failure_message != nil {
-		result.error.message = copy_core_bytes(state.failure_message)
-		result.error.status_code = state.status_code
-		raw.byte_array_free(runtime, state.failure_message)
-		if state.failure_details != nil {
-			result.error.details = copy_core_bytes(state.failure_details)
-			raw.byte_array_free(runtime, state.failure_details)
-		}
-		return result
-	}
-	if state.success == nil {
-		result.error.message = bytes.clone(transmute([]u8)string("Core RPC returned neither success nor failure"))
-		return result
-	}
+	for attempt in 0..<2 {
+		state := Rpc_State{}
+		raw.client_rpc_call(client.handle, &options, &state, rpc_callback)
+		wait_until(&state.done)
 
-	result.protobuf = copy_core_bytes(state.success)
-	raw.byte_array_free(runtime, state.success)
+		if state.failure_message != nil {
+			failure_message := copy_core_bytes(state.failure_message)
+			failure_details: []u8
+			raw.byte_array_free(runtime, state.failure_message)
+			if state.failure_details != nil {
+				failure_details = copy_core_bytes(state.failure_details)
+				raw.byte_array_free(runtime, state.failure_details)
+			}
+			if rpc_should_retry_lost_h2_transport(
+				retry,
+				state.status_code,
+				string(failure_message),
+				attempt,
+			) {
+				delete(failure_message)
+				delete(failure_details)
+				time.sleep(100 * time.Millisecond)
+				continue
+			}
+			result.error.message = failure_message
+			result.error.status_code = state.status_code
+			result.error.details = failure_details
+			return result
+		}
+		if state.success == nil {
+			result.error.message = bytes.clone(transmute([]u8)string("Core RPC returned neither success nor failure"))
+			return result
+		}
+
+		result.protobuf = copy_core_bytes(state.success)
+		raw.byte_array_free(runtime, state.success)
+		return result
+	}
 	return result
 }
