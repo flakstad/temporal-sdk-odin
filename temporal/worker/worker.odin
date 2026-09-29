@@ -182,6 +182,7 @@ Lifecycle :: enum {
 Worker_Versioning_Mode :: temporal_core.Worker_Versioning_Mode
 Worker_Versioning_Behavior :: temporal_core.Worker_Versioning_Behavior
 Worker_Versioning_Options :: temporal_core.Worker_Versioning_Options
+Nondeterminism_Policy :: temporal_core.Nondeterminism_Policy
 
 Worker :: struct {
 	core:                   temporal_core.Worker,
@@ -198,6 +199,7 @@ Worker :: struct {
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
 	versioning:             Worker_Versioning_Options,
+	nondeterminism_policy:  Nondeterminism_Policy,
 }
 
 Error :: struct {
@@ -225,12 +227,36 @@ error_from_core :: proc(core_error: ^temporal_core.Error) -> Error {
 	return result
 }
 
+owned_string_slice_free :: proc(values: []string) {
+	for value in values {
+		delete(value)
+	}
+	delete(values)
+}
+
+owned_string_slice_clone :: proc(values: []string) -> (result: []string, ok: bool) {
+	result = make([]string, len(values))
+	for value, index in values {
+		cloned, clone_error := strings.clone(value)
+		if clone_error != nil {
+			for owned in result[:index] {
+				delete(owned)
+			}
+			delete(result)
+			return nil, false
+		}
+		result[index] = cloned
+	}
+	return result, true
+}
+
 create :: proc(
 	client: ^temporal_core.Client,
 	task_queue: string,
 	namespace := "default",
 	max_concurrent_activities := 10,
 	versioning := Worker_Versioning_Options{},
+	nondeterminism_policy := Nondeterminism_Policy{},
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		return {}, error_from_string("client is not initialized")
@@ -247,6 +273,12 @@ create :: proc(
 	versioning_error := temporal_core.worker_versioning_options_validate(versioning)
 	if versioning_error.message != nil {
 		return {}, error_from_core(&versioning_error)
+	}
+	nondeterminism_error := temporal_core.nondeterminism_policy_validate(
+		nondeterminism_policy,
+	)
+	if nondeterminism_error.message != nil {
+		return {}, error_from_core(&nondeterminism_error)
 	}
 	owned_task_queue, allocation_error := strings.clone(task_queue)
 	if allocation_error != nil {
@@ -272,6 +304,16 @@ create :: proc(
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate worker deployment name")
 	}
+	owned_failure_types, failure_types_ok := owned_string_slice_clone(
+		nondeterminism_policy.fail_workflow_types,
+	)
+	if !failure_types_ok {
+		delete(owned_deployment_name)
+		delete(owned_build_id)
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate nondeterminism failure Workflow types")
+	}
 	worker.client = client
 	worker.namespace = owned_namespace
 	worker.task_queue = owned_task_queue
@@ -280,6 +322,8 @@ create :: proc(
 	worker.versioning = versioning
 	worker.versioning.build_id = owned_build_id
 	worker.versioning.deployment_name = owned_deployment_name
+	worker.nondeterminism_policy = nondeterminism_policy
+	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
@@ -1834,6 +1878,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		enable_remote_activities = poll_remote_activities,
 		max_activity_slots = worker.max_concurrent_activities,
 		versioning = worker.versioning,
+		nondeterminism_policy = worker.nondeterminism_policy,
 	)
 	if create_error.message != nil {
 		return {}, error_from_core(&create_error)
@@ -1948,6 +1993,7 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.task_queue)
 	delete(worker.versioning.build_id)
 	delete(worker.versioning.deployment_name)
+	owned_string_slice_free(worker.nondeterminism_policy.fail_workflow_types)
 	worker.activity_registrations = nil
 	worker.activity_interceptors = nil
 	worker.workflow_inbound_interceptors = nil
@@ -1961,5 +2007,6 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
 	worker.versioning = {}
+	worker.nondeterminism_policy = {}
 	return error_from_core(&core_error)
 }

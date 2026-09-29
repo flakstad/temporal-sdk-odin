@@ -107,7 +107,9 @@ generates another 500 replay/notified/deprecated combinations, checks Core's
 truth table, and requires duplicate calls to emit at most one marker. Another
 500 cases generate all three Worker versioning strategies and require exact
 preservation of deployment/build identity, routing intent, and default behavior
-across the Odin-to-C ABI mapping. Another
+across the Odin-to-C ABI mapping. Another 500 generate global and per-type
+nondeterminism policies containing zero to twelve Workflow types and require
+exact C-array preservation. Another
 500 activation contexts vary initial/reset seeds, timestamps, and history
 lengths, then require exact random values and byte-identical fresh-stack replay.
 PBT is a
@@ -166,6 +168,15 @@ deployment model with `.Pinned` or `.Auto_Upgrade` defaults;
 identity strings until `worker.close`; the C bridge converts their borrowed
 byte references into Rust-owned strings synchronously during `worker_new`.
 Validation rejects ambiguous combinations before the Core worker is created.
+
+The optional `nondeterminism_policy` maps to Core's two existing Worker config
+fields. The zero value preserves Temporal's repairable default: Core reports a
+nondeterministic completion as a failed Workflow Task. `fail_all_workflows`
+changes that behavior globally, while `fail_workflow_types` changes it only for
+the named types. The language Worker clones every type name because Core worker
+creation is delayed until `run`; `core.worker_create` builds a temporary C
+reference array, and the bridge synchronously copies it into Rust `String`
+keys during `worker_new`.
 
 The C wrapper currently presents blocking poll calls. When both task types are
 registered, `worker.run` creates one Workflow poll thread and one Activity poll
@@ -708,6 +719,14 @@ marks its `.Pinned` version Current through Temporal CLI, and executes a real
 Workflow through it. Describe output must report the exact deployment name and
 Build ID. Cleanup is best-effort because CLI 1.5.1 exposes an unversioned
 transition that its bundled dev Server 1.29.1 currently rejects.
+
+A separate isolated-queue case starts revision one of a Workflow and records a
+one-hour Timer. It then stops that Worker, starts revision two—which emits an
+incompatible completion—with per-type terminal nondeterminism enabled, and
+signals the execution to force replay. The Service history must close with
+`WORKFLOW_EXECUTION_STATUS_FAILED` and Core's `[TMPRL1100]` nondeterminism
+message. This proves the policy changes Service-visible behavior rather than
+only filling C fields.
 
 The typed retry case returns a retryable `TransientGreetingError` with JSON
 details and `next_retry_delay = 10 ms` on attempt 1. Core and the dev server

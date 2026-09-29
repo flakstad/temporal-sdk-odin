@@ -4767,3 +4767,59 @@ worker_versioning_options_preserve_generated_abi_values :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+nondeterminism_policy_abi_property :: proc(t: ^pbt.T) -> pbt.Result {
+	fail_all := pbt.draw(t, pbt.boolean())
+	workflow_type_count := pbt.draw(t, pbt.int_range(0, 12))
+	prefix := pbt.draw(t, pbt.string_ascii(1, 32))
+	pbt.cover(t, fail_all, 30.0, "fail all Workflows")
+	pbt.cover(t, workflow_type_count == 0, 3.0, "no per-type policy")
+	pbt.cover(t, workflow_type_count >= 8, 20.0, "many per-type policies")
+
+	workflow_types := make([]string, workflow_type_count)
+	workflow_type_refs := make([]raw.Byte_Array_Ref, workflow_type_count)
+	defer {
+		for workflow_type in workflow_types {
+			delete(workflow_type)
+		}
+		delete(workflow_type_refs)
+		delete(workflow_types)
+	}
+	for index in 0..<workflow_type_count {
+		workflow_types[index] = fmt.aprintf("%s-%d", prefix, index)
+	}
+	policy := temporal_core.Nondeterminism_Policy{
+		fail_all_workflows = fail_all,
+		fail_workflow_types = workflow_types,
+	}
+	validation_error := temporal_core.nondeterminism_policy_validate(policy)
+	defer temporal_core.error_free(&validation_error)
+	if validation_error.message != nil {
+		return pbt.fail("generated nondeterminism policy was rejected")
+	}
+	actual_fail_all, actual_types := temporal_core.nondeterminism_policy_raw(
+		policy,
+		workflow_type_refs,
+	)
+	if actual_fail_all != fail_all || int(actual_types.size) != workflow_type_count {
+		return pbt.fail("nondeterminism policy flags changed across the C ABI mapping")
+	}
+	actual := ([^]raw.Byte_Array_Ref)(actual_types.data)[:int(actual_types.size)]
+	for expected, index in workflow_types {
+		if pbt_raw_byte_ref_string(actual[index]) != expected {
+			return pbt.fail("nondeterminism Workflow type changed across the C ABI mapping")
+		}
+	}
+	return pbt.pass()
+}
+
+@(test)
+nondeterminism_policy_preserves_generated_abi_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Nondeterminism policy preserves generated C ABI values",
+		nondeterminism_policy_abi_property,
+		{num_tests = 500, seed = 0x4e4f_4e44_4554_4552},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

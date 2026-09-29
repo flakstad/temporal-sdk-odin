@@ -1931,7 +1931,7 @@ Workflows are enabled.
    detached Update/Activity cleanup, Child Workflows, external Workflow
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
-   accepted Updates, panic containment,
+   accepted Updates, panic containment, offline replay tooling, richer
    nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -2005,6 +2005,7 @@ Signal request/header round trips over 0–12 arguments, 500 paginated Visibilit
 list/count round trips, 500 repeated Query request/header round trips over 0–12
 arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 Worker versioning mappings across every C-union strategy,
+500 global/per-type nondeterminism policy mappings,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
@@ -2361,6 +2362,34 @@ encoding. CLI 1.5.1 exposes `--unversioned` cleanup, but bundled Server 1.29.1
 rejects that transition with `BuildID cannot be empty`; cleanup is consequently
 best-effort and uniquely names every test deployment. Core's experimental
 rollout callback remains unexposed.
+
+### Nondeterminism failure policy boundary
+
+Core—not the Odin scheduler—detects a mismatch between replay history and an
+Odin `WorkflowActivationCompletion`. By default Core fails the Workflow Task,
+leaving the Workflow Execution running so a compatible deployment can repair
+it, matching Temporal's
+[execution-failure guidance](https://github.com/temporalio/documentation/blob/main/docs/troubleshooting/execution-failures.mdx).
+The pinned C bridge's
+[`WorkerOptions` conversion](https://github.com/temporalio/sdk-core/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core-c-bridge/src/worker.rs)
+exposes two inputs on `TemporalCoreWorkerOptions`:
+`nondeterminism_as_workflow_fail` applies terminal failure globally, while
+`nondeterminism_as_workflow_fail_for_types` applies it to named Workflow types.
+
+Odin exposes these as `Nondeterminism_Policy`. `worker.create` validates and
+clones the type names; `worker.run` builds a temporary
+`TemporalCoreByteArrayRefArray` for the synchronous `temporal_core_worker_new`
+call. The bridge immediately creates Rust-owned strings and Core converts the
+list to its per-type failure map. No protobuf type or additional C symbol is
+required.
+
+The live test records a Timer command with one Worker process, replaces the
+same Workflow type with code that emits `CompleteWorkflowExecution`, and sends
+a Signal to force fresh replay. Core reports `[TMPRL1100]`, transforms the
+mismatch into `FailWorkflow`, and the Service history closes as failed. This
+proves detection, per-type selection, process-loss replay, and terminal policy.
+It does not replace patching/versioned deployments, nor does it provide an
+offline replay command or richer Odin-originated mismatch diagnostics.
 
 ### Workflow time and randomness boundary
 

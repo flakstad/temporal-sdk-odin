@@ -89,7 +89,9 @@ Workflow runtime now implements Core's patch protocol through
 The CLI-devserver suite verifies the resulting `core_patch` history marker. The
 Worker API also exposes Core's unversioned, deployment-based, and legacy Build
 ID strategies. A live `Pinned` deployment test sets an Odin Worker version as
-Current and proves the Service routes a Workflow to it. The
+Current and proves the Service routes a Workflow to it. Workers can also opt
+all or selected Workflow types into terminal failure on Core-detected
+nondeterminism; the default remains a retryable Workflow Task failure. The
 same activation-context layer now exposes `workflow.now`, `history_length`,
 `is_replaying`, deterministic `random_u64`/`random_f64`, and `uuid_v4` without
 consulting host time or OS entropy. Core-provided start/reset seeds are applied
@@ -988,6 +990,25 @@ Current/ramping version administration remains a Temporal Service operation,
 normally performed with `temporal worker deployment` or deployment APIs. The
 legacy Build-ID strategy is exposed for existing installations but should not
 be selected for new deployments.
+
+Core-detected nondeterminism normally fails the Workflow Task so a compatible
+code deployment can repair the execution. Applications that deliberately want
+terminal failure can opt in globally or by Workflow type:
+
+```odin
+sdk_worker, create_error := worker.create(
+    &client,
+    "orders",
+    nondeterminism_policy = {
+        fail_workflow_types = []string{"order_workflow"},
+    },
+)
+```
+
+Set `fail_all_workflows = true` only when every Workflow on the Worker should
+use that policy. This changes failure semantics and remains experimental in
+upstream SDKs; patching or Worker Deployment Versioning is normally preferable
+for compatible code evolution.
 
 Workflow time and random values must use Temporal-aware primitives:
 

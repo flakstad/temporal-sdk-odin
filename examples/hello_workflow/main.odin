@@ -24,7 +24,12 @@ SIGNAL_WITH_START_WORKFLOW_TYPE :: "odin_signal_with_start_workflow"
 REPEATED_SIGNAL_WORKFLOW_TYPE :: "odin_repeated_signal_workflow"
 REPEATED_QUERY_WORKFLOW_TYPE :: "odin_repeated_query_workflow"
 REPEATED_UPDATE_WORKFLOW_TYPE :: "odin_repeated_update_workflow"
+NONDETERMINISM_WORKFLOW_TYPE :: "odin_nondeterminism_workflow"
 PATCH_ID :: "odin-sdk-live-patch-v1"
+
+// Acceptance-harness switch used to prove that Core detects an incompatible
+// command sequence after a Worker process replacement.
+nondeterminism_revision_two: bool
 
 Typed_Greeting_Input :: struct {
 	name:       string,
@@ -1045,6 +1050,22 @@ patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	return result
 }
 
+nondeterminism_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if nondeterminism_revision_two {
+		result, allocation_error := strings.concatenate({"Incompatible ", name})
+		if allocation_error != nil {
+			return ""
+		}
+		return result
+	}
+	workflow.sleep(ctx, time.Hour)
+	result, allocation_error := strings.concatenate({"Timer completed ", name})
+	if allocation_error != nil {
+		return ""
+	}
+	return result
+}
+
 workflow_properties :: proc(ctx: ^workflow.Fiber_Context, expected_workflow_id: string) -> string {
 	metadata, metadata_found := workflow.info(ctx)
 	if !metadata_found || metadata.namespace != "default" ||
@@ -1233,6 +1254,7 @@ main :: proc() {
 	}
 
 	versioning := worker.Worker_Versioning_Options{}
+	nondeterminism_policy := worker.Nondeterminism_Policy{}
 	create_scenario_buffer: [64]u8
 	create_scenario := os.get_env(
 		create_scenario_buffer[:],
@@ -1260,10 +1282,17 @@ main :: proc() {
 			default_versioning_behavior = .Pinned,
 		}
 	}
+	if create_scenario == "nondeterminism-fail" {
+		nondeterminism_revision_two = true
+		nondeterminism_policy = {
+			fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
+		}
+	}
 	activity_worker, create_error := worker.create(
 		&client,
 		task_queue,
 		versioning = versioning,
+		nondeterminism_policy = nondeterminism_policy,
 	)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
@@ -1563,6 +1592,22 @@ main :: proc() {
 		temporal_core.runtime_close(&runtime)
 		os.exit(1)
 	}
+	nondeterminism_workflow_register_error := worker.register_workflow(
+		&activity_worker,
+		NONDETERMINISM_WORKFLOW_TYPE,
+		nondeterminism_workflow,
+	)
+	if nondeterminism_workflow_register_error.message != nil {
+		fmt.eprintf(
+			"Nondeterminism Workflow registration failed: %s\n",
+			string(nondeterminism_workflow_register_error.message),
+		)
+		worker.error_free(&nondeterminism_workflow_register_error)
+		_ = worker.close(&activity_worker)
+		temporal_core.client_close(&client)
+		temporal_core.runtime_close(&runtime)
+		os.exit(1)
+	}
 	properties_workflow_register_error := worker.register_workflow(
 		&activity_worker,
 		WORKFLOW_PROPERTIES_TYPE,
@@ -1614,6 +1659,7 @@ main :: proc() {
 	expect_terminal_failure := scenario == "terminal-failure"
 	expect_patch := scenario == "patch"
 	expect_deployment_versioning := scenario == "deployment-versioning"
+	expect_nondeterminism_fail := scenario == "nondeterminism-fail"
 	expect_properties := scenario == "workflow-properties"
 	expect_signal_with_start := scenario == "signal-with-start"
 	expect_activity_cancel_details := scenario == "activity-cancel-details"
@@ -1631,7 +1677,7 @@ main :: proc() {
 		{
 			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_deployment_versioning || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1666,7 +1712,7 @@ main :: proc() {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
 				failed = true
 			}
-		} else if expect_patch || expect_deployment_versioning || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
+		} else if expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
 			expected_signals := 0
 			if expect_signal_with_start {
 				expected_signals = 2
@@ -1799,6 +1845,8 @@ main :: proc() {
 		fmt.println("Workflow patch marker completed through Core and Temporal Server")
 	} else if expect_deployment_versioning {
 		fmt.println("Worker Deployment Versioning routed a Workflow through Core and Temporal Server")
+	} else if expect_nondeterminism_fail {
+		fmt.println("Core converted selected Workflow nondeterminism into terminal failure")
 	} else if expect_properties {
 		fmt.println("Workflow info, memo, and Search Attributes completed through Core and Temporal Server")
 	} else if expect_signal_with_start {

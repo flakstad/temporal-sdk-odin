@@ -55,6 +55,14 @@ Worker_Versioning_Options :: struct {
 	default_versioning_behavior: Worker_Versioning_Behavior,
 }
 
+// Nondeterminism_Policy is borrowed only for worker_create. Core normally
+// fails and retries the Workflow Task after a replay mismatch. These opt-ins
+// instead make nondeterminism fail the Workflow Execution.
+Nondeterminism_Policy :: struct {
+	fail_all_workflows: bool,
+	fail_workflow_types: []string,
+}
+
 Get_System_Info_Result :: struct {
 	protobuf: []u8,
 	error:    Error,
@@ -309,6 +317,32 @@ worker_versioning_strategy_raw :: proc(
 	}
 }
 
+nondeterminism_policy_validate :: proc(policy: Nondeterminism_Policy) -> Error {
+	for workflow_type in policy.fail_workflow_types {
+		if len(workflow_type) == 0 {
+			return client_option_error(
+				"nondeterminism failure Workflow types must not be empty",
+			)
+		}
+	}
+	return {}
+}
+
+nondeterminism_policy_raw :: proc(
+	policy: Nondeterminism_Policy,
+	workflow_type_refs: []raw.Byte_Array_Ref,
+) -> (bool, raw.Byte_Array_Ref_Array) {
+	assert(len(workflow_type_refs) >= len(policy.fail_workflow_types))
+	for workflow_type, index in policy.fail_workflow_types {
+		workflow_type_refs[index] = byte_ref(workflow_type)
+	}
+	result := raw.Byte_Array_Ref_Array{size = c.size_t(len(policy.fail_workflow_types))}
+	if len(policy.fail_workflow_types) > 0 {
+		result.data = raw_data(workflow_type_refs)
+	}
+	return policy.fail_all_workflows, result
+}
+
 worker_create :: proc(
 	client: ^Client,
 	task_queue: string,
@@ -318,6 +352,7 @@ worker_create :: proc(
 	enable_remote_activities := true,
 	max_activity_slots := 10,
 	versioning := Worker_Versioning_Options{},
+	nondeterminism_policy := Nondeterminism_Policy{},
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
@@ -335,6 +370,19 @@ worker_create :: proc(
 	if versioning_error.message != nil {
 		return {}, versioning_error
 	}
+	nondeterminism_error := nondeterminism_policy_validate(nondeterminism_policy)
+	if nondeterminism_error.message != nil {
+		return {}, nondeterminism_error
+	}
+	workflow_type_refs := make(
+		[]raw.Byte_Array_Ref,
+		len(nondeterminism_policy.fail_workflow_types),
+	)
+	defer delete(workflow_type_refs)
+	fail_all_workflows, fail_workflow_types := nondeterminism_policy_raw(
+		nondeterminism_policy,
+		workflow_type_refs,
+	)
 
 	options := raw.Worker_Options{
 		namespace = byte_ref(namespace),
@@ -355,6 +403,8 @@ worker_create :: proc(
 		default_heartbeat_throttle_interval_ms = 1_000,
 		graceful_shutdown_period_ms            = 5_000,
 		nonsticky_to_sticky_poll_ratio         = 0.2,
+		nondeterminism_as_workflow_fail         = fail_all_workflows,
+		nondeterminism_as_workflow_fail_for_types = fail_workflow_types,
 	}
 	result := raw.worker_new(client.handle, &options)
 	if result.fail != nil {

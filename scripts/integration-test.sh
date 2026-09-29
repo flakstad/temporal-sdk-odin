@@ -7,6 +7,7 @@ worker_pid=""
 workflow_cli_pid=""
 slow_update_pid=""
 unknown_workflow_id=""
+nondeterminism_workflow_id=""
 deployment_name=""
 deployment_build_id=""
 server_log="${TMPDIR:-/tmp}/temporal-sdk-odin-dev-server.log"
@@ -22,6 +23,13 @@ cleanup() {
     temporal workflow terminate \
       --workflow-id "$unknown_workflow_id" \
       --reason "Temporal Odin SDK integration cleanup" \
+      --command-timeout 2s \
+      --output none >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$nondeterminism_workflow_id" ]]; then
+    temporal workflow terminate \
+      --workflow-id "$nondeterminism_workflow_id" \
+      --reason "Temporal Odin SDK nondeterminism test cleanup" \
       --command-timeout 2s \
       --output none >/dev/null 2>&1 || true
   fi
@@ -1861,6 +1869,112 @@ grep -q 'continued_as_new=true' "$worker_log"
 grep -q 'continued_as_new=false completed=true' "$worker_log"
 grep -q 'Workflow Continue-As-New interceptor entered' "$worker_log"
 grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+nondeterminism_task_queue="odin-sdk-nondeterminism-queue-$$-$(date +%s)"
+nondeterminism_workflow_id="odin-sdk-nondeterminism-$$-$(date +%s)"
+TEMPORAL_ODIN_SCENARIO=nondeterminism-seed \
+  TEMPORAL_ODIN_TASK_QUEUE="$nondeterminism_task_queue" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Nondeterminism seed Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+temporal workflow start \
+  --workflow-id "$nondeterminism_workflow_id" \
+  --type odin_nondeterminism_workflow \
+  --task-queue "$nondeterminism_task_queue" \
+  --input '"Odin"' \
+  --command-timeout 10s \
+  --output none
+
+for _ in {1..30}; do
+  temporal workflow show \
+    --workflow-id "$nondeterminism_workflow_id" \
+    --command-timeout 2s \
+    --output json >"$typed_history_file" 2>/dev/null || true
+  if grep -q 'EVENT_TYPE_TIMER_STARTED' "$typed_history_file" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Nondeterminism seed Worker exited before recording its Timer" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+grep -q 'EVENT_TYPE_TIMER_STARTED' "$typed_history_file"
+kill "$worker_pid"
+wait "$worker_pid" 2>/dev/null || true
+worker_pid=""
+
+TEMPORAL_ODIN_SCENARIO=nondeterminism-fail \
+  TEMPORAL_ODIN_TASK_QUEUE="$nondeterminism_task_queue" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Nondeterminism failure Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+temporal workflow signal \
+  --workflow-id "$nondeterminism_workflow_id" \
+  --name force-replay \
+  --input '"replay"' \
+  --command-timeout 10s \
+  --output none
+
+for _ in {1..50}; do
+  temporal workflow describe \
+    --workflow-id "$nondeterminism_workflow_id" \
+    --command-timeout 2s \
+    --output json >"$workflow_output_file" 2>/dev/null || true
+  temporal workflow show \
+    --workflow-id "$nondeterminism_workflow_id" \
+    --command-timeout 2s \
+    --output json >"$typed_history_file" 2>/dev/null || true
+  if grep -q '"status": "WORKFLOW_EXECUTION_STATUS_FAILED"' "$workflow_output_file" 2>/dev/null &&
+     grep -Eq 'Nondeterminism|TMPRL1100' "$typed_history_file" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+grep -q '"status": "WORKFLOW_EXECUTION_STATUS_FAILED"' "$workflow_output_file"
+grep -Eq 'Nondeterminism|TMPRL1100' "$typed_history_file"
+nondeterminism_workflow_id=""
+
+for _ in {1..30}; do
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+if kill -0 "$worker_pid" 2>/dev/null; then
+  echo "Nondeterminism failure Worker did not finish after terminal Workflow failure" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Core converted selected Workflow nondeterminism into terminal failure" "$worker_log"
 
 # Keep this scenario last because cleanup is best-effort. Its unique task queue
 # also prevents persisted routing state from affecting the normal example queue.

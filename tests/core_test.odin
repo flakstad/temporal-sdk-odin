@@ -5561,6 +5561,37 @@ worker_versioning_options_map_to_the_pinned_core_abi :: proc(t: ^testing.T) {
 }
 
 @(test)
+nondeterminism_policy_maps_to_the_pinned_core_abi :: proc(t: ^testing.T) {
+	workflow_types := [?]string{"orders", "billing"}
+	policy := temporal_core.Nondeterminism_Policy{
+		fail_all_workflows = true,
+		fail_workflow_types = workflow_types[:],
+	}
+	validation_error := temporal_core.nondeterminism_policy_validate(policy)
+	testing.expect(t, validation_error.message == nil)
+	temporal_core.error_free(&validation_error)
+
+	workflow_type_refs: [2]raw.Byte_Array_Ref
+	fail_all, raw_types := temporal_core.nondeterminism_policy_raw(
+		policy,
+		workflow_type_refs[:],
+	)
+	testing.expect(t, fail_all)
+	testing.expect_value(t, int(raw_types.size), len(workflow_types))
+	actual := ([^]raw.Byte_Array_Ref)(raw_types.data)[:int(raw_types.size)]
+	for workflow_type, index in workflow_types {
+		testing.expect_value(t, raw_byte_ref_string(actual[index]), workflow_type)
+	}
+
+	invalid_types := [?]string{"orders", ""}
+	invalid_error := temporal_core.nondeterminism_policy_validate({
+		fail_workflow_types = invalid_types[:],
+	})
+	testing.expect(t, invalid_error.message != nil)
+	temporal_core.error_free(&invalid_error)
+}
+
+@(test)
 language_worker_owns_versioning_identity_until_close :: proc(t: ^testing.T) {
 	raw_runtime := raw.Runtime{}
 	runtime := temporal_core.Runtime{handle = &raw_runtime}
@@ -5600,6 +5631,46 @@ language_worker_owns_versioning_identity_until_close :: proc(t: ^testing.T) {
 	worker.error_free(&close_error)
 	testing.expect(t, sdk_worker.versioning.build_id == "")
 	testing.expect(t, sdk_worker.versioning.deployment_name == "")
+}
+
+@(test)
+language_worker_owns_nondeterminism_workflow_types_until_close :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	first_type, first_error := strings.clone("owned-orders")
+	second_type, second_error := strings.clone("owned-billing")
+	testing.expect(t, first_error == nil)
+	testing.expect(t, second_error == nil)
+	source_types := []string{first_type, second_type}
+
+	sdk_worker, create_error := worker.create(
+		&client,
+		"nondeterminism-policy-worker",
+		nondeterminism_policy = {
+			fail_workflow_types = source_types,
+		},
+	)
+	delete(first_type)
+	delete(second_type)
+	testing.expectf(t, create_error.message == nil, "worker.create failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	testing.expect_value(
+		t,
+		sdk_worker.nondeterminism_policy.fail_workflow_types[0],
+		"owned-orders",
+	)
+	testing.expect_value(
+		t,
+		sdk_worker.nondeterminism_policy.fail_workflow_types[1],
+		"owned-billing",
+	)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+	testing.expect(t, sdk_worker.nondeterminism_policy.fail_workflow_types == nil)
 }
 
 @(test)
