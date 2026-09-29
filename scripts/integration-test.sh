@@ -113,6 +113,7 @@ TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \
 eager_output="$(<"$workflow_output_file")"
 echo "$eager_output"
 grep -q "Eager Workflow start accepted and completed workflow_id=$eager_workflow_id" <<<"$eager_output"
+grep -q "Fetched server history and replayed it offline through Core" <<<"$eager_output"
 temporal workflow show \
   --workflow-id "$eager_workflow_id" \
   --command-timeout 10s \

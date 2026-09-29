@@ -19,7 +19,14 @@ timeouts, priority, memo/Search Attributes, and pending execution summaries—an
 iterates full Workflow history with explicit pagination tokens. Each history
 event includes stable metadata plus an owned canonical protobuf representation.
 The live suite requests one-event pages against the CLI dev server and follows
-every returned token. The Client also lists Workflow executions through
+every returned token. The Client can now eagerly aggregate those pages into the
+binary `temporal.api.history.v1.History` accepted by Core's offline replayer.
+`worker.create_replayer` uses the dedicated C-bridge replay worker, drives the
+same Odin Workflow registry with Core activations, and distinguishes compatible
+history, nondeterminism, Workflow-task failure, and unexpected eviction. Unit
+tests prove compatible and intentionally incompatible histories without a
+server; the eager live example fetches a completed execution from the CLI dev
+server and replays it offline. The Client also lists Workflow executions through
 Temporal Visibility and counts raw or grouped queries. List pages own their
 summaries, memo/Search Attribute Payloads, and opaque continuation token;
 grouped count values remain codec-neutral Temporal Payloads. Client connection
@@ -413,11 +420,40 @@ close event, and decodes the result Payload without Temporal CLI:
 ```
 
 The self-contained eager example creates a public Client and Worker on the same
-Core connection and proves inline first-task dispatch:
+Core connection, proves inline first-task dispatch, fetches the resulting full
+history, and replays it through an offline Core worker:
 
 ```bash
 ./scripts/run-eager-workflow.sh
 ```
+
+The underlying replay boundary is explicit. The Client returns the exact binary
+History protobuf; the replayer borrows it for the call and returns an owned
+diagnostic result:
+
+```odin
+history, err := temporal_client.fetch_history_protobuf(&handle)
+defer delete(history)
+
+core_client := temporal_client.core_client(&client)
+replayer, err := worker.create_replayer(core_client.runtime)
+defer worker.close(&replayer)
+
+err = worker.register_workflow(&replayer, "orders", order_workflow)
+replay_result, err := worker.replay_history(
+    &replayer,
+    handle.id,
+    history,
+)
+defer worker.replay_result_free(&replay_result)
+
+if replay_result.failure == .Nondeterminism {
+    // replay_result.message contains Core's TMPRL1100 diagnostic
+}
+```
+
+CLI JSON is not silently converted. The C bridge requires protobuf wire bytes;
+`fetch_history_protobuf` is the supported path from Service history to replay.
 
 With `examples/hello_workflow` running in the `patch` scenario, exercise the
 complete Schedule lifecycle without Temporal CLI acting as the client:

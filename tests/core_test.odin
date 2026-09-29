@@ -15885,3 +15885,176 @@ client_connection_options_validate_security_and_metadata_contracts :: proc(t: ^t
 	temporal_client.error_free(&public_error)
 	temporal_client.close(&invalid_client)
 }
+
+offline_replay_history_fixture :: proc(workflow_type_name: string) -> [dynamic]u8 {
+	input, input_error := codec.encode_json("replay-input")
+	assert(input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	inputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(inputs.payloads)
+	append(&inputs.payloads, proto_input)
+
+	output, output_error := codec.encode_json("first")
+	assert(output_error == .None)
+	defer codec.payload_free(&output)
+	proto_output := proto.encode_payload(codec.payload_view(&output))
+	defer delete(proto_output.metadata)
+	defer delete(proto_output.external_payloads)
+	outputs := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(outputs.payloads)
+	append(&outputs.payloads, proto_output)
+
+	workflow_type := proto.Temporal_Api_Common_V1_WorkflowType{name = workflow_type_name}
+	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "replay-test-queue"}
+	workflow_task_timeout := proto.Google_Protobuf_Duration{seconds = 5}
+	started := proto.Temporal_Api_History_V1_WorkflowExecutionStartedEventAttributes{
+		workflow_type = &workflow_type,
+		task_queue = &task_queue,
+		input = &inputs,
+		workflow_task_timeout = &workflow_task_timeout,
+		original_execution_run_id = "offline-replay-run",
+		first_execution_run_id = "offline-replay-run",
+		workflow_id = "offline-replay-workflow",
+	}
+	scheduled := proto.Temporal_Api_History_V1_WorkflowTaskScheduledEventAttributes{}
+	task_started := proto.Temporal_Api_History_V1_WorkflowTaskStartedEventAttributes{
+		scheduled_event_id = 2,
+		history_size_bytes = 50,
+	}
+	task_completed := proto.Temporal_Api_History_V1_WorkflowTaskCompletedEventAttributes{
+		scheduled_event_id = 2,
+		started_event_id = 3,
+	}
+	completed := proto.Temporal_Api_History_V1_WorkflowExecutionCompletedEventAttributes{
+		result = &outputs,
+		workflow_task_completed_event_id = 4,
+	}
+	event_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000}
+	history := proto.Temporal_Api_History_V1_History{}
+	defer delete(history.events)
+	append(
+		&history.events,
+		proto.Temporal_Api_History_V1_HistoryEvent{
+			event_id = 1,
+			event_time = &event_time,
+			event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+			version = 1,
+			attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Started_Event_Attributes{value = &started},
+		},
+		proto.Temporal_Api_History_V1_HistoryEvent{
+			event_id = 2,
+			event_time = &event_time,
+			event_type = .EVENT_TYPE_WORKFLOW_TASK_SCHEDULED,
+			version = 1,
+			attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Task_Scheduled_Event_Attributes{value = &scheduled},
+		},
+		proto.Temporal_Api_History_V1_HistoryEvent{
+			event_id = 3,
+			event_time = &event_time,
+			event_type = .EVENT_TYPE_WORKFLOW_TASK_STARTED,
+			version = 1,
+			attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Task_Started_Event_Attributes{value = &task_started},
+		},
+		proto.Temporal_Api_History_V1_HistoryEvent{
+			event_id = 4,
+			event_time = &event_time,
+			event_type = .EVENT_TYPE_WORKFLOW_TASK_COMPLETED,
+			version = 1,
+			attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Task_Completed_Event_Attributes{value = &task_completed},
+		},
+		proto.Temporal_Api_History_V1_HistoryEvent{
+			event_id = 5,
+			event_time = &event_time,
+			event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,
+			version = 1,
+			attributes = proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Completed_Event_Attributes{value = &completed},
+		},
+	)
+	return proto.encode_Temporal_Api_History_V1_History(&history)
+}
+
+@(test)
+workflow_replayer_runs_complete_history_through_core_offline :: proc(t: ^testing.T) {
+	runtime, runtime_error := temporal_core.runtime_create()
+	testing.expectf(t, runtime_error.message == nil, "runtime creation failed: %s", string(runtime_error.message))
+	temporal_core.error_free(&runtime_error)
+	defer temporal_core.runtime_close(&runtime)
+
+	replayer, create_error := worker.create_replayer(&runtime)
+	testing.expectf(t, create_error.message == nil, "replayer creation failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&replayer)
+		testing.expectf(t, close_error.message == nil, "replayer close failed: %s", string(close_error.message))
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&replayer,
+		"offline_replay_workflow",
+		registry_first_test_workflow,
+	)
+	testing.expectf(t, register_error.message == nil, "replay Workflow registration failed: %s", string(register_error.message))
+	worker.error_free(&register_error)
+
+	history := offline_replay_history_fixture("offline_replay_workflow")
+	defer delete(history)
+	result, replay_error := worker.replay_history(
+		&replayer,
+		"offline-replay-workflow",
+		history[:],
+	)
+	testing.expectf(t, replay_error.message == nil, "offline replay failed: %s", string(replay_error.message))
+	worker.error_free(&replay_error)
+	defer worker.replay_result_free(&result)
+	testing.expect_value(t, result.failure, worker.Replay_Failure_Kind.None)
+	testing.expect_value(t, result.eviction_reason, worker.Replay_Eviction_Reason.LANG_REQUESTED)
+	testing.expect(t, result.activations_processed >= 2)
+
+	malformed_result, malformed_error := worker.replay_history(
+		&replayer,
+		"malformed-replay-workflow",
+		[]u8{0xff},
+	)
+	worker.replay_result_free(&malformed_result)
+	testing.expect(t, malformed_error.message != nil)
+	worker.error_free(&malformed_error)
+}
+
+@(test)
+workflow_replayer_reports_core_nondeterminism_as_data :: proc(t: ^testing.T) {
+	runtime, runtime_error := temporal_core.runtime_create()
+	testing.expect(t, runtime_error.message == nil)
+	temporal_core.error_free(&runtime_error)
+	defer temporal_core.runtime_close(&runtime)
+	replayer, create_error := worker.create_replayer(&runtime)
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&replayer)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&replayer,
+		"offline_replay_workflow",
+		fiber_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	history := offline_replay_history_fixture("offline_replay_workflow")
+	defer delete(history)
+	result, replay_error := worker.replay_history(
+		&replayer,
+		"offline-replay-nondeterministic",
+		history[:],
+	)
+	testing.expectf(t, replay_error.message == nil, "replay worker failed: %s", string(replay_error.message))
+	worker.error_free(&replay_error)
+	defer worker.replay_result_free(&result)
+	testing.expect_value(t, result.failure, worker.Replay_Failure_Kind.Nondeterminism)
+	testing.expect_value(t, result.eviction_reason, worker.Replay_Eviction_Reason.NONDETERMINISM)
+	testing.expect(t, bytes.contains(result.message, transmute([]u8)string("[TMPRL1100]")))
+}

@@ -29,6 +29,14 @@ Worker :: struct {
 	remote_activities_enabled: bool,
 }
 
+// Replay_Worker is an offline Core worker. The pusher feeds complete serialized
+// temporal.api.history.v1.History messages into Core; the ordinary Worker handle
+// then exposes WorkflowActivations and accepts WorkflowActivationCompletions.
+Replay_Worker :: struct {
+	worker: Worker,
+	pusher: ^raw.Worker_Replay_Pusher,
+}
+
 DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
 
 Worker_Versioning_Mode :: enum {
@@ -418,6 +426,112 @@ worker_create :: proc(
 	worker.local_activities_enabled = enable_local_activities
 	worker.remote_activities_enabled = enable_remote_activities
 	return
+}
+
+replay_worker_create :: proc(
+	runtime: ^Runtime,
+	namespace := "default",
+	task_queue := "temporal-sdk-odin-replay",
+) -> (replayer: Replay_Worker, error: Error) {
+	if runtime == nil || runtime.handle == nil {
+		error.message = bytes.clone(transmute([]u8)string("runtime is not initialized"))
+		return
+	}
+	if len(namespace) == 0 {
+		error.message = bytes.clone(transmute([]u8)string("namespace must not be empty"))
+		return
+	}
+	if len(task_queue) == 0 {
+		error.message = bytes.clone(transmute([]u8)string("task queue must not be empty"))
+		return
+	}
+	options := raw.Worker_Options{
+		namespace = byte_ref(namespace),
+		task_queue = byte_ref(task_queue),
+		versioning_strategy = worker_versioning_strategy_raw({}),
+		// Upstream replay workers use a small cache and at least two Workflow
+		// slots so eviction of one history cannot starve the replay stream.
+		max_cached_workflows = 2,
+		tuner = raw.Tuner_Holder{
+			workflow_slot_supplier       = fixed_slot_supplier(2),
+			activity_slot_supplier       = fixed_slot_supplier(1),
+			local_activity_slot_supplier = fixed_slot_supplier(1),
+			nexus_task_slot_supplier     = fixed_slot_supplier(1),
+		},
+		task_types = raw.Worker_Task_Types{enable_workflows = true},
+		max_heartbeat_throttle_interval_ms     = 60_000,
+		default_heartbeat_throttle_interval_ms = 1_000,
+		graceful_shutdown_period_ms            = 5_000,
+		nonsticky_to_sticky_poll_ratio         = 0.2,
+	}
+	result := raw.worker_replayer_new(runtime.handle, &options)
+	if result.fail != nil {
+		error.message = copy_core_bytes(result.fail)
+		raw.byte_array_free(runtime.handle, result.fail)
+		return
+	}
+	if result.worker == nil || result.worker_replay_pusher == nil {
+		error.message = bytes.clone(transmute([]u8)string("Core returned an incomplete replay worker"))
+		if result.worker != nil {
+			raw.worker_free(result.worker)
+		}
+		if result.worker_replay_pusher != nil {
+			raw.worker_replay_pusher_free(result.worker_replay_pusher)
+		}
+		return
+	}
+	replayer.worker = Worker{
+		handle = result.worker,
+		runtime = runtime,
+		workflows_enabled = true,
+	}
+	replayer.pusher = result.worker_replay_pusher
+	return
+}
+
+replay_worker_push :: proc(
+	replayer: ^Replay_Worker,
+	workflow_id: string,
+	history_protobuf: []u8,
+) -> Error {
+	if replayer == nil || replayer.worker.handle == nil ||
+	   replayer.worker.runtime == nil || replayer.pusher == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("replay worker is not initialized"))}
+	}
+	if len(workflow_id) == 0 {
+		return Error{message = bytes.clone(transmute([]u8)string("replay workflow ID must not be empty"))}
+	}
+	if len(history_protobuf) == 0 {
+		return Error{message = bytes.clone(transmute([]u8)string("replay history protobuf must not be empty"))}
+	}
+	result := raw.worker_replay_push(
+		replayer.worker.handle,
+		replayer.pusher,
+		byte_ref(workflow_id),
+		bytes_ref(history_protobuf),
+	)
+	if result.fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(result.fail)}
+	raw.byte_array_free(replayer.worker.runtime.handle, result.fail)
+	return error
+}
+
+replay_worker_close_pusher :: proc(replayer: ^Replay_Worker) {
+	if replayer == nil || replayer.pusher == nil {
+		return
+	}
+	raw.worker_replay_pusher_free(replayer.pusher)
+	replayer.pusher = nil
+}
+
+replay_worker_close :: proc(replayer: ^Replay_Worker) -> Error {
+	if replayer == nil {
+		return {}
+	}
+	replay_worker_close_pusher(replayer)
+	return worker_close(&replayer.worker)
 }
 
 Worker_Callback_State :: struct {

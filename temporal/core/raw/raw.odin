@@ -13,6 +13,7 @@ when ODIN_OS == .Darwin || ODIN_OS == .Linux {
 Runtime    :: struct { _opaque: u8 }
 Connection :: struct { _opaque: u8 }
 Worker     :: struct { _opaque: u8 }
+Worker_Replay_Pusher :: struct { _opaque: u8 }
 
 Byte_Array_Ref :: struct {
 	data: ^u8,
@@ -168,6 +169,16 @@ Client_Rpc_Call_Callback :: #type proc "c" (
 Worker_Or_Fail :: struct {
 	worker: ^Worker,
 	fail:   ^Byte_Array,
+}
+
+Worker_Replayer_Or_Fail :: struct {
+	worker:               ^Worker,
+	worker_replay_pusher: ^Worker_Replay_Pusher,
+	fail:                 ^Byte_Array,
+}
+
+Worker_Replay_Push_Result :: struct {
+	fail: ^Byte_Array,
 }
 
 Worker_Versioning_Strategy_Tag :: enum c.int {
@@ -326,6 +337,8 @@ when size_of(uintptr) == 8 {
 	#assert(size_of(Client_HTTP_Connect_Proxy_Options) == 48)
 	#assert(size_of(Client_DNS_Load_Balancing_Options) == 8)
 	#assert(size_of(Rpc_Call_Options) == 96)
+	#assert(size_of(Worker_Replayer_Or_Fail) == 24)
+	#assert(size_of(Worker_Replay_Push_Result) == 8)
 	#assert(offset_of(Rpc_Call_Options, retry) == 40)
 	#assert(offset_of(Rpc_Call_Options, cancellation_token) == 88)
 	#assert(size_of(Worker_Versioning_Strategy) == 48)
@@ -371,6 +384,17 @@ foreign temporal_core {
 		callback: Client_Rpc_Call_Callback,
 	) ---
 	worker_new :: proc(connection: ^Connection, options: ^Worker_Options) -> Worker_Or_Fail ---
+	worker_replayer_new :: proc(
+		runtime: ^Runtime,
+		options: ^Worker_Options,
+	) -> Worker_Replayer_Or_Fail ---
+	worker_replay_pusher_free :: proc(worker_replay_pusher: ^Worker_Replay_Pusher) ---
+	worker_replay_push :: proc(
+		worker: ^Worker,
+		worker_replay_pusher: ^Worker_Replay_Pusher,
+		workflow_id: Byte_Array_Ref,
+		history: Byte_Array_Ref,
+	) -> Worker_Replay_Push_Result ---
 	worker_free :: proc(worker: ^Worker) ---
 	worker_validate :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
 	worker_poll_activity_task :: proc(

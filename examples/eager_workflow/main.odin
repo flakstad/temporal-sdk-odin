@@ -127,10 +127,64 @@ run :: proc() -> int {
 		fmt.eprintf("Unexpected eager Workflow result: %q\n", result)
 		return 1
 	}
+	history, history_error := temporal_client.fetch_history_protobuf(&state.handle, 1)
+	if history_error.message != nil {
+		fmt.eprintf("Eager Workflow history fetch failed: %s\n", string(history_error.message))
+		temporal_client.error_free(&history_error)
+		return 1
+	}
+	defer delete(history)
+	core_client := temporal_client.core_client(&client)
+	replayer, replayer_error := worker.create_replayer(core_client.runtime)
+	if replayer_error.message != nil {
+		fmt.eprintf("Offline replayer creation failed: %s\n", string(replayer_error.message))
+		worker.error_free(&replayer_error)
+		return 1
+	}
+	defer {
+		close_error := worker.close(&replayer)
+		if close_error.message != nil {
+			fmt.eprintf("Offline replayer close failed: %s\n", string(close_error.message))
+			worker.error_free(&close_error)
+		}
+	}
+	replay_register_error := worker.register_workflow(
+		&replayer,
+		WORKFLOW_TYPE,
+		eager_workflow,
+	)
+	if replay_register_error.message != nil {
+		fmt.eprintf("Offline replay Workflow registration failed: %s\n", string(replay_register_error.message))
+		worker.error_free(&replay_register_error)
+		return 1
+	}
+	replay_result, replay_error := worker.replay_history(
+		&replayer,
+		state.handle.id,
+		history,
+	)
+	defer worker.replay_result_free(&replay_result)
+	if replay_error.message != nil {
+		fmt.eprintf("Offline replay worker failed: %s\n", string(replay_error.message))
+		worker.error_free(&replay_error)
+		return 1
+	}
+	if replay_result.failure != .None {
+		fmt.eprintf(
+			"Offline replay rejected compatible history (reason=%v): %s\n",
+			replay_result.eviction_reason,
+			string(replay_result.message),
+		)
+		return 1
+	}
 	fmt.printf(
 		"Eager Workflow start accepted and completed workflow_id=%s run_id=%s\n",
 		state.handle.id,
 		state.handle.run_id,
+	)
+	fmt.printf(
+		"Fetched server history and replayed it offline through Core activations=%d\n",
+		replay_result.activations_processed,
 	)
 	return 0
 }

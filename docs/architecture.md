@@ -6,7 +6,7 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
-Activity/Workflow worker registry and poll loop, updated 2026-09-27. The Activity slice now also has a
+Activity/Workflow worker registry and poll loop, updated 2026-09-29. The Activity slice now also has a
 generic Temporal Payload boundary, typed JSON Activity registration, and
 structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
@@ -103,6 +103,46 @@ Core is therefore much more than a gRPC client, but less than a complete Odin
 SDK. It does not call Odin procedures, choose an Odin payload codec, maintain an
 Odin workflow call stack, or provide an Odin deterministic scheduler.
 
+### Offline history replay boundary
+
+The pinned C bridge contains a dedicated replay path; it is not necessary to
+simulate a Service or feed server Workflow Tasks directly. Odin calls
+`temporal_core_worker_replayer_new(runtime, worker_options)`, which creates a
+Core worker over an in-process history stream. Each
+`temporal_core_worker_replay_push(worker, pusher, workflow_id, history)` call
+synchronously decodes a binary `temporal.api.history.v1.History` and then
+queues the owned decoded history onto Core's async stream. Malformed protobuf is
+returned immediately as a Core-allocated error buffer.
+
+After a successful push the normal language boundary applies:
+
+```text
+History protobuf -> Core state machines -> WorkflowActivation
+                                      Odin Workflow runtime
+WorkflowActivationCompletion <- deterministic commands
+```
+
+Core reports the outcome through a final `RemoveFromCache` activation. Following
+the upstream Rust SDK's `ReplayOutcomeInterceptor`, Odin classifies `CACHE_FULL`
+and `LANG_REQUESTED` as compatible replay, `NONDETERMINISM` as an incompatible
+Workflow definition, `LANG_FAIL` as a language Workflow-task failure, and every
+other eviction reason as an internal replay failure. Odin still completes that
+final activation so Core can finish its lifecycle.
+
+The language API creates one Core replay worker per `replay_history` call while
+retaining registered Odin Workflow definitions across calls. This keeps the C
+pusher lifetime simple and guarantees that each accepted history ends in
+eviction before another history begins. It is intentionally synchronous.
+Batch/streaming replay can later reuse one Core worker once cancellation,
+backpressure, and result correlation have dedicated tests.
+
+`client.fetch_history_protobuf` follows all Service pagination tokens, retains
+each canonical encoded event until aggregation is finished, and returns the
+single History message Core expects. Retaining event buffers matters: generated
+protobuf decoders allocate message structure in the supplied arena but borrow
+strings and bytes from their input. CLI `workflow show --output json` is not an
+input to this ABI and is not part of the current replay path.
+
 ## The C bridge that exists today
 
 The bridge source is
@@ -124,6 +164,9 @@ The bridge exposes opaque handles plus C-layout options and callback APIs:
 | Activity heartbeat | synchronous error return | binary `coresdk.ActivityHeartbeat` |
 | Workflow poll | async callback | binary `coresdk.workflow_activation.WorkflowActivation` |
 | Workflow completion | async callback | binary `coresdk.workflow_completion.WorkflowActivationCompletion` |
+| Replay construction | `temporal_core_worker_replayer_new` | worker options, without a Client connection |
+| Replay history input | `temporal_core_worker_replay_push` | binary `temporal.api.history.v1.History` plus Workflow ID |
+| Replay input close | `temporal_core_worker_replay_pusher_free` | closes Core's history stream |
 | Errors | `TemporalCoreByteArray*` | UTF-8 message, with gRPC status/details where applicable |
 
 The asynchronous functions return through callbacks invoked by Core-managed
@@ -596,6 +639,15 @@ as ABI requirements:
 - `temporal_core_worker_record_activity_heartbeat` borrows its protobuf bytes
   only for the synchronous call. A non-null return is a Core-allocated UTF-8
   error and must be freed exactly once with the worker runtime.
+- `temporal_core_worker_replay_push` borrows Workflow ID and History bytes for
+  the synchronous call. Its non-null `fail` member is Core-allocated and is
+  freed with `temporal_core_byte_array_free`. A successful call schedules a send
+  through the pusher; the pusher must remain alive while that history is being
+  consumed.
+- `temporal_core_worker_replay_pusher_free` owns and drops the opaque pusher and
+  closes Core's history stream. Odin calls it after the final replay eviction
+  and before normal worker shutdown/finalization. It must be called exactly
+  once and before freeing the runtime.
 - Forwarded-log references are valid only inside the log callback. Similar
   callback-borrowed data must be copied before returning when it must persist.
 - Callback thread identity is unspecified. Odin callbacks must not assume they
@@ -1931,8 +1983,8 @@ Workflows are enabled.
    detached Update/Activity cleanup, Child Workflows, external Workflow
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
-   accepted Updates, panic containment, offline replay tooling, richer
-   nondeterminism diagnostics, bounded stack policy, or a production
+   accepted Updates, panic containment, replay-history JSON import/batching,
+   richer nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.

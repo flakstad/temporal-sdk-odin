@@ -179,6 +179,11 @@ Lifecycle :: enum {
 	Closed,
 }
 
+Worker_Mode :: enum {
+	Online,
+	Replay,
+}
+
 Worker_Versioning_Mode :: temporal_core.Worker_Versioning_Mode
 Worker_Versioning_Behavior :: temporal_core.Worker_Versioning_Behavior
 Worker_Versioning_Options :: temporal_core.Worker_Versioning_Options
@@ -200,6 +205,32 @@ Worker :: struct {
 	max_concurrent_activities: int,
 	versioning:             Worker_Versioning_Options,
 	nondeterminism_policy:  Nondeterminism_Policy,
+	mode:                   Worker_Mode,
+	replay_runtime:         ^temporal_core.Runtime,
+}
+
+Replay_Failure_Kind :: enum {
+	None,
+	Nondeterminism,
+	Workflow_Task_Failure,
+	Internal,
+}
+
+Replay_Eviction_Reason :: proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason
+
+Replay_Result :: struct {
+	failure:              Replay_Failure_Kind,
+	eviction_reason:      Replay_Eviction_Reason,
+	message:              []u8,
+	activations_processed: int,
+}
+
+replay_result_free :: proc(result: ^Replay_Result) {
+	if result == nil {
+		return
+	}
+	delete(result.message)
+	result^ = {}
 }
 
 Error :: struct {
@@ -324,6 +355,46 @@ create :: proc(
 	worker.versioning.deployment_name = owned_deployment_name
 	worker.nondeterminism_policy = nondeterminism_policy
 	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
+	worker.activity_registrations = make([dynamic]Activity_Registration)
+	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
+	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
+	worker.workflow_interceptors = make([dynamic]workflow.Outbound_Interceptor)
+	worker.workflow_registrations = make([dynamic]Workflow_Registration)
+	worker.workflow_runs = make([dynamic]Workflow_Run)
+	worker.rejected_workflow_runs = make([dynamic]Rejected_Workflow_Run)
+	worker.mode = .Online
+	return
+}
+
+create_replayer :: proc(
+	runtime: ^temporal_core.Runtime,
+	namespace := "default",
+	task_queue := "temporal-sdk-odin-replay",
+) -> (worker: Worker, error: Error) {
+	if runtime == nil || runtime.handle == nil {
+		return {}, error_from_string("runtime is not initialized")
+	}
+	if len(namespace) == 0 {
+		return {}, error_from_string("namespace must not be empty")
+	}
+	if len(task_queue) == 0 {
+		return {}, error_from_string("task queue must not be empty")
+	}
+	owned_task_queue, task_queue_error := strings.clone(task_queue)
+	if task_queue_error != nil {
+		return {}, error_from_string("could not allocate replay task queue")
+	}
+	owned_namespace, namespace_error := strings.clone(namespace)
+	if namespace_error != nil {
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate replay namespace")
+	}
+	worker.namespace = owned_namespace
+	worker.task_queue = owned_task_queue
+	worker.lifecycle = .Configuring
+	worker.max_concurrent_activities = 1
+	worker.mode = .Replay
+	worker.replay_runtime = runtime
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
@@ -1815,6 +1886,188 @@ run_workflow_loop :: proc(
 	return
 }
 
+Replay_Eviction :: struct {
+	found:   bool,
+	reason:  Replay_Eviction_Reason,
+	message: []u8,
+}
+
+replay_eviction_free :: proc(eviction: ^Replay_Eviction) {
+	if eviction == nil {
+		return
+	}
+	delete(eviction.message)
+	eviction^ = {}
+}
+
+inspect_replay_eviction :: proc(data: []u8) -> (eviction: Replay_Eviction, ok: bool) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{}
+	ok = proto.decode_Coresdk_Workflow_Activation_WorkflowActivation(data, &activation)
+	context.allocator = previous_allocator
+	if !ok {
+		return
+	}
+	for job in activation.jobs {
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
+			if variant.value == nil || eviction.found {
+				ok = false
+				return
+			}
+			eviction.found = true
+			eviction.reason = variant.value.reason
+			eviction.message = bytes.clone(transmute([]u8)variant.value.message)
+		}
+	}
+	return
+}
+
+replay_failure_from_eviction :: proc(reason: Replay_Eviction_Reason) -> Replay_Failure_Kind {
+	switch reason {
+	case .CACHE_FULL, .LANG_REQUESTED:
+		return .None
+	case .NONDETERMINISM:
+		return .Nondeterminism
+	case .LANG_FAIL:
+		return .Workflow_Task_Failure
+	case .UNSPECIFIED,
+	     .CACHE_MISS,
+	     .TASK_NOT_FOUND,
+	     .UNHANDLED_COMMAND,
+	     .FATAL,
+	     .PAGINATION_OR_HISTORY_FETCH,
+	     .WORKFLOW_EXECUTION_ENDING:
+		return .Internal
+	}
+	return .Internal
+}
+
+// replay_history runs one serialized temporal.api.history.v1.History through
+// Core and the registered Odin Workflow implementation. Replay incompatibility
+// is reported in Replay_Result; transport, protobuf, and lifecycle faults use
+// Error. The input bytes are borrowed only for this call.
+replay_history :: proc(
+	worker: ^Worker,
+	workflow_id: string,
+	history_protobuf: []u8,
+) -> (result: Replay_Result, error: Error) {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return {}, error_from_string("replayer is not initialized")
+	}
+	if worker.mode != .Replay {
+		return {}, error_from_string("worker was not created with create_replayer")
+	}
+	if worker.lifecycle == .Running {
+		return {}, error_from_string("replayer is already running")
+	}
+	if worker.replay_runtime == nil || worker.replay_runtime.handle == nil {
+		return {}, error_from_string("runtime must remain open until replay returns")
+	}
+	if len(worker.workflow_registrations) == 0 {
+		return {}, error_from_string("at least one Workflow must be registered for replay")
+	}
+	if len(workflow_id) == 0 {
+		return {}, error_from_string("replay workflow ID must not be empty")
+	}
+	if len(history_protobuf) == 0 {
+		return {}, error_from_string("replay history protobuf must not be empty")
+	}
+	if len(worker.workflow_runs) != 0 || len(worker.rejected_workflow_runs) != 0 {
+		return {}, error_from_string("previous replay did not fully evict its Workflow state")
+	}
+
+	core_replayer, create_error := temporal_core.replay_worker_create(
+		worker.replay_runtime,
+		worker.namespace,
+		worker.task_queue,
+	)
+	if create_error.message != nil {
+		return {}, error_from_core(&create_error)
+	}
+	worker.lifecycle = .Running
+	defer {
+		close_error := temporal_core.replay_worker_close(&core_replayer)
+		if error.message == nil && close_error.message != nil {
+			error = error_from_core(&close_error)
+		} else {
+			temporal_core.error_free(&close_error)
+		}
+		worker.lifecycle = .Configuring
+	}
+
+	push_error := temporal_core.replay_worker_push(
+		&core_replayer,
+		workflow_id,
+		history_protobuf,
+	)
+	if push_error.message != nil {
+		return {}, error_from_core(&push_error)
+	}
+
+	for {
+		poll := temporal_core.worker_poll_workflow(&core_replayer.worker)
+		if poll.error.message != nil {
+			return {}, error_from_core(&poll.error)
+		}
+		if poll.shutdown {
+			return {}, error_from_string("replay worker stopped before reporting an outcome")
+		}
+
+		eviction, inspected := inspect_replay_eviction(poll.protobuf)
+		if !inspected {
+			delete(poll.protobuf)
+			return {}, error_from_string("Core returned a malformed replay WorkflowActivation")
+		}
+		processed, dispatch_error := process_workflow_activation(worker, poll.protobuf)
+		delete(poll.protobuf)
+		if dispatch_error.message != nil {
+			replay_eviction_free(&eviction)
+			return {}, dispatch_error
+		}
+		if processed.completion == nil {
+			replay_eviction_free(&eviction)
+			workflow.error_free(&processed.error)
+			return {}, error_from_string("replay activation produced no completion")
+		}
+		complete_error := temporal_core.worker_complete_workflow(
+			&core_replayer.worker,
+			processed.completion[:],
+		)
+		delete(processed.completion)
+		processed.completion = nil
+		if complete_error.message != nil {
+			replay_eviction_free(&eviction)
+			workflow.error_free(&processed.error)
+			return {}, error_from_core(&complete_error)
+		}
+		result.activations_processed += 1
+		if processed.error.message != nil && !processed.activation_failed {
+			message := string(processed.error.message)
+			workflow.error_free(&processed.error)
+			replay_eviction_free(&eviction)
+			return {}, error_from_string(message)
+		}
+		workflow.error_free(&processed.error)
+		if !eviction.found {
+			replay_eviction_free(&eviction)
+			continue
+		}
+		result.failure = replay_failure_from_eviction(eviction.reason)
+		result.eviction_reason = eviction.reason
+		result.message = eviction.message
+		eviction.message = nil
+		replay_eviction_free(&eviction)
+		return
+	}
+}
+
 Activity_Thread_State :: struct {
 	worker:    ^Worker,
 	max_tasks: int,
@@ -1853,6 +2106,9 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	}
 	if worker.lifecycle == .Stopped {
 		return {}, error_from_string("worker cannot be run more than once")
+	}
+	if worker.mode == .Replay {
+		return {}, error_from_string("replay workers must use replay_history")
 	}
 	if options.max_activity_tasks < 0 || options.max_workflow_executions < 0 {
 		return {}, error_from_string("worker run limits must not be negative")
@@ -2002,11 +2258,13 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.workflow_runs = nil
 	worker.rejected_workflow_runs = nil
 	worker.client = nil
+	worker.replay_runtime = nil
 	worker.namespace = ""
 	worker.task_queue = ""
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
 	worker.versioning = {}
 	worker.nondeterminism_policy = {}
+	worker.mode = .Online
 	return error_from_core(&core_error)
 }

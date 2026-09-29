@@ -209,3 +209,94 @@ fetch_history_page :: proc(
 	}
 	return decode_history_page(rpc_result.protobuf)
 }
+
+// fetch_history_protobuf eagerly follows every history page and returns the
+// binary temporal.api.history.v1.History message expected by SDK Core's replay
+// worker. The caller owns the returned bytes. This intentionally does not use
+// Temporal CLI JSON as an intermediate representation.
+fetch_history_protobuf :: proc(
+	handle: ^Workflow_Handle,
+	maximum_page_size: i32 = 1_000,
+) -> (encoded: []u8, error: Error) {
+	if !workflow_handle_valid(handle) {
+		return nil, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	if maximum_page_size < 0 {
+		return nil, error_from_string(.Invalid_Argument, "history page size must not be negative")
+	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return nil, error_from_string(.Malformed_Response, "could not initialize history replay arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	arena_allocator := virtual.arena_allocator(&decode_arena)
+	history := proto.Temporal_Api_History_V1_History{}
+	previous_allocator := context.allocator
+	context.allocator = arena_allocator
+	history.events = make([dynamic]proto.Temporal_Api_History_V1_HistoryEvent)
+	context.allocator = previous_allocator
+	event_protobufs := make([dynamic][]u8)
+	defer {
+		for event_protobuf in event_protobufs {
+			delete(event_protobuf)
+		}
+		delete(event_protobufs)
+	}
+
+	next_page_token: []u8
+	defer delete(next_page_token)
+	page_count := 0
+	for {
+		page, page_error := fetch_history_page(handle, {
+			maximum_page_size = maximum_page_size,
+			next_page_token = next_page_token,
+			filter = .All,
+			skip_archival = true,
+		})
+		if page_error.message != nil {
+			return nil, page_error
+		}
+		page_count += 1
+		for event in page.events {
+			// Generated protobuf decoders borrow byte/string fields from their
+			// input. Keep every encoded event alive until the aggregate History
+			// has been encoded below.
+			append(&event_protobufs, bytes.clone(event.protobuf[:]))
+		}
+		delete(next_page_token)
+		next_page_token = bytes.clone(page.next_page_token)
+		history_page_free(&page)
+		if len(next_page_token) == 0 {
+			break
+		}
+		if page_count >= 10_000 {
+			return nil, error_from_string(
+				.Malformed_Response,
+				"Workflow history pagination did not terminate",
+			)
+		}
+	}
+	if len(event_protobufs) == 0 {
+		return nil, error_from_string(.Malformed_Response, "Workflow history is empty")
+	}
+	for event_protobuf in event_protobufs {
+		decoded_event := proto.Temporal_Api_History_V1_HistoryEvent{}
+		context.allocator = arena_allocator
+		decoded := proto.decode_Temporal_Api_History_V1_HistoryEvent(
+			event_protobuf,
+			&decoded_event,
+		)
+		if decoded {
+			append(&history.events, decoded_event)
+		}
+		context.allocator = previous_allocator
+		if !decoded {
+			return nil, error_from_string(
+				.Malformed_Response,
+				"could not decode an owned Workflow history event",
+			)
+		}
+	}
+	encoded_dynamic := proto.encode_Temporal_Api_History_V1_History(&history)
+	return encoded_dynamic[:], {}
+}
