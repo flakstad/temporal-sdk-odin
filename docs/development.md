@@ -168,6 +168,13 @@ Update fibers. Unit tests inspect the actual native coroutine sizes, not only
 the Odin configuration records. Another 500 generated late-handler traces put
 one to twelve matching Signals behind one to four unknown names, then register
 the handler and require arrival-ordered dispatch plus byte-identical replay.
+The Workflow-mutex property generates all six arrival permutations for three
+accepted Update waiters behind a Signal routine that suspends while owning the
+lock. It requires FIFO handoff and byte-identical initialize, queue, handoff,
+and terminal completions after eviction and fresh-stack replay. A focused unit
+test separately cancels a queued waiter through its selected Workflow
+cancellation token and proves that the owner remains live and can release the
+lock normally.
 PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent

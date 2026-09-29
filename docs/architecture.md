@@ -1437,6 +1437,31 @@ the routine whose own wait condition is ready resumes; registration order is
 the deterministic tie-breaker when several become ready in one activation.
 Forced eviction and replay reproduce every completion byte-for-byte.
 
+The same cooperative scheduler now owns a small synchronization primitive for
+shared language state. `workflow.Mutex` is a zero-value FIFO lock bound to one
+`Fiber_Instance` on first use. Its owner and waiter queue contain only
+Workflow-fiber contexts allocated within that run; it does not cross the Core C
+ABI, create a command, block a host thread, or claim durable state outside
+history. Unlock marks the oldest non-canceled waiter ready, after which the
+ordinary Signal -> Update -> main fixed-point scheduler resumes it. A waiter
+captures its current Workflow cancellation-token ID, so cancellation removes
+it without violating FIFO order for the remaining waiters. Eviction discards
+the queue with the fiber arena, and replay reconstructs the queue from the same
+handler ordering and suspension points.
+
+This is explicitly a language-runtime responsibility. Core supplies activation
+ordering, replay inputs, and durable operation resolutions, but it neither sees
+nor coordinates mutations to Odin values between concurrently live handler
+fibers. The Odin runtime therefore rejects reentrant locking, cross-run mutex
+reuse, and non-owner unlock as deterministic execution failures. The usual
+handler boundary applies: a main/Signal failure fails the Workflow, while an
+Update failure rejects that Update. The runtime also tracks locks per fiber,
+releases them during routine teardown, and converts a successful return while
+owning one into `OdinWorkflowMutexOwnershipError` so a forgotten unlock cannot
+strand the scheduler. User code should still pair each successful lock with
+`defer mutex_unlock`; ordinary OS locks would block the worker thread and have
+no replay semantics.
+
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
 failed operation sequence. Its terminal `UpdateResponse.Rejected` restores the
@@ -1682,9 +1707,10 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are shared-state races between handlers and
-stack/resource limits. These must be fixed before the routine API can be
-considered stable.
+The deterministic mutex provides an explicit answer for state that must span a
+suspension, but the runtime cannot infer which user fields require it or detect
+every logical race/deadlock. Stack/resource limits and panic containment also
+remain before the routine API can be considered stable.
 
 ### Workflow Signal handlers
 

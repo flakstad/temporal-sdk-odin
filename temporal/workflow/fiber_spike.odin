@@ -18,6 +18,10 @@ import fiber_raw "fiber/raw"
 Fiber_Context :: struct {
 	instance:       ^Fiber_Instance,
 	update_context: ^Update_Context,
+	waiting_mutex:  ^Mutex,
+	waiting_mutex_cancellation_token_id: u32,
+	mutex_granted:  bool,
+	owned_mutexes:  [dynamic]^Mutex,
 }
 
 Fiber_Proc :: proc(ctx: ^Fiber_Context, input: string) -> string
@@ -520,6 +524,7 @@ Owned_Continue_As_New_Options :: struct {
 
 Fiber_Phase :: enum {
 	Ready,
+	Waiting_Mutex,
 	Waiting_Activity,
 	Waiting_Child_Workflow_Start,
 	Waiting_Child_Workflow,
@@ -533,6 +538,17 @@ Fiber_Phase :: enum {
 	Canceled,
 	Completed,
 	Failed,
+}
+
+// Mutex is a zero-value, deterministic, Workflow-local FIFO mutex. It
+// coordinates Odin fibers only; it never blocks an OS thread and has no server
+// representation. Keep it in Workflow-owned state, do not copy it after first
+// use, and do not share it across Workflow runs.
+Mutex :: struct {
+	instance:    ^Fiber_Instance,
+	instance_id: u64,
+	owner:       ^Fiber_Context,
+	waiters:     [dynamic]^Fiber_Context,
 }
 
 Fiber_Operation_State :: enum {
@@ -1113,6 +1129,7 @@ Fiber_Update_Routine :: struct {
 
 Fiber_Instance :: struct {
 	runtime:         ^Fiber_Runtime,
+	instance_id:     u64,
 	namespace:       string,
 	run_id:          string,
 	workflow_id:     string,
@@ -1194,6 +1211,7 @@ Fiber_Runtime :: struct {
 	invoke:                 Workflow_Invoke_Proc,
 	callback_destroy:       Workflow_Callback_Destroy_Proc,
 	instances:              [dynamic]^Fiber_Instance,
+	next_instance_id:       u64,
 	inbound_interceptors:    [dynamic]Inbound_Interceptor,
 	outbound_interceptors:   [dynamic]Outbound_Interceptor,
 	activations:            int,
@@ -1594,6 +1612,7 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 		routine = routine,
 	}
 	result := inbound_handle_signal_chain(&interceptor_state, &interceptor_input)
+	released_mutex := mutex_release_owned(&routine.ctx)
 	if instance.phase == .Failed {
 		codec.payload_free(&result.payload)
 		message := instance.failure_message
@@ -1616,6 +1635,15 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 			message = "Workflow Signal routine failed"
 		}
 		routine.result = payload_fail(message, failure_type)
+		return
+	}
+	if released_mutex && result.status == .Completed {
+		codec.payload_free(&result.payload)
+		routine.result = payload_fail(
+			"Workflow Signal routine returned while owning a mutex",
+			"OdinWorkflowMutexOwnershipError",
+		)
+		instance.phase = .Failed
 		return
 	}
 	routine.result = result
@@ -1696,6 +1724,7 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 		routine = routine,
 	}
 	result := inbound_handle_update_handler_chain(&interceptor_state, &interceptor_input)
+	released_mutex := mutex_release_owned(&routine.ctx)
 	if instance.phase == .Failed {
 		codec.payload_free(&result.payload)
 		message := instance.failure_message
@@ -1718,6 +1747,15 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 			message = "Workflow Update routine failed"
 		}
 		routine.result = payload_fail(message, failure_type)
+		return
+	}
+	if released_mutex && result.status == .Completed {
+		codec.payload_free(&result.payload)
+		routine.result = payload_fail(
+			"Workflow Update routine returned while owning a mutex",
+			"OdinWorkflowMutexOwnershipError",
+		)
+		instance.phase = .Failed
 		return
 	}
 	routine.result = result
@@ -1868,8 +1906,16 @@ fiber_entry :: proc "c" (user_data: rawptr) {
 	}
 	execute_state := Inbound_Execute_Workflow_State{instance = instance}
 	workflow_result := inbound_execute_workflow_chain(&execute_state, &execute_input)
+	released_mutex := mutex_release_owned(&instance.workflow_context)
 	if instance.phase == .Failed {
 		codec.payload_free(&workflow_result.payload)
+		return
+	}
+	if released_mutex && workflow_result.status == .Completed {
+		codec.payload_free(&workflow_result.payload)
+		instance.failure_message = "Workflow returned while owning a mutex"
+		instance.failure_type = "OdinWorkflowMutexOwnershipError"
+		instance.phase = .Failed
 		return
 	}
 	if workflow_result.status == .Failed {
@@ -2082,6 +2128,11 @@ add_fiber_instance :: proc(
 
 	instance := new(Fiber_Instance)
 	instance.runtime = runtime
+	runtime.next_instance_id += 1
+	if runtime.next_instance_id == 0 {
+		runtime.next_instance_id = 1
+	}
+	instance.instance_id = runtime.next_instance_id
 	instance.owner_allocator = context.allocator
 	arena_error := virtual.arena_init_growing(&instance.arena)
 	if arena_error != nil {
@@ -7785,6 +7836,183 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	outbound_sleep_chain(&state, &input)
 }
 
+mutex_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	ctx.instance.failure_message = message
+	ctx.instance.failure_type = "OdinWorkflowMutexError"
+	ctx.instance.phase = .Failed
+}
+
+mutex_remove_waiter :: proc(mutex: ^Mutex, ctx: ^Fiber_Context) {
+	if mutex == nil || ctx == nil {
+		return
+	}
+	for waiter, index in mutex.waiters {
+		if waiter == ctx {
+			ordered_remove(&mutex.waiters, index)
+			return
+		}
+	}
+}
+
+mutex_record_owned :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) {
+	append(&ctx.owned_mutexes, mutex)
+}
+
+mutex_forget_owned :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) -> bool {
+	for owned, index in ctx.owned_mutexes {
+		if owned == mutex {
+			ordered_remove(&ctx.owned_mutexes, index)
+			return true
+		}
+	}
+	return false
+}
+
+mutex_grant_next :: proc(mutex: ^Mutex) {
+	if mutex == nil || mutex.instance == nil || mutex.owner != nil {
+		return
+	}
+	for len(mutex.waiters) > 0 {
+		waiter := mutex.waiters[0]
+		ordered_remove(&mutex.waiters, 0)
+		if waiter == nil || waiter.instance != mutex.instance || waiter.waiting_mutex != mutex {
+			continue
+		}
+		if cancellation_token_is_requested_id(
+			mutex.instance,
+			waiter.waiting_mutex_cancellation_token_id,
+		) {
+			continue
+		}
+		mutex.owner = waiter
+		waiter.mutex_granted = true
+		mutex_record_owned(waiter, mutex)
+		return
+	}
+}
+
+mutex_unlock_internal :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) -> bool {
+	if ctx == nil || mutex == nil || mutex.owner != ctx {
+		return false
+	}
+	mutex.owner = nil
+	_ = mutex_forget_owned(ctx, mutex)
+	mutex_grant_next(mutex)
+	return true
+}
+
+// mutex_try_lock acquires a free Workflow-local mutex without suspension.
+// Reentrant acquisition is rejected as a deterministic execution failure.
+mutex_try_lock :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) -> bool {
+	if ctx == nil || ctx.instance == nil || mutex == nil || ctx.instance.phase != .Ready {
+		mutex_fail(ctx, "invalid Workflow mutex acquisition")
+		return false
+	}
+	instance := ctx.instance
+	if mutex.instance == nil {
+		mutex.instance = instance
+		mutex.instance_id = instance.instance_id
+	} else if mutex.instance != instance || mutex.instance_id != instance.instance_id {
+		mutex_fail(ctx, "Workflow mutex belongs to another Workflow run")
+		return false
+	}
+	if mutex.owner == ctx {
+		mutex_fail(ctx, "Workflow mutex is not reentrant")
+		return false
+	}
+	if current_cancellation_applies(instance) || mutex.owner != nil || len(mutex.waiters) > 0 {
+		return false
+	}
+	mutex.owner = ctx
+	mutex_record_owned(ctx, mutex)
+	return true
+}
+
+// mutex_lock acquires a Workflow-local FIFO mutex, suspending only the current
+// Workflow fiber. False without a Workflow failure means its cancellation token
+// was requested while it waited. Callers should normally pair success with
+// `defer mutex_unlock(...)`.
+mutex_lock :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) -> bool {
+	if ctx == nil || ctx.instance == nil || mutex == nil || ctx.instance.phase != .Ready {
+		mutex_fail(ctx, "invalid Workflow mutex acquisition")
+		return false
+	}
+	instance := ctx.instance
+	if mutex.instance == nil {
+		mutex.instance = instance
+		mutex.instance_id = instance.instance_id
+	} else if mutex.instance != instance || mutex.instance_id != instance.instance_id {
+		mutex_fail(ctx, "Workflow mutex belongs to another Workflow run")
+		return false
+	}
+	if mutex.owner == ctx || ctx.waiting_mutex != nil {
+		mutex_fail(ctx, "Workflow mutex is not reentrant")
+		return false
+	}
+	if current_cancellation_applies(instance) {
+		return false
+	}
+	if mutex.owner == nil && len(mutex.waiters) == 0 {
+		mutex.owner = ctx
+		mutex_record_owned(ctx, mutex)
+		return true
+	}
+	append(&mutex.waiters, ctx)
+	ctx.waiting_mutex = mutex
+	ctx.waiting_mutex_cancellation_token_id = current_cancellation_token_id(instance)
+	ctx.mutex_granted = false
+	instance.phase = .Waiting_Mutex
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		mutex_remove_waiter(mutex, ctx)
+		ctx.waiting_mutex = nil
+		ctx.waiting_mutex_cancellation_token_id = 0
+		ctx.mutex_granted = false
+		mutex_fail(ctx, "could not resume Workflow mutex wait")
+		return false
+	}
+	granted := ctx.mutex_granted && mutex.owner == ctx
+	if !granted {
+		mutex_remove_waiter(mutex, ctx)
+	}
+	ctx.waiting_mutex = nil
+	ctx.waiting_mutex_cancellation_token_id = 0
+	ctx.mutex_granted = false
+	return granted
+}
+
+// mutex_unlock transfers ownership to the oldest non-canceled waiter. Unlock
+// by a non-owner is a deterministic execution failure.
+mutex_unlock :: proc(ctx: ^Fiber_Context, mutex: ^Mutex) -> bool {
+	if ctx == nil || ctx.instance == nil || mutex == nil ||
+	   mutex.instance != ctx.instance || mutex.instance_id != ctx.instance.instance_id ||
+	   !mutex_unlock_internal(ctx, mutex) {
+		mutex_fail(ctx, "Workflow mutex unlock requires its current owner")
+		return false
+	}
+	return true
+}
+
+// mutex_is_locked observes local ownership and never suspends.
+mutex_is_locked :: proc(mutex: ^Mutex) -> bool {
+	return mutex != nil && mutex.owner != nil
+}
+
+mutex_release_owned :: proc(ctx: ^Fiber_Context) -> bool {
+	if ctx == nil || len(ctx.owned_mutexes) == 0 {
+		return false
+	}
+	for len(ctx.owned_mutexes) > 0 {
+		mutex := ctx.owned_mutexes[len(ctx.owned_mutexes) - 1]
+		if !mutex_unlock_internal(ctx, mutex) {
+			ordered_remove(&ctx.owned_mutexes, len(ctx.owned_mutexes) - 1)
+		}
+	}
+	return true
+}
+
 // all_handlers_finished reports whether every concurrent Signal and accepted
 // Update routine has finished.
 all_handlers_finished :: proc(ctx: ^Fiber_Context) -> bool {
@@ -8764,6 +8992,8 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		routine.current_cancellation_token_id,
 	)
 	switch routine.phase {
+	case .Waiting_Mutex:
+		return routine.ctx.mutex_granted || cancellation_applies
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && activity_operation_ready_for_waiter(
@@ -9122,6 +9352,8 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		routine.current_cancellation_token_id,
 	)
 	switch routine.phase {
+	case .Waiting_Mutex:
+		return routine.ctx.mutex_granted || cancellation_applies
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && activity_operation_ready_for_waiter(
@@ -9190,6 +9422,9 @@ resume_main_workflow_if_ready :: proc(
 	}
 	should_resume := false
 	switch instance.phase {
+	case .Waiting_Mutex:
+		should_resume = instance.workflow_context.mutex_granted ||
+		                current_cancellation_applies(instance)
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
 		should_resume = found && activity_operation_ready_for_waiter(
@@ -9660,6 +9895,7 @@ append_fiber_pending_commands :: proc(
 ) -> Error {
 	append_shared_operation_commands(result, commands, instance, task_queue)
 	switch instance.phase {
+	case .Waiting_Mutex:
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
 	case .Waiting_Child_Workflow_Start:

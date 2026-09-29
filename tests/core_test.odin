@@ -3870,6 +3870,207 @@ fiber_update_activity_failure_test_workflow :: proc(
 	return result
 }
 
+Workflow_Mutex_Test_State :: struct {
+	mutex: workflow.Mutex,
+	order: [3]int,
+	count: int,
+}
+
+workflow_mutex_signal_routine :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Workflow_Mutex_Test_State,
+	_: string,
+) {
+	if !workflow.mutex_lock(ctx, &state.mutex) {
+		return
+	}
+	defer workflow.mutex_unlock(ctx, &state.mutex)
+	state.order[state.count] = 1
+	state.count += 1
+	workflow.sleep(ctx, time.Second)
+	state.order[state.count] = 2
+	state.count += 1
+}
+
+workflow_mutex_update_routine :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Workflow_Mutex_Test_State,
+	_: string,
+) -> int {
+	if !workflow.mutex_lock(ctx, &state.mutex) {
+		return -1
+	}
+	defer workflow.mutex_unlock(ctx, &state.mutex)
+	state.order[state.count] = 3
+	state.count += 1
+	return state.count
+}
+
+fiber_workflow_mutex_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	state := Workflow_Mutex_Test_State{}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"lock_signal",
+		&state,
+		workflow_mutex_signal_routine,
+	) || !workflow.set_update_routine_json(
+		ctx,
+		"lock_update",
+		&state,
+		workflow_mutex_update_routine,
+	) {
+		return "mutex handler registration failed"
+	}
+	result := workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	if state.count != 3 || state.order != {1, 2, 3} || workflow.mutex_is_locked(&state.mutex) {
+		return "mutex FIFO ordering failed"
+	}
+	return result
+}
+
+Workflow_Mutex_Cancellation_State :: struct {
+	mutex: workflow.Mutex,
+	token: workflow.Cancellation_Token,
+}
+
+workflow_mutex_cancellation_owner :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Workflow_Mutex_Cancellation_State,
+	_: string,
+) {
+	if !workflow.mutex_lock(ctx, &state.mutex) {
+		return
+	}
+	defer workflow.mutex_unlock(ctx, &state.mutex)
+	workflow.sleep(ctx, time.Hour)
+}
+
+workflow_mutex_cancellation_waiter :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Workflow_Mutex_Cancellation_State,
+	_: string,
+) -> string {
+	scope := workflow.cancellation_scope(ctx, state.token)
+	defer workflow.cancellation_scope_end(&scope)
+	if !workflow.mutex_lock(ctx, &state.mutex) {
+		return "canceled"
+	}
+	defer workflow.mutex_unlock(ctx, &state.mutex)
+	return "acquired"
+}
+
+fiber_workflow_mutex_cancellation_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	state := Workflow_Mutex_Cancellation_State{
+		token = workflow.cancellation_child(workflow.cancellation_root(ctx)),
+	}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"owner",
+		&state,
+		workflow_mutex_cancellation_owner,
+	) || !workflow.set_update_routine_json(
+		ctx,
+		"waiter",
+		&state,
+		workflow_mutex_cancellation_waiter,
+	) {
+		return "mutex cancellation handler registration failed"
+	}
+	_ = workflow.await_signal(ctx, "cancel_waiter")
+	if !workflow.cancellation_request(state.token, "cancel mutex waiter") {
+		return "mutex waiter cancellation failed"
+	}
+	result := workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	return result
+}
+
+fiber_workflow_mutex_reentrant_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	mutex := workflow.Mutex{}
+	if !workflow.mutex_lock(ctx, &mutex) {
+		return "initial lock failed"
+	}
+	defer workflow.mutex_unlock(ctx, &mutex)
+	_ = workflow.mutex_lock(ctx, &mutex)
+	return "reentrant lock unexpectedly succeeded"
+}
+
+fiber_workflow_mutex_leak_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	mutex := workflow.Mutex{}
+	if !workflow.mutex_lock(ctx, &mutex) {
+		return "initial lock failed"
+	}
+	return "lock unexpectedly escaped Workflow return"
+}
+
+assert_workflow_mutex_failure :: proc(
+	t: ^testing.T,
+	workflow_type: string,
+	run_id: string,
+	callback: workflow.Fiber_Proc,
+	expected_type: string,
+) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		workflow_type,
+		"test-queue",
+		callback,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("go")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = workflow_type,
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = run_id,
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.failure_type), expected_type)
+	testing.expect(t, inspection.non_retryable)
+	delete(inspection.message)
+	delete(inspection.failure_type)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
 fiber_abandon_update_routine_test_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	name: string,
@@ -12410,6 +12611,410 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	delete(update_finish_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_mutex_serializes_signal_and_update_routines_fifo :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_workflow_mutex_test",
+		"test-queue",
+		fiber_workflow_mutex_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("go")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_workflow_mutex_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-mutex-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "lock_signal"}
+	defer delete(signal.input)
+	append(&signal.input, proto_input)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "mutex-update",
+		protocol_instance_id = "mutex-update-protocol",
+		name = "lock_update",
+		run_validator = false,
+	}
+	defer delete(update.input)
+	append(&update.input, proto_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "mutex handlers failed to start: %s", string(processed.error.message))
+	testing.expect(t, processed.started_timer)
+	testing.expect_value(t, processed.timer_seq, u32(1))
+	testing.expect_value(t, processed.signal_handlers_started, 1)
+	testing.expect_value(t, processed.signal_handlers_completed, 0)
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect_value(t, processed.updates_completed, 0)
+	accepted := inspect_update_responses(processed.completion[:], "mutex-update-protocol")
+	testing.expect_value(t, accepted.accepted, 1)
+	testing.expect_value(t, accepted.completed, 0)
+	update_response_inspection_free(&accepted)
+	start_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 10
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "mutex handoff failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.signal_handlers_completed, 1)
+	testing.expect_value(t, processed.updates_completed, 1)
+	testing.expect(t, processed.waiting_signal)
+	completed_update := inspect_update_responses(
+		processed.completion[:],
+		"mutex-update-protocol",
+	)
+	testing.expect_value(t, completed_update.completed, 1)
+	update_result: int
+	update_decode_error := codec.decode_json(
+		codec.payload_view(&completed_update.payload),
+		&update_result,
+	)
+	testing.expect_value(t, update_decode_error, codec.Error.None)
+	testing.expect_value(t, update_result, 3)
+	update_response_inspection_free(&completed_update)
+	handoff_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	finish := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish.input)
+	append(&finish.input, proto_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 13
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	completion := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(t, string(completion.completion_result), `"go"`)
+	delete(completion.failure_message)
+	delete(completion.completion_result)
+	finish_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.is_replaying = true
+	activation.history_length = 3
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.history_length = 7
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(start_completion[:], processed.completion[:]))
+	delete(start_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.history_length = 10
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(handoff_completion[:], processed.completion[:]))
+	delete(handoff_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.history_length = 13
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(finish_completion[:], processed.completion[:]))
+	delete(finish_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_mutex_wait_is_cancellation_aware :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_workflow_mutex_cancellation_test",
+		"test-queue",
+		fiber_workflow_mutex_cancellation_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("go")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_workflow_mutex_cancellation_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-mutex-cancellation-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	owner := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "owner"}
+	defer delete(owner.input)
+	append(&owner.input, proto_input)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "mutex-cancellation-update",
+		protocol_instance_id = "mutex-cancellation-protocol",
+		name = "waiter",
+		run_validator = false,
+	}
+	defer delete(update.input)
+	append(&update.input, proto_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &owner,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.started_timer)
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect_value(t, processed.updates_completed, 0)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	cancel := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "cancel_waiter"}
+	defer delete(cancel.input)
+	append(&cancel.input, proto_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "mutex cancellation failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_completed, 1)
+	testing.expect_value(t, processed.signal_handlers_completed, 0)
+	canceled_update := inspect_update_responses(
+		processed.completion[:],
+		"mutex-cancellation-protocol",
+	)
+	canceled_value: string
+	decode_error := codec.decode_json(codec.payload_view(&canceled_update.payload), &canceled_value)
+	testing.expect_value(t, decode_error, codec.Error.None)
+	testing.expect_value(t, canceled_value, "canceled")
+	delete(canceled_value)
+	update_response_inspection_free(&canceled_update)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_timer,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.signal_handlers_completed, 1)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	finish := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish.input)
+	append(&finish.input, proto_input)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 15
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_mutex_rejects_reentrancy_and_leaked_ownership :: proc(t: ^testing.T) {
+	assert_workflow_mutex_failure(
+		t,
+		"odin_workflow_mutex_reentrant_test",
+		"workflow-mutex-reentrant-run",
+		fiber_workflow_mutex_reentrant_test_workflow,
+		"OdinWorkflowMutexError",
+	)
+	assert_workflow_mutex_failure(
+		t,
+		"odin_workflow_mutex_leak_test",
+		"workflow-mutex-leak-run",
+		fiber_workflow_mutex_leak_test_workflow,
+		"OdinWorkflowMutexOwnershipError",
+	)
 }
 
 @(test)

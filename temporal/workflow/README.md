@@ -35,6 +35,36 @@ This permits `Accepted` plus an Activity command in one completion and the
 terminal Update response after a later Activity resolution. Replay recreates
 both stacks and requires byte-identical completions.
 
+Signal and Update routines may overlap at Temporal suspension points, so shared
+Workflow state sometimes needs explicit coordination. `Mutex` is a zero-value,
+Workflow-local FIFO mutex for that purpose:
+
+```odin
+state: struct {
+	mutex: workflow.Mutex,
+	value: int,
+}
+
+if !workflow.mutex_lock(ctx, &state.mutex) {
+	return // the selected cancellation token was requested while waiting
+}
+defer workflow.mutex_unlock(ctx, &state.mutex)
+state.value += 1
+```
+
+The mutex suspends only the current Workflow fiber; it never blocks an OS
+thread and emits no Temporal command. A waiter uses the cancellation token
+selected when it starts waiting, and ownership passes to non-canceled waiters
+in arrival order. `mutex_try_lock` never jumps ahead of queued waiters, and
+`mutex_is_locked` is only an observation helper. Mutexes are bound to one
+Workflow run on first use: keep them in Workflow-owned state, do not copy them
+after first use, and never retain them across eviction. Reentrant locking,
+cross-run use, non-owner unlock, or returning while still owning a mutex becomes
+a deterministic execution failure. In the main or a Signal routine that fails
+the Workflow; in an Update routine it rejects that Update. Use
+`defer mutex_unlock` after every successful acquisition. Host synchronization
+primitives remain invalid inside Workflow code because they are not replay-aware.
+
 `workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
 stack sizes independently when the Worker is created. Zero selects the 128 KiB
 default; explicit sizes are validated between 32 KiB and 16 MiB. Replay Workers

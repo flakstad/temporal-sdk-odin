@@ -1393,6 +1393,27 @@ their handler responses, and can release `await_all_handlers_finished` in the
 same activation. Activity options using `Wait_Cancellation_Completed` remain
 suspended until Core delivers the terminal Activity resolution.
 
+Shared state across the main Workflow, Signal routines, and Update routines can
+be guarded by the zero-value `workflow.Mutex`. It is a deterministic FIFO
+primitive implemented entirely by the Odin Workflow scheduler: locking
+suspends only the current fiber, produces no server command, and honors the
+cancellation token selected at the start of the wait.
+
+```odin
+if !workflow.mutex_lock(ctx, &state.mutex) {
+    return "canceled"
+}
+defer workflow.mutex_unlock(ctx, &state.mutex)
+state.balance += delta
+```
+
+Keep a mutex in state owned by one Workflow run and do not copy it after first
+use. `mutex_try_lock` respects queued waiters; `mutex_is_locked` only observes
+the current state. Reentrant use, cross-run use, non-owner unlock, and returning
+while holding a mutex fail deterministically. Main/Signal failures fail the
+Workflow; an Update-handler failure rejects that Update. OS mutexes and other
+host synchronization are not safe substitutes in replaying Workflow code.
+
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child
 deadline adds its own timer, while a later one adds no redundant command.
