@@ -1601,8 +1601,8 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are general cancellation-token semantics,
-detached timer/signal coverage, client cancellation of an accepted Update,
+The remaining Update-runtime risks are cross-routine same-activation
+cancellation scheduling, detached timer/signal coverage, client cancellation of an accepted Update,
 shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
@@ -1752,11 +1752,44 @@ The Odin runtime now models the Workflow's root cancellation state explicitly:
    between main and Update fibers keeps their scopes independent even though
    their deterministic operation tables are shared.
 
-This is a useful cleanup scope, not yet a general cancellation tree: there are
-no public token values, arbitrary child relationships, user-triggered sources,
-or propagated deadlines. There is also no separate protocol for canceling an
-already accepted Update; root Workflow cancellation and the handler's operation
-scope determine whether that routine can finish before close.
+The runtime now also exposes borrowed run-local `Cancellation_Token` values.
+The root token is linked to `CancelWorkflow`; `cancellation_child` creates an
+arbitrary downward-only relationship; and `cancellation_detached` creates an
+unrelated root. Token IDs are assigned deterministically by Workflow execution.
+The first cancellation reason wins, descendants inherit it unless already
+canceled independently, and parents/siblings are untouched. A lexical
+`cancellation_scope` selects the token captured by newly created Activities,
+Local Activities, timers, Child Workflows, external Signals, and Signal waits.
+The older detached-scope API is implemented as a compatibility adapter over a
+new detached token. Tokens, nodes, and cancellation reasons are owned by the
+Workflow run arena; public token values are borrowed IDs and become invalid at
+cache eviction. Scope state belongs to the currently running fiber and nested
+scopes must close in LIFO order.
+
+`cancellation_request` changes deterministic language-runtime state. It emits
+only the appropriate operation cancellation commands and never synthesizes
+`CancelWorkflowExecution`. Core's `CancelWorkflow` activation remains the sole
+source of server-requested root cancellation, which the Odin runtime
+acknowledges after Workflow code and any explicitly drained handlers return.
+
+The offline acceptance test builds root/child/grandchild/sibling/detached
+branches and schedules five Activities. Canceling the child emits exactly
+`RequestCancelActivity(seq=2)` and `RequestCancelActivity(seq=3)`; seq 1, 4,
+and 5 remain resolvable. An Activity, Child Workflow, external Signal, and
+timer created later under a new descendant of that canceled child all resolve
+locally without adding commands. After eviction, fresh-stack replay reproduces
+the initial and cancellation completion protobufs byte-for-byte. The live
+dev-server scenario schedules child/sibling/detached Activities, receives a
+public client Signal, observes one cooperative Activity cancellation, lets both
+unrelated branches finish, and completes the Workflow successfully.
+
+The token tree has no deadline propagation yet. There is also no separate
+protocol for canceling an already accepted Update; root Workflow cancellation
+and the handler's operation scope determine whether that routine can finish
+before close. A token canceled by another routine after that waiter has already
+had its scheduler turn may require the next activation before a commandless
+Signal wait resumes; fixed-point same-activation scheduling remains explicit
+hardening work.
 Activity cancellation remains cooperative at the Activity implementation
 boundary; the Workflow request does not forcibly stop arbitrary Odin code.
 
@@ -2017,8 +2050,9 @@ Workflows are enabled.
    synchronous/asynchronous Signal handlers, preemptively detached operations,
    detached Update/Activity cleanup, Child Workflows, external Workflow
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
-   yet prove general nested cancellation-token trees, client cancellation of
-   accepted Updates, panic containment, replay-history JSON import,
+   now proves downward-only nested cancellation-token trees across Activity
+   commands and replay. It does not yet prove token-driven timer/Signal waits
+   across handler fibers, client cancellation of accepted Updates, panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, guard-page/growable stack protection, or
    a production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
@@ -2035,9 +2069,10 @@ Workflows are enabled.
    Failure, in addition to their operation-specific cause enum.
    Activity cancellation now preserves Core's primary reason, all six detail
    flags, and callback-authored cancellation Payloads through a
-   `Wait_Cancellation_Completed` Workflow result. The remaining cancellation
-   gap is a general nested token/scope tree rather than information loss at the
-   Activity boundary. The Activity API now models typed success, retryability, failure type,
+   `Wait_Cancellation_Completed` Workflow result. Nested token/scope trees now
+   isolate child, sibling, and detached Activity branches; remaining gaps are
+   propagated deadlines and cross-handler timer/Signal scheduling rather than
+   information loss at the Activity boundary. The Activity API now models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
@@ -2161,8 +2196,9 @@ API can be called stable.
 Update cancellation through root Workflow cancellation is now proven while a
 handler awaits an Activity: the detached operation survives, explicit draining
 prevents early close, the Update response precedes cancellation acknowledgement,
-and late resolution/replay are deterministic. Remaining cancellation work is a
-public token/tree abstraction, timer/signal coverage for detached handlers, and
+and late resolution/replay are deterministic. The public token/tree abstraction
+now covers deterministic child/detached scopes and Activity cancellation.
+Remaining cancellation work is timer/signal coverage across handlers, and
 any future client-facing policy for canceling an accepted Update.
 
 Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
@@ -2173,8 +2209,9 @@ statechart oracle can later expand to retry/cancellation/shutdown interleavings.
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
 dependency. The Update routine table now has explicit ownership, replay tests,
-a defined Workflow-close policy, and a live cancellation/drain path, but the
-public cancellation model remains experimental.
+a defined Workflow-close policy, and a live cancellation/drain path. The public
+cancellation model remains experimental while cross-handler wakeups and
+deadlines are incomplete.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

@@ -1491,6 +1491,74 @@ grep -Eq "replay=false .*cancel=true canceled_workflow=false .*canceled_timer=tr
 grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*canceled_workflow=true .*completed=true" "$worker_log"
 grep -q "detached Workflow Update completed before cancellation acknowledgement" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=cancellation-tree \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Cancellation-tree Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+cancellation_tree_workflow_id="odin-sdk-cancellation-tree-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$cancellation_tree_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"cancellation-tree"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..50}; do
+  if grep -q "cancel-activity heartbeat recorded" "$worker_log" 2>/dev/null && \
+     grep -Eq "scheduled=3 .*last_activity=3 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Cancellation-tree Workflow did not start all branches" >&2
+    cat "$worker_log" >&2
+    cat "$workflow_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! grep -q "cancel-activity heartbeat recorded" "$worker_log" 2>/dev/null ||
+   ! grep -Eq "scheduled=3 .*last_activity=3 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+  echo "Cancellation-tree Workflow did not make every branch observable before cancellation" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cancellation_tree_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=cancel-child-token \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=cancel \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+cancellation_tree_output="$(<"$workflow_output_file")"
+echo "$cancellation_tree_output"
+grep -q '"status": "COMPLETED"' <<<"$cancellation_tree_output"
+grep -q '"result": "Cancellation tree completed"' <<<"$cancellation_tree_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*signal=true .*canceled_activity=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=3 .*last_activity=3 .*waiting_signal=true" "$worker_log"
+grep -q "Workflow cancellation tokens propagated downward and isolated sibling branches" "$worker_log"
+
 run_workflow_cancellation_case() {
   local scenario="$1"
   local input="$2"

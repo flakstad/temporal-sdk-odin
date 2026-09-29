@@ -1055,6 +1055,13 @@ The cleanup case resumes the suspended user fiber, exposes `.Canceled` and the
 request reason, runs a second Activity in `detached_cancellation_scope`, and
 closes the Workflow as canceled only after that Activity resolves.
 
+`TEMPORAL_ODIN_SCENARIO=cancellation-tree` exercises selective language-side
+cancellation instead of canceling the Workflow Execution. It starts child,
+sibling, and detached Activity branches, receives `cancel-child-token`, emits a
+Core Activity-cancellation command only for the child branch, and requires the
+sibling and detached branches to complete. The Workflow itself completes
+successfully and replay rebuilds the same token IDs and commands.
+
 ## Child, external, Continue-As-New, and patch acceptance test
 
 `examples/child_workflow` registers successful, failing, and cancellation-aware

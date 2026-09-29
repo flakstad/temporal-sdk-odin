@@ -176,7 +176,12 @@ in an explicit detached scope before `CancelWorkflowExecution`. Detached
 operations may be started before cancellation, or afterward for cleanup. A
 canceling main Workflow can also drain a detached Update handler; the live
 suite proves that its Update result reaches the caller before the Workflow is
-acknowledged as canceled. A
+acknowledged as canceled. Workflow code can now build borrowed deterministic
+`Cancellation_Token` trees: child cancellation flows downward without reaching
+parents or siblings, detached roots ignore Workflow cancellation, and the first
+reason wins. Activities, Local Activities, timers, Child Workflows, external
+Signals, and Signal waits capture the token selected by their lexical
+`cancellation_scope`. A
 reusable worker now registers both Activity and Workflow procedures, routes run IDs to the
 correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
@@ -215,8 +220,8 @@ now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
-**not** provide general nested cancellation-token trees, guard-page/growable
-stack protection, client
+**not** yet provide cross-routine same-activation cancellation scheduling,
+propagated deadlines, guard-page/growable stack protection, client
 cancellation of an accepted Update,
 in-process panic containment, or a stable public API.
 Do not use it in production.
@@ -1304,6 +1309,30 @@ if result.status == .Canceled {
     _ = reason
 }
 ```
+
+For selective cancellation, create child or detached tokens and select one
+while starting operations:
+
+```odin
+root := workflow.cancellation_root(ctx)
+branch := workflow.cancellation_child(root)
+scope := workflow.cancellation_scope(ctx, branch)
+future := workflow.start_activity(ctx, "charge", order_id)
+workflow.cancellation_scope_end(&scope)
+
+_ = workflow.cancellation_request(branch, "order superseded")
+result := workflow.await_activity_result(ctx, future)
+```
+
+Tokens are borrowed run-local handles and must not survive Workflow eviction.
+Cancellation is downward-only, repeated requests preserve the first reason,
+and `cancellation_detached` creates a new root unrelated to Workflow
+cancellation. The older `detached_cancellation_scope` helper now creates and
+selects such a token as a compatibility convenience. Nested scopes must be
+ended in LIFO order, normally with `defer workflow.cancellation_scope_end(&scope)`.
+`cancellation_request` cancels associated operations but does not itself cancel
+the Workflow Execution; only a server-delivered root cancellation is
+acknowledged with `CancelWorkflowExecution`.
 
 Returning from the Workflow while root cancellation is pending acknowledges it
 with `CancelWorkflowExecution`; the return value is not completed successfully.

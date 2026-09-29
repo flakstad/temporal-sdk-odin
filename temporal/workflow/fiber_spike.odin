@@ -817,8 +817,26 @@ Json_Signal_Wait_Result :: struct(T: typeid) {
 }
 
 Cancellation_Scope :: struct {
+	instance:                      ^Fiber_Instance,
+	previous_token_id:             u32,
+	selected_token_id:             u32,
+	previous_detached_scope_depth: int,
+	active:                        bool,
+}
+
+// Cancellation_Token is a borrowed handle into one Workflow run. It must not
+// escape Workflow execution or be retained after cache eviction.
+Cancellation_Token :: struct {
 	instance: ^Fiber_Instance,
-	active:   bool,
+	id:       u32,
+}
+
+Fiber_Cancellation_Node :: struct {
+	id:                     u32,
+	parent_id:              u32,
+	linked_to_root:         bool,
+	cancellation_requested: bool,
+	reason:                 string,
 }
 
 // Query_Context exists only for the synchronous query callback. Its identity,
@@ -922,6 +940,7 @@ Fiber_Activity_Operation :: struct {
 	state:         Fiber_Operation_State,
 	cancellation_command_emitted: bool,
 	detached_from_root_cancellation: bool,
+	cancellation_token_id: u32,
 }
 
 Fiber_Named_Payload :: struct {
@@ -946,6 +965,7 @@ Fiber_Timer_Operation :: struct {
 	duration: time.Duration,
 	state:    Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
+	cancellation_token_id: u32,
 }
 
 Fiber_Child_Workflow_Operation :: struct {
@@ -967,6 +987,7 @@ Fiber_Child_Workflow_Operation :: struct {
 	completion_state: Child_Workflow_Completion_State,
 	start_failure_cause: Child_Workflow_Start_Failure_Cause,
 	detached_from_root_cancellation: bool,
+	cancellation_token_id: u32,
 }
 
 Fiber_External_Signal_Operation :: struct {
@@ -983,6 +1004,7 @@ Fiber_External_Signal_Operation :: struct {
 	cause:              Workflow_Signal_Failure_Cause,
 	state:              Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
+	cancellation_token_id: u32,
 }
 
 Fiber_External_Cancel_Operation :: struct {
@@ -1041,6 +1063,7 @@ Fiber_Signal_Routine :: struct {
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
+	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
@@ -1071,6 +1094,7 @@ Fiber_Update_Routine :: struct {
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
+	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
@@ -1125,6 +1149,9 @@ Fiber_Instance :: struct {
 	cancellation_reason:  string,
 	cancellation_requested: bool,
 	detached_scope_depth:   int,
+	cancellation_nodes: [dynamic]Fiber_Cancellation_Node,
+	current_cancellation_token_id: u32,
+	next_cancellation_token_id: u32,
 	terminal_command_sent: bool,
 	terminal_failure_requested: bool,
 	terminal_failure_message:   string,
@@ -1446,6 +1473,7 @@ Fiber_Execution_State :: struct {
 	waiting_timer_seq:    u32,
 	waiting_signal_name:  string,
 	detached_scope_depth: int,
+	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
@@ -1463,6 +1491,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 		waiting_timer_seq = instance.waiting_timer_seq,
 		waiting_signal_name = instance.waiting_signal_name,
 		detached_scope_depth = instance.detached_scope_depth,
+		current_cancellation_token_id = instance.current_cancellation_token_id,
 		unhandled_activity_seq = instance.unhandled_activity_seq,
 		unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq,
 		failure_message = instance.failure_message,
@@ -1480,6 +1509,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 	instance.waiting_timer_seq = state.waiting_timer_seq
 	instance.waiting_signal_name = state.waiting_signal_name
 	instance.detached_scope_depth = state.detached_scope_depth
+	instance.current_cancellation_token_id = state.current_cancellation_token_id
 	instance.unhandled_activity_seq = state.unhandled_activity_seq
 	instance.unhandled_child_workflow_seq = state.unhandled_child_workflow_seq
 	instance.failure_message = state.failure_message
@@ -1497,6 +1527,7 @@ signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execut
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
+		current_cancellation_token_id = routine.current_cancellation_token_id,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
 		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
@@ -1517,6 +1548,7 @@ capture_signal_routine_execution :: proc(
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
+	routine.current_cancellation_token_id = instance.current_cancellation_token_id
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
 	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
@@ -1597,6 +1629,7 @@ update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execut
 		waiting_timer_seq = routine.waiting_timer_seq,
 		waiting_signal_name = routine.waiting_signal_name,
 		detached_scope_depth = routine.detached_scope_depth,
+		current_cancellation_token_id = routine.current_cancellation_token_id,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
 		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
@@ -1617,6 +1650,7 @@ capture_update_routine_execution :: proc(
 	routine.waiting_timer_seq = instance.waiting_timer_seq
 	routine.waiting_signal_name = instance.waiting_signal_name
 	routine.detached_scope_depth = instance.detached_scope_depth
+	routine.current_cancellation_token_id = instance.current_cancellation_token_id
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
 	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
@@ -2095,6 +2129,13 @@ add_fiber_instance :: proc(
 	instance.query_handlers = make([dynamic]Fiber_Query_Handler)
 	instance.update_handlers = make([dynamic]Fiber_Update_Handler)
 	instance.update_routines = make([dynamic]^Fiber_Update_Routine)
+	instance.cancellation_nodes = make([dynamic]Fiber_Cancellation_Node)
+	instance.next_cancellation_token_id = 1
+	instance.current_cancellation_token_id = 1
+	append(
+		&instance.cancellation_nodes,
+		Fiber_Cancellation_Node{id = 1, linked_to_root = true},
+	)
 
 	info := &instance.info
 	info.namespace = instance.namespace
@@ -3721,14 +3762,83 @@ set_validated_update_handler_json :: proc(
 	)
 }
 
-apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
-	instance.cancellation_reason = reason
-	instance.cancellation_requested = true
+find_cancellation_node :: proc(
+	instance: ^Fiber_Instance,
+	token_id: u32,
+) -> (^Fiber_Cancellation_Node, bool) {
+	if instance == nil || token_id == 0 {
+		return nil, false
+	}
+	for index in 0..<len(instance.cancellation_nodes) {
+		if instance.cancellation_nodes[index].id == token_id {
+			return &instance.cancellation_nodes[index], true
+		}
+	}
+	return nil, false
+}
+
+current_cancellation_token_id :: proc(instance: ^Fiber_Instance) -> u32 {
+	if instance == nil {
+		return 0
+	}
+	if instance.current_cancellation_token_id == 0 {
+		return 1
+	}
+	return instance.current_cancellation_token_id
+}
+
+cancellation_token_is_requested_id :: proc(instance: ^Fiber_Instance, token_id: u32) -> bool {
+	node, found := find_cancellation_node(instance, token_id)
+	return found && node.cancellation_requested
+}
+
+cancellation_token_reason_id :: proc(instance: ^Fiber_Instance, token_id: u32) -> string {
+	node, found := find_cancellation_node(instance, token_id)
+	if !found || !node.cancellation_requested {
+		return ""
+	}
+	return node.reason
+}
+
+cancellation_token_linked_to_root :: proc(instance: ^Fiber_Instance, token_id: u32) -> bool {
+	node, found := find_cancellation_node(instance, token_id)
+	return found && node.linked_to_root
+}
+
+cancellation_token_descends_from :: proc(
+	instance: ^Fiber_Instance,
+	token_id, ancestor_id: u32,
+) -> bool {
+	if instance == nil || token_id == 0 || ancestor_id == 0 {
+		return false
+	}
+	candidate_id := token_id
+	for candidate_id != 0 {
+		if candidate_id == ancestor_id {
+			return true
+		}
+		node, found := find_cancellation_node(instance, candidate_id)
+		if !found || node.parent_id == candidate_id {
+			return false
+		}
+		candidate_id = node.parent_id
+	}
+	return false
+}
+
+apply_cancellation_to_operations :: proc(instance: ^Fiber_Instance) {
+	if instance == nil {
+		return
+	}
 	for index in 0..<len(instance.activities) {
 		operation := &instance.activities[index]
-		if operation.detached_from_root_cancellation {
+		if !cancellation_token_is_requested_id(instance, operation.cancellation_token_id) {
 			continue
 		}
+		operation.failure_message = cancellation_token_reason_id(
+			instance,
+			operation.cancellation_token_id,
+		)
 		switch operation.state {
 		case .Scheduled:
 			operation.state = .Canceled
@@ -3753,7 +3863,7 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	}
 	for index in 0..<len(instance.timers) {
 		operation := &instance.timers[index]
-		if operation.detached_from_root_cancellation {
+		if !cancellation_token_is_requested_id(instance, operation.cancellation_token_id) {
 			continue
 		}
 		switch operation.state {
@@ -3766,9 +3876,10 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	}
 	for index in 0..<len(instance.child_workflows) {
 		operation := &instance.child_workflows[index]
-		if operation.detached_from_root_cancellation {
+		if !cancellation_token_is_requested_id(instance, operation.cancellation_token_id) {
 			continue
 		}
+		reason := cancellation_token_reason_id(instance, operation.cancellation_token_id)
 		switch operation.command_state {
 		case .Scheduled:
 			operation.command_state = .Canceled
@@ -3797,9 +3908,10 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 	}
 	for index in 0..<len(instance.external_signals) {
 		operation := &instance.external_signals[index]
-		if operation.detached_from_root_cancellation {
+		if !cancellation_token_is_requested_id(instance, operation.cancellation_token_id) {
 			continue
 		}
+		reason := cancellation_token_reason_id(instance, operation.cancellation_token_id)
 		switch operation.state {
 		case .Scheduled:
 			operation.state = .Canceled
@@ -3810,6 +3922,41 @@ apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
 		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
 		}
 	}
+}
+
+request_cancellation_token :: proc(
+	instance: ^Fiber_Instance,
+	token_id: u32,
+	reason: string,
+) -> bool {
+	target, found := find_cancellation_node(instance, token_id)
+	if !found {
+		return false
+	}
+	if target.cancellation_requested {
+		return true
+	}
+	owned_reason, allocation_error := strings.clone(reason, instance.odin_context.allocator)
+	if allocation_error != nil {
+		return false
+	}
+	for index in 0..<len(instance.cancellation_nodes) {
+		node := &instance.cancellation_nodes[index]
+		if node.cancellation_requested ||
+		   !cancellation_token_descends_from(instance, node.id, token_id) {
+			continue
+		}
+		node.cancellation_requested = true
+		node.reason = owned_reason
+	}
+	apply_cancellation_to_operations(instance)
+	return true
+}
+
+apply_fiber_cancellation :: proc(instance: ^Fiber_Instance, reason: string) {
+	instance.cancellation_reason = reason
+	instance.cancellation_requested = true
+	_ = request_cancellation_token(instance, 1, reason)
 }
 
 is_cancellation_requested :: proc(ctx: ^Fiber_Context) -> bool {
@@ -4341,31 +4488,162 @@ deprecate_patch :: proc(ctx: ^Fiber_Context, patch_id: string) -> bool {
 	return patch_impl(ctx, patch_id, true)
 }
 
-// detached_cancellation_scope prevents operations created inside the scope from
-// inheriting root Workflow cancellation. It may be opened before cancellation
-// for work that must finish independently, or afterward for deterministic
-// cleanup. The scope is local to the currently executing main/handler fiber.
-detached_cancellation_scope :: proc(ctx: ^Fiber_Context) -> Cancellation_Scope {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+// cancellation_root returns the Workflow run's root token. The token is
+// borrowed and remains valid only until the run is evicted.
+cancellation_root :: proc(ctx: ^Fiber_Context) -> Cancellation_Token {
+	if ctx == nil || ctx.instance == nil {
 		return {}
 	}
-	ctx.instance.detached_scope_depth += 1
-	return {instance = ctx.instance, active = true}
+	return {instance = ctx.instance, id = 1}
+}
+
+// cancellation_current returns the token selected by the current main,
+// Signal-handler, or Update-handler fiber.
+cancellation_current :: proc(ctx: ^Fiber_Context) -> Cancellation_Token {
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	return {
+		instance = ctx.instance,
+		id = current_cancellation_token_id(ctx.instance),
+	}
+}
+
+new_cancellation_token :: proc(
+	instance: ^Fiber_Instance,
+	parent_id: u32,
+	linked_to_root: bool,
+) -> Cancellation_Token {
+	if instance == nil || instance.phase != .Ready {
+		return {}
+	}
+	root_linked := linked_to_root
+	if parent_id != 0 {
+		parent, found := find_cancellation_node(instance, parent_id)
+		if !found {
+			return {}
+		}
+		root_linked = parent.linked_to_root
+	}
+	instance.next_cancellation_token_id += 1
+	node := Fiber_Cancellation_Node{
+		id = instance.next_cancellation_token_id,
+		parent_id = parent_id,
+		linked_to_root = root_linked,
+	}
+	if parent_id != 0 {
+		parent, _ := find_cancellation_node(instance, parent_id)
+		if parent.cancellation_requested {
+			node.cancellation_requested = true
+			node.reason = parent.reason
+		}
+	}
+	append(&instance.cancellation_nodes, node)
+	return {instance = instance, id = node.id}
+}
+
+// cancellation_detached creates a token with no parent. Root Workflow
+// cancellation does not reach it.
+cancellation_detached :: proc(ctx: ^Fiber_Context) -> Cancellation_Token {
+	if ctx == nil {
+		return {}
+	}
+	return new_cancellation_token(ctx.instance, 0, false)
+}
+
+// cancellation_child creates a token that inherits cancellation from parent.
+// Cancellation flows downward only; canceling the child does not affect parent.
+cancellation_child :: proc(parent: Cancellation_Token) -> Cancellation_Token {
+	if parent.instance == nil || parent.id == 0 {
+		return {}
+	}
+	return new_cancellation_token(parent.instance, parent.id, false)
+}
+
+cancellation_requested :: proc(token: Cancellation_Token) -> bool {
+	return token.instance != nil &&
+	       cancellation_token_is_requested_id(token.instance, token.id)
+}
+
+cancellation_token_reason :: proc(token: Cancellation_Token) -> string {
+	if token.instance == nil {
+		return ""
+	}
+	return cancellation_token_reason_id(token.instance, token.id)
+}
+
+// cancellation_request is deterministic language-runtime state. It emits no
+// command by itself; linked pending operations emit their normal Core
+// cancellation commands at the end of the activation.
+cancellation_request :: proc(
+	token: Cancellation_Token,
+	reason := "Workflow cancellation token requested",
+) -> bool {
+	if token.instance == nil || token.id == 0 || token.instance.phase != .Ready {
+		return false
+	}
+	return request_cancellation_token(token.instance, token.id, reason)
+}
+
+// cancellation_scope selects a token for operations created by the current
+// fiber until cancellation_scope_end. Scopes must be ended in LIFO order.
+cancellation_scope :: proc(
+	ctx: ^Fiber_Context,
+	token: Cancellation_Token,
+) -> Cancellation_Scope {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   token.instance != ctx.instance || token.id == 0 {
+		return {}
+	}
+	_, found := find_cancellation_node(ctx.instance, token.id)
+	if !found {
+		return {}
+	}
+	previous_id := current_cancellation_token_id(ctx.instance)
+	previous_depth := ctx.instance.detached_scope_depth
+	ctx.instance.current_cancellation_token_id = token.id
+	ctx.instance.detached_scope_depth = token.id == 1 ||
+		cancellation_token_linked_to_root(ctx.instance, token.id) ? 0 : 1
+	return {
+		instance = ctx.instance,
+		previous_token_id = previous_id,
+		selected_token_id = token.id,
+		previous_detached_scope_depth = previous_depth,
+		active = true,
+	}
+}
+
+// detached_cancellation_scope is the compatibility convenience for creating
+// and immediately selecting a detached token.
+detached_cancellation_scope :: proc(ctx: ^Fiber_Context) -> Cancellation_Scope {
+	token := cancellation_detached(ctx)
+	return cancellation_scope(ctx, token)
 }
 
 cancellation_scope_end :: proc(scope: ^Cancellation_Scope) {
 	if scope == nil || !scope.active || scope.instance == nil {
 		return
 	}
-	if scope.instance.detached_scope_depth > 0 {
-		scope.instance.detached_scope_depth -= 1
+	// Preserve enough state for the caller to recover from an out-of-order end.
+	// A later LIFO call can still close this scope after the nested one ends.
+	if current_cancellation_token_id(scope.instance) != scope.selected_token_id {
+		return
 	}
+	scope.instance.current_cancellation_token_id = scope.previous_token_id
+	scope.instance.detached_scope_depth = scope.previous_detached_scope_depth
 	scope.active = false
 	scope.instance = nil
 }
 
 root_cancellation_applies :: proc(instance: ^Fiber_Instance) -> bool {
 	return instance != nil && instance.cancellation_requested && instance.detached_scope_depth == 0
+}
+
+current_cancellation_applies :: proc(instance: ^Fiber_Instance) -> bool {
+	return instance != nil && cancellation_token_is_requested_id(
+		instance,
+		current_cancellation_token_id(instance),
+	)
 }
 
 activity_options_error :: proc(activity_type: string, options: Activity_Options) -> string {
@@ -4511,7 +4789,7 @@ start_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
@@ -4520,6 +4798,11 @@ start_activity_owned :: proc(
 				seq = instance.next_activity_seq,
 				command_seq = instance.next_activity_seq,
 				state = .Canceled,
+				cancellation_token_id = current_cancellation_token_id(instance),
+				failure_message = cancellation_token_reason_id(
+					instance,
+					current_cancellation_token_id(instance),
+				),
 			},
 		)
 		return {seq = instance.next_activity_seq}
@@ -4569,7 +4852,11 @@ start_activity_owned :: proc(
 		options = owned_options,
 		inputs = owned_inputs,
 		state = .Scheduled,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+		detached_from_root_cancellation = !cancellation_token_linked_to_root(
+			instance,
+			current_cancellation_token_id(instance),
+		),
+		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.activities, operation)
 	return Activity_Future{seq = operation.seq}
@@ -4826,7 +5113,7 @@ start_local_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
@@ -4837,6 +5124,11 @@ start_local_activity_owned :: proc(
 				is_local = true,
 				attempt = 1,
 				state = .Canceled,
+				cancellation_token_id = current_cancellation_token_id(instance),
+				failure_message = cancellation_token_reason_id(
+					instance,
+					current_cancellation_token_id(instance),
+				),
 			},
 		)
 		return {seq = instance.next_activity_seq}
@@ -4880,7 +5172,11 @@ start_local_activity_owned :: proc(
 		local_options = owned_options,
 		inputs = owned_inputs,
 		state = .Scheduled,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+		detached_from_root_cancellation = !cancellation_token_linked_to_root(
+			instance,
+			current_cancellation_token_id(instance),
+		),
+		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.activities, operation)
 	return {seq = operation.seq}
@@ -5093,6 +5389,27 @@ start_child_workflow_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
+	if current_cancellation_applies(instance) {
+		activity_inputs_free(&owned_inputs)
+		instance.next_child_workflow_seq += 1
+		reason := cancellation_token_reason_id(
+			instance,
+			current_cancellation_token_id(instance),
+		)
+		append(
+			&instance.child_workflows,
+			Fiber_Child_Workflow_Operation{
+				seq = instance.next_child_workflow_seq,
+				command_state = .Canceled,
+				start_state = .Canceled,
+				completion_state = .Canceled,
+				cancellation_reason = reason,
+				failure_message = reason,
+				cancellation_token_id = current_cancellation_token_id(instance),
+			},
+		)
+		return {seq = instance.next_child_workflow_seq}
+	}
 	validation_error := child_workflow_options_error(workflow_type, options)
 	if len(validation_error) > 0 {
 		activity_inputs_free(&owned_inputs)
@@ -5117,7 +5434,11 @@ start_child_workflow_owned :: proc(
 		command_state = .Scheduled,
 		start_state = .Pending,
 		completion_state = .Pending,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+		detached_from_root_cancellation = !cancellation_token_linked_to_root(
+			instance,
+			current_cancellation_token_id(instance),
+		),
+		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.child_workflows, operation)
 	return {seq = operation.seq}
@@ -5507,7 +5828,11 @@ schedule_external_signal_and_await :: proc(
 	instance.next_external_signal_seq += 1
 	owned_operation.seq = instance.next_external_signal_seq
 	owned_operation.state = .Scheduled
-	owned_operation.detached_from_root_cancellation = instance.detached_scope_depth > 0
+	owned_operation.detached_from_root_cancellation = !cancellation_token_linked_to_root(
+		instance,
+		current_cancellation_token_id(instance),
+	)
+	owned_operation.cancellation_token_id = current_cancellation_token_id(instance)
 	append(&instance.external_signals, owned_operation)
 	instance.waiting_external_signal_seq = owned_operation.seq
 	instance.phase = .Waiting_External_Signal
@@ -5555,9 +5880,15 @@ signal_child_workflow_payloads_owned :: proc(
 		return {status = status, failure_message = start_result.failure_message}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		activity_inputs_free(&owned_inputs)
-		return {status = .Canceled, failure_message = instance.cancellation_reason}
+		return {
+			status = .Canceled,
+			failure_message = cancellation_token_reason_id(
+				instance,
+				current_cancellation_token_id(instance),
+			),
+		}
 	}
 	child, found := find_child_workflow_operation(instance, future.seq)
 	if !found || child.completion_state != .Pending {
@@ -5705,9 +6036,15 @@ signal_external_workflow_payloads_owned :: proc(
 		return {status = .Failed, failure_message = "invalid external Workflow signal"}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		activity_inputs_free(&owned_inputs)
-		return {status = .Canceled, failure_message = instance.cancellation_reason}
+		return {
+			status = .Canceled,
+			failure_message = cancellation_token_reason_id(
+				instance,
+				current_cancellation_token_id(instance),
+			),
+		}
 	}
 	owned_namespace, namespace_error := strings.clone(
 		execution.namespace,
@@ -6969,7 +7306,7 @@ await_signal_payloads_with_context :: proc(ctx: ^Fiber_Context, name: string) ->
 		return {}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		return {}
 	}
 	signal, found := find_buffered_signal(instance, name)
@@ -6991,7 +7328,7 @@ await_signal_payloads_with_context :: proc(ctx: ^Fiber_Context, name: string) ->
 		instance.phase = .Failed
 		return {}
 	}
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		return {}
 	}
 	signal, found = find_buffered_signal(instance, name)
@@ -7012,7 +7349,7 @@ await_signal_payload_with_context :: proc(ctx: ^Fiber_Context, name: string) -> 
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
 		return {metadata = result.metadata}
 	}
-	if root_cancellation_applies(ctx.instance) {
+	if current_cancellation_applies(ctx.instance) {
 		return {metadata = result.metadata}
 	}
 	if len(result.values) != 1 {
@@ -7041,7 +7378,7 @@ await_signal :: proc(ctx: ^Fiber_Context, name: string) -> string {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
 		return ""
 	}
-	if root_cancellation_applies(ctx.instance) {
+	if current_cancellation_applies(ctx.instance) {
 		return ""
 	}
 	value, decode_error := codec.decode_string(payload.data, codec.encoding(payload))
@@ -7058,7 +7395,7 @@ await_signal_json :: proc(ctx: ^Fiber_Context, name: string, $T: typeid) -> T {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
 		return value
 	}
-	if root_cancellation_applies(ctx.instance) {
+	if current_cancellation_applies(ctx.instance) {
 		return value
 	}
 	if codec.decode_json(payload, &value) != .None {
@@ -7078,7 +7415,7 @@ await_signal_json_with_context :: proc(
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase == .Failed {
 		return {metadata = result.metadata}
 	}
-	if root_cancellation_applies(ctx.instance) {
+	if current_cancellation_applies(ctx.instance) {
 		return {metadata = result.metadata}
 	}
 	if codec.decode_json(result.value, &value) != .None {
@@ -7104,7 +7441,7 @@ await_signal_payloads_or_timeout :: proc(
 		return {status = .Timed_Out}
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		return {status = .Canceled}
 	}
 	signal, signal_found := find_buffered_signal(instance, name)
@@ -7126,7 +7463,11 @@ await_signal_payloads_or_timeout :: proc(
 		seq = instance.next_timer_seq,
 		duration = duration,
 		state = .Scheduled,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+		detached_from_root_cancellation = !cancellation_token_linked_to_root(
+			instance,
+			current_cancellation_token_id(instance),
+		),
+		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.timers, operation)
 	instance.waiting_signal_name = waiting_name
@@ -7136,7 +7477,7 @@ await_signal_payloads_or_timeout :: proc(
 		instance.phase = .Failed
 		return {status = .Timed_Out}
 	}
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		return {status = .Canceled}
 	}
 
@@ -7233,7 +7574,7 @@ sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 		return
 	}
 	instance := ctx.instance
-	if root_cancellation_applies(instance) {
+	if current_cancellation_applies(instance) {
 		return
 	}
 	instance.next_timer_seq += 1
@@ -7241,7 +7582,11 @@ sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 		seq = instance.next_timer_seq,
 		duration = duration,
 		state = .Scheduled,
-		detached_from_root_cancellation = instance.detached_scope_depth > 0,
+		detached_from_root_cancellation = !cancellation_token_linked_to_root(
+			instance,
+			current_cancellation_token_id(instance),
+		),
+		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.timers, operation)
 	instance.waiting_timer_seq = operation.seq
@@ -8161,6 +8506,7 @@ start_signal_routine :: proc(
 	routine.invoke_payloads_with_context = handler.invoke_payloads_routine_with_context
 	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
+	routine.current_cancellation_token_id = 1
 	routine.phase = .Ready
 	create_result := fiber_raw.create(
 		&routine.fiber,
@@ -8231,7 +8577,10 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		return false
 	}
 	instance := routine.instance
-	cancellation_applies := instance.cancellation_requested && routine.detached_scope_depth == 0
+	cancellation_applies := cancellation_token_is_requested_id(
+		instance,
+		routine.current_cancellation_token_id,
+	)
 	switch routine.phase {
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
@@ -8493,6 +8842,7 @@ start_update_routine :: proc(
 	routine.unfinished_policy = handler.unfinished_policy
 	routine.ctx.instance = instance
 	routine.ctx.update_context = &routine.update_context
+	routine.current_cancellation_token_id = 1
 	routine.phase = .Ready
 	create_result := fiber_raw.create(
 		&routine.fiber,
@@ -8562,7 +8912,10 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		return false
 	}
 	instance := routine.instance
-	cancellation_applies := instance.cancellation_requested && routine.detached_scope_depth == 0
+	cancellation_applies := cancellation_token_is_requested_id(
+		instance,
+		routine.current_cancellation_token_id,
+	)
 	switch routine.phase {
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
@@ -9689,6 +10042,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 						duration = backoff_duration,
 						state = .Scheduled,
 						detached_from_root_cancellation = operation.detached_from_root_cancellation,
+						cancellation_token_id = operation.cancellation_token_id,
 					},
 				)
 				result.resolved_activity_seq = operation.command_seq
@@ -10122,15 +10476,15 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				operation.state == .Cancel_Requested || operation.state == .Canceled)
 		case .Waiting_Signal:
 			_, found := find_buffered_signal(instance, instance.waiting_signal_name)
-			should_resume = found || root_cancellation_applies(instance)
+			should_resume = found || current_cancellation_applies(instance)
 		case .Waiting_Signal_Or_Timer:
 			_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
 			timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
-			should_resume = signal_found || root_cancellation_applies(instance) ||
+			should_resume = signal_found || current_cancellation_applies(instance) ||
 				(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
 				timer.state == .Canceled))
 		case .Waiting_Handlers:
-			should_resume = !has_active_handlers(instance) || root_cancellation_applies(instance)
+			should_resume = !has_active_handlers(instance) || current_cancellation_applies(instance)
 		case .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
 		}
 		if should_resume {

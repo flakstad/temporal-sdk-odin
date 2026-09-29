@@ -824,6 +824,43 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		}
 		return "cleanup completed before cancellation"
 	}
+	if name == "cancellation-tree" {
+		root := workflow.cancellation_root(ctx)
+		child := workflow.cancellation_child(root)
+		sibling := workflow.cancellation_child(root)
+		detached := workflow.cancellation_detached(ctx)
+		if child.id == 0 || sibling.id == 0 || detached.id == 0 {
+			return "could not create cancellation tokens"
+		}
+		child_scope := workflow.cancellation_scope(ctx, child)
+		child_activity := workflow.start_activity(ctx, "hello", "cancel-activity")
+		workflow.cancellation_scope_end(&child_scope)
+		sibling_scope := workflow.cancellation_scope(ctx, sibling)
+		sibling_activity := workflow.start_activity(ctx, "hello", "Temporal-slow")
+		workflow.cancellation_scope_end(&sibling_scope)
+		detached_scope := workflow.cancellation_scope(ctx, detached)
+		detached_activity := workflow.start_activity(ctx, "hello", "detached")
+		workflow.cancellation_scope_end(&detached_scope)
+		_ = workflow.await_signal(ctx, "cancel-child-token")
+		if !workflow.cancellation_request(child, "child deadline") ||
+		   workflow.cancellation_requested(root) ||
+		   !workflow.cancellation_requested(child) ||
+		   workflow.cancellation_requested(sibling) ||
+		   workflow.cancellation_requested(detached) ||
+		   workflow.cancellation_token_reason(child) != "child deadline" {
+			return "cancellation token propagation mismatch"
+		}
+		child_result := workflow.await_activity_result(ctx, child_activity)
+		if child_result.status != .Canceled ||
+		   child_result.failure_message != "child deadline" {
+			return "child Activity was not canceled by its token"
+		}
+		if workflow.await_activity(ctx, sibling_activity) != "Hello Temporal-slow" ||
+		   workflow.await_activity(ctx, detached_activity) != "Hello detached" {
+			return "uncanceled cancellation-tree branch did not finish"
+		}
+		return "Cancellation tree completed"
+	}
 	if name == "failing-signal-handler" {
 		registered := workflow.set_signal_handler_payload(
 			ctx,
@@ -1668,6 +1705,7 @@ main :: proc() {
 	expect_cancel_timer := scenario == "cancel-timer"
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
+	expect_cancellation_tree := scenario == "cancellation-tree"
 	expect_update := scenario == "update"
 	expect_abandon_update := scenario == "abandon-update"
 	expect_cancel_update := scenario == "cancel-update"
@@ -1697,7 +1735,7 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
 			disable_activity_polling = expect_cancel_timer || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
@@ -1732,6 +1770,16 @@ main :: proc() {
 		} else if expect_cancel_cleanup {
 			if run_stats.activity_tasks_completed != 2 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
+				failed = true
+			}
+		} else if expect_cancellation_tree {
+			if run_stats.activity_tasks_completed != 3 ||
+			   run_stats.activity_cancellations_received != 1 ||
+			   run_stats.workflow_signals_received != 1 ||
+			   run_stats.workflow_cancellations_received != 0 ||
+			   run_stats.activity_cancellations_requested != 1 ||
+			   run_stats.timers_canceled != 0 {
+				fmt.eprintln("Workflow cancellation-token tree stats did not match")
 				failed = true
 			}
 		} else if expect_signal_handler_failure {
@@ -1848,6 +1896,8 @@ main :: proc() {
 		fmt.println("Activity heartbeat delivered cancellation and Odin acknowledged it")
 	} else if expect_cancel_cleanup {
 		fmt.println("Workflow ran detached cleanup before acknowledging cancellation")
+	} else if expect_cancellation_tree {
+		fmt.println("Workflow cancellation tokens propagated downward and isolated sibling branches")
 	} else if expect_typed_payload {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_multiple_activity_arguments {

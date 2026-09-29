@@ -3193,6 +3193,113 @@ fiber_preemptive_detached_activity_test_workflow :: proc(
 	return result.value
 }
 
+fiber_cancellation_tree_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	root := workflow.cancellation_root(ctx)
+	if root.id == 0 || workflow.cancellation_current(ctx).id != root.id {
+		return "missing root cancellation token"
+	}
+	child := workflow.cancellation_child(root)
+	grandchild := workflow.cancellation_child(child)
+	sibling := workflow.cancellation_child(root)
+	detached := workflow.cancellation_detached(ctx)
+	if child.id == 0 || grandchild.id == 0 || sibling.id == 0 || detached.id == 0 {
+		return "could not create cancellation tree"
+	}
+	outer_scope := workflow.cancellation_scope(ctx, child)
+	inner_scope := workflow.cancellation_scope(ctx, sibling)
+	workflow.cancellation_scope_end(&outer_scope)
+	if workflow.cancellation_current(ctx).id != sibling.id {
+		return "out-of-order scope end changed the current token"
+	}
+	workflow.cancellation_scope_end(&inner_scope)
+	if workflow.cancellation_current(ctx).id != child.id {
+		return "nested scope did not restore its parent selection"
+	}
+	workflow.cancellation_scope_end(&outer_scope)
+	if workflow.cancellation_current(ctx).id != root.id {
+		return "outer scope did not restore the root token"
+	}
+
+	root_activity := workflow.start_activity(ctx, "root", name)
+	child_scope := workflow.cancellation_scope(ctx, child)
+	child_activity := workflow.start_activity(ctx, "child", name)
+	workflow.cancellation_scope_end(&child_scope)
+	grandchild_scope := workflow.cancellation_scope(ctx, grandchild)
+	grandchild_activity := workflow.start_activity(ctx, "grandchild", name)
+	workflow.cancellation_scope_end(&grandchild_scope)
+	sibling_scope := workflow.cancellation_scope(ctx, sibling)
+	sibling_activity := workflow.start_activity(ctx, "sibling", name)
+	workflow.cancellation_scope_end(&sibling_scope)
+	detached_scope := workflow.cancellation_scope(ctx, detached)
+	detached_activity := workflow.start_activity(ctx, "detached", name)
+	workflow.cancellation_scope_end(&detached_scope)
+
+	_ = workflow.await_signal(ctx, "cancel-child")
+	if !workflow.cancellation_request(child, "child deadline") ||
+	   !workflow.cancellation_request(child, "ignored second reason") ||
+	   workflow.cancellation_requested(root) ||
+	   !workflow.cancellation_requested(child) ||
+	   !workflow.cancellation_requested(grandchild) ||
+	   workflow.cancellation_requested(sibling) ||
+	   workflow.cancellation_requested(detached) ||
+	   workflow.cancellation_token_reason(child) != "child deadline" ||
+	   workflow.cancellation_token_reason(grandchild) != "child deadline" {
+		return "cancellation propagation mismatch"
+	}
+
+	late_grandchild := workflow.cancellation_child(child)
+	if late_grandchild.id == 0 ||
+	   !workflow.cancellation_requested(late_grandchild) ||
+	   workflow.cancellation_token_reason(late_grandchild) != "child deadline" {
+		return "late child did not inherit cancellation"
+	}
+	child_scope = workflow.cancellation_scope(ctx, late_grandchild)
+	late_child_activity := workflow.start_activity(ctx, "late-child", name)
+	late_child_workflow := workflow.start_child_workflow_json(
+		ctx,
+		"late-child-workflow",
+		name,
+		{},
+	)
+	late_signal := workflow.signal_external_workflow_json(
+		ctx,
+		{
+			namespace = "default",
+			workflow_id = "late-external-workflow",
+		},
+		"late-signal",
+		name,
+	)
+	workflow.sleep(ctx, time.Hour)
+	workflow.cancellation_scope_end(&child_scope)
+	child_result := workflow.await_activity_result(ctx, child_activity)
+	grandchild_result := workflow.await_activity_result(ctx, grandchild_activity)
+	late_child_result := workflow.await_activity_result(ctx, late_child_activity)
+	late_workflow_result := workflow.await_child_workflow_result(ctx, late_child_workflow)
+	if child_result.status != .Canceled || grandchild_result.status != .Canceled ||
+	   late_child_result.status != .Canceled ||
+	   late_workflow_result.status != .Canceled || late_signal.status != .Canceled ||
+	   child_result.failure_message != "child deadline" ||
+	   grandchild_result.failure_message != "child deadline" ||
+	   late_child_result.failure_message != "child deadline" ||
+	   late_workflow_result.failure_message != "child deadline" ||
+	   late_signal.failure_message != "child deadline" {
+		return "canceled descendant result mismatch"
+	}
+
+	root_result := workflow.await_activity(ctx, root_activity)
+	sibling_result := workflow.await_activity(ctx, sibling_activity)
+	detached_result := workflow.await_activity(ctx, detached_activity)
+	if root_result != "root-ok" || sibling_result != "sibling-ok" ||
+	   detached_result != "detached-ok" {
+		return "uncanceled branch result mismatch"
+	}
+	return "cancellation-tree-ok"
+}
+
 Query_Test_State :: struct {
 	phase: string,
 	count: int,
@@ -4592,6 +4699,8 @@ Workflow_Completion_Inspection :: struct {
 	started_timer_seq:      u32,
 	started_timer_duration: time.Duration,
 	canceled_activity_seq:  u32,
+	canceled_activity_count: int,
+	canceled_activity_seqs: [4]u32,
 	canceled_workflow:      bool,
 	completed:        bool,
 	completion_result: []u8,
@@ -4814,6 +4923,11 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_Activity:
 				if variant.value != nil {
 					inspection.canceled_activity_seq = variant.value.seq
+					if inspection.canceled_activity_count < len(inspection.canceled_activity_seqs) {
+						inspection.canceled_activity_seqs[inspection.canceled_activity_count] =
+							variant.value.seq
+					}
+					inspection.canceled_activity_count += 1
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Workflow_Execution:
 				inspection.canceled_workflow = variant.value != nil
@@ -16005,6 +16119,231 @@ workflow_fiber_preemptive_detached_activity_survives_cancellation_and_replays ::
 	testing.expectf(t, processed.error.message == nil, "detached Activity replay failed: %s", string(processed.error.message))
 	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
 	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_cancellation_tokens_propagate_downward_and_replay :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_cancellation_tree_workflow",
+		"test-queue",
+		fiber_cancellation_tree_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_cancellation_tree_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-cancellation-tree-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "cancellation-tree initialization failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.scheduled_activity_count, 5)
+	testing.expect(t, processed.waiting_signal)
+	initial_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, initial_inspection.decoded)
+	testing.expect_value(t, initial_inspection.command_count, 5)
+	testing.expect_value(t, initial_inspection.scheduled_activity_seq, u32(5))
+	delete(initial_inspection.failure_message)
+	delete(initial_inspection.completion_result)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	signal_input, signal_error := codec.encode_json("cancel")
+	testing.expect(t, signal_error == .None)
+	defer codec.payload_free(&signal_input)
+	signal_input_proto := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(signal_input_proto.metadata)
+	defer delete(signal_input_proto.external_payloads)
+	cancel_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "cancel-child",
+	}
+	defer delete(cancel_signal.input)
+	append(&cancel_signal.input, signal_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "cancellation-tree request failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.requested_activity_cancellation_count, 2)
+	testing.expect_value(t, processed.waiting_activity_seq, u32(1))
+	cancel_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, cancel_inspection.decoded)
+	testing.expect_value(t, cancel_inspection.command_count, 2)
+	testing.expect_value(t, cancel_inspection.canceled_activity_count, 2)
+	testing.expect_value(t, cancel_inspection.canceled_activity_seqs[0], u32(2))
+	testing.expect_value(t, cancel_inspection.canceled_activity_seqs[1], u32(3))
+	delete(cancel_inspection.failure_message)
+	delete(cancel_inspection.completion_result)
+	cancel_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	root_output, root_output_error := codec.encode_json("root-ok")
+	sibling_output, sibling_output_error := codec.encode_json("sibling-ok")
+	detached_output, detached_output_error := codec.encode_json("detached-ok")
+	testing.expect(
+		t,
+		root_output_error == .None && sibling_output_error == .None &&
+		detached_output_error == .None,
+	)
+	defer codec.payload_free(&root_output)
+	defer codec.payload_free(&sibling_output)
+	defer codec.payload_free(&detached_output)
+	root_output_proto := proto.encode_payload(codec.payload_view(&root_output))
+	sibling_output_proto := proto.encode_payload(codec.payload_view(&sibling_output))
+	detached_output_proto := proto.encode_payload(codec.payload_view(&detached_output))
+	defer delete(root_output_proto.metadata)
+	defer delete(root_output_proto.external_payloads)
+	defer delete(sibling_output_proto.metadata)
+	defer delete(sibling_output_proto.external_payloads)
+	defer delete(detached_output_proto.metadata)
+	defer delete(detached_output_proto.external_payloads)
+	root_success := proto.Coresdk_Activity_Result_Success{result = &root_output_proto}
+	sibling_success := proto.Coresdk_Activity_Result_Success{result = &sibling_output_proto}
+	detached_success := proto.Coresdk_Activity_Result_Success{result = &detached_output_proto}
+	root_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &root_success,
+		},
+	}
+	sibling_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &sibling_success,
+		},
+	}
+	detached_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &detached_success,
+		},
+	}
+	resolve := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &root_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 13
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(1))
+	testing.expect_value(t, processed.waiting_activity_seq, u32(4))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	resolve.seq = 4
+	resolve.result = &sibling_resolution
+	activation.history_length = 18
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect_value(t, processed.resolved_activity_seq, u32(4))
+	testing.expect_value(t, processed.waiting_activity_seq, u32(5))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	resolve.seq = 5
+	resolve.result = &detached_resolution
+	activation.history_length = 23
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "cancellation-tree completion failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded && terminal_inspection.completed)
+	testing.expect_value(t, string(terminal_inspection.completion_result), `"cancellation-tree-ok"`)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil && processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 3
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "cancellation-tree replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(cancel_completion[:], processed.completion[:]))
+	delete(cancel_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
