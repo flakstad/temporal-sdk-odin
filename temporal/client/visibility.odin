@@ -284,10 +284,14 @@ decode_workflow_count :: proc(
 	return result, {}
 }
 
-list_workflows :: proc(
-	client: ^Client,
-	options := List_Workflows_Options{},
+list_workflows_terminal :: proc(
+	input: ^Client_List_Workflows_Input,
 ) -> (Workflow_List_Page, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow list interceptor input is missing")
+	}
+	client := input.client
+	options := input.options
 	if client == nil || client.connection == nil || client.runtime == nil || len(client.namespace) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -315,7 +319,21 @@ list_workflows :: proc(
 	return decode_workflow_list_page(rpc_result.protobuf)
 }
 
-count_workflows :: proc(client: ^Client, query := "") -> (Workflow_Count, Error) {
+list_workflows :: proc(
+	client: ^Client,
+	options := List_Workflows_Options{},
+) -> (Workflow_List_Page, Error) {
+	input := Client_List_Workflows_Input{client = client, options = options}
+	state := Client_Interceptor_State{client = client}
+	return client_list_workflows_chain(&state, &input)
+}
+
+count_workflows_terminal :: proc(input: ^Client_Count_Workflows_Input) -> (Workflow_Count, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow count interceptor input is missing")
+	}
+	client := input.client
+	query := input.query
 	if client == nil || client.connection == nil || client.runtime == nil || len(client.namespace) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -336,4 +354,10 @@ count_workflows :: proc(client: ^Client, query := "") -> (Workflow_Count, Error)
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_workflow_count(rpc_result.protobuf)
+}
+
+count_workflows :: proc(client: ^Client, query := "") -> (Workflow_Count, Error) {
+	input := Client_Count_Workflows_Input{client = client, query = query}
+	state := Client_Interceptor_State{client = client}
+	return client_count_workflows_chain(&state, &input)
 }

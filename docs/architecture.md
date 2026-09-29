@@ -1532,15 +1532,17 @@ Signal-With-Start carries both user Payloads and mutable start options, but only
 one isolated Header builder: the pinned Service RPC assigns that map to the
 Signal event and cannot represent an independent Workflow-start Header.
 Cancellation provides mutable reason/request-ID fields, while termination
-provides a mutable reason and optional borrowed Payload view. Their terminal
-continuations encode only after the complete chain has run. The Client owns a
-copy of interceptor records, but callback `user_data` is borrowed. A 500-case
-property checks nested Signal/Signal-With-Start/result/cancel/terminate chains
-and arbitrary short-circuit depth. `get_result` surrounds the whole logical
+provides a mutable reason and optional borrowed Payload view. Visibility list
+and count expose mutable queries (plus list pagination options) and preserve
+the existing allocator-owned result contract through typed continuations.
+Their terminal continuations encode only after the complete chain has run. The
+Client owns a copy of interceptor records, but callback `user_data` is borrowed.
+A 500-case property checks seven nested operation families and arbitrary
+short-circuit depth. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. Live start, Signal-With-Start, Signal, Query,
-result, Update, cancellation, and termination paths cross Service/Core.
-Schedule and Visibility operations and connection mutation are not yet
+result, Update, cancellation, termination, and Visibility list/count paths
+cross Service/Core. Schedule operations and connection mutation are not yet
 intercepted.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.

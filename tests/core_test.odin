@@ -31,6 +31,8 @@ Client_Interceptor_Test_State :: struct {
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
 	get_result_input_seen:   bool,
+	list_query_seen:         bool,
+	count_query_seen:        bool,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -188,6 +190,58 @@ client_interceptor_test_terminate :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result
+}
+
+client_interceptor_test_list_workflows :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_List_Workflows_Input,
+	next: temporal_client.Client_List_Workflows_Next,
+) -> (temporal_client.Workflow_List_Page, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.query = `WorkflowType = "intercepted"`
+		input.options.page_size = 17
+	} else {
+		node.state.list_query_seen = input.options.query == `WorkflowType = "intercepted"` &&
+		                             input.options.page_size == 17
+	}
+	result: temporal_client.Workflow_List_Page
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Workflow list short circuit")
+	} else {
+		result, result_error = temporal_client.client_list_workflows_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_count_workflows :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Count_Workflows_Input,
+	next: temporal_client.Client_Count_Workflows_Next,
+) -> (temporal_client.Workflow_Count, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.query = `ExecutionStatus = "Running"`
+	} else {
+		node.state.count_query_seen = input.query == `ExecutionStatus = "Running"`
+	}
+	result: temporal_client.Workflow_Count
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Workflow count short circuit")
+	} else {
+		result, result_error = temporal_client.client_count_workflows_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
 }
 
 @(test)
@@ -6949,6 +7003,57 @@ client_signal_interceptors_nest_and_isolate_working_headers :: proc(t: ^testing.
 	// builder remains unchanged and can be reused safely.
 	testing.expect_value(t, len(headers.entries), 1)
 	testing.expect_value(t, headers.entries[0].key, "caller")
+}
+
+@(test)
+client_visibility_interceptors_nest_and_propagate_queries :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	client := temporal_client.Client{
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			list_workflows = client_interceptor_test_list_workflows,
+			count_workflows = client_interceptor_test_count_workflows,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			list_workflows = client_interceptor_test_list_workflows,
+			count_workflows = client_interceptor_test_count_workflows,
+		},
+	)
+
+	page, list_error := temporal_client.list_workflows(
+		&client,
+		{page_size = 3, query = `WorkflowType = "caller"`},
+	)
+	temporal_client.workflow_list_page_free(&page)
+	testing.expect_value(t, list_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(list_error.message), "Workflow list short circuit")
+	temporal_client.error_free(&list_error)
+	testing.expect(t, state.list_query_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+
+	state.count = 0
+	count, count_error := temporal_client.count_workflows(&client, `WorkflowType = "caller"`)
+	temporal_client.workflow_count_free(&count)
+	testing.expect_value(t, count_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(count_error.message), "Workflow count short circuit")
+	temporal_client.error_free(&count_error)
+	testing.expect(t, state.count_query_seen)
+	testing.expect_value(t, state.count, 4)
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
 }
 
 @(test)

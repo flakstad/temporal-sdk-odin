@@ -193,6 +193,48 @@ Client_Terminate_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Terminate_Workflow_Next,
 ) -> Error
 
+Client_List_Workflows_Input :: struct {
+	client:  ^Client,
+	options: List_Workflows_Options,
+}
+
+Client_List_Workflows_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_List_Workflows_Input,
+) -> (Workflow_List_Page, Error)
+
+Client_List_Workflows_Next :: struct {
+	data:   rawptr,
+	invoke: Client_List_Workflows_Next_Proc,
+}
+
+Client_List_Workflows_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_List_Workflows_Input,
+	next: Client_List_Workflows_Next,
+) -> (Workflow_List_Page, Error)
+
+Client_Count_Workflows_Input :: struct {
+	client: ^Client,
+	query:  string,
+}
+
+Client_Count_Workflows_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Count_Workflows_Input,
+) -> (Workflow_Count, Error)
+
+Client_Count_Workflows_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Count_Workflows_Next_Proc,
+}
+
+Client_Count_Workflows_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Count_Workflows_Input,
+	next: Client_Count_Workflows_Next,
+) -> (Workflow_Count, Error)
+
 Client_Interceptor :: struct {
 	user_data:          rawptr,
 	start_workflow:     Client_Start_Workflow_Interceptor_Proc,
@@ -203,6 +245,8 @@ Client_Interceptor :: struct {
 	start_update:       Client_Start_Update_Interceptor_Proc,
 	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
+	list_workflows:     Client_List_Workflows_Interceptor_Proc,
+	count_workflows:    Client_Count_Workflows_Interceptor_Proc,
 }
 
 client_start_workflow_next :: proc(
@@ -281,6 +325,26 @@ client_terminate_workflow_next :: proc(
 ) -> Error {
 	if next.invoke == nil || input == nil {
 		return error_from_string(.Invalid_Argument, "invalid terminate Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_list_workflows_next :: proc(
+	next: Client_List_Workflows_Next,
+	input: ^Client_List_Workflows_Input,
+) -> (Workflow_List_Page, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow list interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_count_workflows_next :: proc(
+	next: Client_Count_Workflows_Next,
+	input: ^Client_Count_Workflows_Input,
+) -> (Workflow_Count, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow count interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -500,4 +564,46 @@ client_terminate_workflow_chain :: proc(
 		)
 	}
 	return terminate_workflow_terminal(input)
+}
+
+client_list_workflows_chain :: proc(
+	data: rawptr,
+	input: ^Client_List_Workflows_Input,
+) -> (Workflow_List_Page, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow list interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.list_workflows == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.list_workflows(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_list_workflows_chain},
+		)
+	}
+	return list_workflows_terminal(input)
+}
+
+client_count_workflows_chain :: proc(
+	data: rawptr,
+	input: ^Client_Count_Workflows_Input,
+) -> (Workflow_Count, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow count interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.count_workflows == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.count_workflows(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_count_workflows_chain},
+		)
+	}
+	return count_workflows_terminal(input)
 }

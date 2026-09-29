@@ -139,6 +139,45 @@ get_result_interceptor :: proc(
 	return result, result_error
 }
 
+list_workflows_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_List_Workflows_Input,
+	next: temporal_client.Client_List_Workflows_Next,
+) -> (temporal_client.Workflow_List_Page, temporal_client.Error) {
+	if len(input.options.query) == 0 {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"Visibility list interceptor expected a query",
+		)
+	}
+	input.options.page_size = 2
+	fmt.println("Client Visibility list interceptor entered before Core")
+	page, list_error := temporal_client.client_list_workflows_next(next, input)
+	if list_error.message == nil {
+		fmt.println("Client Visibility list interceptor exited after Core")
+	}
+	return page, list_error
+}
+
+count_workflows_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Count_Workflows_Input,
+	next: temporal_client.Client_Count_Workflows_Next,
+) -> (temporal_client.Workflow_Count, temporal_client.Error) {
+	if len(input.query) == 0 {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"Visibility count interceptor expected a query",
+		)
+	}
+	fmt.println("Client Visibility count interceptor entered before Core")
+	result, count_error := temporal_client.client_count_workflows_next(next, input)
+	if count_error.message == nil {
+		fmt.println("Client Visibility count interceptor exited after Core")
+	}
+	return result, count_error
+}
+
 run :: proc() -> int {
 	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
 		key = "x-odin-sdk",
@@ -171,6 +210,8 @@ run :: proc() -> int {
 		query_workflow = query_workflow_interceptor,
 		start_update = start_update_interceptor,
 		get_result = get_result_interceptor,
+		list_workflows = list_workflows_interceptor,
+		count_workflows = count_workflows_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",

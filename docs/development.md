@@ -1433,9 +1433,11 @@ metadata, external details, headers, and deterministic request bytes.
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start,
-cancellation, termination, and Workflow result waiting. Each operation has a
-dedicated mutable input and result-bearing `next`; no result passes through an
-untyped pointer.
+cancellation, termination, Workflow result waiting, and Visibility list/count.
+Each operation has a dedicated mutable input and result-bearing `next`; no
+result passes through an untyped pointer. Visibility interceptors may replace
+the query and list pagination options, and return allocator-owned list/count
+results under the same free-procedure contract as the public calls.
 Signal-With-Start exposes both user Payloads, mutable start options, and the
 single Header map the upstream RPC assigns to its Signal event. Cancellation
 exposes its reason and request ID. Termination exposes its reason plus an
@@ -1461,7 +1463,10 @@ Client calls may run concurrently; mutable interceptor user data therefore needs
 application-level synchronization.
 
 The unit and 500-case PBT tests cover nested order, short-circuiting, header
-isolation, Signal-With-Start, and mutable cancellation/termination inputs.
+isolation, Signal-With-Start, mutable cancellation/termination inputs, and
+Visibility list/count query mutation. The `workflow-properties` live scenario
+wraps both Visibility RPCs and requires the continuations to unwind after Core
+returns owned results.
 `client_start` injects start and Signal-With-Start headers solely through its
 interceptors; `client_control` does the same for Signal, Query, and Update. The
 full dev-server suite requires those headers to arrive in Workflow code,

@@ -124,10 +124,49 @@ client_interceptor_property_terminate :: proc(
 	return result
 }
 
+client_interceptor_property_list_workflows :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_List_Workflows_Input,
+	next: temporal_client.Client_List_Workflows_Next,
+) -> (page: temporal_client.Workflow_List_Page, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	input.options.query = "generated list query"
+	input.options.page_size = i32(node.id)
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		page, error = temporal_client.client_list_workflows_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_count_workflows :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Count_Workflows_Input,
+	next: temporal_client.Client_Count_Workflows_Next,
+) -> (result: temporal_client.Workflow_Count, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	input.query = "generated count query"
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = temporal_client.client_count_workflows_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 4))
+	operation := pbt.draw(t, pbt.int_range(0, 6))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -136,6 +175,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 2, 12.0, "Workflow termination")
 	pbt.cover(t, operation == 3, 12.0, "Signal-With-Start")
 	pbt.cover(t, operation == 4, 12.0, "Workflow result")
+	pbt.cover(t, operation == 5, 10.0, "Workflow Visibility list")
+	pbt.cover(t, operation == 6, 10.0, "Workflow Visibility count")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -163,6 +204,10 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.signal_with_start = client_interceptor_property_signal_with_start
 		case 4:
 			interceptor.get_result = client_interceptor_property_get_result
+		case 5:
+			interceptor.list_workflows = client_interceptor_property_list_workflows
+		case 6:
+			interceptor.count_workflows = client_interceptor_property_count_workflows
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -210,6 +255,17 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		result: codec.Payload
 		result, operation_error = temporal_client.get_result_payload(&handle)
 		codec.payload_free(&result)
+	case 5:
+		page: temporal_client.Workflow_List_Page
+		page, operation_error = temporal_client.list_workflows(
+			&client,
+			{page_size = 100, query = "caller list query"},
+		)
+		temporal_client.workflow_list_page_free(&page)
+	case 6:
+		count: temporal_client.Workflow_Count
+		count, operation_error = temporal_client.count_workflows(&client, "caller count query")
+		temporal_client.workflow_count_free(&count)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {
