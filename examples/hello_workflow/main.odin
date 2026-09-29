@@ -824,6 +824,24 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		}
 		return "cleanup completed before cancellation"
 	}
+	if name == "failing-signal-handler" {
+		registered := workflow.set_signal_handler_payload(
+			ctx,
+			"fail_signal",
+			ctx,
+			proc(_: rawptr, _: codec.Payload_View) -> workflow.Payload_Result {
+				return workflow.payload_fail(
+					"intentional Signal handler failure",
+					"IntentionalSignalHandlerFailure",
+				)
+			},
+		)
+		if !registered {
+			return "could not register failing Signal handler"
+		}
+		_ = workflow.await_signal(ctx, "never")
+		return "failing Signal handler unexpectedly resumed main"
+	}
 
 	query_state := Greeting_Query_State{phase = "waiting-for-approval", name = name}
 	if !workflow.set_query_handler_json_with_context(
@@ -1654,6 +1672,7 @@ main :: proc() {
 	expect_abandon_update := scenario == "abandon-update"
 	expect_cancel_update := scenario == "cancel-update"
 	expect_signal_handler := scenario == "signal-handler"
+	expect_signal_handler_failure := scenario == "signal-handler-failure"
 	expect_query := scenario == "query" || expect_update || expect_signal_handler
 	expect_typed_payload := scenario == "typed-payload"
 	expect_local_activity := scenario == "local-activity"
@@ -1678,9 +1697,9 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1713,6 +1732,15 @@ main :: proc() {
 		} else if expect_cancel_cleanup {
 			if run_stats.activity_tasks_completed != 2 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
 				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
+				failed = true
+			}
+		} else if expect_signal_handler_failure {
+			if run_stats.activity_tasks_completed != 0 ||
+			   run_stats.workflow_activation_failures < 1 ||
+			   run_stats.workflow_signal_handlers_started < 1 ||
+			   run_stats.workflow_signal_handlers_completed != 0 ||
+			   run_stats.timers_canceled != 0 {
+				fmt.eprintln("Signal-handler failure did not survive Core eviction and Worker recovery")
 				failed = true
 			}
 		} else if expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments {
@@ -1860,6 +1888,8 @@ main :: proc() {
 		fmt.println("detached Workflow Update completed before cancellation acknowledgement")
 	} else if expect_signal_handler {
 		fmt.println("buffered asynchronous Workflow Signal handler registered late, awaited an Activity, and replayed")
+	} else if expect_signal_handler_failure {
+		fmt.println("Signal handler failure triggered Core eviction and the Worker recovered on a fresh Workflow stack")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

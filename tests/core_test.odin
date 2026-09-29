@@ -9871,6 +9871,291 @@ worker_fails_unknown_workflow_activation_without_losing_poll_loop_state :: proc(
 }
 
 @(test)
+worker_evicts_failed_signal_handler_before_fresh_stack_retry :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		task_queue = "test-queue",
+		workflow_registrations = make([dynamic]worker.Workflow_Registration),
+		workflow_runs = make([dynamic]worker.Workflow_Run),
+		rejected_workflow_runs = make([dynamic]worker.Rejected_Workflow_Run),
+	}
+	defer {
+		for &registration in sdk_worker.workflow_registrations {
+			workflow.fiber_runtime_close(&registration.runtime)
+		}
+		for workflow_run in sdk_worker.workflow_runs {
+			delete(workflow_run.run_id)
+		}
+		for rejected_run in sdk_worker.rejected_workflow_runs {
+			delete(rejected_run.run_id)
+		}
+		delete(sdk_worker.workflow_registrations)
+		delete(sdk_worker.workflow_runs)
+		delete(sdk_worker.rejected_workflow_runs)
+	}
+
+	failing_runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&failing_runtime,
+		"failing_signal_workflow",
+		"test-queue",
+		fiber_late_failing_signal_handler_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	healthy_runtime := workflow.Fiber_Runtime{}
+	init_error = workflow.fiber_runtime_init(
+		&healthy_runtime,
+		"healthy_workflow",
+		"test-queue",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	append(
+		&sdk_worker.workflow_registrations,
+		worker.Workflow_Registration{name = "failing_signal_workflow", runtime = failing_runtime},
+		worker.Workflow_Registration{name = "healthy_workflow", runtime = healthy_runtime},
+	)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "failing_signal_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "failed-signal-handler-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error := worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil && processed.waiting_signal)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
+	testing.expect(
+		t,
+		workflow.fiber_runtime_has_run(
+			&sdk_worker.workflow_registrations[0].runtime,
+			activation.run_id,
+		),
+	)
+	initial_completion := processed.completion
+	processed.completion = nil
+	workflow.error_free(&processed.error)
+	defer delete(initial_completion)
+
+	failing_input, failing_input_error := codec.encode_json("fail")
+	register_input, register_input_error := codec.encode_json("register")
+	testing.expect(t, failing_input_error == .None && register_input_error == .None)
+	defer codec.payload_free(&failing_input)
+	defer codec.payload_free(&register_input)
+	failing_input_proto := proto.encode_payload(codec.payload_view(&failing_input))
+	register_input_proto := proto.encode_payload(codec.payload_view(&register_input))
+	defer delete(failing_input_proto.metadata)
+	defer delete(failing_input_proto.external_payloads)
+	defer delete(register_input_proto.metadata)
+	defer delete(register_input_proto.external_payloads)
+	failing_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "fail_late"}
+	defer delete(failing_signal.input)
+	append(&failing_signal.input, failing_input_proto)
+	register_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "register_handler",
+	}
+	defer delete(register_signal.input)
+	append(&register_signal.input, register_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &failing_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.activation_failed)
+	testing.expect_value(t, string(processed.error.message), "late Signal handler failed")
+	testing.expect_value(t, processed.signal_handlers_started, 1)
+	testing.expect_value(t, processed.signal_handlers_completed, 0)
+	failed_completion := processed.completion
+	processed.completion = nil
+	workflow.error_free(&processed.error)
+	defer delete(failed_completion)
+	// Core has accepted the failed completion but owns the eviction decision.
+	// Odin retains the failed instance only until RemoveFromCache arrives.
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
+	testing.expect(
+		t,
+		workflow.fiber_runtime_has_run(
+			&sdk_worker.workflow_registrations[0].runtime,
+			activation.run_id,
+		),
+	)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{
+		message = "Workflow activation completion failed",
+		reason = .LANG_FAIL,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil && processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 0)
+	testing.expect(
+		t,
+		!workflow.fiber_runtime_has_run(
+			&sdk_worker.workflow_registrations[0].runtime,
+			activation.run_id,
+		),
+	)
+
+	// A Core retry starts from history on a newly allocated Odin fiber. The
+	// same activation sequence must reproduce byte-identical completions.
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 3
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil && processed.is_replaying)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 1)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &failing_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.activation_failed && processed.is_replaying)
+	testing.expect(t, bytes.equal(failed_completion[:], processed.completion[:]))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil && processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, len(sdk_worker.workflow_runs), 0)
+
+	// A different run must still route and complete through the same Worker.
+	healthy_initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "healthy_workflow",
+	}
+	defer delete(healthy_initialize.arguments)
+	append(&healthy_initialize.arguments, workflow_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.run_id = "healthy-after-handler-failure"
+	activation.history_length = 3
+	activation.is_replaying = false
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &healthy_initialize,
+			},
+		},
+	)
+	encoded = proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, dispatch_error = worker.process_workflow_activation(&sdk_worker, encoded[:])
+	delete(encoded)
+	testing.expect(t, dispatch_error.message == nil)
+	worker.error_free(&dispatch_error)
+	testing.expect(t, processed.error.message == nil && processed.completed)
+	healthy_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, healthy_inspection.decoded && !healthy_inspection.failed)
+	testing.expect_value(t, string(healthy_inspection.completion_result), `"first"`)
+	delete(healthy_inspection.completion_result)
+	delete(healthy_inspection.failure_message)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
 activity_task_protobuf_round_trip :: proc(t: ^testing.T) {
 	payload := proto.Temporal_Api_Common_V1_Payload{
 		data = transmute([]u8)string(`"Odin"`),

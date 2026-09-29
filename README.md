@@ -68,6 +68,11 @@ before their handler is registered are retained and synchronously dispatched in
 arrival order when registration occurs; unmatched older names do not block
 them. Offline replay, 500 generated traces, and the live dev-server path cover
 late registration.
+Signal-handler failures are now isolated as retryable Workflow Task failures:
+Core evicts the failed Odin fiber, replay reconstructs the execution on a fresh
+stack with byte-identical failure output, and the Worker continues serving
+other executions. The CLI-devserver suite verifies the failed history event,
+eviction, replay, and same-process recovery.
 Child Workflows now have a vertical start/result/failure/cancellation path:
 Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and completion
 resolutions, decodes typed JSON results and structured Child Workflow failures,

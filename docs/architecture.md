@@ -1659,8 +1659,22 @@ order, and replay bytes. The live CLI-devserver test sends the asynchronous
 Signal before its handler exists, then lets the Workflow register it, await an
 Activity, query the mutated state, and replay after Core eviction.
 
-Remaining Signal risks are handler-failure retry/eviction stress, concurrent
-shared-state policy, and timer/cancellation coverage for Signal routines.
+Handler failure now has an explicit Core/language lifecycle test. A handler
+failure produces a failed `WorkflowActivationCompletion` with
+`WorkflowWorkerUnhandledFailure`; it does not directly fail the Workflow
+Execution. Pinned Core
+[`failed_completion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core/src/worker/workflow/managed_run.rs#L598-L680)
+requests language cache eviction and reports the Workflow Task failure only for
+the first task attempt. Odin keeps the failed fiber routable only until the
+corresponding `RemoveFromCache(LANG_FAIL)`, then destroys it. The retry rebuilds
+the run from history on a fresh stack and reproduces the same failed completion
+bytes. The CLI-devserver acceptance case observes the Workflow Task failure in
+server history, observes eviction plus replay in Odin, terminates the
+intentionally retrying execution, and proves that the same Worker can complete
+a different Workflow afterward.
+
+Remaining Signal risks are concurrent shared-state policy and timer/cancellation
+coverage for Signal routines.
 
 ### Durable signal/timer race
 
@@ -2139,8 +2153,10 @@ deterministic handler-before-main ordering, shared handler draining,
 warn/abandon close policy, public Client delivery, Query-observed state mutation,
 Core eviction, and fresh-stack replay are tested. Dynamic registration and
 late buffered dispatch are now covered offline, generatively, and through the
-live server. Handler-failure retry/eviction stress remains before this API can
-be called stable.
+live server. Handler failure is also covered through failed completion, Core
+`LANG_FAIL` eviction, fresh-stack replay, server history, and continued Worker
+service. Shared-state policy and timer/cancellation behavior remain before this
+API can be called stable.
 
 Update cancellation through root Workflow cancellation is now proven while a
 handler awaits an Activity: the detached operation survives, explicit draining

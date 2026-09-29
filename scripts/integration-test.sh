@@ -7,6 +7,7 @@ worker_pid=""
 workflow_cli_pid=""
 slow_update_pid=""
 unknown_workflow_id=""
+signal_failure_workflow_id=""
 nondeterminism_workflow_id=""
 deployment_name=""
 deployment_build_id=""
@@ -24,6 +25,13 @@ cleanup() {
     temporal workflow terminate \
       --workflow-id "$unknown_workflow_id" \
       --reason "Temporal Odin SDK integration cleanup" \
+      --command-timeout 2s \
+      --output none >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$signal_failure_workflow_id" ]]; then
+    temporal workflow terminate \
+      --workflow-id "$signal_failure_workflow_id" \
+      --reason "Temporal Odin SDK Signal handler failure cleanup" \
       --command-timeout 2s \
       --output none >/dev/null 2>&1 || true
   fi
@@ -1195,6 +1203,115 @@ grep -Eq "replay=false .*signal=true signal_handlers_started=0 signal_handlers_c
 grep -q "buffered asynchronous Workflow Signal handler registered late, awaited an Activity, and replayed" "$worker_log"
 grep -q "Workflow Signal interceptor entered before handler" "$worker_log"
 grep -q "Workflow Signal interceptor exited after handler" "$worker_log"
+
+TEMPORAL_ODIN_SCENARIO=signal-handler-failure \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal-handler-failure Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+signal_failure_workflow_id="odin-sdk-signal-handler-failure-$$-$(date +%s)"
+temporal workflow start \
+  --workflow-id "$signal_failure_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"failing-signal-handler"' \
+  --command-timeout 10s \
+  --output none
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Failing Signal-handler Workflow did not reach its await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_failure_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=fail_signal \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=fail \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+for _ in {1..100}; do
+  temporal workflow show \
+    --workflow-id "$signal_failure_workflow_id" \
+    --command-timeout 2s \
+    --output json >"$unknown_history_file" 2>/dev/null || true
+  signal_handler_failure_attempts="$(grep -c 'activation_failed=true error="intentional Signal handler failure"' "$worker_log" 2>/dev/null || true)"
+  if [[ "$signal_handler_failure_attempts" -ge 2 ]] && \
+     grep -Eq 'replay=true .*waiting_signal=true' "$worker_log" 2>/dev/null && \
+     grep -q 'activation_failed=false .*evicted=true' "$worker_log" 2>/dev/null && \
+     grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal handler failure terminated the Odin Worker" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+grep -q 'activation_failed=true error="intentional Signal handler failure"' "$worker_log"
+grep -q 'activation_failed=false .*evicted=true' "$worker_log"
+grep -q 'EVENT_TYPE_WORKFLOW_TASK_FAILED' "$unknown_history_file"
+signal_handler_failure_events="$(grep -c '"eventType": "EVENT_TYPE_WORKFLOW_TASK_FAILED"' "$unknown_history_file" || true)"
+if [[ "$signal_handler_failure_events" -ne 1 ]]; then
+  echo "Expected Core to report exactly one Workflow Task failure, got $signal_handler_failure_events" >&2
+  exit 1
+fi
+kill -0 "$worker_pid"
+
+signal_failure_terminate_output="$(TEMPORAL_CLIENT_ACTION=terminate \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_failure_workflow_id" \
+  TEMPORAL_CLIENT_REASON="Signal handler failure test completed" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh")"
+echo "$signal_failure_terminate_output"
+grep -q 'Client terminate interceptor entered reason="Signal handler failure test completed" has_details=false' <<<"$signal_failure_terminate_output"
+grep -q 'Client terminate interceptor exited after Core' <<<"$signal_failure_terminate_output"
+signal_failure_workflow_id=""
+
+signal_failure_recovery_workflow_id="odin-sdk-signal-handler-recovery-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$signal_failure_recovery_workflow_id" \
+  --type odin_patch_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"Recovered"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+signal_failure_recovery_output="$(<"$workflow_output_file")"
+echo "$signal_failure_recovery_output"
+grep -q '"status": "COMPLETED"' <<<"$signal_failure_recovery_output"
+grep -q '"result": "Patched Recovered ' <<<"$signal_failure_recovery_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'activation_failed=true error="intentional Signal handler failure"' "$worker_log"
+grep -Eq 'replay=true .*waiting_signal=true' "$worker_log"
+signal_handler_failure_attempts="$(grep -c 'activation_failed=true error="intentional Signal handler failure"' "$worker_log" || true)"
+if [[ "$signal_handler_failure_attempts" -lt 2 ]]; then
+  echo "Expected Signal handler failure before and after fresh-stack replay" >&2
+  exit 1
+fi
+grep -q "Signal handler failure triggered Core eviction and the Worker recovered on a fresh Workflow stack" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=abandon-update \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

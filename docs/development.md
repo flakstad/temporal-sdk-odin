@@ -397,6 +397,17 @@ such as malformed protobuf or an impossible run route—still stop `run`.
 `Run_Stats.workflow_activation_failures` counts the nonfatal failed
 completions.
 
+The same rule applies when user Workflow code fails inside a Signal handler.
+Core first records the failed Workflow Task, then delivers
+`RemoveFromCache(LANG_FAIL)`. Odin retains the failed fiber only long enough to
+acknowledge that eviction; the retry initializes a fresh stack and reconstructs
+state from history. The unit regression compares both initial and failed
+completion bytes across that fresh-stack replay, then routes a healthy run
+through the same Worker. The `signal-handler-failure` integration scenario
+observes exactly one reported Workflow Task failure in CLI-devserver history,
+terminates the intentionally retrying Workflow, and completes a second Workflow
+without restarting the Worker.
+
 ## Client start/result slice
 
 `temporal/client` now owns the high-level connection lifecycle:
@@ -817,6 +828,15 @@ the new name. A later unregistered `approval` signal takes the buffered-await
 path, cancels main's timer, and completes the Workflow. Core evicts between
 stages, and replay reconstructs the late registration, handler stack, and its
 Activity command/resolution.
+
+The following `signal-handler-failure` case registers a handler that returns an
+intentional language failure. The script requires a failed activation, a Core
+cache eviction, replay initialization on a new Odin stack, a repeated handler
+failure, and an `EVENT_TYPE_WORKFLOW_TASK_FAILED` in Temporal history. Core
+marks history reconstruction as replay; the Signal job in the new Workflow Task
+attempt is not itself marked replay. Because this class of failure is retryable
+by design, the script terminates that execution and starts a command-only
+Workflow on the still-running Worker to prove failure isolation.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each
 callback waits at an atomic barrier, so the expected results are possible only
