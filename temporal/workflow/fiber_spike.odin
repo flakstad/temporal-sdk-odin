@@ -6837,6 +6837,30 @@ activity_waits_for_cancellation_completion :: proc(operation: ^Fiber_Activity_Op
 	return operation.options.cancellation_type == .Wait_Cancellation_Completed
 }
 
+activity_operation_ready_for_waiter :: proc(
+	instance: ^Fiber_Instance,
+	operation: ^Fiber_Activity_Operation,
+	waiter_token_id: u32,
+) -> bool {
+	if instance == nil || operation == nil {
+		return false
+	}
+	switch operation.state {
+	case .Resolved, .Failed, .Canceled:
+		return true
+	case .Cancel_Requested:
+		// A language-side token cancellation must honor
+		// Wait_Cancellation_Completed. Server root cancellation may resume the
+		// linked waiter immediately so Workflow code can acknowledge shutdown.
+		return !activity_waits_for_cancellation_completion(operation) ||
+		       (instance.cancellation_requested &&
+		        cancellation_token_linked_to_root(instance, waiter_token_id) &&
+		        !operation.detached_from_root_cancellation)
+	case .Scheduled, .Commanded:
+	}
+	return false
+}
+
 payload_activity_result_from_operation :: proc(operation: ^Fiber_Activity_Operation) -> Payload_Activity_Result {
 	if operation.state == .Resolved {
 		return {status = .Succeeded, value = codec.payload_view(&operation.result)}
@@ -8584,8 +8608,11 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 	switch routine.phase {
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
-		return found && (operation.state == .Resolved || operation.state == .Failed ||
-			operation.state == .Cancel_Requested || operation.state == .Canceled)
+		return found && activity_operation_ready_for_waiter(
+			instance,
+			operation,
+			routine.current_cancellation_token_id,
+		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.start_state != .Pending
@@ -8617,11 +8644,12 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 	return false
 }
 
-resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> Error {
+resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> (resumed: bool, error: Error) {
 	for routine in instance.signal_routines {
 		if !signal_routine_should_resume(routine) {
 			continue
 		}
+		resumed = true
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
 		routine.waiting_child_workflow_seq = 0
@@ -8631,10 +8659,10 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		routine.waiting_signal_name = ""
 		resume_error := resume_signal_routine(routine)
 		if resume_error.message != nil {
-			return resume_error
+			return resumed, resume_error
 		}
 	}
-	return {}
+	return resumed, {}
 }
 
 dispatch_signal_handler :: proc(
@@ -8919,8 +8947,11 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 	switch routine.phase {
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
-		return found && (operation.state == .Resolved || operation.state == .Failed ||
-			operation.state == .Cancel_Requested || operation.state == .Canceled)
+		return found && activity_operation_ready_for_waiter(
+			instance,
+			operation,
+			routine.current_cancellation_token_id,
+		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.start_state != .Pending
@@ -8952,11 +8983,12 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 	return false
 }
 
-resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
+resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> (resumed: bool, error: Error) {
 	for routine in instance.update_routines {
 		if !update_routine_should_resume(routine) {
 			continue
 		}
+		resumed = true
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
 		routine.waiting_child_workflow_seq = 0
@@ -8966,10 +8998,76 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> Error {
 		routine.waiting_signal_name = ""
 		resume_error := resume_update_routine(routine)
 		if resume_error.message != nil {
-			return resume_error
+			return resumed, resume_error
 		}
 	}
-	return {}
+	return resumed, {}
+}
+
+resume_main_workflow_if_ready :: proc(
+	instance: ^Fiber_Instance,
+) -> (resumed: bool, error: Error) {
+	if instance == nil || instance.fiber == nil ||
+	   fiber_raw.status(instance.fiber) != .Suspended {
+		return false, {}
+	}
+	should_resume := false
+	switch instance.phase {
+	case .Waiting_Activity:
+		operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
+		should_resume = found && activity_operation_ready_for_waiter(
+			instance,
+			operation,
+			current_cancellation_token_id(instance),
+		)
+	case .Waiting_Child_Workflow_Start:
+		operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
+		should_resume = found && operation.start_state != .Pending
+	case .Waiting_Child_Workflow:
+		operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
+		should_resume = found && operation.completion_state != .Pending
+	case .Waiting_External_Signal:
+		operation, found := find_external_signal_operation(instance, instance.waiting_external_signal_seq)
+		should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
+			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_External_Cancel:
+		operation, found := find_external_cancel_operation(instance, instance.waiting_external_cancel_seq)
+		should_resume = found && (operation.state == .Resolved || operation.state == .Failed)
+	case .Waiting_Timer:
+		operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
+		should_resume = found && (operation.state == .Resolved ||
+			operation.state == .Cancel_Requested || operation.state == .Canceled)
+	case .Waiting_Signal:
+		_, found := find_buffered_signal(instance, instance.waiting_signal_name)
+		should_resume = found || current_cancellation_applies(instance)
+	case .Waiting_Signal_Or_Timer:
+		_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
+		timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
+		should_resume = signal_found || current_cancellation_applies(instance) ||
+			(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
+			timer.state == .Canceled))
+	case .Waiting_Handlers:
+		should_resume = !has_active_handlers(instance) || current_cancellation_applies(instance)
+	case .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
+	}
+	if !should_resume {
+		return false, {}
+	}
+	instance.phase = .Ready
+	instance.waiting_activity_seq = 0
+	instance.waiting_child_workflow_seq = 0
+	instance.waiting_external_signal_seq = 0
+	instance.waiting_external_cancel_seq = 0
+	instance.waiting_timer_seq = 0
+	instance.waiting_signal_name = ""
+	resume_result := fiber_raw.resume(instance.fiber)
+	if resume_result != .Success {
+		return true, fiber_result_error(
+			"could not resume Workflow fiber after applying activation jobs",
+			resume_result,
+		)
+	}
+	return true, {}
 }
 
 clone_update_context :: proc(
@@ -10411,98 +10509,70 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	}
 
 	if instance_found {
-		resume_signals_error := resume_ready_signal_routines(instance)
-		if resume_signals_error.message != nil {
-			message := string(resume_signals_error.message)
-			process_error(&result, activation.run_id, message)
-			error_free(&resume_signals_error)
-			return
-		}
-		if len(instance.activation_error_message) > 0 {
-			process_error(&result, activation.run_id, instance.activation_error_message)
-			return
-		}
-		finished_signals_error := finish_signal_routines(instance, &result)
-		if finished_signals_error.message != nil {
-			message := string(finished_signals_error.message)
-			process_error(&result, activation.run_id, message)
-			error_free(&finished_signals_error)
-			return
-		}
-		resume_updates_error := resume_ready_update_routines(instance)
-		if resume_updates_error.message != nil {
-			message := string(resume_updates_error.message)
-			process_error(&result, activation.run_id, message)
-			error_free(&resume_updates_error)
-			return
-		}
-		if len(instance.activation_error_message) > 0 {
-			process_error(&result, activation.run_id, instance.activation_error_message)
-			return
-		}
-		finished_updates_error := append_finished_update_routine_responses(
-			instance,
-			&pending_update_responses,
-		)
-		if finished_updates_error.message != nil {
-			message := string(finished_updates_error.message)
-			process_error(&result, activation.run_id, message)
-			error_free(&finished_updates_error)
-			return
-		}
+		// A routine resumed later in this order may make an earlier routine
+		// ready (for example by canceling its token). Drain deterministically
+		// until every main/Signal/Update fiber is blocked or terminal before
+		// encoding the activation completion.
+		for {
+			made_progress := false
 
-		should_resume := false
-		switch instance.phase {
-		case .Waiting_Activity:
-			operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
-			should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
-				operation.state == .Cancel_Requested || operation.state == .Canceled)
-		case .Waiting_Child_Workflow_Start:
-			operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
-			should_resume = found && operation.start_state != .Pending
-		case .Waiting_Child_Workflow:
-			operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
-			should_resume = found && operation.completion_state != .Pending
-		case .Waiting_External_Signal:
-			operation, found := find_external_signal_operation(instance, instance.waiting_external_signal_seq)
-			should_resume = found && (operation.state == .Resolved || operation.state == .Failed ||
-				operation.state == .Cancel_Requested || operation.state == .Canceled)
-		case .Waiting_External_Cancel:
-			operation, found := find_external_cancel_operation(instance, instance.waiting_external_cancel_seq)
-			should_resume = found && (operation.state == .Resolved || operation.state == .Failed)
-		case .Waiting_Timer:
-			operation, found := find_timer_operation(instance, instance.waiting_timer_seq)
-			should_resume = found && (operation.state == .Resolved ||
-				operation.state == .Cancel_Requested || operation.state == .Canceled)
-		case .Waiting_Signal:
-			_, found := find_buffered_signal(instance, instance.waiting_signal_name)
-			should_resume = found || current_cancellation_applies(instance)
-		case .Waiting_Signal_Or_Timer:
-			_, signal_found := find_buffered_signal(instance, instance.waiting_signal_name)
-			timer, timer_found := find_timer_operation(instance, instance.waiting_timer_seq)
-			should_resume = signal_found || current_cancellation_applies(instance) ||
-				(timer_found && (timer.state == .Resolved || timer.state == .Cancel_Requested ||
-				timer.state == .Canceled))
-		case .Waiting_Handlers:
-			should_resume = !has_active_handlers(instance) || current_cancellation_applies(instance)
-		case .Ready, .Continued_As_New, .Canceled, .Completed, .Failed:
-		}
-		if should_resume {
-			instance.phase = .Ready
-			instance.waiting_activity_seq = 0
-			instance.waiting_child_workflow_seq = 0
-			instance.waiting_external_signal_seq = 0
-			instance.waiting_external_cancel_seq = 0
-			instance.waiting_timer_seq = 0
-			instance.waiting_signal_name = ""
-			resume_result := fiber_raw.resume(instance.fiber)
-			if resume_result != .Success {
-				process_error(&result, activation.run_id, "could not resume Workflow fiber after applying activation jobs")
+			resumed_signals, resume_signals_error := resume_ready_signal_routines(instance)
+			made_progress = made_progress || resumed_signals
+			if resume_signals_error.message != nil {
+				message := string(resume_signals_error.message)
+				process_error(&result, activation.run_id, message)
+				error_free(&resume_signals_error)
 				return
 			}
 			if len(instance.activation_error_message) > 0 {
 				process_error(&result, activation.run_id, instance.activation_error_message)
 				return
+			}
+			finished_signals_error := finish_signal_routines(instance, &result)
+			if finished_signals_error.message != nil {
+				message := string(finished_signals_error.message)
+				process_error(&result, activation.run_id, message)
+				error_free(&finished_signals_error)
+				return
+			}
+
+			resumed_updates, resume_updates_error := resume_ready_update_routines(instance)
+			made_progress = made_progress || resumed_updates
+			if resume_updates_error.message != nil {
+				message := string(resume_updates_error.message)
+				process_error(&result, activation.run_id, message)
+				error_free(&resume_updates_error)
+				return
+			}
+			if len(instance.activation_error_message) > 0 {
+				process_error(&result, activation.run_id, instance.activation_error_message)
+				return
+			}
+			finished_updates_error := append_finished_update_routine_responses(
+				instance,
+				&pending_update_responses,
+			)
+			if finished_updates_error.message != nil {
+				message := string(finished_updates_error.message)
+				process_error(&result, activation.run_id, message)
+				error_free(&finished_updates_error)
+				return
+			}
+
+			resumed_main, resume_main_error := resume_main_workflow_if_ready(instance)
+			made_progress = made_progress || resumed_main
+			if resume_main_error.message != nil {
+				message := string(resume_main_error.message)
+				process_error(&result, activation.run_id, message)
+				error_free(&resume_main_error)
+				return
+			}
+			if len(instance.activation_error_message) > 0 {
+				process_error(&result, activation.run_id, instance.activation_error_message)
+				return
+			}
+			if !made_progress {
+				break
 			}
 		}
 	}

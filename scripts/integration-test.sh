@@ -1559,6 +1559,138 @@ grep -Eq "replay=false .*signal=true .*canceled_activity=true" "$worker_log"
 grep -Eq "replay=true .*scheduled=3 .*last_activity=3 .*waiting_signal=true" "$worker_log"
 grep -q "Workflow cancellation tokens propagated downward and isolated sibling branches" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=cross-routine-cancellation \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Cross-routine cancellation Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+  echo "Cross-routine cancellation Worker did not become ready" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+cross_routine_workflow_id="odin-sdk-cross-routine-cancellation-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$cross_routine_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"cross-routine-cancellation"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Cross-routine cancellation Workflow did not reach its main await" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! grep -Eq "replay=false .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+  echo "Cross-routine cancellation Workflow main await was not observable" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cross_routine_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=start_cancel_waiter \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=start \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+for _ in {1..50}; do
+  if grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Cross-routine Signal waiter did not suspend" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+  echo "Cross-routine Signal waiter was not observable before Update start" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+TEMPORAL_CLIENT_ACTION=update \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cross_routine_workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_NAME=cancel_timer_update \
+  TEMPORAL_CLIENT_UPDATE_INPUT=Temporal \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$slow_update_output_file" 2>&1 &
+slow_update_pid=$!
+
+for _ in {1..50}; do
+  if grep -Eq "replay=false .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*started_timer=true .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null ||
+     ! kill -0 "$slow_update_pid" 2>/dev/null; then
+    echo "Cross-routine Update timer did not suspend" >&2
+    cat "$worker_log" >&2
+    cat "$slow_update_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if ! grep -Eq "replay=false .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*started_timer=true .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+  echo "Cross-routine Update timer was not observable before cancellation" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$cross_routine_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=cancel_shared_branch \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=cancel \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+wait "$slow_update_pid"
+slow_update_pid=""
+cross_routine_update_output="$(<"$slow_update_output_file")"
+echo "$cross_routine_update_output"
+grep -q "Odin client update=cancel_timer_update workflow_id=$cross_routine_workflow_id" <<<"$cross_routine_update_output"
+grep -q 'previous="Temporal" current="timer-canceled"' <<<"$cross_routine_update_output"
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+cross_routine_workflow_output="$(<"$workflow_output_file")"
+echo "$cross_routine_workflow_output"
+grep -q '"status": "COMPLETED"' <<<"$cross_routine_workflow_output"
+grep -q '"result": "Cross-routine cancellation completed"' <<<"$cross_routine_workflow_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*signal=true signal_handlers_started=0 signal_handlers_completed=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*canceled_timer=true .*completed=true" "$worker_log"
+grep -Eq "replay=true .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*started_timer=true .*waiting_signal=true" "$worker_log"
+grep -q "Workflow scheduler drained cancellation across Signal, Update, and main fibers" "$worker_log"
+
 run_workflow_cancellation_case() {
   local scenario="$1"
   local input="$2"

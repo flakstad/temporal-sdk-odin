@@ -220,8 +220,8 @@ now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
-**not** yet provide cross-routine same-activation cancellation scheduling,
-propagated deadlines, guard-page/growable stack protection, client
+**not** yet provide propagated cancellation deadlines,
+guard-page/growable stack protection, client
 cancellation of an accepted Update,
 in-process panic containment, or a stable public API.
 Do not use it in production.
@@ -361,8 +361,9 @@ The fiber experiment also builds pinned
 [minicoro](https://github.com/edubart/minicoro) through a seven-symbol local C
 shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
-payload/failure contracts and activation races, and verifies byte-identical
-replay completions. A pinned [statecharts](https://github.com/flakstad/statecharts)
+payload/failure contracts, activation races, and all six orderings of
+Signal-start/Update-start/token-cancel jobs, and verifies byte-identical replay
+completions. A pinned [statecharts](https://github.com/flakstad/statecharts)
 model independently checks Update close/await/late-event lifecycle traces.
 
 Clone submodules and build the pinned Core bridge:
@@ -1333,6 +1334,13 @@ ended in LIFO order, normally with `defer workflow.cancellation_scope_end(&scope
 `cancellation_request` cancels associated operations but does not itself cancel
 the Workflow Execution; only a server-delivered root cancellation is
 acknowledged with `CancelWorkflowExecution`.
+
+After applying every Core job, the Workflow scheduler drains ready Signal,
+Update, and main fibers to a deterministic fixed point. Cancellation in a
+later-scheduled fiber therefore wakes earlier Signal/timer waiters, completes
+their handler responses, and can release `await_all_handlers_finished` in the
+same activation. Activity options using `Wait_Cancellation_Completed` remain
+suspended until Core delivers the terminal Activity resolution.
 
 Returning from the Workflow while root cancellation is pending acknowledges it
 with `CancelWorkflowExecution`; the return value is not completed successfully.

@@ -1062,6 +1062,13 @@ Core Activity-cancellation command only for the child branch, and requires the
 sibling and detached branches to complete. The Workflow itself completes
 successfully and replay rebuilds the same token IDs and commands.
 
+`TEMPORAL_ODIN_SCENARIO=cross-routine-cancellation` starts a stackful Signal
+handler waiting for a Signal and an accepted Update handler waiting for a
+durable timer under one child token. A public client Signal makes main cancel
+that token. The same Workflow Activation must cancel the timer, finish both
+handlers, return the Update result, release main's handler drain, and complete
+the Workflow. This is the live fixed-point scheduler acceptance case.
+
 ## Child, external, Continue-As-New, and patch acceptance test
 
 `examples/child_workflow` registers successful, failing, and cancellation-aware

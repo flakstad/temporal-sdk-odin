@@ -92,6 +92,44 @@ Greeting_Update_Output :: struct {
 	caller:        string,
 }
 
+Cross_Routine_Cancellation_State :: struct {
+	token:           workflow.Cancellation_Token,
+	signal_started:  bool,
+	signal_canceled: bool,
+	update_started:  bool,
+	update_canceled: bool,
+}
+
+cross_routine_signal_waiter :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Cross_Routine_Cancellation_State,
+	_: string,
+) {
+	scope := workflow.cancellation_scope(ctx, state.token)
+	defer workflow.cancellation_scope_end(&scope)
+	state.signal_started = scope.active
+	_ = workflow.await_signal(ctx, "never-delivered-cross-routine")
+	state.signal_canceled = workflow.cancellation_requested(state.token) &&
+		workflow.cancellation_token_reason(state.token) == "stop shared handler branch"
+}
+
+cross_routine_update_waiter :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Cross_Routine_Cancellation_State,
+	input: Greeting_Update_Input,
+) -> Greeting_Update_Output {
+	scope := workflow.cancellation_scope(ctx, state.token)
+	defer workflow.cancellation_scope_end(&scope)
+	state.update_started = scope.active
+	workflow.sleep(ctx, 24 * time.Hour)
+	state.update_canceled = workflow.cancellation_requested(state.token) &&
+		workflow.cancellation_token_reason(state.token) == "stop shared handler branch"
+	return {
+		previous_name = input.name,
+		current_name = "timer-canceled",
+	}
+}
+
 greeting_status_query :: proc(
 	query: ^workflow.Query_Context,
 	state: Greeting_Query_State,
@@ -860,6 +898,36 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 			return "uncanceled cancellation-tree branch did not finish"
 		}
 		return "Cancellation tree completed"
+	}
+	if name == "cross-routine-cancellation" {
+		state := Cross_Routine_Cancellation_State{
+			token = workflow.cancellation_child(workflow.cancellation_root(ctx)),
+		}
+		if state.token.id == 0 ||
+		   !workflow.set_signal_routine_json(
+			ctx,
+			"start_cancel_waiter",
+			&state,
+			cross_routine_signal_waiter,
+		   ) ||
+		   !workflow.set_update_routine_json(
+			ctx,
+			"cancel_timer_update",
+			&state,
+			cross_routine_update_waiter,
+		   ) {
+			return "could not register cross-routine cancellation handlers"
+		}
+		_ = workflow.await_signal(ctx, "cancel_shared_branch")
+		if !state.signal_started || !state.update_started ||
+		   !workflow.cancellation_request(state.token, "stop shared handler branch") {
+			return "cross-routine handlers were not ready"
+		}
+		workflow.await_all_handlers_finished(ctx)
+		if !state.signal_canceled || !state.update_canceled {
+			return "cross-routine cancellation did not drain every handler"
+		}
+		return "Cross-routine cancellation completed"
 	}
 	if name == "failing-signal-handler" {
 		registered := workflow.set_signal_handler_payload(
@@ -1706,6 +1774,7 @@ main :: proc() {
 	expect_cancel_activity := scenario == "cancel-activity"
 	expect_cancel_cleanup := scenario == "cancel-cleanup"
 	expect_cancellation_tree := scenario == "cancellation-tree"
+	expect_cross_routine_cancellation := scenario == "cross-routine-cancellation"
 	expect_update := scenario == "update"
 	expect_abandon_update := scenario == "abandon-update"
 	expect_cancel_update := scenario == "cancel-update"
@@ -1735,9 +1804,9 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = 1,
-			disable_activity_polling = expect_cancel_timer || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
+			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -1780,6 +1849,18 @@ main :: proc() {
 			   run_stats.activity_cancellations_requested != 1 ||
 			   run_stats.timers_canceled != 0 {
 				fmt.eprintln("Workflow cancellation-token tree stats did not match")
+				failed = true
+			}
+		} else if expect_cross_routine_cancellation {
+			if run_stats.activity_tasks_completed != 0 ||
+			   run_stats.workflow_signals_received < 2 ||
+			   run_stats.workflow_signal_handlers_started < 1 ||
+			   run_stats.workflow_signal_handlers_completed != 1 ||
+			   run_stats.workflow_updates_accepted != 1 ||
+			   run_stats.workflow_updates_completed != 1 ||
+			   run_stats.workflow_updates_rejected != 0 ||
+			   run_stats.timers_canceled != 1 {
+				fmt.eprintln("Cross-routine cancellation stats did not match")
 				failed = true
 			}
 		} else if expect_signal_handler_failure {
@@ -1898,6 +1979,8 @@ main :: proc() {
 		fmt.println("Workflow ran detached cleanup before acknowledging cancellation")
 	} else if expect_cancellation_tree {
 		fmt.println("Workflow cancellation tokens propagated downward and isolated sibling branches")
+	} else if expect_cross_routine_cancellation {
+		fmt.println("Workflow scheduler drained cancellation across Signal, Update, and main fibers")
 	} else if expect_typed_payload {
 		fmt.println("typed Workflow and Activity Payloads completed end-to-end")
 	} else if expect_multiple_activity_arguments {
