@@ -1105,13 +1105,13 @@ temporal workflow execute \
   --workflow-id "$signal_handler_workflow_id" \
   --type odin_hello_workflow \
   --task-queue odin-hello-workflow \
-  --input '"signal-handler"' \
+  --input '"late-signal-handler"' \
   --command-timeout 30s \
   --output json >"$workflow_output_file" 2>&1 &
 workflow_cli_pid=$!
 
 for _ in {1..30}; do
-  if grep -Eq "started_timer=true .*waiting_timer=1 waiting_signal=true" "$worker_log" 2>/dev/null; then
+  if grep -Eq "replay=false .*started_timer=false .*waiting_signal=true" "$worker_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
@@ -1126,6 +1126,25 @@ TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \
   TEMPORAL_CLIENT_SIGNAL_NAME=set_greeting_name_async \
   TEMPORAL_CLIENT_SIGNAL_INPUT=Temporal-slow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh"
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*signal=true signal_handlers_started=0 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Signal sent before handler registration was not buffered" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+TEMPORAL_CLIENT_ACTION=signal \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$signal_handler_workflow_id" \
+  TEMPORAL_CLIENT_SIGNAL_NAME=register_signal_handler \
+  TEMPORAL_CLIENT_SIGNAL_INPUT=ready \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-client-control.sh"
 
@@ -1172,7 +1191,8 @@ cat "$worker_log"
 grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*signal=true signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=1 .*signal_handlers_started=0 signal_handlers_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*signal_handlers_started=1 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
-grep -q "asynchronous Workflow Signal handler awaited an Activity and replayed" "$worker_log"
+grep -Eq "replay=false .*signal=true signal_handlers_started=0 signal_handlers_completed=0 .*waiting_signal=true" "$worker_log"
+grep -q "buffered asynchronous Workflow Signal handler registered late, awaited an Activity, and replayed" "$worker_log"
 grep -q "Workflow Signal interceptor entered before handler" "$worker_log"
 grep -q "Workflow Signal interceptor exited after handler" "$worker_log"
 

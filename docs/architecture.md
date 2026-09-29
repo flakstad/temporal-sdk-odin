@@ -1627,6 +1627,10 @@ Odin now follows that boundary:
   main and Update routines, while Activity/timer sequence tables remain shared.
 - Registered names dispatch to handlers. Unregistered names continue into the
   existing codec-neutral buffer for `await_signal_payload/json`.
+- Registration synchronously drains every older buffered invocation with that
+  name in arrival order. Older signals for names that still lack handlers do
+  not block matching entries. Dispatch happens before the registering Workflow
+  fiber continues, so handler state is visible to the very next statement.
 - Ready Signal routines run before Update routines and main. This preserves the
   upstream handler-before-main rule and gives deterministic registration order
   as the tie-breaker among ready Signal routines.
@@ -1645,13 +1649,18 @@ finish signal while that handler is suspended, and proves main remains in
 the same activation. All four completion byte sequences match after eviction
 and fresh-stack replay. A second test invokes an immediate handler and main's
 buffered signal in one activation, proving handler state mutation is visible
-before main resumes. The live CLI-devserver test additionally queries the
-mutated state after Core eviction/replay.
+before main resumes. A late-registration regression sends an unknown Signal,
+then a matching Signal, then the Signal that lets main register the handler;
+the matching invocation runs synchronously before main returns, while the
+unknown invocation stays buffered. Eviction and fresh-stack replay produce
+byte-identical completions. A 500-case property varies 1–12 matching buffered
+Signals and 1–4 earlier unknown Signals and checks dispatch count, arrival
+order, and replay bytes. The live CLI-devserver test sends the asynchronous
+Signal before its handler exists, then lets the Workflow register it, await an
+Activity, query the mutated state, and replay after Core eviction.
 
-Remaining Signal risks are handler-failure retry/eviction stress, dynamic
-registration after a matching signal was already buffered, header exposure,
-concurrent shared-state policy, and timer/cancellation coverage for Signal
-routines.
+Remaining Signal risks are handler-failure retry/eviction stress, concurrent
+shared-state policy, and timer/cancellation coverage for Signal routines.
 
 ### Durable signal/timer race
 
@@ -2074,7 +2083,8 @@ arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
 repeated-signal/cancel/replay cases, 500 Continue-As-New repeated-argument/metadata/versioning/replay cases, 500 patch
-truth-table cases, 500 deterministic time/random activation contexts, and 1,000
+truth-table cases, 500 deterministic time/random activation contexts, 500 late
+Signal-handler buffer/order/replay cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
@@ -2128,7 +2138,9 @@ scheduler. Immediate and stackful registrations, independent suspension,
 deterministic handler-before-main ordering, shared handler draining,
 warn/abandon close policy, public Client delivery, Query-observed state mutation,
 Core eviction, and fresh-stack replay are tested. Dynamic registration and
-handler-failure retry stress remain before this API can be called stable.
+late buffered dispatch are now covered offline, generatively, and through the
+live server. Handler-failure retry/eviction stress remains before this API can
+be called stable.
 
 Update cancellation through root Workflow cancellation is now proven while a
 handler awaits an Activity: the detached operation survives, explicit draining

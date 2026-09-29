@@ -4368,6 +4368,280 @@ workflow_deterministic_primitives_for_generated_activations :: proc(t: ^testing.
 	pbt.require_pass(t, result)
 }
 
+Buffered_Signal_Property_State :: struct {
+	count:    int,
+	checksum: i64,
+}
+
+buffered_signal_property_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	_ = input
+	state := Buffered_Signal_Property_State{}
+	_ = workflow.await_signal_payloads(ctx, "register_handler")
+	if !workflow.set_signal_handler_json(
+		ctx,
+		"generated_late_signal",
+		&state,
+		proc(state: ^Buffered_Signal_Property_State, value: int) {
+			state.count += 1
+			state.checksum = state.checksum * 131 + i64(value)
+		},
+	) {
+		return "registration failed"
+	}
+	return fmt.aprintf("%d:%d", state.count, state.checksum)
+}
+
+buffered_signal_registration_property :: proc(t: ^pbt.T) -> pbt.Result {
+	values := pbt.draw(t, pbt.array(pbt.int_range(-10_000, 10_000), 1, 12))
+	unknown_count := pbt.draw(t, pbt.int_range(1, 4))
+	pbt.cover(t, len(values) == 1, 5.0, "one buffered Signal")
+	pbt.cover(t, len(values) >= 8, 25.0, "many buffered Signals")
+	pbt.cover(t, unknown_count >= 3, 30.0, "several earlier unknown Signals")
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"generated_late_signal_workflow",
+		"pbt-queue",
+		buffered_signal_property_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	if init_error.message != nil {
+		return pbt.error("could not initialize buffered Signal property runtime")
+	}
+
+	workflow_input, input_error := codec.encode_json("pbt")
+	if input_error != .None {
+		return pbt.error("could not encode buffered Signal Workflow input")
+	}
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "generated_late_signal_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "generated-late-signal-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.waiting_signal {
+		return pbt.fail("generated Workflow did not wait before late Signal registration")
+	}
+
+	encoded_payloads := make([dynamic]codec.Payload, 0, len(values))
+	proto_payloads := make(
+		[dynamic]proto.Temporal_Api_Common_V1_Payload,
+		0,
+		len(values),
+	)
+	signals := make(
+		[dynamic]proto.Coresdk_Workflow_Activation_SignalWorkflow,
+		0,
+		len(values),
+	)
+	defer {
+		for &signal in signals {
+			delete(signal.input)
+		}
+		for &payload in proto_payloads {
+			delete(payload.metadata)
+			delete(payload.external_payloads)
+		}
+		for &payload in encoded_payloads {
+			codec.payload_free(&payload)
+		}
+		delete(signals)
+		delete(proto_payloads)
+		delete(encoded_payloads)
+	}
+	expected_checksum: i64
+	for value in values {
+		payload, encode_error := codec.encode_json(value)
+		if encode_error != .None {
+			return pbt.error("could not encode generated buffered Signal")
+		}
+		append(&encoded_payloads, payload)
+		append(
+			&proto_payloads,
+			proto.encode_payload(codec.payload_view(&encoded_payloads[len(encoded_payloads) - 1])),
+		)
+		signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+			signal_name = "generated_late_signal",
+		}
+		append(&signal.input, proto_payloads[len(proto_payloads) - 1])
+		append(&signals, signal)
+		expected_checksum = expected_checksum * 131 + i64(value)
+	}
+
+	unknown_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "generated_unknown_signal",
+	}
+	register_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "register_handler",
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = u32(5 + unknown_count + len(values) * 2)
+	for _ in 0..<unknown_count {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+					value = &unknown_signal,
+				},
+			},
+		)
+	}
+	for &signal in signals {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+					value = &signal,
+				},
+			},
+		)
+	}
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	terminal := process_activation(&runtime, &activation)
+	defer destroy_process_result(&terminal)
+	if terminal.error.message != nil || !terminal.completed ||
+	   terminal.signal_handlers_started != len(values) ||
+	   terminal.signal_handlers_completed != len(values) {
+		return pbt.fail("late handler did not consume every matching buffered Signal")
+	}
+	result_payload, result_found := clone_pbt_workflow_result(terminal.completion[:])
+	if !result_found {
+		return pbt.fail("late Signal Workflow completion had no result")
+	}
+	defer codec.payload_free(&result_payload)
+	actual: string
+	if codec.decode_json(codec.payload_view(&result_payload), &actual) != .None {
+		return pbt.fail("late Signal Workflow result did not decode")
+	}
+	defer delete(actual)
+	expected := fmt.aprintf("%d:%d", len(values), expected_checksum)
+	defer delete(expected)
+	if actual != expected {
+		return pbt.fail("matching buffered Signals were not dispatched in arrival order")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(&runtime, &activation)
+	if evicted.error.message != nil || !evicted.evicted {
+		destroy_process_result(&evicted)
+		return pbt.fail("could not evict generated late Signal Workflow")
+	}
+	destroy_process_result(&evicted)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_activation(&runtime, &activation)
+	if replayed_initial.error.message != nil ||
+	   !bytes.equal(initial.completion[:], replayed_initial.completion[:]) {
+		destroy_process_result(&replayed_initial)
+		return pbt.fail("late Signal Workflow initialization changed during replay")
+	}
+	destroy_process_result(&replayed_initial)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = u32(5 + unknown_count + len(values) * 2)
+	for _ in 0..<unknown_count {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+					value = &unknown_signal,
+				},
+			},
+		)
+	}
+	for &signal in signals {
+		append(
+			&activation.jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+					value = &signal,
+				},
+			},
+		)
+	}
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	replayed := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed)
+	if replayed.error.message != nil ||
+	   !bytes.equal(terminal.completion[:], replayed.completion[:]) {
+		return pbt.fail("late Signal dispatch changed completion bytes during replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_late_signal_registration_dispatches_generated_buffers_deterministically :: proc(
+	t: ^testing.T,
+) {
+	result := pbt.check(
+		"late Workflow Signal registration preserves buffered order and replay bytes",
+		buffered_signal_registration_property,
+		{num_tests = 500, seed = 0x4c41_5445_5349_474e},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 race_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	_ = input
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)

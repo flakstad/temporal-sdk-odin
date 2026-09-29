@@ -124,7 +124,9 @@ lengths, then require exact random values and byte-identical fresh-stack replay.
 Another 500 generated stack policies cover default, minimum, aligned custom,
 below-minimum, and above-maximum sizes independently for Workflow, Signal, and
 Update fibers. Unit tests inspect the actual native coroutine sizes, not only
-the Odin configuration records.
+the Odin configuration records. Another 500 generated late-handler traces put
+one to twelve matching Signals behind one to four unknown names, then register
+the handler and require arrival-ordered dispatch plus byte-identical replay.
 PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent
@@ -807,11 +809,13 @@ Workflow then reaches `CANCELED`. The unit test evicts the instance and requires
 all four activation completions to be byte-identical on fresh-stack replay.
 
 The `signal-handler` live case sends `set_greeting_name_async` through the
-public Odin Client. The registered Signal routine schedules an Odin Activity
-and suspends without waking main. After resolution it mutates Workflow state; a
-typed Query observes the new name. A later unregistered `approval` signal takes
-the buffered-await path, cancels main's timer, and completes the Workflow. Core
-evicts between stages, and replay reconstructs both the handler stack and its
+public Odin Client before the Workflow has registered that handler. A separate
+`register_signal_handler` Signal resumes main; registration synchronously drains
+the earlier invocation, and the Signal routine schedules an Odin Activity and
+suspends. After resolution it mutates Workflow state; a typed Query observes
+the new name. A later unregistered `approval` signal takes the buffered-await
+path, cancels main's timer, and completes the Workflow. Core evicts between
+stages, and replay reconstructs the late registration, handler stack, and its
 Activity command/resolution.
 
 The script then schedules two Activities in one upstream-driver Workflow. Each

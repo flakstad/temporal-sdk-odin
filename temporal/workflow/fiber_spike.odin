@@ -1142,6 +1142,8 @@ Fiber_Instance :: struct {
 	activation_history_length: u32,
 	activation_time:         time.Time,
 	has_activation_time:     bool,
+	activation_result:       ^Process_Result,
+	activation_error_message: string,
 	random_state:            u64,
 	random_initialized:      bool,
 	phase:           Fiber_Phase,
@@ -2665,6 +2667,35 @@ signal_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
 	instance.phase = .Failed
 }
 
+record_signal_activation_error :: proc(instance: ^Fiber_Instance, dispatch_error: ^Error) {
+	if instance == nil || dispatch_error == nil || dispatch_error.message == nil ||
+	   len(instance.activation_error_message) > 0 {
+		return
+	}
+	message, allocation_error := strings.clone(
+		string(dispatch_error.message),
+		instance.odin_context.allocator,
+	)
+	if allocation_error != nil {
+		instance.activation_error_message = "Workflow Signal handler failed"
+		return
+	}
+	instance.activation_error_message = message
+}
+
+finish_signal_handler_registration :: proc(instance: ^Fiber_Instance, name: string) -> bool {
+	dispatch_error := dispatch_buffered_signals_for_handler(
+		instance,
+		name,
+		instance.activation_result,
+	)
+	if dispatch_error.message != nil {
+		record_signal_activation_error(instance, &dispatch_error)
+		error_free(&dispatch_error)
+	}
+	return true
+}
+
 set_signal_handler_payload :: proc(
 	ctx: ^Fiber_Context,
 	name: string,
@@ -2701,7 +2732,7 @@ set_signal_handler_payload :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 // set_signal_handler_payloads exposes Temporal's repeated Signal argument
@@ -2742,7 +2773,7 @@ set_signal_handler_payloads :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 set_signal_routine_payload_with_context :: proc(
@@ -2779,7 +2810,7 @@ set_signal_routine_payload_with_context :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 set_signal_routine_payloads_with_context :: proc(
@@ -2816,7 +2847,7 @@ set_signal_routine_payloads_with_context :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 set_signal_handler_payload_with_context :: proc(
@@ -2853,7 +2884,7 @@ set_signal_handler_payload_with_context :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 set_signal_handler_payloads_with_context :: proc(
@@ -2890,7 +2921,7 @@ set_signal_handler_payloads_with_context :: proc(
 			unfinished_policy = options.unfinished_policy,
 		},
 	)
-	return true
+	return finish_signal_handler_registration(instance, owned_name)
 }
 
 // set_signal_handler_json registers an immediate deterministic Signal handler.
@@ -8175,7 +8206,9 @@ finish_signal_routine :: proc(
 		return error_from_string(message)
 	}
 	codec.payload_free(&routine.result.payload)
-	result.signal_handlers_completed += 1
+	if result != nil {
+		result.signal_handlers_completed += 1
+	}
 	return {}
 }
 
@@ -8255,6 +8288,89 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> Error {
 	return {}
 }
 
+dispatch_signal_handler :: proc(
+	instance: ^Fiber_Instance,
+	handler: ^Fiber_Signal_Handler,
+	signal: ^Fiber_Signal,
+	result: ^Process_Result,
+) -> Error {
+	if instance == nil || handler == nil || signal == nil {
+		return error_from_string("invalid Workflow Signal handler dispatch")
+	}
+	signal_context := fiber_signal_context(signal)
+	if result != nil {
+		result.signal_handlers_started += 1
+	}
+	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil ||
+	   handler.invoke_payloads_routine != nil || handler.invoke_payloads_routine_with_context != nil {
+		routine, routine_error := start_signal_routine(
+			instance,
+			handler,
+			signal.name,
+			&signal_context,
+			signal.input_views,
+		)
+		if routine_error.message != nil {
+			return routine_error
+		}
+		return finish_signal_routine(routine, result)
+	}
+	command_state := workflow_command_state(instance)
+	interceptor_input := Inbound_Handle_Signal_Input{
+		workflow_type = instance.workflow_type,
+		signal = &signal_context,
+		inputs = signal.input_views,
+	}
+	interceptor_state := Inbound_Handle_Signal_State{
+		instance = instance,
+		handler = handler,
+	}
+	handler_result := inbound_handle_signal_chain(&interceptor_state, &interceptor_input)
+	if workflow_command_state_changed(instance, command_state) {
+		codec.payload_free(&handler_result.payload)
+		restore_workflow_command_state(instance, command_state)
+		return error_from_string("synchronous Workflow Signal handler attempted to mutate runtime command state")
+	}
+	if handler_result.status == .Failed {
+		message := handler_result.failure_message
+		if len(message) == 0 {
+			message = "Workflow Signal handler failed"
+		}
+		codec.payload_free(&handler_result.payload)
+		return error_from_string(message)
+	}
+	codec.payload_free(&handler_result.payload)
+	if result != nil {
+		result.signal_handlers_completed += 1
+	}
+	return {}
+}
+
+dispatch_buffered_signals_for_handler :: proc(
+	instance: ^Fiber_Instance,
+	name: string,
+	result: ^Process_Result,
+) -> Error {
+	if instance == nil || len(name) == 0 {
+		return error_from_string("invalid buffered Workflow Signal dispatch")
+	}
+	for {
+		signal, found := find_buffered_signal(instance, name)
+		if !found {
+			return {}
+		}
+		handler, handler_found := find_signal_handler(instance, name)
+		if !handler_found {
+			return {}
+		}
+		signal.consumed = true
+		dispatch_error := dispatch_signal_handler(instance, handler, signal, result)
+		if dispatch_error.message != nil {
+			return dispatch_error
+		}
+	}
+}
+
 invoke_workflow_signal :: proc(
 	instance: ^Fiber_Instance,
 	signal: ^proto.Coresdk_Workflow_Activation_SignalWorkflow,
@@ -8310,49 +8426,7 @@ invoke_workflow_signal :: proc(
 		buffered = true
 		return {}
 	}
-	signal_context := fiber_signal_context(&preserved)
-	result.signal_handlers_started += 1
-	if handler.invoke_routine != nil || handler.invoke_routine_with_context != nil ||
-	   handler.invoke_payloads_routine != nil || handler.invoke_payloads_routine_with_context != nil {
-		routine, routine_error := start_signal_routine(
-			instance,
-			handler,
-			signal.signal_name,
-			&signal_context,
-			preserved.input_views,
-		)
-		if routine_error.message != nil {
-			return routine_error
-		}
-		return finish_signal_routine(routine, result)
-	}
-	command_state := workflow_command_state(instance)
-	interceptor_input := Inbound_Handle_Signal_Input{
-		workflow_type = instance.workflow_type,
-		signal = &signal_context,
-		inputs = preserved.input_views,
-	}
-	interceptor_state := Inbound_Handle_Signal_State{
-		instance = instance,
-		handler = handler,
-	}
-	handler_result := inbound_handle_signal_chain(&interceptor_state, &interceptor_input)
-	if workflow_command_state_changed(instance, command_state) {
-		codec.payload_free(&handler_result.payload)
-		restore_workflow_command_state(instance, command_state)
-		return error_from_string("synchronous Workflow Signal handler attempted to mutate runtime command state")
-	}
-	if handler_result.status == .Failed {
-		message := handler_result.failure_message
-		if len(message) == 0 {
-			message = "Workflow Signal handler failed"
-		}
-		codec.payload_free(&handler_result.payload)
-		return error_from_string(message)
-	}
-	codec.payload_free(&handler_result.payload)
-	result.signal_handlers_completed += 1
-	return {}
+	return dispatch_signal_handler(instance, handler, &preserved, result)
 }
 
 find_update_routine :: proc(
@@ -9409,7 +9483,15 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		}
 	}
 	instance, instance_found := find_fiber_instance(runtime, activation.run_id)
+	defer {
+		active_instance, active_found := find_fiber_instance(runtime, activation.run_id)
+		if active_found {
+			active_instance.activation_result = nil
+		}
+	}
 	if instance_found {
+		instance.activation_result = &result
+		instance.activation_error_message = ""
 		metadata_error := apply_activation_metadata(instance, &activation)
 		if metadata_error.message != nil {
 			message := string(metadata_error.message)
@@ -9443,6 +9525,8 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			instance_found = true
+			instance.activation_result = &result
+			instance.activation_error_message = ""
 			instance.random_state = variant.value.randomness_seed
 			instance.random_initialized = true
 			metadata_error := apply_activation_metadata(instance, &activation)
@@ -9966,6 +10050,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			process_error(&result, activation.run_id, "Workflow fiber spike received an unsupported activation job")
 			return
 		}
+		if instance_found && len(instance.activation_error_message) > 0 {
+			process_error(&result, activation.run_id, instance.activation_error_message)
+			return
+		}
 	}
 
 	if instance_found {
@@ -9974,6 +10062,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			message := string(resume_signals_error.message)
 			process_error(&result, activation.run_id, message)
 			error_free(&resume_signals_error)
+			return
+		}
+		if len(instance.activation_error_message) > 0 {
+			process_error(&result, activation.run_id, instance.activation_error_message)
 			return
 		}
 		finished_signals_error := finish_signal_routines(instance, &result)
@@ -9988,6 +10080,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			message := string(resume_updates_error.message)
 			process_error(&result, activation.run_id, message)
 			error_free(&resume_updates_error)
+			return
+		}
+		if len(instance.activation_error_message) > 0 {
+			process_error(&result, activation.run_id, instance.activation_error_message)
 			return
 		}
 		finished_updates_error := append_finished_update_routine_responses(
@@ -10048,6 +10144,10 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			resume_result := fiber_raw.resume(instance.fiber)
 			if resume_result != .Success {
 				process_error(&result, activation.run_id, "could not resume Workflow fiber after applying activation jobs")
+				return
+			}
+			if len(instance.activation_error_message) > 0 {
+				process_error(&result, activation.run_id, instance.activation_error_message)
 				return
 			}
 		}

@@ -63,7 +63,11 @@ stackful routines. An asynchronous Signal handler can await an Activity, mutate
 Workflow-owned state, participate in handler draining, and replay on a fresh
 stack. `set_signal_routine_json_with_context` keeps Signal identity, event ID,
 and headers available across those waits; the CLI-devserver suite proves the
-state and propagated header through a public Client Query.
+state and propagated header through a public Client Query. Signals received
+before their handler is registered are retained and synchronously dispatched in
+arrival order when registration occurs; unmatched older names do not block
+them. Offline replay, 500 generated traces, and the live dev-server path cover
+late registration.
 Child Workflows now have a vertical start/result/failure/cancellation path:
 Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and completion
 resolutions, decodes typed JSON results and structured Child Workflow failures,
@@ -1321,6 +1325,8 @@ workflow.set_signal_routine_json(
 
 Registered names are dispatched to handlers; unregistered names retain the
 existing deterministic buffer semantics used by `workflow.await_signal*`.
+Registering a handler drains older matching buffered Signals before the
+registering fiber continues.
 `await_all_handlers_finished` covers both Signal and Update routines.
 
 `worker.create` owns only language-side configuration and registries. The first

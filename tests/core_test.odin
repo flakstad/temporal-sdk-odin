@@ -3367,6 +3367,44 @@ fiber_signal_handler_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 	return state.name
 }
 
+fiber_late_signal_handler_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	state := Signal_Routine_State{name = name}
+	_ = workflow.await_signal(ctx, "register_handler")
+	registered := workflow.set_signal_handler_json(
+		ctx,
+		"rename_late",
+		&state,
+		proc(state: ^Signal_Routine_State, input: string) {
+			state.name = input
+		},
+	)
+	if !registered {
+		return "late Workflow Signal handler registration failed"
+	}
+	// A Signal buffered before registration must run before this fiber
+	// continues, matching the other Core-based SDKs' handler semantics.
+	return state.name
+}
+
+fiber_late_failing_signal_handler_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	_ = workflow.await_signal(ctx, "register_handler")
+	_ = workflow.set_signal_handler_payload(
+		ctx,
+		"fail_late",
+		ctx,
+		proc(_: rawptr, _: codec.Payload_View) -> workflow.Payload_Result {
+			return workflow.payload_fail("late Signal handler failed", "LateSignalFailure")
+		},
+	)
+	return name
+}
+
 fiber_signal_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	state := Signal_Routine_State{name = name}
 	registered := workflow.set_signal_routine_json_with_context(
@@ -11750,6 +11788,263 @@ workflow_update_routine_registration_preserves_unfinished_policy :: proc(t: ^tes
 			)
 		}
 	}
+}
+
+@(test)
+workflow_late_signal_handler_dispatches_buffered_signal_in_order_and_replays :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_late_signal_handler_workflow",
+		"test-queue",
+		fiber_late_signal_handler_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_late_signal_handler_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-late-signal-handler-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "late Signal handler initialization failed: %s", string(initial.error.message))
+	testing.expect(t, initial.waiting_signal)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	late_input, late_input_error := codec.encode_json("Temporal")
+	register_input, register_input_error := codec.encode_json("register")
+	testing.expect(t, late_input_error == .None && register_input_error == .None)
+	defer codec.payload_free(&late_input)
+	defer codec.payload_free(&register_input)
+	late_input_proto := proto.encode_payload(codec.payload_view(&late_input))
+	register_input_proto := proto.encode_payload(codec.payload_view(&register_input))
+	defer delete(late_input_proto.metadata)
+	defer delete(late_input_proto.external_payloads)
+	defer delete(register_input_proto.metadata)
+	defer delete(register_input_proto.external_payloads)
+	unknown_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "still_unknown",
+	}
+	late_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "rename_late",
+	}
+	defer delete(late_signal.input)
+	append(&late_signal.input, late_input_proto)
+	register_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "register_handler",
+	}
+	defer delete(register_signal.input)
+	append(&register_signal.input, register_input_proto)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 10
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &unknown_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &late_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "buffered Signal handler dispatch failed: %s", string(completed.error.message))
+	testing.expect(t, completed.completed)
+	testing.expect_value(t, completed.received_signal_count, 3)
+	testing.expect_value(t, completed.signal_handlers_started, 1)
+	testing.expect_value(t, completed.signal_handlers_completed, 1)
+	inspection := inspect_workflow_completion(completed.completion[:])
+	testing.expect(t, inspection.decoded && inspection.completed)
+	testing.expect_value(t, string(inspection.completion_result), `"Temporal"`)
+	delete(inspection.completion_result)
+	terminal_completion := completed.completion
+	workflow.error_free(&completed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 10
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &unknown_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &late_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "buffered Signal replay failed: %s", string(replayed.error.message))
+	testing.expect(t, bytes.equal(terminal_completion[:], replayed.completion[:]))
+	testing.expect_value(t, replayed.signal_handlers_started, 1)
+	testing.expect_value(t, replayed.signal_handlers_completed, 1)
+	delete(terminal_completion)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+}
+
+@(test)
+workflow_late_signal_handler_failure_fails_activation :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_late_failing_signal_handler_workflow",
+		"test-queue",
+		fiber_late_failing_signal_handler_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_late_failing_signal_handler_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-late-failing-signal-handler-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil && initial.waiting_signal)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	failing_input, failing_input_error := codec.encode_json("fail")
+	register_input, register_input_error := codec.encode_json("register")
+	testing.expect(t, failing_input_error == .None && register_input_error == .None)
+	defer codec.payload_free(&failing_input)
+	defer codec.payload_free(&register_input)
+	failing_input_proto := proto.encode_payload(codec.payload_view(&failing_input))
+	register_input_proto := proto.encode_payload(codec.payload_view(&register_input))
+	defer delete(failing_input_proto.metadata)
+	defer delete(failing_input_proto.external_payloads)
+	defer delete(register_input_proto.metadata)
+	defer delete(register_input_proto.external_payloads)
+	failing_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "fail_late",
+	}
+	defer delete(failing_signal.input)
+	append(&failing_signal.input, failing_input_proto)
+	register_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "register_handler",
+	}
+	defer delete(register_signal.input)
+	append(&register_signal.input, register_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &failing_signal,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &register_signal,
+			},
+		},
+	)
+	failed := process_fiber_test_activation(&runtime, &activation)
+	defer delete(failed.completion)
+	defer workflow.error_free(&failed.error)
+	testing.expect(t, failed.activation_failed)
+	testing.expect(t, failed.error.message != nil)
+	testing.expect_value(t, string(failed.error.message), "late Signal handler failed")
+	testing.expect_value(t, failed.signal_handlers_started, 1)
+	testing.expect_value(t, failed.signal_handlers_completed, 0)
 }
 
 @(test)

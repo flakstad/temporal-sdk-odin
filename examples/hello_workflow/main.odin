@@ -859,6 +859,9 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	) {
 		return "could not register detached greeting name Update"
 	}
+	if name == "late-signal-handler" {
+		_ = workflow.await_signal(ctx, "register_signal_handler")
+	}
 	if !workflow.set_signal_routine_json_with_context(
 		ctx,
 		"set_greeting_name_async",
@@ -1763,7 +1766,7 @@ main :: proc() {
 				failed = true
 			}
 		} else if expect_signal_handler {
-			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 2 ||
+			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 3 ||
 			   run_stats.workflow_signal_handlers_started != 1 ||
 			   run_stats.workflow_signal_handlers_completed != 1 ||
 			   run_stats.workflow_signal_handlers_abandoned != 0 ||
@@ -1856,7 +1859,7 @@ main :: proc() {
 	} else if expect_cancel_update {
 		fmt.println("detached Workflow Update completed before cancellation acknowledgement")
 	} else if expect_signal_handler {
-		fmt.println("asynchronous Workflow Signal handler awaited an Activity and replayed")
+		fmt.println("buffered asynchronous Workflow Signal handler registered late, awaited an Activity, and replayed")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}
