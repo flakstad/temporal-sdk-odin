@@ -67,6 +67,13 @@ int temporal_odin_fiber_status(temporal_odin_fiber *fiber) {
   return mco_status(fiber->coroutine);
 }
 
+size_t temporal_odin_fiber_stack_size(temporal_odin_fiber *fiber) {
+  if (fiber == NULL || fiber->coroutine == NULL) {
+    return 0;
+  }
+  return fiber->coroutine->stack_size;
+}
+
 int temporal_odin_fiber_destroy(temporal_odin_fiber *fiber) {
   mco_result result;
   if (fiber == NULL) {

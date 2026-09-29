@@ -203,8 +203,11 @@ attempt 1 to attempt 2. Workflow initialization, Activity arguments/results,
 and Workflow completion now preserve generic Payloads; typed JSON Workflows run
 end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
-cancellation type, and eager-execution control. It does **not** provide general
-nested cancellation-token trees, client
+cancellation type, and eager-execution control. Workflow, Signal-handler, and
+Update-handler fiber stacks now have an explicit Worker policy with validated
+independent sizes, shared by online execution and offline replay. It does
+**not** provide general nested cancellation-token trees, guard-page/growable
+stack protection, client
 cancellation of an accepted Update,
 in-process panic containment, or a stable public API.
 Do not use it in production.
@@ -341,7 +344,7 @@ Prerequisites:
 - Clang/linker tooling for the target platform
 
 The fiber experiment also builds pinned
-[minicoro](https://github.com/edubart/minicoro) through a six-symbol local C
+[minicoro](https://github.com/edubart/minicoro) through a seven-symbol local C
 shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
 payload/failure contracts and activation races, and verifies byte-identical
@@ -812,6 +815,28 @@ _ = worker.register_workflow(&temporal_worker, "odin_hello_workflow", hello_work
 _ = worker.register_json_workflow(&temporal_worker, "odin_typed_workflow", typed_workflow)
 _, _ = worker.run(&temporal_worker)
 ```
+
+Every live Workflow and asynchronous Signal/Update handler owns a native fiber
+stack. The default is 128 KiB per fiber. Workers can choose independent bounded
+sizes when their call depth or concurrency profile needs a different tradeoff:
+
+```odin
+temporal_worker, err := worker.create(
+    &client,
+    "orders",
+    workflow_stacks = {
+        workflow = 256 * 1024,
+        signal_handler = 128 * 1024,
+        update_handler = 192 * 1024,
+    },
+)
+```
+
+Zero selects the default. Explicit values must be between 32 KiB and 16 MiB
+and are aligned to the native runtime's 16-byte boundary. The same option is
+available on `worker.create_replayer`, so replay uses the production stack
+policy. These are fully allocated fixed stacks, not growable or guard-page-backed
+virtual-memory stacks.
 
 `register_json_activity` accepts ordinary typed Odin procedures such as
 `proc(^activity.Context, Greeting_Input) -> Greeting_Output`. The generic

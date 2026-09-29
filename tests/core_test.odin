@@ -16,6 +16,7 @@ import temporal_failure "../temporal/failure"
 import protobuf "../temporal/protobuf"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
+import fiber_raw "../temporal/workflow/fiber/raw"
 
 Heartbeat_Capture :: struct {
 	calls:   int,
@@ -5674,6 +5675,88 @@ language_worker_owns_nondeterminism_workflow_types_until_close :: proc(t: ^testi
 }
 
 @(test)
+workflow_stack_options_default_align_and_reject_unsafe_sizes :: proc(t: ^testing.T) {
+	defaults, default_error := workflow.stack_options_resolve({})
+	testing.expect(t, default_error.message == nil)
+	workflow.error_free(&default_error)
+	testing.expect_value(t, defaults.workflow, workflow.DEFAULT_FIBER_STACK_SIZE)
+	testing.expect_value(t, defaults.signal_handler, workflow.DEFAULT_FIBER_STACK_SIZE)
+	testing.expect_value(t, defaults.update_handler, workflow.DEFAULT_FIBER_STACK_SIZE)
+
+	custom, custom_error := workflow.stack_options_resolve({
+		workflow = workflow.MIN_FIBER_STACK_SIZE + 1,
+		signal_handler = 256 * 1024,
+		update_handler = workflow.MAX_FIBER_STACK_SIZE,
+	})
+	testing.expect(t, custom_error.message == nil)
+	workflow.error_free(&custom_error)
+	testing.expect_value(
+		t,
+		custom.workflow,
+		workflow.MIN_FIBER_STACK_SIZE + workflow.FIBER_STACK_ALIGNMENT,
+	)
+	testing.expect_value(t, custom.signal_handler, 256 * 1024)
+	testing.expect_value(t, custom.update_handler, workflow.MAX_FIBER_STACK_SIZE)
+
+	_, too_small_error := workflow.stack_options_resolve({workflow = 1})
+	testing.expect(t, too_small_error.message != nil)
+	workflow.error_free(&too_small_error)
+	_, too_large_error := workflow.stack_options_resolve({signal_handler = workflow.MAX_FIBER_STACK_SIZE + 1})
+	testing.expect(t, too_large_error.message != nil)
+	workflow.error_free(&too_large_error)
+	_, negative_error := workflow.stack_options_resolve({update_handler = -1})
+	testing.expect(t, negative_error.message != nil)
+	workflow.error_free(&negative_error)
+}
+
+@(test)
+language_worker_propagates_bounded_stack_policy_to_workflow_runtime :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	_, invalid_error := worker.create(
+		&client,
+		"invalid-stack-policy-worker",
+		workflow_stacks = {signal_handler = workflow.MIN_FIBER_STACK_SIZE - 1},
+	)
+	testing.expect(t, invalid_error.message != nil)
+	worker.error_free(&invalid_error)
+
+	sdk_worker, create_error := worker.create(
+		&client,
+		"stack-policy-worker",
+		workflow_stacks = {
+			workflow = 192 * 1024,
+			signal_handler = 96 * 1024,
+			update_handler = 160 * 1024,
+		},
+	)
+	testing.expectf(t, create_error.message == nil, "worker.create failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&sdk_worker,
+		"stack_policy_workflow",
+		registry_first_test_workflow,
+	)
+	testing.expectf(t, register_error.message == nil, "Workflow registration failed: %s", string(register_error.message))
+	worker.error_free(&register_error)
+	testing.expect_value(t, len(sdk_worker.workflow_registrations), 1)
+	if len(sdk_worker.workflow_registrations) != 1 {
+		return
+	}
+	options := sdk_worker.workflow_registrations[0].runtime.stack_options
+	testing.expect_value(t, options.workflow, 192 * 1024)
+	testing.expect_value(t, options.signal_handler, 96 * 1024)
+	testing.expect_value(t, options.update_handler, 160 * 1024)
+}
+
+@(test)
 language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	raw_runtime := raw.Runtime{}
 	runtime := temporal_core.Runtime{handle = &raw_runtime}
@@ -10487,6 +10570,7 @@ workflow_fiber_recreates_stack_after_eviction :: proc(t: ^testing.T) {
 		"odin_hello_workflow",
 		"test-queue",
 		fiber_test_workflow,
+		stack_options = {workflow = 192 * 1024},
 	)
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
@@ -10526,6 +10610,13 @@ workflow_fiber_recreates_stack_after_eviction :: proc(t: ^testing.T) {
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.scheduled_activity)
 	testing.expect_value(t, len(runtime.instances), 1)
+	if len(runtime.instances) == 1 {
+		testing.expect_value(
+			t,
+			fiber_raw.stack_size(runtime.instances[0].fiber),
+			uint(192 * 1024),
+		)
+	}
 	initial_completion := processed.completion
 	workflow.error_free(&processed.error)
 
@@ -11112,6 +11203,7 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 		"odin_update_routine_workflow",
 		"test-queue",
 		fiber_update_routine_test_workflow,
+		stack_options = {update_handler = 224 * 1024},
 	)
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
@@ -11241,6 +11333,15 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expect_value(t, inbound_state.events[5], 42)
 	testing.expect(t, inbound_state.update_validator_context_seen)
 	testing.expect(t, !inbound_state.update_context_after_next)
+	if len(runtime.instances) == 1 && len(runtime.instances[0].update_routines) == 1 {
+		testing.expect_value(
+			t,
+			fiber_raw.stack_size(runtime.instances[0].update_routines[0].fiber),
+			uint(224 * 1024),
+		)
+	} else {
+		testing.expect(t, false)
+	}
 	started_update := inspect_update_responses(
 		processed.completion[:],
 		"update-routine-protocol-1",
@@ -11768,6 +11869,7 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 		"odin_signal_routine_workflow",
 		"test-queue",
 		fiber_signal_routine_test_workflow,
+		stack_options = {signal_handler = 160 * 1024},
 	)
 	testing.expect(t, init_error.message == nil)
 	defer workflow.error_free(&init_error)
@@ -11865,6 +11967,15 @@ workflow_signal_routine_awaits_activity_drains_and_replays :: proc(t: ^testing.T
 	testing.expect_value(t, inbound_state.events[0], 21)
 	testing.expect_value(t, inbound_state.events[1], 22)
 	testing.expect(t, !inbound_state.signal_context_after_next)
+	if len(runtime.instances) == 1 && len(runtime.instances[0].signal_routines) == 1 {
+		testing.expect_value(
+			t,
+			fiber_raw.stack_size(runtime.instances[0].signal_routines[0].fiber),
+			uint(160 * 1024),
+		)
+	} else {
+		testing.expect(t, false)
+	}
 	handler_start_completion := processed.completion
 	workflow.error_free(&processed.error)
 
@@ -15983,7 +16094,10 @@ workflow_replayer_runs_complete_history_through_core_offline :: proc(t: ^testing
 	temporal_core.error_free(&runtime_error)
 	defer temporal_core.runtime_close(&runtime)
 
-	replayer, create_error := worker.create_replayer(&runtime)
+	replayer, create_error := worker.create_replayer(
+		&runtime,
+		workflow_stacks = {workflow = 192 * 1024},
+	)
 	testing.expectf(t, create_error.message == nil, "replayer creation failed: %s", string(create_error.message))
 	worker.error_free(&create_error)
 	defer {
@@ -15998,6 +16112,15 @@ workflow_replayer_runs_complete_history_through_core_offline :: proc(t: ^testing
 	)
 	testing.expectf(t, register_error.message == nil, "replay Workflow registration failed: %s", string(register_error.message))
 	worker.error_free(&register_error)
+	if len(replayer.workflow_registrations) == 1 {
+		testing.expect_value(
+			t,
+			replayer.workflow_registrations[0].runtime.stack_options.workflow,
+			192 * 1024,
+		)
+	} else {
+		testing.expect(t, false)
+	}
 
 	history := offline_replay_history_fixture("offline_replay_workflow")
 	defer delete(history)

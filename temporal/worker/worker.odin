@@ -205,6 +205,7 @@ Worker :: struct {
 	max_concurrent_activities: int,
 	versioning:             Worker_Versioning_Options,
 	nondeterminism_policy:  Nondeterminism_Policy,
+	workflow_stacks:        workflow.Stack_Options,
 	mode:                   Worker_Mode,
 	replay_runtime:         ^temporal_core.Runtime,
 }
@@ -281,6 +282,15 @@ error_from_core :: proc(core_error: ^temporal_core.Error) -> Error {
 	return result
 }
 
+error_from_workflow :: proc(workflow_error: ^workflow.Error) -> Error {
+	if workflow_error == nil || workflow_error.message == nil {
+		return {}
+	}
+	result := Error{message = workflow_error.message}
+	workflow_error.message = nil
+	return result
+}
+
 owned_string_slice_free :: proc(values: []string) {
 	for value in values {
 		delete(value)
@@ -311,6 +321,7 @@ create :: proc(
 	max_concurrent_activities := 10,
 	versioning := Worker_Versioning_Options{},
 	nondeterminism_policy := Nondeterminism_Policy{},
+	workflow_stacks := workflow.Stack_Options{},
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		return {}, error_from_string("client is not initialized")
@@ -333,6 +344,10 @@ create :: proc(
 	)
 	if nondeterminism_error.message != nil {
 		return {}, error_from_core(&nondeterminism_error)
+	}
+	resolved_stacks, stack_error := workflow.stack_options_resolve(workflow_stacks)
+	if stack_error.message != nil {
+		return {}, error_from_workflow(&stack_error)
 	}
 	owned_task_queue, allocation_error := strings.clone(task_queue)
 	if allocation_error != nil {
@@ -378,6 +393,7 @@ create :: proc(
 	worker.versioning.deployment_name = owned_deployment_name
 	worker.nondeterminism_policy = nondeterminism_policy
 	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
+	worker.workflow_stacks = resolved_stacks
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
@@ -393,6 +409,7 @@ create_replayer :: proc(
 	runtime: ^temporal_core.Runtime,
 	namespace := "default",
 	task_queue := "temporal-sdk-odin-replay",
+	workflow_stacks := workflow.Stack_Options{},
 ) -> (worker: Worker, error: Error) {
 	if runtime == nil || runtime.handle == nil {
 		return {}, error_from_string("runtime is not initialized")
@@ -402,6 +419,10 @@ create_replayer :: proc(
 	}
 	if len(task_queue) == 0 {
 		return {}, error_from_string("task queue must not be empty")
+	}
+	resolved_stacks, stack_error := workflow.stack_options_resolve(workflow_stacks)
+	if stack_error.message != nil {
+		return {}, error_from_workflow(&stack_error)
 	}
 	owned_task_queue, task_queue_error := strings.clone(task_queue)
 	if task_queue_error != nil {
@@ -416,6 +437,7 @@ create_replayer :: proc(
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = 1
+	worker.workflow_stacks = resolved_stacks
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
 	worker.activity_registrations = make([dynamic]Activity_Registration)
@@ -777,6 +799,7 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 		worker.task_queue,
 		callback,
 		namespace = workflow_runtime_namespace(worker),
+		stack_options = worker.workflow_stacks,
 	)
 	if init_error.message != nil {
 		delete(owned_name)
@@ -827,6 +850,7 @@ register_payload_workflow :: proc(
 		worker.task_queue,
 		callback,
 		namespace = workflow_runtime_namespace(worker),
+		stack_options = worker.workflow_stacks,
 	)
 	if init_error.message != nil {
 		delete(owned_name)
@@ -881,6 +905,7 @@ register_payloads_workflow :: proc(
 		worker.task_queue,
 		callback,
 		namespace = workflow_runtime_namespace(worker),
+		stack_options = worker.workflow_stacks,
 	)
 	if init_error.message != nil {
 		delete(owned_name)
@@ -968,6 +993,7 @@ register_json_workflow :: proc(
 			free(cast(^Callback)data, allocator_runtime.heap_allocator())
 		},
 		namespace = workflow_runtime_namespace(worker),
+		stack_options = worker.workflow_stacks,
 	)
 	if init_error.message != nil {
 		delete(owned_name)
@@ -2360,6 +2386,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.max_concurrent_activities = 0
 	worker.versioning = {}
 	worker.nondeterminism_policy = {}
+	worker.workflow_stacks = {}
 	worker.mode = .Online
 	return error_from_core(&core_error)
 }

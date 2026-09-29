@@ -121,6 +121,10 @@ nondeterminism policies containing zero to twelve Workflow types and require
 exact C-array preservation. Another
 500 activation contexts vary initial/reset seeds, timestamps, and history
 lengths, then require exact random values and byte-identical fresh-stack replay.
+Another 500 generated stack policies cover default, minimum, aligned custom,
+below-minimum, and above-maximum sizes independently for Workflow, Signal, and
+Update fibers. Unit tests inspect the actual native coroutine sizes, not only
+the Odin configuration records.
 PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent

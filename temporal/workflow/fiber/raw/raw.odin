@@ -45,6 +45,9 @@ foreign fiber_lib {
 	@(link_name = "temporal_odin_fiber_status")
 	status :: proc(fiber: Handle) -> State ---
 
+	@(link_name = "temporal_odin_fiber_stack_size")
+	stack_size :: proc(fiber: Handle) -> c.size_t ---
+
 	@(link_name = "temporal_odin_fiber_destroy")
 	destroy :: proc(fiber: Handle) -> Result ---
 

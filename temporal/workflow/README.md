@@ -35,6 +35,12 @@ This permits `Accepted` plus an Activity command in one completion and the
 terminal Update response after a later Activity resolution. Replay recreates
 both stacks and requires byte-identical completions.
 
+`workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
+stack sizes independently when the Worker is created. Zero selects the 128 KiB
+default; explicit sizes are validated between 32 KiB and 16 MiB. Replay Workers
+accept the same policy. Minicoro allocates the full fixed stack for every live
+fiber, so larger handler stacks directly multiply concurrent-handler memory.
+
 Both implementations exist to test Core activations, commands, ownership,
 forced eviction, and replay. The fiber version has seq-keyed Activity/timer
 operation tables, emits multiple commands in one completion, and applies every

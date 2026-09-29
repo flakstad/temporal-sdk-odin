@@ -871,20 +871,27 @@ temporal_odin_fiber_create
 temporal_odin_fiber_resume
 temporal_odin_fiber_yield
 temporal_odin_fiber_status
+temporal_odin_fiber_stack_size
 temporal_odin_fiber_destroy
 temporal_odin_fiber_result_description
 ```
 
-Each cached Workflow instance owns a 128 KiB C-allocated fiber stack and an
-Odin arena. The instance is heap-stable because the C trampoline retains its
-address. The trampoline restores a captured Odin `runtime.Context`, with the
-instance arena as allocator, before calling user code. Inputs, Activity request
-payloads, resolved values, and arbitrary Workflow allocations can therefore
-survive suspension without borrowing an activation decode arena. Command
-storage itself remains alive for the full activation encode; an early version
-of the spike found that pointers to helper-local command structs become invalid
-before protobuf encoding, a concrete reason to keep this ownership rule
-explicit.
+Each cached Workflow instance and asynchronous Signal/Update handler owns a
+C-allocated fiber stack and the Workflow instance owns an Odin arena. The
+default is 128 KiB per fiber. `workflow.Stack_Options`, accepted by online and
+replay Worker creation, independently configures the three stack classes from
+32 KiB through 16 MiB and aligns values to 16 bytes before they cross the C
+ABI. The project-owned stack-size diagnostic proves that each value reaches the
+corresponding native coroutine. These are fully allocated fixed stacks; the
+policy bounds their memory but does not add guard pages or make overflow safe.
+The instance is heap-stable because the C trampoline retains its address. The
+trampoline restores a captured Odin `runtime.Context`, with the instance arena
+as allocator, before calling user code. Inputs, Activity request payloads,
+resolved values, and arbitrary Workflow allocations can therefore survive
+suspension without borrowing an activation decode arena. Command storage
+itself remains alive for the full activation encode; an early version of the
+spike found that pointers to helper-local command structs become invalid before
+protobuf encoding, a concrete reason to keep this ownership rule explicit.
 
 The author-facing proof is genuinely sequential:
 
@@ -1945,11 +1952,13 @@ This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
 thread-safe, fixed stacks can overflow, and minicoro cautions against migrating
-coroutines that use thread-local state. The production runtime should drive a
-Workflow instance from one deterministic executor thread at a time, prohibit
-concurrent resume/eviction, decide whether fixed or virtual-memory-backed stacks
-are acceptable, and test sanitizers and all four target builds. Panics crossing
-the C trampoline also need an explicit containment policy.
+coroutines that use thread-local state. The Worker now validates and propagates
+an explicit per-fiber resource policy, but the production runtime should still
+drive a Workflow instance from one deterministic executor thread at a time,
+prohibit concurrent resume/eviction, decide whether fixed or
+virtual-memory-backed guard-page stacks are preferable, and test sanitizers and
+all four target builds. Panics crossing the C trampoline also need an explicit
+containment policy.
 
 The blocking wrapper now drains both enabled poll streams during shutdown.
 Core requires every enabled workflow/activity poll stream to observe shutdown
@@ -1987,8 +1996,8 @@ Workflows are enabled.
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
    accepted Updates, panic containment, replay-history JSON import,
-   richer nondeterminism diagnostics, bounded stack policy, or a production
-   deterministic scheduler.
+   richer nondeterminism diagnostics, guard-page/growable stack protection, or
+   a production deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
    other architectures need CI proof before claiming support.
 6. **Core version skew.** Server compatibility is broad, but Core-local

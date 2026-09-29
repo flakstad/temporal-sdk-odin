@@ -1165,9 +1165,48 @@ Fiber_Runtime :: struct {
 	replay_activations:     int,
 	replay_initializations: int,
 	evictions:              int,
+	stack_options:          Stack_Options,
 }
 
-FIBER_STACK_SIZE :: 128 * 1024
+// Minicoro's compiled minimum is 32 KiB. Keeping the same limit here avoids
+// silently accepting a smaller value which the C runtime would round up.
+MIN_FIBER_STACK_SIZE :: 32 * 1024
+DEFAULT_FIBER_STACK_SIZE :: 128 * 1024
+MAX_FIBER_STACK_SIZE :: 16 * 1024 * 1024
+FIBER_STACK_ALIGNMENT :: 16
+
+// Stack_Options bounds the native memory reserved by every live Workflow and
+// asynchronous handler fiber. Zero selects DEFAULT_FIBER_STACK_SIZE. Signal
+// and Update handler sizes are independent because every concurrent handler
+// owns its own stack.
+Stack_Options :: struct {
+	workflow:       int,
+	signal_handler: int,
+	update_handler: int,
+}
+
+resolve_stack_size :: proc(value: int) -> (int, bool) {
+	if value == 0 {
+		return DEFAULT_FIBER_STACK_SIZE, true
+	}
+	if value < MIN_FIBER_STACK_SIZE || value > MAX_FIBER_STACK_SIZE {
+		return 0, false
+	}
+	return ((value + FIBER_STACK_ALIGNMENT - 1) / FIBER_STACK_ALIGNMENT) * FIBER_STACK_ALIGNMENT, true
+}
+
+stack_options_resolve :: proc(options: Stack_Options) -> (resolved: Stack_Options, error: Error) {
+	workflow_size, workflow_ok := resolve_stack_size(options.workflow)
+	signal_size, signal_ok := resolve_stack_size(options.signal_handler)
+	update_size, update_ok := resolve_stack_size(options.update_handler)
+	if !workflow_ok || !signal_ok || !update_ok {
+		return {}, error_from_string("Workflow fiber stack sizes must be zero or between 32 KiB and 16 MiB")
+	}
+	resolved.workflow = workflow_size
+	resolved.signal_handler = signal_size
+	resolved.update_handler = update_size
+	return
+}
 
 fiber_runtime_init_invoker :: proc(
 	runtime: ^Fiber_Runtime,
@@ -1176,11 +1215,16 @@ fiber_runtime_init_invoker :: proc(
 	invoke: Workflow_Invoke_Proc,
 	callback_destroy: Workflow_Callback_Destroy_Proc,
 	namespace := "default",
+	stack_options := Stack_Options{},
 ) -> Error {
 	if runtime == nil || len(namespace) == 0 || len(workflow_type) == 0 ||
 	   len(task_queue) == 0 || callback_data == nil || invoke == nil ||
 	   callback_destroy == nil {
 		return error_from_string("namespace, workflow type, task queue, and workflow procedure are required")
+	}
+	resolved_stacks, stack_error := stack_options_resolve(stack_options)
+	if stack_error.message != nil {
+		return stack_error
 	}
 	owned_namespace, namespace_error := strings.clone(namespace)
 	if namespace_error != nil {
@@ -1206,6 +1250,7 @@ fiber_runtime_init_invoker :: proc(
 	runtime.instances = make([dynamic]^Fiber_Instance)
 	runtime.inbound_interceptors = make([dynamic]Inbound_Interceptor)
 	runtime.outbound_interceptors = make([dynamic]Outbound_Interceptor)
+	runtime.stack_options = resolved_stacks
 	return {}
 }
 
@@ -1248,6 +1293,7 @@ fiber_runtime_init :: proc(
 	workflow_type, task_queue: string,
 	workflow: Fiber_Proc,
 	namespace := "default",
+	stack_options := Stack_Options{},
 ) -> Error {
 	if workflow == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
@@ -1292,6 +1338,7 @@ fiber_runtime_init :: proc(
 			free(cast(^Fiber_Proc)data, allocator_runtime.heap_allocator())
 		},
 		namespace,
+		stack_options,
 	)
 	if init_error.message != nil {
 		free(owned_callback, allocator)
@@ -1304,6 +1351,7 @@ fiber_runtime_init_payload :: proc(
 	workflow_type, task_queue: string,
 	workflow: Payload_Proc,
 	namespace := "default",
+	stack_options := Stack_Options{},
 ) -> Error {
 	if workflow == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
@@ -1333,6 +1381,7 @@ fiber_runtime_init_payload :: proc(
 			free(cast(^Payload_Proc)data, allocator_runtime.heap_allocator())
 		},
 		namespace,
+		stack_options,
 	)
 	if init_error.message != nil {
 		free(owned_callback, allocator)
@@ -1345,6 +1394,7 @@ fiber_runtime_init_payloads :: proc(
 	workflow_type, task_queue: string,
 	workflow: Payloads_Proc,
 	namespace := "default",
+	stack_options := Stack_Options{},
 ) -> Error {
 	if workflow == nil {
 		return error_from_string("workflow type, task queue, and workflow procedure are required")
@@ -1368,6 +1418,7 @@ fiber_runtime_init_payloads :: proc(
 			free(cast(^Payloads_Proc)data, allocator_runtime.heap_allocator())
 		},
 		namespace,
+		stack_options,
 	)
 	if init_error.message != nil {
 		free(owned_callback, allocator)
@@ -2210,7 +2261,7 @@ add_fiber_instance :: proc(
 		&instance.fiber,
 		fiber_entry,
 		instance,
-		FIBER_STACK_SIZE,
+		uint(runtime.stack_options.workflow),
 	)
 	if fiber_result != .Success {
 		virtual.arena_destroy(&instance.arena)
@@ -8084,7 +8135,7 @@ start_signal_routine :: proc(
 		&routine.fiber,
 		signal_routine_entry,
 		routine,
-		FIBER_STACK_SIZE,
+		uint(instance.runtime.stack_options.signal_handler),
 	)
 	if create_result != .Success {
 		return nil, fiber_result_error("could not create Workflow Signal routine", create_result)
@@ -8373,7 +8424,7 @@ start_update_routine :: proc(
 		&routine.fiber,
 		update_routine_entry,
 		routine,
-		FIBER_STACK_SIZE,
+		uint(instance.runtime.stack_options.update_handler),
 	)
 	if create_result != .Success {
 		return nil, fiber_result_error("could not create Workflow Update routine", create_result)
