@@ -16018,9 +16018,12 @@ workflow_replayer_runs_complete_history_through_core_offline :: proc(t: ^testing
 		"malformed-replay-workflow",
 		[]u8{0xff},
 	)
-	worker.replay_result_free(&malformed_result)
-	testing.expect(t, malformed_error.message != nil)
+	testing.expect(t, malformed_error.message == nil)
 	worker.error_free(&malformed_error)
+	testing.expect_value(t, malformed_result.failure, worker.Replay_Failure_Kind.Invalid_History)
+	testing.expect_value(t, malformed_result.workflow_id, "malformed-replay-workflow")
+	testing.expect(t, malformed_result.message != nil)
+	worker.replay_result_free(&malformed_result)
 }
 
 @(test)
@@ -16057,4 +16060,65 @@ workflow_replayer_reports_core_nondeterminism_as_data :: proc(t: ^testing.T) {
 	testing.expect_value(t, result.failure, worker.Replay_Failure_Kind.Nondeterminism)
 	testing.expect_value(t, result.eviction_reason, worker.Replay_Eviction_Reason.NONDETERMINISM)
 	testing.expect(t, bytes.contains(result.message, transmute([]u8)string("[TMPRL1100]")))
+}
+
+@(test)
+workflow_replayer_batches_histories_in_order_on_one_core_worker :: proc(t: ^testing.T) {
+	runtime, runtime_error := temporal_core.runtime_create()
+	testing.expect(t, runtime_error.message == nil)
+	temporal_core.error_free(&runtime_error)
+	defer temporal_core.runtime_close(&runtime)
+	replayer, create_error := worker.create_replayer(&runtime)
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&replayer)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&replayer,
+		"offline_batch_compatible",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	register_error = worker.register_workflow(
+		&replayer,
+		"offline_batch_incompatible",
+		fiber_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+
+	compatible := offline_replay_history_fixture("offline_batch_compatible")
+	defer delete(compatible)
+	incompatible := offline_replay_history_fixture("offline_batch_incompatible")
+	defer delete(incompatible)
+	histories := [?]worker.Replay_History{
+		{workflow_id = "batch-compatible-1", protobuf = compatible[:]},
+		{workflow_id = "batch-incompatible", protobuf = incompatible[:]},
+		{workflow_id = "batch-invalid", protobuf = []u8{0xff}},
+		{protobuf = compatible[:]},
+	}
+	results, replay_error := worker.replay_histories(&replayer, histories[:])
+	defer worker.replay_results_free(&results)
+	testing.expectf(t, replay_error.message == nil, "batch replay failed: %s", string(replay_error.message))
+	worker.error_free(&replay_error)
+	testing.expect_value(t, len(results), 4)
+	if len(results) != 4 {
+		return
+	}
+	testing.expect_value(t, results[0].workflow_id, "batch-compatible-1")
+	testing.expect_value(t, results[0].failure, worker.Replay_Failure_Kind.None)
+	testing.expect_value(t, results[1].workflow_id, "batch-incompatible")
+	testing.expect_value(t, results[1].failure, worker.Replay_Failure_Kind.Nondeterminism)
+	testing.expect_value(t, results[2].workflow_id, "batch-invalid")
+	testing.expect_value(t, results[2].failure, worker.Replay_Failure_Kind.Invalid_History)
+	testing.expect_value(t, results[2].activations_processed, 0)
+	testing.expect_value(t, results[3].workflow_id, worker.DEFAULT_REPLAY_WORKFLOW_ID)
+	testing.expect_value(t, results[3].failure, worker.Replay_Failure_Kind.None)
+	testing.expect(t, results[0].activations_processed >= 2)
+	testing.expect(t, results[1].activations_processed >= 2)
+	testing.expect(t, results[3].activations_processed >= 2)
 }

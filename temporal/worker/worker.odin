@@ -211,6 +211,7 @@ Worker :: struct {
 
 Replay_Failure_Kind :: enum {
 	None,
+	Invalid_History,
 	Nondeterminism,
 	Workflow_Task_Failure,
 	Internal,
@@ -219,18 +220,40 @@ Replay_Failure_Kind :: enum {
 Replay_Eviction_Reason :: proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason
 
 Replay_Result :: struct {
+	workflow_id:          string,
 	failure:              Replay_Failure_Kind,
 	eviction_reason:      Replay_Eviction_Reason,
 	message:              []u8,
 	activations_processed: int,
 }
 
+Replay_History :: struct {
+	// Empty IDs are replaced with DEFAULT_REPLAY_WORKFLOW_ID. Both fields are
+	// borrowed until replay_histories returns.
+	workflow_id: string,
+	protobuf:    []u8,
+}
+
+DEFAULT_REPLAY_WORKFLOW_ID :: "temporal-sdk-odin-replay-workflow"
+
 replay_result_free :: proc(result: ^Replay_Result) {
 	if result == nil {
 		return
 	}
+	delete(result.workflow_id)
 	delete(result.message)
 	result^ = {}
+}
+
+replay_results_free :: proc(results: ^[dynamic]Replay_Result) {
+	if results == nil {
+		return
+	}
+	for &result in results^ {
+		replay_result_free(&result)
+	}
+	delete(results^)
+	results^ = nil
 }
 
 Error :: struct {
@@ -1949,92 +1972,37 @@ replay_failure_from_eviction :: proc(reason: Replay_Eviction_Reason) -> Replay_F
 	return .Internal
 }
 
-// replay_history runs one serialized temporal.api.history.v1.History through
-// Core and the registered Odin Workflow implementation. Replay incompatibility
-// is reported in Replay_Result; transport, protobuf, and lifecycle faults use
-// Error. The input bytes are borrowed only for this call.
-replay_history :: proc(
+replay_accepted_history :: proc(
 	worker: ^Worker,
-	workflow_id: string,
-	history_protobuf: []u8,
+	core_replayer: ^temporal_core.Replay_Worker,
+	owned_workflow_id: string,
 ) -> (result: Replay_Result, error: Error) {
-	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
-		return {}, error_from_string("replayer is not initialized")
-	}
-	if worker.mode != .Replay {
-		return {}, error_from_string("worker was not created with create_replayer")
-	}
-	if worker.lifecycle == .Running {
-		return {}, error_from_string("replayer is already running")
-	}
-	if worker.replay_runtime == nil || worker.replay_runtime.handle == nil {
-		return {}, error_from_string("runtime must remain open until replay returns")
-	}
-	if len(worker.workflow_registrations) == 0 {
-		return {}, error_from_string("at least one Workflow must be registered for replay")
-	}
-	if len(workflow_id) == 0 {
-		return {}, error_from_string("replay workflow ID must not be empty")
-	}
-	if len(history_protobuf) == 0 {
-		return {}, error_from_string("replay history protobuf must not be empty")
-	}
-	if len(worker.workflow_runs) != 0 || len(worker.rejected_workflow_runs) != 0 {
-		return {}, error_from_string("previous replay did not fully evict its Workflow state")
-	}
-
-	core_replayer, create_error := temporal_core.replay_worker_create(
-		worker.replay_runtime,
-		worker.namespace,
-		worker.task_queue,
-	)
-	if create_error.message != nil {
-		return {}, error_from_core(&create_error)
-	}
-	worker.lifecycle = .Running
-	defer {
-		close_error := temporal_core.replay_worker_close(&core_replayer)
-		if error.message == nil && close_error.message != nil {
-			error = error_from_core(&close_error)
-		} else {
-			temporal_core.error_free(&close_error)
-		}
-		worker.lifecycle = .Configuring
-	}
-
-	push_error := temporal_core.replay_worker_push(
-		&core_replayer,
-		workflow_id,
-		history_protobuf,
-	)
-	if push_error.message != nil {
-		return {}, error_from_core(&push_error)
-	}
+	result.workflow_id = owned_workflow_id
 
 	for {
 		poll := temporal_core.worker_poll_workflow(&core_replayer.worker)
 		if poll.error.message != nil {
-			return {}, error_from_core(&poll.error)
+			return result, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
-			return {}, error_from_string("replay worker stopped before reporting an outcome")
+			return result, error_from_string("replay worker stopped before reporting an outcome")
 		}
 
 		eviction, inspected := inspect_replay_eviction(poll.protobuf)
 		if !inspected {
 			delete(poll.protobuf)
-			return {}, error_from_string("Core returned a malformed replay WorkflowActivation")
+			return result, error_from_string("Core returned a malformed replay WorkflowActivation")
 		}
 		processed, dispatch_error := process_workflow_activation(worker, poll.protobuf)
 		delete(poll.protobuf)
 		if dispatch_error.message != nil {
 			replay_eviction_free(&eviction)
-			return {}, dispatch_error
+			return result, dispatch_error
 		}
 		if processed.completion == nil {
 			replay_eviction_free(&eviction)
 			workflow.error_free(&processed.error)
-			return {}, error_from_string("replay activation produced no completion")
+			return result, error_from_string("replay activation produced no completion")
 		}
 		complete_error := temporal_core.worker_complete_workflow(
 			&core_replayer.worker,
@@ -2045,14 +2013,14 @@ replay_history :: proc(
 		if complete_error.message != nil {
 			replay_eviction_free(&eviction)
 			workflow.error_free(&processed.error)
-			return {}, error_from_core(&complete_error)
+			return result, error_from_core(&complete_error)
 		}
 		result.activations_processed += 1
 		if processed.error.message != nil && !processed.activation_failed {
-			message := string(processed.error.message)
+			result_error := error_from_string(string(processed.error.message))
 			workflow.error_free(&processed.error)
 			replay_eviction_free(&eviction)
-			return {}, error_from_string(message)
+			return result, result_error
 		}
 		workflow.error_free(&processed.error)
 		if !eviction.found {
@@ -2066,6 +2034,133 @@ replay_history :: proc(
 		replay_eviction_free(&eviction)
 		return
 	}
+}
+
+// replay_histories runs histories in input order through one Core replay
+// worker. Per-history incompatibility and malformed protobuf are data in the
+// corresponding Replay_Result; worker/lifecycle faults use Error. Input bytes
+// and IDs are borrowed until this call returns. Returned results are owned.
+replay_histories :: proc(
+	worker: ^Worker,
+	histories: []Replay_History,
+) -> (results: [dynamic]Replay_Result, error: Error) {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return nil, error_from_string("replayer is not initialized")
+	}
+	if worker.mode != .Replay {
+		return nil, error_from_string("worker was not created with create_replayer")
+	}
+	if worker.lifecycle == .Running {
+		return nil, error_from_string("replayer is already running")
+	}
+	if worker.lifecycle == .Stopped {
+		return nil, error_from_string("replayer cannot be reused after an operational failure")
+	}
+	if worker.replay_runtime == nil || worker.replay_runtime.handle == nil {
+		return nil, error_from_string("runtime must remain open until replay returns")
+	}
+	if len(worker.workflow_registrations) == 0 {
+		return nil, error_from_string("at least one Workflow must be registered for replay")
+	}
+	if len(worker.workflow_runs) != 0 || len(worker.rejected_workflow_runs) != 0 {
+		return nil, error_from_string("previous replay did not fully evict its Workflow state")
+	}
+	results = make([dynamic]Replay_Result, 0, len(histories))
+	if len(histories) == 0 {
+		return
+	}
+
+	core_replayer, create_error := temporal_core.replay_worker_create(
+		worker.replay_runtime,
+		worker.namespace,
+		worker.task_queue,
+	)
+	if create_error.message != nil {
+		return results, error_from_core(&create_error)
+	}
+	worker.lifecycle = .Running
+	defer {
+		close_error := temporal_core.replay_worker_close(&core_replayer)
+		if error.message == nil && close_error.message != nil {
+			error = error_from_core(&close_error)
+		} else {
+			temporal_core.error_free(&close_error)
+		}
+		if error.message == nil {
+			worker.lifecycle = .Configuring
+		} else {
+			worker.lifecycle = .Stopped
+		}
+	}
+
+	for history in histories {
+		workflow_id := history.workflow_id
+		if len(workflow_id) == 0 {
+			workflow_id = DEFAULT_REPLAY_WORKFLOW_ID
+		}
+		owned_workflow_id, allocation_error := strings.clone(workflow_id)
+		if allocation_error != nil {
+			return results, error_from_string("could not allocate replay Workflow ID")
+		}
+		if len(history.protobuf) == 0 {
+			append(&results, Replay_Result{
+				workflow_id = owned_workflow_id,
+				failure = .Invalid_History,
+				message = bytes.clone(transmute([]u8)string("replay history protobuf must not be empty")),
+			})
+			continue
+		}
+		push_error := temporal_core.replay_worker_push(
+			&core_replayer,
+			workflow_id,
+			history.protobuf,
+		)
+		if push_error.message != nil {
+			append(&results, Replay_Result{
+				workflow_id = owned_workflow_id,
+				failure = .Invalid_History,
+				message = push_error.message,
+			})
+			push_error.message = nil
+			temporal_core.error_free(&push_error)
+			continue
+		}
+		result, replay_error := replay_accepted_history(
+			worker,
+			&core_replayer,
+			owned_workflow_id,
+		)
+		if replay_error.message != nil {
+			replay_result_free(&result)
+			return results, replay_error
+		}
+		append(&results, result)
+	}
+	return
+}
+
+// replay_history is the single-history convenience form. Replay failures,
+// including malformed history, are returned in Replay_Result.
+replay_history :: proc(
+	worker: ^Worker,
+	workflow_id: string,
+	history_protobuf: []u8,
+) -> (result: Replay_Result, error: Error) {
+	histories := [?]Replay_History{{
+		workflow_id = workflow_id,
+		protobuf = history_protobuf,
+	}}
+	results, batch_error := replay_histories(worker, histories[:])
+	defer replay_results_free(&results)
+	if batch_error.message != nil {
+		return {}, batch_error
+	}
+	if len(results) != 1 {
+		return {}, error_from_string("single-history replay produced an unexpected result count")
+	}
+	result = results[0]
+	results[0] = {}
+	return
 }
 
 Activity_Thread_State :: struct {

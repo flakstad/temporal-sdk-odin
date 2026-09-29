@@ -17,6 +17,7 @@ workflow_control_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-workfl
 slow_update_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-slow-update.XXXXXX")"
 unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
 typed_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-typed-history.XXXXXX")"
+replay_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-replay-history.XXXXXX")"
 
 cleanup() {
   if [[ -n "$unknown_workflow_id" ]]; then
@@ -69,7 +70,7 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file" "$workflow_control_output_file" "$slow_update_output_file" "$unknown_history_file" "$typed_history_file"
+  rm -f "$workflow_output_file" "$workflow_control_output_file" "$slow_update_output_file" "$unknown_history_file" "$typed_history_file" "$replay_history_file"
 }
 trap cleanup EXIT INT TERM
 
@@ -108,12 +109,19 @@ TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
 eager_workflow_id="odin-sdk-eager-$$-$(date +%s)"
 TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \
+  TEMPORAL_REPLAY_HISTORY_OUT="$replay_history_file" \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-eager-workflow.sh" >"$workflow_output_file"
 eager_output="$(<"$workflow_output_file")"
 echo "$eager_output"
 grep -q "Eager Workflow start accepted and completed workflow_id=$eager_workflow_id" <<<"$eager_output"
 grep -q "Fetched server history and replayed it offline through Core" <<<"$eager_output"
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-replay-history.sh" \
+  "$replay_history_file" >"$workflow_output_file"
+replay_output="$(<"$workflow_output_file")"
+echo "$replay_output"
+grep -q "PASS $replay_history_file" <<<"$replay_output"
 temporal workflow show \
   --workflow-id "$eager_workflow_id" \
   --command-timeout 10s \

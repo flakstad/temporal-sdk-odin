@@ -23,4 +23,5 @@ build_example schedule_lifecycle temporal-odin-schedule-lifecycle
 build_example hello_activity temporal-odin-hello-activity
 build_example hello_workflow temporal-odin-hello-workflow
 build_example eager_workflow temporal-odin-eager-workflow
+build_example replay_history temporal-odin-replay-history
 build_example child_workflow temporal-odin-child-workflow

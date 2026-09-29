@@ -129,12 +129,15 @@ Workflow definition, `LANG_FAIL` as a language Workflow-task failure, and every
 other eviction reason as an internal replay failure. Odin still completes that
 final activation so Core can finish its lifecycle.
 
-The language API creates one Core replay worker per `replay_history` call while
-retaining registered Odin Workflow definitions across calls. This keeps the C
-pusher lifetime simple and guarantees that each accepted history ends in
-eviction before another history begins. It is intentionally synchronous.
-Batch/streaming replay can later reuse one Core worker once cancellation,
-backpressure, and result correlation have dedicated tests.
+The language API retains registered Odin Workflow definitions across calls.
+`replay_history` creates one Core worker for its single input;
+`replay_histories` creates one Core worker for the entire batch, pushes the next
+history only after the previous final eviction, and returns outcomes in input
+order. Malformed protobuf, nondeterminism, and Workflow-task failures are
+per-history results, while worker/lifecycle failures abort the batch. This
+sequential use of the C bridge's capacity-one async channel keeps pusher
+lifetime and result correlation explicit. Concurrent streaming replay remains
+deferred until cancellation and backpressure have dedicated tests.
 
 `client.fetch_history_protobuf` follows all Service pagination tokens, retains
 each canonical encoded event until aggregation is finished, and returns the
@@ -1983,7 +1986,7 @@ Workflows are enabled.
    detached Update/Activity cleanup, Child Workflows, external Workflow
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It does not
    yet prove general nested cancellation-token trees, client cancellation of
-   accepted Updates, panic containment, replay-history JSON import/batching,
+   accepted Updates, panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, bounded stack policy, or a production
    deterministic scheduler.
 5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all

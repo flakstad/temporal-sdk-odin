@@ -134,6 +134,19 @@ run :: proc() -> int {
 		return 1
 	}
 	defer delete(history)
+	history_path_buffer: [1024]u8
+	history_path := os.get_env(
+		history_path_buffer[:],
+		"TEMPORAL_REPLAY_HISTORY_OUT",
+	)
+	if len(history_path) > 0 {
+		write_error := os.write_entire_file(history_path, history)
+		if write_error != nil {
+			fmt.eprintf("Could not write replay history %s: %v\n", history_path, write_error)
+			return 1
+		}
+		fmt.printf("Wrote binary replay history to %s\n", history_path)
+	}
 	core_client := temporal_client.core_client(&client)
 	replayer, replayer_error := worker.create_replayer(core_client.runtime)
 	if replayer_error.message != nil {

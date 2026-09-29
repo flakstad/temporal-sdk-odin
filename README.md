@@ -454,6 +454,27 @@ if replay_result.failure == .Nondeterminism {
 
 CLI JSON is not silently converted. The C bridge requires protobuf wire bytes;
 `fetch_history_protobuf` is the supported path from Service history to replay.
+`worker.replay_histories` accepts a borrowed slice of histories and runs all of
+them through one Core worker. Results remain in input order; malformed protobuf,
+nondeterminism, and Workflow-task failures are per-history results so a corpus
+run can continue, while worker/lifecycle failures abort the batch.
+
+The eager example can persist its fetched History and the replay example can
+use one or many such files as a CI compatibility corpus:
+
+```bash
+temporal server start-dev
+
+TEMPORAL_REPLAY_HISTORY_OUT=/tmp/eager.pb \
+  ./scripts/run-eager-workflow.sh
+
+./scripts/run-replay-history.sh /tmp/eager.pb
+```
+
+`examples/replay_history` intentionally registers the eager sample Workflow.
+Applications should copy its small driver and replace that registration with
+their own Workflow definitions. The command exits non-zero if any history is
+incompatible or invalid.
 
 With `examples/hello_workflow` running in the `patch` scenario, exercise the
 complete Schedule lifecycle without Temporal CLI acting as the client:
@@ -1356,6 +1377,7 @@ examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/eager_workflow/  same-connection eager Workflow start proof
+examples/replay_history/  offline binary-history compatibility corpus runner
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof

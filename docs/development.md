@@ -96,8 +96,10 @@ The fast suite also creates Core's dedicated offline replay worker through the
 C ABI. It replays a complete synthetic `temporal.api.history.v1.History`, then
 runs an incompatible Workflow definition against the same history and requires
 Core's `NONDETERMINISM` eviction with a `TMPRL1100` diagnostic. A malformed
-History verifies immediate Core error ownership and shutdown. These tests use a
-real Core runtime but no Temporal Service.
+History verifies immediate Core error ownership and shutdown. A batch test then
+feeds compatible, nondeterministic, malformed, and compatible histories through
+one Core worker, requiring ordered per-history outcomes and successful recovery.
+These tests use a real Core runtime but no Temporal Service.
 
 The script runs the repository tests with Odin vetting, strict style, and
 warnings promoted to errors. It then runs a separate property suite from
@@ -981,6 +983,13 @@ the Service-to-offline-replay loop. It starts and completes a Workflow, calls
 worker without a Client connection, registers the same Workflow definition,
 and requires a compatible `LANG_REQUESTED` eviction. The full integration suite
 asserts this output.
+
+Set `TEMPORAL_REPLAY_HISTORY_OUT` to make the eager example persist the exact
+binary History it fetched. `./scripts/run-replay-history.sh` accepts one or more
+of those files, runs them as one Core replay batch, prints one PASS/FAIL line per
+file, and exits non-zero if any result is incompatible or invalid. The example
+registers `odin_eager_workflow`; application repositories should use the driver
+with their own complete Workflow registry.
 
 `run-hello-activity.sh` polls task queue `odin-hello-activity` and completes one
 task before shutting down. Run `./scripts/integration-test.sh` instead when you
