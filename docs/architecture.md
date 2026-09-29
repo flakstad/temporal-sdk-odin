@@ -395,11 +395,17 @@ pinned bridge's generic WorkflowService dispatcher with:
 - `RecordActivityTaskHeartbeat[ById]`.
 
 This adds no C ABI symbol. It adds the exact WorkflowService request/heartbeat
-response schemas to the generated Odin protobuf roots. The live token path is
-Odin worker → Core `WillCompleteAsync` → Service pending Activity → separate
-Odin Client → Core RPC bridge → Service completion → waiting Workflow. Local
-Activities explicitly reject this result because no server task remains to
-complete.
+response schemas to the generated Odin protobuf roots. The live path is Odin
+worker → Core `WillCompleteAsync` → Service pending Activity → separate Odin
+Client → Core RPC bridge → Service terminal operation → waiting Workflow. The
+CLI-devserver matrix proves task-token and Workflow/Activity-ID heartbeats and
+completion, task-token failure with typed JSON details, and By-ID cancellation
+acknowledgement. Cancellation is not an unsolicited terminal operation: the
+Workflow first requests cancellation, the Odin Client observes
+`cancel_requested` in a heartbeat response, and only then calls
+`RespondActivityTaskCanceledById`. Temporal history is decoded to verify the
+failure type/details and cancellation details. Local Activities explicitly
+reject asynchronous completion because no server task remains to complete.
 
 ### Activity execution context boundary
 

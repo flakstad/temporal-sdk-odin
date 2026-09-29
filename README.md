@@ -203,8 +203,10 @@ user data is borrowed until `worker.close`. Remote Activities may now return
 `activity.result_will_complete_async(T)` (or the Payload equivalent). A public
 Odin Client can subsequently complete, fail, report cancellation, or heartbeat
 the Activity by copied task token, Workflow/Activity ID, or standalone Activity
-ID. The live dev-server case defers in the worker and completes through Core's
-generic WorkflowService RPC bridge from a separate Client. Local Activities
+ID. The live dev-server matrix defers in the worker, heartbeats and completes by
+both task token and Workflow/Activity ID, fails by task token with typed details,
+and acknowledges a requested cancellation by ID through Core's generic
+WorkflowService RPC bridge from a separate Client. Local Activities
 reject asynchronous completion because they have no server-side pending task.
 Workers can also register deterministic
 Workflow outbound interceptors for remote and Local Activity scheduling, Child

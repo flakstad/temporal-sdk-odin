@@ -464,12 +464,17 @@ grep -q "signal won the durable timer race and replay reproduced timer cancellat
 
 run_activity_case() {
   local mode="$1"
+  local activity_workflow_id=""
+  if [[ "$mode" == async-* ]]; then
+    activity_workflow_id="odin-sdk-${mode}-$$-$(date +%s%N)"
+  fi
   if [[ "$mode" == "retry" ]]; then
     ACTIVITY_EXPECT_RETRY=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
-  elif [[ "$mode" == "async" ]]; then
+  elif [[ "$mode" == async-* ]]; then
     ACTIVITY_EXPECT_ASYNC=1 \
+      ACTIVITY_ASYNC_MODE="${mode#async-}" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   else
@@ -506,8 +511,10 @@ run_activity_case() {
     ACTIVITY_RETRY=1 cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
-  elif [[ "$mode" == "async" ]]; then
-    ACTIVITY_ASYNC=1 cargo run --quiet \
+  elif [[ "$mode" == async-* ]]; then
+    ACTIVITY_ASYNC_MODE="${mode#async-}" \
+      ACTIVITY_WORKFLOW_ID="$activity_workflow_id" \
+      cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   else
@@ -521,8 +528,45 @@ run_activity_case() {
   cat "$worker_log"
   if [[ "$mode" == "retry" ]]; then
     grep -q "retryable Activity failed once, then completed and worker shut down cleanly" "$worker_log"
-  elif [[ "$mode" == "async" ]]; then
-    grep -q "Activity deferred completion and Odin Client completed it by task token" "$worker_log"
+  elif [[ "$mode" == async-* ]]; then
+    grep -q "Activity deferred completion and Odin Client applied mode=${mode#async-}" "$worker_log"
+    temporal workflow show \
+      --workflow-id "$activity_workflow_id" \
+      --namespace default \
+      --output json >"$typed_history_file"
+    if [[ "$mode" == "async-token-failure" ]]; then
+      jq -e '
+        [.events[]
+          | select(.eventType == "EVENT_TYPE_ACTIVITY_TASK_FAILED")
+          | .activityTaskFailedEventAttributes.failure
+          | select(
+              .message == "async dependency failed" and
+              .applicationFailureInfo.type == "AsyncGreetingError" and
+              .applicationFailureInfo.nonRetryable == true
+            )]
+        | length == 1
+      ' "$typed_history_file" >/dev/null
+      jq -e '
+        [.events[]
+          | select(.eventType == "EVENT_TYPE_ACTIVITY_TASK_FAILED")
+          | .activityTaskFailedEventAttributes.failure.applicationFailureInfo.details.payloads[].data
+          | @base64d
+          | fromjson
+          | select(.dependency == "async-greeting" and .mode == "token-failure")]
+        | length == 1
+      ' "$typed_history_file" >/dev/null
+    elif [[ "$mode" == "async-id-cancel" ]]; then
+      grep -q 'EVENT_TYPE_ACTIVITY_TASK_CANCELED' "$typed_history_file"
+      jq -e '
+        [.events[]
+          | select(.eventType == "EVENT_TYPE_ACTIVITY_TASK_CANCELED")
+          | .activityTaskCanceledEventAttributes.details.payloads[].data
+          | @base64d
+          | fromjson
+          | select(.reason == "integration requested cancellation" and .mode == "id-cancel")]
+        | length == 1
+      ' "$typed_history_file" >/dev/null
+    fi
   else
     grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
   fi
@@ -532,7 +576,10 @@ run_activity_case string
 run_activity_case failure
 run_activity_case typed
 run_activity_case retry
-run_activity_case async
+run_activity_case async-token-complete
+run_activity_case async-id-complete
+run_activity_case async-token-failure
+run_activity_case async-id-cancel
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

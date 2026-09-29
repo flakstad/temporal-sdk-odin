@@ -335,14 +335,19 @@ pause, and reset. ID forms also cover standalone Activities by leaving Workflow
 ID empty. Local Activities convert an attempted asynchronous result into a
 non-retryable contract failure.
 
-The live dev-server case schedules `async_hello`, lets the Odin worker emit
+The live dev-server matrix schedules `async_hello`, lets the Odin worker emit
 `WillCompleteAsync` and stop after one task, then uses a separately connected
-Odin Client to call `RespondActivityTaskCompleted` with the copied task token.
-The Rust workflow driver observes `Hello async Odin` from the Service. The
-remaining by-ID, failure, cancellation, and heartbeat variants share the same
-generated WorkflowService boundary and currently have wire/unit coverage; add
-live cases before declaring each operationally proven against every Server
-version.
+Odin Client for four paths: heartbeat plus completion by copied task token,
+heartbeat plus completion by Workflow/Activity ID, heartbeat plus typed
+Application Failure by task token, and heartbeat plus cancellation reporting by
+ID. The cancellation driver requests Activity cancellation with
+`WaitCancellationCompleted`; Odin waits until the heartbeat response exposes
+`cancel_requested` before acknowledging it. The integration test reads the
+completed histories and decodes their Payload data with `jq`, proving the
+failure message/type/non-retryable flag/details and the cancellation details.
+Standalone-Activity ID addressing uses the same By-ID requests but is not yet a
+live test because the pinned CLI Server does not implement
+`StartActivityExecution`.
 
 Activity panics are not caught in-process. In the tested Odin toolchain,
 `panic` delegates to `context.assertion_failure_proc`, whose type returns `!`;
@@ -1582,8 +1587,8 @@ after real Activity round trips.
 Milestones 1–3 and the stackful-fiber experiment were built and run end-to-end
 on macOS arm64. Native packaging and packaged-runtime smoke verification also
 run locally there. A clean Ubuntu 24.04 arm64 container has also built Core from
-a Git-free complete source archive, run all 135 unit tests and 42 property
-tests, built every example, and passed runtime init/shutdown against the
+a Git-free complete source archive, run the then-current 135 unit tests and 42
+property tests, built every example, and passed runtime init/shutdown against the
 packaged Linux arm64 artifact. The repository now has a four-target hosted CI
 matrix for macOS arm64/x86_64 and Linux glibc arm64/x86_64. The two x86_64
 targets still require a green hosted run before support is claimed; musl and

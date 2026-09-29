@@ -9,7 +9,8 @@ use temporalio_client::{
 use temporalio_common::{ActivityDefinition, RetryPolicy};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityOptions, Runtime, Worker, WorkerOptions, WorkflowContext, WorkflowResult,
+    ActivityCancellationType, ActivityOptions, CancellableFuture, Runtime, Worker, WorkerOptions,
+    WorkflowContext, WorkflowResult,
 };
 
 struct HelloActivity;
@@ -184,13 +185,19 @@ struct AsyncActivityDriverWorkflow;
 impl AsyncActivityDriverWorkflow {
     #[run(name = "odin_async_activity_driver")]
     async fn run(ctx: &mut WorkflowContext<Self>, name: String) -> WorkflowResult<String> {
-        let result = ctx
-            .execute_activity(
-                AsyncHelloActivity,
-                name,
-                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
-            )
-            .await?;
+        let cancel_activity = name == "__cancel__";
+        let activity = ctx.execute_activity(
+            AsyncHelloActivity,
+            name,
+            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                .build(),
+        );
+        if cancel_activity {
+            ctx.timer(Duration::from_millis(10)).await;
+            activity.cancel();
+        }
+        let result = activity.await?;
         Ok(result)
     }
 }
@@ -206,7 +213,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
-    let async_completion = std::env::var_os("ACTIVITY_ASYNC").is_some();
+    let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
     let expected = if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
     } else {
@@ -229,13 +236,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = worker.shutdown_handle();
 
     let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let workflow_id = format!("odin-sdk-activity-spike-{}-{unique}", std::process::id());
+    let workflow_id = std::env::var("ACTIVITY_WORKFLOW_ID")
+        .unwrap_or_else(|_| format!("odin-sdk-activity-spike-{}-{unique}", std::process::id()));
     let driver = async move {
-        if async_completion {
+        if let Some(async_mode) = async_mode {
+            let activity_input = if async_mode == "id-cancel" {
+                "__cancel__".to_string()
+            } else {
+                input
+            };
             let handle = client
                 .start_workflow(
                     AsyncActivityDriverWorkflow::run,
-                    input,
+                    activity_input,
                     WorkflowStartOptions::new(queue, workflow_id).build(),
                 )
                 .await?;
@@ -243,12 +256,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_secs(30),
                 handle.get_result(WorkflowGetResultOptions::default()),
             )
-            .await??;
+            .await?;
             shutdown();
-            if result != "Hello async Odin" {
-                return Err(format!("unexpected async Activity result: {result}").into());
+            match async_mode.as_str() {
+                "token-complete" => {
+                    let value = result?;
+                    if value != "Hello async Odin" {
+                        return Err(
+                            format!("unexpected token-completed Activity result: {value}").into(),
+                        );
+                    }
+                    println!("Workflow observed token-completed Odin Activity result: {value}");
+                }
+                "id-complete" => {
+                    let value = result?;
+                    if value != "Hello async by ID Odin" {
+                        return Err(
+                            format!("unexpected ID-completed Activity result: {value}").into()
+                        );
+                    }
+                    println!("Workflow observed ID-completed Odin Activity result: {value}");
+                }
+                "token-failure" => match result {
+                    Ok(value) => {
+                        return Err(
+                            format!("asynchronously failed Activity returned: {value}").into()
+                        );
+                    }
+                    Err(error) => {
+                        println!("Workflow observed expected async Activity failure: {error}");
+                    }
+                },
+                "id-cancel" => match result {
+                    Ok(value) => {
+                        return Err(
+                            format!("asynchronously canceled Activity returned: {value}").into(),
+                        );
+                    }
+                    Err(error) => {
+                        println!("Workflow observed expected async Activity cancellation: {error}");
+                    }
+                },
+                value => return Err(format!("unsupported ACTIVITY_ASYNC_MODE: {value}").into()),
             }
-            println!("Workflow observed asynchronously completed Odin Activity result: {result}");
             return Ok::<(), Box<dyn std::error::Error>>(());
         }
         if retry {
