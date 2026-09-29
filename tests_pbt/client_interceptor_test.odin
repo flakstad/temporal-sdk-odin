@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:testing"
+import "core:time"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
 import temporal_core "../temporal/core"
@@ -163,20 +164,59 @@ client_interceptor_property_count_workflows :: proc(
 	return
 }
 
+client_interceptor_property_describe_schedule :: proc(user_data: rawptr, input: ^temporal_client.Client_Describe_Schedule_Input, next: temporal_client.Client_Describe_Schedule_Next) -> (result: temporal_client.Schedule_Description, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result, error = temporal_client.client_describe_schedule_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_list_schedules :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedules_Input, next: temporal_client.Client_List_Schedules_Next) -> (result: temporal_client.Schedule_List_Page, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	input.options.maximum_page_size = i32(node.id)
+	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result, error = temporal_client.client_list_schedules_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_count_schedules :: proc(user_data: rawptr, input: ^temporal_client.Client_Count_Schedules_Input, next: temporal_client.Client_Count_Schedules_Next) -> (result: temporal_client.Schedule_Count, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	input.query = "generated Schedule count query"
+	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result, error = temporal_client.client_count_schedules_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_matching_times :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedule_Matching_Times_Input, next: temporal_client.Client_List_Schedule_Matching_Times_Next) -> (result: temporal_client.Schedule_Matching_Times, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result, error = temporal_client.client_list_schedule_matching_times_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return
+}
+
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 6))
+	operation := pbt.draw(t, pbt.int_range(0, 10))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 0, 12.0, "Workflow Signal")
-	pbt.cover(t, operation == 1, 12.0, "Workflow cancellation")
-	pbt.cover(t, operation == 2, 12.0, "Workflow termination")
-	pbt.cover(t, operation == 3, 12.0, "Signal-With-Start")
-	pbt.cover(t, operation == 4, 12.0, "Workflow result")
-	pbt.cover(t, operation == 5, 10.0, "Workflow Visibility list")
-	pbt.cover(t, operation == 6, 10.0, "Workflow Visibility count")
+	pbt.cover(t, operation == 0, 5.0, "Workflow Signal")
+	pbt.cover(t, operation == 1, 5.0, "Workflow cancellation")
+	pbt.cover(t, operation == 2, 5.0, "Workflow termination")
+	pbt.cover(t, operation == 3, 5.0, "Signal-With-Start")
+	pbt.cover(t, operation == 4, 5.0, "Workflow result")
+	pbt.cover(t, operation == 5, 5.0, "Workflow Visibility list")
+	pbt.cover(t, operation == 6, 5.0, "Workflow Visibility count")
+	pbt.cover(t, operation >= 7, 20.0, "Schedule read operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -208,6 +248,14 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.list_workflows = client_interceptor_property_list_workflows
 		case 6:
 			interceptor.count_workflows = client_interceptor_property_count_workflows
+		case 7:
+			interceptor.describe_schedule = client_interceptor_property_describe_schedule
+		case 8:
+			interceptor.list_schedules = client_interceptor_property_list_schedules
+		case 9:
+			interceptor.count_schedules = client_interceptor_property_count_schedules
+		case 10:
+			interceptor.list_schedule_matching_times = client_interceptor_property_matching_times
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -227,6 +275,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	temporal_client.error_free(&caller_error)
 	handle := temporal_client.Workflow_Handle{client = &client, id = "property-workflow"}
+	schedule_handle := temporal_client.Schedule_Handle{client = &client, id = "property-schedule"}
 	operation_error: temporal_client.Error
 	switch operation {
 	case 0:
@@ -266,6 +315,27 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		count: temporal_client.Workflow_Count
 		count, operation_error = temporal_client.count_workflows(&client, "caller count query")
 		temporal_client.workflow_count_free(&count)
+	case 7:
+		description: temporal_client.Schedule_Description
+		description, operation_error = temporal_client.describe_schedule(&schedule_handle)
+		temporal_client.schedule_description_free(&description)
+	case 8:
+		page: temporal_client.Schedule_List_Page
+		page, operation_error = temporal_client.list_schedules(&client, {maximum_page_size = 100})
+		temporal_client.schedule_list_page_free(&page)
+	case 9:
+		count: temporal_client.Schedule_Count
+		count, operation_error = temporal_client.count_schedules(&client, "caller Schedule query")
+		temporal_client.schedule_count_free(&count)
+	case 10:
+		matching: temporal_client.Schedule_Matching_Times
+		start := time.now()
+		matching, operation_error = temporal_client.list_schedule_matching_times(
+			&schedule_handle,
+			start,
+			time.time_add(start, time.Hour),
+		)
+		temporal_client.schedule_matching_times_free(&matching)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

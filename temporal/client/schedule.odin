@@ -1246,10 +1246,10 @@ decode_schedule_description :: proc(
 	return description, {}
 }
 
-describe_schedule :: proc(
-	handle: ^Schedule_Handle,
-	allocator := context.allocator,
-) -> (Schedule_Description, Error) {
+describe_schedule_terminal :: proc(input: ^Client_Describe_Schedule_Input) -> (Schedule_Description, Error) {
+	if input == nil do return {}, error_from_string(.Invalid_Argument, "Schedule Describe interceptor input is missing")
+	handle := input.handle
+	allocator := input.allocator
 	if !schedule_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
@@ -1270,6 +1270,14 @@ describe_schedule :: proc(
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_schedule_description(handle.id, rpc_result.protobuf, allocator)
+}
+
+describe_schedule :: proc(handle: ^Schedule_Handle, allocator := context.allocator) -> (Schedule_Description, Error) {
+	input := Client_Describe_Schedule_Input{handle = handle, allocator = allocator}
+	client: ^Client
+	if handle != nil do client = handle.client
+	state := Client_Interceptor_State{client = client}
+	return client_describe_schedule_chain(&state, &input)
 }
 
 schedule_list_entry_free :: proc(entry: ^Schedule_List_Entry, allocator: mem.Allocator) {
@@ -1384,10 +1392,10 @@ decode_schedule_list_page :: proc(
 	return page, {}
 }
 
-list_schedules :: proc(
-	client: ^Client,
-	options := List_Schedules_Options{},
-) -> (Schedule_List_Page, Error) {
+list_schedules_terminal :: proc(input: ^Client_List_Schedules_Input) -> (Schedule_List_Page, Error) {
+	if input == nil do return {}, error_from_string(.Invalid_Argument, "Schedule list interceptor input is missing")
+	client := input.client
+	options := input.options
 	if client == nil || client.connection == nil || client.runtime == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -1413,6 +1421,12 @@ list_schedules :: proc(
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_schedule_list_page(rpc_result.protobuf)
+}
+
+list_schedules :: proc(client: ^Client, options := List_Schedules_Options{}) -> (Schedule_List_Page, Error) {
+	input := Client_List_Schedules_Input{client = client, options = options}
+	state := Client_Interceptor_State{client = client}
+	return client_list_schedules_chain(&state, &input)
 }
 
 schedule_count_free :: proc(result: ^Schedule_Count) {
@@ -1471,7 +1485,10 @@ decode_schedule_count :: proc(
 	return result, {}
 }
 
-count_schedules :: proc(client: ^Client, query := "") -> (Schedule_Count, Error) {
+count_schedules_terminal :: proc(input: ^Client_Count_Schedules_Input) -> (Schedule_Count, Error) {
+	if input == nil do return {}, error_from_string(.Invalid_Argument, "Schedule count interceptor input is missing")
+	client := input.client
+	query := input.query
 	if client == nil || client.connection == nil || client.runtime == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -1492,6 +1509,12 @@ count_schedules :: proc(client: ^Client, query := "") -> (Schedule_Count, Error)
 		return {}, error_from_core(&rpc_result.error)
 	}
 	return decode_schedule_count(rpc_result.protobuf)
+}
+
+count_schedules :: proc(client: ^Client, query := "") -> (Schedule_Count, Error) {
+	input := Client_Count_Schedules_Input{client = client, query = query}
+	state := Client_Interceptor_State{client = client}
+	return client_count_schedules_chain(&state, &input)
 }
 
 encode_backfill_schedule_request :: proc(
@@ -1600,11 +1623,12 @@ decode_schedule_matching_times :: proc(
 	return result, {}
 }
 
-list_schedule_matching_times :: proc(
-	handle: ^Schedule_Handle,
-	start_time, end_time: time.Time,
-	allocator := context.allocator,
-) -> (Schedule_Matching_Times, Error) {
+list_schedule_matching_times_terminal :: proc(input: ^Client_List_Schedule_Matching_Times_Input) -> (Schedule_Matching_Times, Error) {
+	if input == nil do return {}, error_from_string(.Invalid_Argument, "Schedule matching-times interceptor input is missing")
+	handle := input.handle
+	start_time := input.start_time
+	end_time := input.end_time
+	allocator := input.allocator
 	if !schedule_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
@@ -1630,6 +1654,14 @@ list_schedule_matching_times :: proc(
 	defer delete(rpc_result.protobuf)
 	if rpc_result.error.message != nil { return {}, error_from_core(&rpc_result.error) }
 	return decode_schedule_matching_times(rpc_result.protobuf, allocator)
+}
+
+list_schedule_matching_times :: proc(handle: ^Schedule_Handle, start_time, end_time: time.Time, allocator := context.allocator) -> (Schedule_Matching_Times, Error) {
+	input := Client_List_Schedule_Matching_Times_Input{handle = handle, start_time = start_time, end_time = end_time, allocator = allocator}
+	client: ^Client
+	if handle != nil do client = handle.client
+	state := Client_Interceptor_State{client = client}
+	return client_list_schedule_matching_times_chain(&state, &input)
 }
 
 schedule_patch :: proc(

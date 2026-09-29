@@ -7,6 +7,38 @@ import "core:strings"
 import "core:time"
 import temporal_client "../../temporal/client"
 
+Schedule_Read_Interceptor_State :: struct {
+	described: bool,
+	listed:    bool,
+	counted:   bool,
+	matched:   bool,
+}
+
+describe_schedule_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_Describe_Schedule_Input, next: temporal_client.Client_Describe_Schedule_Next) -> (temporal_client.Schedule_Description, temporal_client.Error) {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.described = true
+	return temporal_client.client_describe_schedule_next(next, input)
+}
+
+list_schedules_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedules_Input, next: temporal_client.Client_List_Schedules_Next) -> (temporal_client.Schedule_List_Page, temporal_client.Error) {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.listed = true
+	input.options.maximum_page_size = 50
+	return temporal_client.client_list_schedules_next(next, input)
+}
+
+count_schedules_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_Count_Schedules_Input, next: temporal_client.Client_Count_Schedules_Next) -> (temporal_client.Schedule_Count, temporal_client.Error) {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.counted = true
+	return temporal_client.client_count_schedules_next(next, input)
+}
+
+matching_times_interceptor :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedule_Matching_Times_Input, next: temporal_client.Client_List_Schedule_Matching_Times_Next) -> (temporal_client.Schedule_Matching_Times, temporal_client.Error) {
+	state := cast(^Schedule_Read_Interceptor_State)user_data
+	state.matched = true
+	return temporal_client.client_list_schedule_matching_times_next(next, input)
+}
+
 fail_error :: proc(label: string, error: ^temporal_client.Error) -> int {
 	fmt.eprintf("%s (status=%d): %s\n", label, error.status_code, string(error.message))
 	temporal_client.error_free(error)
@@ -14,7 +46,19 @@ fail_error :: proc(label: string, error: ^temporal_client.Error) -> int {
 }
 
 run :: proc() -> int {
-	client, connect_error := temporal_client.connect()
+	interceptor_state := Schedule_Read_Interceptor_State{}
+	interceptors := [?]temporal_client.Client_Interceptor{{
+		user_data = &interceptor_state,
+		describe_schedule = describe_schedule_interceptor,
+		list_schedules = list_schedules_interceptor,
+		count_schedules = count_schedules_interceptor,
+		list_schedule_matching_times = matching_times_interceptor,
+	}}
+	client, connect_error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		interceptors = interceptors[:],
+	})
 	if connect_error.message != nil {
 		return fail_error("Schedule example connection failed", &connect_error)
 	}
@@ -306,6 +350,11 @@ run :: proc() -> int {
 		fmt.eprintf("unexpected scheduled Workflow result: %q\n", result)
 		return 1
 	}
+	if !interceptor_state.described || !interceptor_state.listed ||
+	   !interceptor_state.counted || !interceptor_state.matched {
+		fmt.eprintln("Schedule read interceptors did not observe every lifecycle operation")
+		return 1
+	}
 
 	delete_error := temporal_client.delete_schedule(&handle)
 	if delete_error.message != nil {
@@ -313,7 +362,7 @@ run :: proc() -> int {
 	}
 	deleted = true
 	fmt.printf(
-		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d paused_unpaused=true backfill_actions=%d workflow_id=%s result=%q deleted=true\n",
+		"Odin Schedule lifecycle completed schedule_id=%s updated=true conflict_token_rotated=%v stale_conflict_guarded=%v stale_rpc_rejected=%v matching_times=%d listed=%v count_supported=%v count=%d read_interceptors=true paused_unpaused=true backfill_actions=%d workflow_id=%s result=%q deleted=true\n",
 		schedule_id,
 		conflict_token_rotated,
 		stale_conflict_guarded,
