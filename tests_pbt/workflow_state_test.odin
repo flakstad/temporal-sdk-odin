@@ -3548,6 +3548,44 @@ Generated_Continue_As_New_Input :: struct {
 	retry_maximum_ms:    int,
 	retry_attempts:      int,
 	backoff_ms:          int,
+	include_memo:        bool,
+	include_search_attributes: bool,
+	search_attribute_type: int,
+	versioning_intent:   int,
+	initial_versioning_behavior: int,
+}
+
+generated_continue_as_new_versioning_intent :: proc(
+	value: int,
+) -> workflow.Continue_As_New_Versioning_Intent {
+	switch value {
+	case 1: return .Compatible
+	case 2: return .Default
+	}
+	return .Unspecified
+}
+
+generated_continue_as_new_versioning_behavior :: proc(
+	value: int,
+) -> workflow.Continue_As_New_Versioning_Behavior {
+	switch value {
+	case 1: return .Auto_Upgrade
+	case 2: return .Use_Ramping_Version
+	}
+	return .Unspecified
+}
+
+generated_search_attribute_type_name :: proc(value: int) -> string {
+	switch value {
+	case 0: return "Bool"
+	case 1: return "Int"
+	case 2: return "Double"
+	case 3: return "Keyword"
+	case 4: return "Text"
+	case 5: return "Datetime"
+	case 6: return "KeywordList"
+	}
+	return "Keyword"
 }
 
 generated_continue_as_new_workflow :: proc(
@@ -3586,6 +3624,29 @@ generated_continue_as_new_workflow :: proc(
 	for &argument in arguments {
 		append(&argument_views, codec.payload_view(&argument))
 	}
+	memo := workflow.Payload_Map{}
+	memo_pointer: ^workflow.Payload_Map
+	if input.include_memo {
+		if !workflow.payload_map_init(&memo) ||
+		   !workflow.payload_map_add_json(&memo, "generated-memo", input.value) {
+			return ""
+		}
+		memo_pointer = &memo
+	}
+	search_attributes := workflow.Payload_Map{}
+	search_attributes_pointer: ^workflow.Payload_Map
+	if input.include_search_attributes {
+		if !workflow.payload_map_init(&search_attributes) ||
+		   !workflow.payload_map_add_search_attribute_json(
+			&search_attributes,
+			"GeneratedSearchAttribute",
+			generated_search_attribute_type(input.search_attribute_type),
+			input.value,
+		) {
+			return ""
+		}
+		search_attributes_pointer = &search_attributes
+	}
 	workflow.continue_as_new_payloads(
 		ctx,
 		argument_views[:],
@@ -3596,6 +3657,14 @@ generated_continue_as_new_workflow :: proc(
 			workflow_task_timeout = time.Duration(input.task_timeout_ms) * time.Millisecond,
 			retry_policy = &retry_policy,
 			backoff_start_interval = time.Duration(input.backoff_ms) * time.Millisecond,
+			memo = memo_pointer,
+			search_attributes = search_attributes_pointer,
+			versioning_intent = generated_continue_as_new_versioning_intent(
+				input.versioning_intent,
+			),
+			initial_versioning_behavior = generated_continue_as_new_versioning_behavior(
+				input.initial_versioning_behavior,
+			),
 		},
 	)
 }
@@ -3628,6 +3697,41 @@ generated_continue_as_new_match :: proc(
 			if command == nil || command.retry_policy == nil {
 				return false
 			}
+			expected_payload, encode_error := codec.encode_json(expected.value)
+			if encode_error != .None {
+				return false
+			}
+			defer codec.payload_free(&expected_payload)
+			memo_matches := len(command.memo) == 0
+			if expected.include_memo {
+				memo_matches = len(command.memo) == 1 &&
+					command.memo[0].key == "generated-memo" &&
+					command.memo[0].value != nil &&
+					bytes.equal(command.memo[0].value.data, expected_payload.data)
+			}
+			search_matches := command.search_attributes == nil
+			if expected.include_search_attributes {
+				search_matches = command.search_attributes != nil &&
+					len(command.search_attributes.indexed_fields) == 1
+				if search_matches {
+					entry := &command.search_attributes.indexed_fields[0]
+					search_matches = entry.key == "GeneratedSearchAttribute" &&
+						entry.value != nil && bytes.equal(entry.value.data, expected_payload.data)
+					if search_matches {
+						type_matches := false
+						for metadata in entry.value.metadata {
+							if metadata.key == "type" {
+								type_matches = string(metadata.value) ==
+									generated_search_attribute_type_name(
+										expected.search_attribute_type,
+									)
+								break
+							}
+						}
+						search_matches = type_matches
+					}
+				}
+			}
 			expected_type := expected.workflow_type
 			if len(expected_type) == 0 {
 				expected_type = "generated_continue_as_new_workflow"
@@ -3643,7 +3747,11 @@ generated_continue_as_new_match :: proc(
 			) {
 				return false
 			}
-			return command.workflow_type == expected_type && command.task_queue == expected_queue &&
+			return memo_matches && search_matches &&
+				int(command.versioning_intent) == expected.versioning_intent &&
+				int(command.initial_versioning_behavior) ==
+					expected.initial_versioning_behavior &&
+				command.workflow_type == expected_type && command.task_queue == expected_queue &&
 				pbt_proto_duration(command.workflow_run_timeout) ==
 					time.Duration(expected.run_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(command.workflow_task_timeout) ==
@@ -3677,12 +3785,31 @@ continue_as_new_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_maximum_ms = retry_maximum_ms,
 		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		backoff_ms = pbt.draw(t, pbt.int_range(0, 30_000)),
+		include_memo = pbt.draw(t, pbt.boolean()),
+		include_search_attributes = pbt.draw(t, pbt.boolean()),
+		search_attribute_type = pbt.draw(t, pbt.int_range(0, 6)),
+		versioning_intent = pbt.draw(t, pbt.int_range(0, 2)),
+		initial_versioning_behavior = pbt.draw(t, pbt.int_range(0, 2)),
 	}
 	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero Continue-As-New arguments")
 	pbt.cover(t, input_value.argument_count == 1, 3.0, "one Continue-As-New argument")
 	pbt.cover(t, input_value.argument_count >= 8, 25.0, "many Continue-As-New arguments")
 	pbt.cover(t, len(input_value.workflow_type) == 0, 0.2, "reuse Workflow type")
 	pbt.cover(t, len(input_value.task_queue) == 0, 0.2, "reuse task queue")
+	pbt.cover(t, input_value.include_memo, 40.0, "Continue-As-New memo override")
+	pbt.cover(
+		t,
+		input_value.include_search_attributes,
+		40.0,
+		"Continue-As-New Search Attribute override",
+	)
+	pbt.cover(t, input_value.versioning_intent == 2, 20.0, "default versioning intent")
+	pbt.cover(
+		t,
+		input_value.initial_versioning_behavior == 2,
+		20.0,
+		"ramping versioning behavior",
+	)
 
 	owned_queue, queue_error := strings.clone("pbt-continue-as-new-queue")
 	if queue_error != nil {

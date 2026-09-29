@@ -335,6 +335,7 @@ Info :: struct {
 Search_Attribute_Type :: codec.Search_Attribute_Type
 
 Headers :: temporal_headers.Headers
+Payload_Map :: temporal_headers.Headers
 
 headers_init :: proc(headers: ^Headers, allocator := context.allocator) -> bool {
 	return temporal_headers.init(headers, allocator) == .None
@@ -350,6 +351,62 @@ headers_add_payload :: proc(headers: ^Headers, key: string, value: codec.Payload
 
 headers_add_json :: proc(headers: ^Headers, key: string, value: $T) -> bool {
 	return temporal_headers.add_json(headers, key, value) == .None
+}
+
+payload_map_init :: proc(payloads: ^Payload_Map, allocator := context.allocator) -> bool {
+	return temporal_headers.init(payloads, allocator) == .None
+}
+
+payload_map_free :: proc(payloads: ^Payload_Map) {
+	temporal_headers.free(payloads)
+}
+
+payload_map_add_payload :: proc(
+	payloads: ^Payload_Map,
+	key: string,
+	value: codec.Payload_View,
+) -> bool {
+	return temporal_headers.add_payload(payloads, key, value) == .None
+}
+
+payload_map_add_json :: proc(payloads: ^Payload_Map, key: string, value: $T) -> bool {
+	return temporal_headers.add_json(payloads, key, value) == .None
+}
+
+payload_map_add_search_attribute_payload :: proc(
+	payloads: ^Payload_Map,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: codec.Payload_View,
+) -> bool {
+	if payloads == nil || payloads.allocator.procedure == nil {
+		return false
+	}
+	payload, clone_error := codec.payload_clone(value, payloads.allocator)
+	if clone_error != .None ||
+	   codec.payload_set_search_attribute_type(&payload, attribute_type) != .None {
+		codec.payload_free(&payload)
+		return false
+	}
+	return temporal_headers.put_owned(payloads, key, payload) == .None
+}
+
+payload_map_add_search_attribute_json :: proc(
+	payloads: ^Payload_Map,
+	key: string,
+	attribute_type: Search_Attribute_Type,
+	value: $T,
+) -> bool {
+	if payloads == nil || payloads.allocator.procedure == nil {
+		return false
+	}
+	payload, encode_error := codec.encode_json(value, payloads.allocator)
+	if encode_error != .None ||
+	   codec.payload_set_search_attribute_type(&payload, attribute_type) != .None {
+		codec.payload_free(&payload)
+		return false
+	}
+	return temporal_headers.put_owned(payloads, key, payload) == .None
 }
 
 Signal_Options :: struct {
@@ -413,9 +470,24 @@ Owned_Local_Activity_Options :: struct {
 	headers:                   [dynamic]Fiber_Named_Payload,
 }
 
-// Continue_As_New_Options borrows its strings, slices, and retry_policy only
-// for the call. Empty workflow_type/task_queue values reuse the current run's
-// registered values. A zero duration means "not specified".
+Continue_As_New_Versioning_Intent :: enum {
+	Unspecified,
+	Compatible,
+	Default,
+}
+
+Continue_As_New_Versioning_Behavior :: enum {
+	Unspecified,
+	Auto_Upgrade,
+	Use_Ramping_Version,
+}
+
+// Continue_As_New_Options borrows its strings, maps, and retry_policy only for
+// the call. Empty workflow_type/task_queue values reuse the current run's
+// registered values. Nil memo/search_attributes reuse the current values. An
+// initialized empty Search Attribute map explicitly clears them; Core's proto3
+// map cannot distinguish an empty memo override from an unset memo. A zero
+// duration means "not specified".
 Continue_As_New_Options :: struct {
 	workflow_type:        string,
 	task_queue:           string,
@@ -423,7 +495,11 @@ Continue_As_New_Options :: struct {
 	workflow_task_timeout: time.Duration,
 	retry_policy:         ^Retry_Policy,
 	backoff_start_interval: time.Duration,
+	memo:                 ^Payload_Map,
 	headers:              ^Headers,
+	search_attributes:    ^Payload_Map,
+	versioning_intent:    Continue_As_New_Versioning_Intent,
+	initial_versioning_behavior: Continue_As_New_Versioning_Behavior,
 }
 
 Owned_Continue_As_New_Options :: struct {
@@ -434,7 +510,12 @@ Owned_Continue_As_New_Options :: struct {
 	retry_policy:         Retry_Policy,
 	has_retry_policy:     bool,
 	backoff_start_interval: time.Duration,
+	memo:                 [dynamic]Fiber_Named_Payload,
 	headers:              [dynamic]Fiber_Named_Payload,
+	search_attributes:    [dynamic]Fiber_Named_Payload,
+	has_search_attributes: bool,
+	versioning_intent:    Continue_As_New_Versioning_Intent,
+	initial_versioning_behavior: Continue_As_New_Versioning_Behavior,
 }
 
 Fiber_Phase :: enum {
@@ -1860,6 +1941,14 @@ clone_workflow_headers :: proc(
 		append(result, Fiber_Named_Payload{key = key, payload = payload})
 	}
 	return true
+}
+
+clone_workflow_payload_map :: proc(
+	payloads: ^Payload_Map,
+	result: ^[dynamic]Fiber_Named_Payload,
+	allocator := context.allocator,
+) -> bool {
+	return clone_workflow_headers(payloads, result, allocator)
 }
 
 clone_named_search_payloads :: proc(
@@ -5802,6 +5891,23 @@ continue_as_new_options_error :: proc(options: Continue_As_New_Options) -> strin
 	if options.headers != nil && options.headers.allocator.procedure == nil {
 		return "Continue-As-New headers are not initialized"
 	}
+	if options.memo != nil && options.memo.allocator.procedure == nil {
+		return "Continue-As-New memo is not initialized"
+	}
+	if options.search_attributes != nil &&
+	   options.search_attributes.allocator.procedure == nil {
+		return "Continue-As-New Search Attributes are not initialized"
+	}
+	if int(options.versioning_intent) < int(Continue_As_New_Versioning_Intent.Unspecified) ||
+	   int(options.versioning_intent) > int(Continue_As_New_Versioning_Intent.Default) {
+		return "Continue-As-New versioning intent is invalid"
+	}
+	if int(options.initial_versioning_behavior) <
+	     int(Continue_As_New_Versioning_Behavior.Unspecified) ||
+	   int(options.initial_versioning_behavior) >
+	     int(Continue_As_New_Versioning_Behavior.Use_Ramping_Version) {
+		return "Continue-As-New initial versioning behavior is invalid"
+	}
 	return ""
 }
 
@@ -5826,7 +5932,20 @@ clone_continue_as_new_options :: proc(
 	owned.workflow_run_timeout = options.workflow_run_timeout
 	owned.workflow_task_timeout = options.workflow_task_timeout
 	owned.backoff_start_interval = options.backoff_start_interval
+	owned.versioning_intent = options.versioning_intent
+	owned.initial_versioning_behavior = options.initial_versioning_behavior
+	if !clone_workflow_payload_map(options.memo, &owned.memo, allocator) {
+		return {}, false
+	}
 	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
+		return {}, false
+	}
+	owned.has_search_attributes = options.search_attributes != nil
+	if !clone_workflow_payload_map(
+		options.search_attributes,
+		&owned.search_attributes,
+		allocator,
+	) {
 		return {}, false
 	}
 	if options.retry_policy != nil {
@@ -7179,6 +7298,30 @@ retry_policy_to_proto :: proc(
 		append(&result.non_retryable_error_types, error_type)
 	}
 	return result
+}
+
+continue_as_new_versioning_intent_to_proto :: proc(
+	value: Continue_As_New_Versioning_Intent,
+) -> proto.Coresdk_Common_VersioningIntent {
+	switch value {
+	case .Compatible: return .COMPATIBLE
+	case .Default:    return .DEFAULT
+	case .Unspecified:
+	}
+	return .UNSPECIFIED
+}
+
+continue_as_new_versioning_behavior_to_proto :: proc(
+	value: Continue_As_New_Versioning_Behavior,
+) -> proto.Temporal_Api_Enums_V1_ContinueAsNewVersioningBehavior {
+	switch value {
+	case .Auto_Upgrade:
+		return .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE
+	case .Use_Ramping_Version:
+		return .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION
+	case .Unspecified:
+	}
+	return .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED
 }
 
 append_fiber_start_child_workflow_command :: proc(
@@ -8882,6 +9025,17 @@ append_fiber_continue_as_new_command :: proc(
 	if options.has_retry_policy {
 		request.retry_policy = retry_policy_to_proto(&options.retry_policy)
 	}
+	for &entry in options.memo {
+		memo_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		memo_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&request.memo,
+			proto.Coresdk_Workflow_Commands_ContinueAsNewWorkflowExecution_MemoEntry{
+				key = entry.key,
+				value = memo_payload,
+			},
+		)
+	}
 	request.backoff_start_interval = duration_to_proto(options.backoff_start_interval)
 	for &entry in options.headers {
 		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
@@ -8894,6 +9048,26 @@ append_fiber_continue_as_new_command :: proc(
 			},
 		)
 	}
+	if options.has_search_attributes {
+		request.search_attributes = new(proto.Temporal_Api_Common_V1_SearchAttributes)
+		for &entry in options.search_attributes {
+			attribute_payload := new(proto.Temporal_Api_Common_V1_Payload)
+			attribute_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+			append(
+				&request.search_attributes.indexed_fields,
+				proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+					key = entry.key,
+					value = attribute_payload,
+				},
+			)
+		}
+	}
+	request.versioning_intent = continue_as_new_versioning_intent_to_proto(
+		options.versioning_intent,
+	)
+	request.initial_versioning_behavior = continue_as_new_versioning_behavior_to_proto(
+		options.initial_versioning_behavior,
+	)
 	append(
 		commands,
 		proto.Coresdk_Workflow_Commands_WorkflowCommand{

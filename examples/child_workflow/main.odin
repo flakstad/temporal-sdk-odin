@@ -388,22 +388,55 @@ external_caller_workflow :: proc(ctx: ^workflow.Fiber_Context, target_workflow_i
 
 continue_as_new_workflow :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
 	if value == "first-run" {
+		memo := workflow.Payload_Map{}
+		if !workflow.payload_map_init(&memo) ||
+		   !workflow.payload_map_add_json(&memo, "odin-continue-memo", "carried") {
+			return "Continue-As-New memo setup failed"
+		}
+		search_attributes := workflow.Payload_Map{}
+		if !workflow.payload_map_init(&search_attributes) ||
+		   !workflow.payload_map_add_search_attribute_json(
+			&search_attributes,
+			"OdinSdkKeyword",
+			workflow.Search_Attribute_Type.Keyword,
+			"continue-as-new",
+		) {
+			return "Continue-As-New Search Attribute setup failed"
+		}
 		workflow.continue_as_new_json(
 			ctx,
 			"continued-run",
 			{
 				workflow_run_timeout = time.Minute,
 				workflow_task_timeout = 10 * time.Second,
+				memo = &memo,
+				search_attributes = &search_attributes,
 			},
 		)
 	}
+	memo_value: string
+	memo_found, memo_error := workflow.memo_json(
+		ctx,
+		"odin-continue-memo",
+		&memo_value,
+	)
+	defer delete(memo_value)
+	search_value: string
+	search_found, search_error := workflow.search_attribute_json(
+		ctx,
+		"OdinSdkKeyword",
+		&search_value,
+	)
+	defer delete(search_value)
 	interceptor_header: string
 	header_found, header_error := workflow.header_json(
 		ctx,
 		"odin-workflow-continue-as-new",
 		&interceptor_header,
 	)
-	if !header_found || header_error != .None || interceptor_header != "intercepted" {
+	if !header_found || header_error != .None || interceptor_header != "intercepted" ||
+	   !memo_found || memo_error != .None || memo_value != "carried" ||
+	   !search_found || search_error != .None || search_value != "continue-as-new" {
 		return "Continue-As-New interceptor header mismatch"
 	}
 	result, allocation_error := strings.concatenate({"Continue-As-New completed on ", value})

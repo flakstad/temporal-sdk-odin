@@ -77,7 +77,11 @@ Workflow executions by namespace/Workflow ID/optional Run ID, suspending until
 Core resolves each outbound operation. The live suite proves this against two
 independent executions. `continue_as_new_json/payload/owned` now terminate the
 current fiber run and carry new input plus timeout/retry/backoff options into a
-new durable run; the CLI-devserver suite follows that chain to completion. The
+new durable run. Continue-As-New can also replace memo and typed Search
+Attributes and select Core's compatible/default Build ID intent plus the
+experimental auto-upgrade/ramping initial versioning behavior. The
+CLI-devserver suite follows the chain to completion and reads the replacement
+memo and Search Attribute from the new run. The
 Workflow runtime now implements Core's patch protocol through
 `workflow.patched` and `workflow.deprecate_patch`. It consumes preemptive
 `NotifyHasPatch` jobs, memoizes each decision per run, emits at most one
@@ -929,9 +933,14 @@ if state.events_processed >= 10_000 {
 Empty Workflow type and task queue options reuse the current registration.
 `continue_as_new_payloads` preserves Core's ordered repeated argument field;
 the singular Payload and JSON forms remain one-argument adapters. The current
-slice also supports Retry Policy, first-task backoff, and typed Payload headers.
-Continue-As-New-specific memo, Search Attribute, and
-versioning overrides are not exposed yet.
+slice also supports Retry Policy, first-task backoff, typed Payload headers,
+memo replacement, typed Search Attribute replacement, versioning intent, and
+initial versioning behavior. Build maps with `workflow.payload_map_init`, add
+memo through `payload_map_add_json/payload`, and add Search Attributes through
+the typed `payload_map_add_search_attribute_json/payload` helpers. Nil maps
+inherit the current run. An initialized empty Search Attribute map explicitly
+clears it; Core's proto3 map cannot distinguish an empty memo override from an
+unset memo, so an empty memo map inherits too.
 The primitive may only be called from the main Workflow context; misuse fails
 the Workflow with an SDK Application Failure rather than returning past the
 terminal command.

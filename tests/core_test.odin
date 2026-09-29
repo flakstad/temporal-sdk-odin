@@ -1265,11 +1265,33 @@ continue_as_new_is_terminal_and_replay_safe :: proc(t: ^testing.T) {
 	testing.expect_value(t, inspection.continue_header_count, 2)
 	testing.expect_value(t, string(inspection.continue_header_key), "workflow-interceptor")
 	testing.expect_value(t, string(inspection.continue_header_data), `"continue-as-new"`)
+	testing.expect_value(t, inspection.continue_memo_count, 1)
+	testing.expect_value(t, string(inspection.continue_memo_key), "carry")
+	testing.expect_value(t, string(inspection.continue_memo_data), `"memo-value"`)
+	testing.expect_value(t, inspection.continue_search_attribute_count, 1)
+	testing.expect_value(t, string(inspection.continue_search_attribute_key), "OdinSdkKeyword")
+	testing.expect_value(t, string(inspection.continue_search_attribute_data), `"continued"`)
+	testing.expect_value(t, string(inspection.continue_search_attribute_type), "Keyword")
+	testing.expect_value(
+		t,
+		inspection.continue_versioning_intent,
+		proto.Coresdk_Common_VersioningIntent.DEFAULT,
+	)
+	testing.expect_value(
+		t,
+		inspection.continue_initial_versioning_behavior,
+		proto.Temporal_Api_Enums_V1_ContinueAsNewVersioningBehavior.CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_AUTO_UPGRADE,
+	)
 	delete(inspection.continue_workflow_type)
 	delete(inspection.continue_task_queue)
 	delete(inspection.continue_input)
 	delete(inspection.continue_header_key)
 	delete(inspection.continue_header_data)
+	delete(inspection.continue_memo_key)
+	delete(inspection.continue_memo_data)
+	delete(inspection.continue_search_attribute_key)
+	delete(inspection.continue_search_attribute_data)
+	delete(inspection.continue_search_attribute_type)
 	delete(initial.completion)
 	workflow.error_free(&initial.error)
 
@@ -4009,6 +4031,21 @@ continue_as_new_test_workflow :: proc(
 		if !workflow.headers_add_json(&headers, "caller", "original") {
 			return "could not add Continue-As-New caller header"
 		}
+		memo := workflow.Payload_Map{}
+		if !workflow.payload_map_init(&memo) ||
+		   !workflow.payload_map_add_json(&memo, "carry", "memo-value") {
+			return "could not build Continue-As-New memo"
+		}
+		search_attributes := workflow.Payload_Map{}
+		if !workflow.payload_map_init(&search_attributes) ||
+		   !workflow.payload_map_add_search_attribute_json(
+			&search_attributes,
+			"OdinSdkKeyword",
+			workflow.Search_Attribute_Type.Keyword,
+			"continued",
+		) {
+			return "could not build Continue-As-New Search Attributes"
+		}
 		retry_policy := workflow.Retry_Policy{
 			initial_interval = 2 * time.Second,
 			backoff_coefficient = 2,
@@ -4023,7 +4060,11 @@ continue_as_new_test_workflow :: proc(
 				workflow_task_timeout = 12 * time.Second,
 				retry_policy = &retry_policy,
 				backoff_start_interval = 3 * time.Second,
+				memo = &memo,
 				headers = &headers,
+				search_attributes = &search_attributes,
+				versioning_intent = .Default,
+				initial_versioning_behavior = .Auto_Upgrade,
 			},
 		)
 	}
@@ -4498,6 +4539,15 @@ Workflow_Completion_Inspection :: struct {
 	continue_header_count: int,
 	continue_header_key: []u8,
 	continue_header_data: []u8,
+	continue_memo_count: int,
+	continue_memo_key: []u8,
+	continue_memo_data: []u8,
+	continue_search_attribute_count: int,
+	continue_search_attribute_key: []u8,
+	continue_search_attribute_data: []u8,
+	continue_search_attribute_type: []u8,
+	continue_versioning_intent: proto.Coresdk_Common_VersioningIntent,
+	continue_initial_versioning_behavior: proto.Temporal_Api_Enums_V1_ContinueAsNewVersioningBehavior,
 	canceled_external_signal_seq: u32,
 	canceled_timer_seq:     u32,
 	started_timer_seq:      u32,
@@ -4688,6 +4738,34 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 						)
 						inspection.continue_header_data = bytes.clone(header.value.data)
 						break
+					}
+					inspection.continue_memo_count = len(variant.value.memo)
+					for entry in variant.value.memo {
+						if entry.key != "carry" || entry.value == nil do continue
+						inspection.continue_memo_key = bytes.clone(transmute([]u8)entry.key)
+						inspection.continue_memo_data = bytes.clone(entry.value.data)
+						break
+					}
+					inspection.continue_versioning_intent = variant.value.versioning_intent
+					inspection.continue_initial_versioning_behavior =
+						variant.value.initial_versioning_behavior
+					if variant.value.search_attributes != nil {
+						inspection.continue_search_attribute_count =
+							len(variant.value.search_attributes.indexed_fields)
+						for entry in variant.value.search_attributes.indexed_fields {
+							if entry.key != "OdinSdkKeyword" || entry.value == nil do continue
+							inspection.continue_search_attribute_key = bytes.clone(
+								transmute([]u8)entry.key,
+							)
+							inspection.continue_search_attribute_data = bytes.clone(entry.value.data)
+							for metadata in entry.value.metadata {
+								if metadata.key == "type" {
+									inspection.continue_search_attribute_type = bytes.clone(metadata.value)
+									break
+								}
+							}
+							break
+						}
 					}
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Cancel_Timer:

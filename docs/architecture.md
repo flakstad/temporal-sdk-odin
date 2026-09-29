@@ -2007,7 +2007,7 @@ arguments, 500 repeated Update request/header round trips over 0–12 arguments,
 500 query response round trips, and
 500 single-Update protocol response sequences, 500 two-Update completion-order sequences,
 500 Child Workflow option/repeated-argument/repeated-signal/replay cases, 500 external Workflow
-repeated-signal/cancel/replay cases, 500 Continue-As-New repeated-argument/option/replay cases, 500 patch
+repeated-signal/cancel/replay cases, 500 Continue-As-New repeated-argument/metadata/versioning/replay cases, 500 patch
 truth-table cases, 500 deterministic time/random activation contexts, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
@@ -2017,8 +2017,9 @@ implemented. The Workflow-local Future acts as the public child handle for
 await, signal, and explicit cancellation. A live duplicate-ID case proves the
 Core-local `WorkflowAlreadyExists` start failure. External Workflow signal and
 cancellation are also implemented and live-proven. Continue-As-New now provides
-the next-run Payload and the main timeout/retry/backoff options through a
-non-returning terminal fiber primitive. Core's patch/versioning protocol is now
+the next-run Payloads, timeout/retry/backoff options, memo, typed Search
+Attributes, headers, and Core versioning choices through a non-returning
+terminal fiber primitive. Core's patch/versioning protocol is now
 implemented and live-proven. The first Local Activity
 command/dispatch/resolution path and timer-backed `DoBackoff` retries are now
 live-proven. Workflow information, headers, memo, and Search Attribute commands
@@ -2245,13 +2246,22 @@ current registered values. The initial slice maps:
 - zero or more ordered generic input Payloads;
 - Workflow type and task queue;
 - Workflow Run and Workflow Task timeouts;
-- Retry Policy; and
-- first-task backoff; and
+- Retry Policy;
+- first-task backoff;
+- replacement memo and typed Search Attributes;
+- Build ID versioning intent and experimental initial versioning behavior; and
 - generic Payload headers, including interceptor mutations.
 
-Core's memo, search attributes, versioning intent, and initial versioning
-behavior fields remain intentionally unexposed until their public Odin models
-exist. Negative/contradictory durations and invalid Retry Policies
+Nil memo/Search Attribute maps preserve the current run's values. An initialized
+empty Search Attribute map is encoded as a present empty message and therefore
+requests replacement with no attributes. The proto3 memo field is a map rather
+than an optional message, so Core's wire format cannot distinguish an empty
+replacement from unset; an empty memo map therefore preserves the current memo.
+Search Attribute builders attach Temporal's canonical `type` Payload metadata.
+`Continue_As_New_Versioning_Intent` maps exactly to Core's `UNSPECIFIED`,
+`COMPATIBLE`, and `DEFAULT`; `Continue_As_New_Versioning_Behavior` maps to the
+Service enum's unspecified, auto-upgrade, and use-ramping-version values.
+Negative/contradictory durations, invalid enum values, and invalid Retry Policies
 fail the Workflow with a non-retryable SDK Application Failure. Calls outside
 the main Workflow context follow the same failure path. This restriction avoids
 letting a concurrent Signal or Update handler silently terminate main while the
@@ -2260,14 +2270,16 @@ handler scheduler still owns a different execution-state snapshot.
 Ownership mirrors other commands: `continue_as_new_payloads` clones a borrowed
 slice including metadata and external payload details, the singular `_payload`
 form clones one view, the `_owned` form consumes one Payload, and JSON encodes directly into the
-Workflow allocator. Options, Retry Policy strings, and headers are cloned
+Workflow allocator. Options, Retry Policy strings, memo, headers, and Search
+Attributes are cloned
 before the fiber yields. The interceptor working headers also live in this
 arena because the terminal call cannot return to a defer. Eviction frees the
 suspended terminal fiber and its arena; replay reruns user code and must
-reconstruct identical command bytes. Unit and
-500-case property tests enforce that invariant. The live dev-server case proves
-the Service creates run two and that the same Odin worker completes it under
-the original Workflow ID.
+reconstruct identical command bytes. Unit and 500-case property tests enforce
+that invariant while varying map presence, all seven Search Attribute metadata
+types, and every versioning enum value. The live dev-server case proves the
+Service creates run two, applies replacement memo/Search Attributes, and that
+the same Odin worker completes it under the original Workflow ID.
 
 ### Workflow patch/versioning boundary
 

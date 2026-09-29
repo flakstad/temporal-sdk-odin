@@ -1787,6 +1787,14 @@ continue_output="$(<"$workflow_output_file")"
 echo "$continue_output"
 grep -q '"status": "COMPLETED"' <<<"$continue_output"
 grep -q 'Continue-As-New completed on continued-run' <<<"$continue_output"
+temporal workflow describe \
+  --workflow-id "$continue_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'odin-continue-memo' "$typed_history_file"
+grep -q 'carried' "$typed_history_file"
+grep -q 'OdinSdkKeyword' "$typed_history_file"
+grep -q 'continue-as-new' "$typed_history_file"
 
 wait "$worker_pid"
 worker_pid=""
