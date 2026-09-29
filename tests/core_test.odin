@@ -3835,6 +3835,41 @@ fiber_update_routine_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 	return result
 }
 
+fiber_update_activity_failure_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	state := name
+	registered := workflow.set_update_routine_json(
+		ctx,
+		"fail_with_activity",
+		&state,
+		proc(
+			routine_ctx: ^workflow.Fiber_Context,
+			_: ^string,
+			input: string,
+		) -> string {
+			retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+			return workflow.execute_activity_with_options(
+				routine_ctx,
+				"failing_activity",
+				input,
+				{
+					activity_id = "update-failure-activity",
+					start_to_close_timeout = time.Second,
+					retry_policy = &retry_policy,
+				},
+			)
+		},
+	)
+	if !registered {
+		return "Update failure handler registration failed"
+	}
+	result := workflow.await_signal(ctx, "finish")
+	workflow.await_all_handlers_finished(ctx)
+	return result
+}
+
 fiber_abandon_update_routine_test_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	name: string,
@@ -5263,6 +5298,7 @@ Update_Response_Inspection :: struct {
 	payload:          codec.Payload,
 	failure_message:  []u8,
 	failure_type:     []u8,
+	failure:          []u8,
 }
 
 inspect_update_responses :: proc(
@@ -5315,6 +5351,8 @@ inspect_update_responses :: proc(
 				case proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Rejected:
 					if response.value != nil {
 						inspection.rejected += 1
+						encoded_failure := proto.encode_Temporal_Api_Failure_V1_Failure(response.value)
+						inspection.failure = encoded_failure[:]
 						inspection.failure_message = bytes.clone(
 							transmute([]u8)response.value.message,
 						)
@@ -5341,6 +5379,7 @@ update_response_inspection_free :: proc(inspection: ^Update_Response_Inspection)
 	codec.payload_free(&inspection.payload)
 	delete(inspection.failure_message)
 	delete(inspection.failure_type)
+	delete(inspection.failure)
 	inspection^ = {}
 }
 
@@ -12369,6 +12408,226 @@ workflow_update_routine_awaits_activity_and_replays_across_activations :: proc(t
 	testing.expectf(t, processed.error.message == nil, "Update routine replay completion failed: %s", string(processed.error.message))
 	testing.expect(t, bytes.equal(update_finish_completion[:], processed.completion[:]))
 	delete(update_finish_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_update_failure_preserves_activity_failure_tree :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_update_activity_failure_workflow",
+		"test-queue",
+		fiber_update_activity_failure_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_update_activity_failure_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "update-activity-failure-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.waiting_signal)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	update_input, update_input_error := codec.encode_json("billing")
+	testing.expect(t, update_input_error == .None)
+	defer codec.payload_free(&update_input)
+	update_input_proto := proto.encode_payload(codec.payload_view(&update_input))
+	defer delete(update_input_proto.metadata)
+	defer delete(update_input_proto.external_payloads)
+	update := proto.Coresdk_Workflow_Activation_DoUpdate{
+		id = "activity-failure-update",
+		protocol_instance_id = "activity-failure-update-protocol",
+		name = "fail_with_activity",
+		run_validator = false,
+	}
+	defer delete(update.input)
+	append(&update.input, update_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Do_Update{
+				value = &update,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update failure start failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_accepted, 1)
+	testing.expect(t, processed.scheduled_activity)
+	testing.expect(t, !processed.completed)
+	started := inspect_update_responses(
+		processed.completion[:],
+		"activity-failure-update-protocol",
+	)
+	testing.expect_value(t, started.accepted, 1)
+	testing.expect_value(t, started.rejected, 0)
+	update_response_inspection_free(&started)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	failure_details, failure_details_error := codec.encode_json(
+		Failure_Test_Details{dependency = "billing", code = 409},
+	)
+	testing.expect(t, failure_details_error == .None)
+	defer codec.payload_free(&failure_details)
+	failure_details_proto := proto.encode_payload(codec.payload_view(&failure_details))
+	defer delete(failure_details_proto.metadata)
+	defer delete(failure_details_proto.external_payloads)
+	failure_detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(failure_detail_payloads.payloads)
+	append(&failure_detail_payloads.payloads, failure_details_proto)
+	next_retry_delay := proto.Google_Protobuf_Duration{nanos = 250_000_000}
+	application_info := proto.Temporal_Api_Failure_V1_ApplicationFailureInfo{
+		type = "DependencyRejected",
+		details = &failure_detail_payloads,
+		next_retry_delay = &next_retry_delay,
+		category = .APPLICATION_ERROR_CATEGORY_BENIGN,
+	}
+	application_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "billing dependency rejected request",
+		source = "OdinSDK",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+			value = &application_info,
+		},
+	}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "failing_activity"}
+	activity_info := proto.Temporal_Api_Failure_V1_ActivityFailureInfo{
+		identity = "test-worker",
+		activity_type = &activity_type,
+		activity_id = "update-failure-activity",
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+	}
+	activity_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Activity task failed",
+		source = "TemporalServer",
+		cause = &application_failure,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Activity_Failure_Info{
+			value = &activity_info,
+		},
+	}
+	failed_result := proto.Coresdk_Activity_Result_Failure{failure = &activity_failure}
+	failure_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Failed{
+			value = &failed_result,
+		},
+	}
+	resolve_failure := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &failure_resolution,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_failure,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "Update Activity failure failed: %s", string(processed.error.message))
+	testing.expect_value(t, processed.updates_rejected, 1)
+	testing.expect(t, !processed.completed)
+	rejected := inspect_update_responses(
+		processed.completion[:],
+		"activity-failure-update-protocol",
+	)
+	defer update_response_inspection_free(&rejected)
+	testing.expect_value(t, rejected.rejected, 1)
+	testing.expect_value(t, string(rejected.failure_message), "Activity task failed")
+	decoded_failure, decode_error := temporal_failure.decode(rejected.failure)
+	defer temporal_failure.failure_free(&decoded_failure)
+	testing.expect_value(t, decode_error, temporal_failure.Decode_Error.None)
+	activity_node := temporal_failure.find_kind(&decoded_failure, .Activity)
+	application_node := temporal_failure.find_kind(&decoded_failure, .Application)
+	testing.expect(t, activity_node != nil)
+	testing.expect(t, application_node != nil)
+	if activity_node != nil {
+		testing.expect_value(t, activity_node.activity.activity_id, "update-failure-activity")
+		testing.expect_value(t, activity_node.activity.activity_type, "failing_activity")
+		testing.expect_value(t, activity_node.activity.retry_state, temporal_failure.Retry_State.Maximum_Attempts_Reached)
+	}
+	if application_node != nil {
+		testing.expect_value(t, application_node.application.type, "DependencyRejected")
+		testing.expect(t, application_node.application.has_next_retry_delay)
+		testing.expect_value(t, application_node.application.next_retry_delay, 250 * time.Millisecond)
+		details: Failure_Test_Details
+		if len(application_node.application.details) == 1 {
+			detail_error := codec.decode_json(
+				codec.payload_view(&application_node.application.details[0]),
+				&details,
+			)
+			testing.expect_value(t, detail_error, codec.Error.None)
+			testing.expect_value(t, details.dependency, "billing")
+			testing.expect_value(t, details.code, 409)
+			delete(details.dependency)
+		} else {
+			testing.expect(t, false)
+		}
+	}
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	finish_input, finish_input_error := codec.encode_json("Workflow survived Update failure")
+	testing.expect(t, finish_input_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	completion := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(t, string(completion.completion_result), `"Workflow survived Update failure"`)
+	delete(completion.failure_message)
+	delete(completion.completion_result)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

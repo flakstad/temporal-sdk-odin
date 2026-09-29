@@ -915,6 +915,9 @@ Pending_Update_Response :: struct {
 	protocol_instance_id: string,
 	kind:                 Update_Response_Kind,
 	result:               Payload_Result,
+	// Borrowed from the Workflow instance until this activation completion has
+	// been encoded. This preserves Core's recursive Activity/Child failure.
+	failure_proto:         []u8,
 }
 
 Fiber_Activity_Operation :: struct {
@@ -8592,6 +8595,7 @@ append_pending_update_response :: proc(
 	protocol_instance_id: string,
 	kind: Update_Response_Kind,
 	result: Payload_Result = {},
+	failure_proto: []u8 = nil,
 ) {
 	append(
 		responses,
@@ -8599,6 +8603,7 @@ append_pending_update_response :: proc(
 			protocol_instance_id = protocol_instance_id,
 			kind = kind,
 			result = result,
+			failure_proto = failure_proto,
 		},
 	)
 }
@@ -9058,11 +9063,30 @@ append_finished_update_routine_response :: proc(
 	if routine.result.status == .Failed || routine.phase == .Failed {
 		kind = .Rejected
 	}
+	failure_proto: []u8
+	if kind == .Rejected && routine.unhandled_activity_seq != 0 {
+		operation, found := find_activity_operation(
+			routine.instance,
+			routine.unhandled_activity_seq,
+		)
+		if found {
+			failure_proto = operation.failure_proto
+		}
+	} else if kind == .Rejected && routine.unhandled_child_workflow_seq != 0 {
+		operation, found := find_child_workflow_operation(
+			routine.instance,
+			routine.unhandled_child_workflow_seq,
+		)
+		if found {
+			failure_proto = operation.failure_proto
+		}
+	}
 	append_pending_update_response(
 		responses,
 		routine.protocol_instance_id,
 		kind,
 		routine.result,
+		failure_proto,
 	)
 	routine.result = {}
 	routine.response_emitted = true
@@ -9468,18 +9492,22 @@ append_update_response_command :: proc(
 			value = payload,
 		}
 	case .Rejected:
-		failure_type := response.result.failure_type
-		if len(failure_type) == 0 {
-			failure_type = "OdinWorkflowUpdateRejected"
-		}
-		application_info := new(proto.Temporal_Api_Failure_V1_ApplicationFailureInfo)
-		application_info.type = failure_type
-		application_info.non_retryable = true
 		failure := new(proto.Temporal_Api_Failure_V1_Failure)
-		failure.message = response.result.failure_message
-		failure.source = "OdinSDK"
-		failure.failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
-			value = application_info,
+		restored := len(response.failure_proto) > 0 &&
+		            proto.decode_Temporal_Api_Failure_V1_Failure(response.failure_proto, failure)
+		if !restored {
+			failure_type := response.result.failure_type
+			if len(failure_type) == 0 {
+				failure_type = "OdinWorkflowUpdateRejected"
+			}
+			application_info := new(proto.Temporal_Api_Failure_V1_ApplicationFailureInfo)
+			application_info.type = failure_type
+			application_info.non_retryable = true
+			failure.message = response.result.failure_message
+			failure.source = "OdinSDK"
+			failure.failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Application_Failure_Info{
+				value = application_info,
+			}
 		}
 		update_response.response = proto.Coresdk_Workflow_Commands_UpdateResponse_Response_Rejected{
 			value = failure,

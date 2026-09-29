@@ -1437,6 +1437,16 @@ the routine whose own wait condition is ready resumes; registration order is
 the deterministic tie-breaker when several become ready in one activation.
 Forced eviction and replay reproduce every completion byte-for-byte.
 
+An unhandled Activity or Child Workflow failure is terminal for its Update
+routine, not for the enclosing Workflow Execution. The routine records the
+failed operation sequence. Its terminal `UpdateResponse.Rejected` restores the
+original encoded Temporal Failure supplied by Core, preserving the recursive
+wrapper/cause tree, retry state, typed details, and retry delay. The pending
+response borrows those bytes from the Workflow instance only until activation
+completion encoding; the operation remains instance-owned throughout that
+window. Explicit result APIs still let handler code inspect and recover from a
+failure without rejecting the Update.
+
 Typed handler input is decoded in the Workflow instance arena—not the
 activation decode arena—because a state mutation may retain strings or slices
 from that input beyond the current activation. It remains valid until eviction.
@@ -1672,9 +1682,9 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are shared-state races between handlers,
-structured propagation of Activity failures from an Update, and stack/resource
-limits. These must be fixed before the routine API can be considered stable.
+The remaining Update-runtime risks are shared-state races between handlers and
+stack/resource limits. These must be fixed before the routine API can be
+considered stable.
 
 ### Workflow Signal handlers
 

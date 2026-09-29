@@ -179,6 +179,25 @@ update_greeting_name :: proc(
 	return {previous_name = previous, current_name = state.name, caller = caller}
 }
 
+fail_greeting_name_with_activity :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: ^Greeting_Query_State,
+	input: Greeting_Update_Input,
+) -> Greeting_Update_Output {
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	_ = workflow.execute_activity_with_options(
+		ctx,
+		"failure_details",
+		input.name,
+		{
+			activity_id = "update-failure-activity",
+			start_to_close_timeout = 10 * time.Second,
+			retry_policy = &retry_policy,
+		},
+	)
+	return {}
+}
+
 hold_greeting_name :: proc(
 	ctx: ^workflow.Fiber_Context,
 	state: ^Greeting_Query_State,
@@ -990,6 +1009,14 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		update_greeting_name,
 	) {
 		return "could not register greeting name Update"
+	}
+	if !workflow.set_update_routine_json(
+		ctx,
+		"fail_greeting_name",
+		&query_state,
+		fail_greeting_name_with_activity,
+	) {
+		return "could not register failing greeting name Update"
 	}
 	if !workflow.set_update_routine_json(
 		ctx,
@@ -1831,7 +1858,7 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 3 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments ? 0 : (expect_update ? 4 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
 			max_workflow_executions = expect_schedule_backfill ? 3 : 1,
 			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
@@ -1978,9 +2005,9 @@ main :: proc() {
 				fmt.eprintln("Activity cancellation-details stats did not match")
 				failed = true
 			}
-		} else if run_stats.activity_tasks_completed != (expect_update ? 3 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
+		} else if run_stats.activity_tasks_completed != (expect_update ? 4 : 1) || run_stats.workflow_signals_received != 1 || run_stats.timers_canceled != 1 || run_stats.workflow_replay_activations < 1 ||
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
-		   (expect_update && (run_stats.workflow_updates_accepted != 2 || run_stats.workflow_updates_rejected != 1 || run_stats.workflow_updates_completed != 2)) {
+		   (expect_update && (run_stats.workflow_updates_accepted != 3 || run_stats.workflow_updates_rejected != 2 || run_stats.workflow_updates_completed != 2)) {
 			fmt.eprintf(
 				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d timers_canceled=%d replay_activations=%d\n",
 				run_stats.activity_tasks_completed,

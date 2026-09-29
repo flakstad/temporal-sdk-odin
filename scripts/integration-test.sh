@@ -1074,6 +1074,15 @@ echo "$rejected_update_output"
 grep -q 'kind=Workflow_Update_Failed' <<<"$rejected_update_output"
 grep -q 'greeting name is invalid' <<<"$rejected_update_output"
 
+TEMPORAL_CLIENT_ACTION=update-failure \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_CLIENT_UPDATE_INPUT=billing \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$workflow_control_output_file"
+structured_update_failure_output="$(<"$workflow_control_output_file")"
+echo "$structured_update_failure_output"
+grep -q 'Workflow Update preserved the structured Activity failure tree' <<<"$structured_update_failure_output"
+
 TEMPORAL_CLIENT_ACTION=update-timeout \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
   TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
@@ -1083,7 +1092,7 @@ TEMPORAL_CLIENT_ACTION=update-timeout \
 slow_update_pid=$!
 
 for _ in {1..30}; do
-  if grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
+  if grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0" "$worker_log" 2>/dev/null; then
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$slow_update_pid" 2>/dev/null; then
@@ -1107,7 +1116,11 @@ grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$fas
 grep -q 'previous="Odin" current="Temporal-fast"' <<<"$fast_update_output"
 grep -q 'caller="odin-client-control"' <<<"$fast_update_output"
 
-wait "$slow_update_pid"
+if ! wait "$slow_update_pid"; then
+  echo "Slow Workflow Update client failed" >&2
+  cat "$slow_update_output_file" >&2
+  exit 1
+fi
 slow_update_pid=""
 slow_update_output="$(<"$slow_update_output_file")"
 echo "$slow_update_output"
@@ -1146,22 +1159,26 @@ grep -q '"result": "Hello Approved"' <<<"$workflow_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=3" "$worker_log"
-grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=3" "$worker_log"
+grep -Eq "replay=true .*signal=true .*canceled_timer=true .*waiting_activity=4" "$worker_log"
+grep -Eq "replay=false .*signal=true .*canceled_timer=true .*waiting_activity=4" "$worker_log"
 grep -Eq "replay=(true|false) .*queries=1 query_failures=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*resolved=1 failed=true .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*scheduled=1 local_scheduled=0 last_activity=3 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=false .*resolved=3 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=false .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=false .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "Workflow Update validator interceptor entered" "$worker_log"
 grep -q "Workflow Update validator interceptor exited" "$worker_log"
 grep -q "Workflow Update handler interceptor entered before handler" "$worker_log"
 grep -q "Workflow Update handler interceptor exited after handler" "$worker_log"
 grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=1 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*resolved=1 failed=true .*updates_accepted=0 updates_rejected=1 updates_completed=0 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=2 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*scheduled=1 local_scheduled=0 last_activity=3 .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*waiting_signal=true" "$worker_log"
+grep -Eq "replay=true .*resolved=3 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -Eq "replay=true .*resolved=2 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
-grep -Eq "replay=true .*resolved=1 .*updates_accepted=0 updates_rejected=0 updates_completed=1 .*waiting_signal=true" "$worker_log"
 grep -q "signal won the durable timer race and replay reproduced timer cancellation" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=signal-handler \

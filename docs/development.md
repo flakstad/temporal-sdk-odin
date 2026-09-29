@@ -716,6 +716,13 @@ Wait long-polls `PollWorkflowExecutionUpdate` for `COMPLETED`. The successful
 Payload is caller-owned. Update failure returns
 `.Workflow_Update_Failed`; `Error.message` owns the Temporal failure message and
 `Error.details` owns the encoded Failure protobuf.
+When an accepted stackful Update terminates through an unhandled Activity or
+Child Workflow failure, the runtime uses Core's original encoded Failure for
+`UpdateResponse.Rejected`. The Client therefore decodes the same recursive
+wrapper/cause tree—including operation identity, retry state, typed details,
+and retry delay—while the enclosing Workflow remains live. Handlers that use
+the explicit `*_result` Activity/Child APIs can still catch the failure and
+complete the Update successfully.
 `wait_update_payload_with_options` and `wait_update_json_with_options` accept a
 monotonic total timeout plus an optional Core-backed cancellation token. They
 return `.Wait_Timed_Out` or `.Wait_Canceled` without changing the durable
@@ -1051,7 +1058,10 @@ Finally, the script starts `examples/hello_workflow` and invokes it with
 `temporal workflow execute` in the background. After the Workflow has
 started a durable timer and is visibly waiting for either that timer or an
 `approval` signal, `examples/client_control` first proves a validator rejection,
-then starts two typed Updates using the public start/wait handle API. Their
+then starts an accepted Update whose Activity returns a structured application
+failure. The Client requires the resulting `ActivityFailure ->
+ApplicationFailure` tree and the Workflow continues. It then starts two typed
+Updates using the public start/wait handle API. Their
 independent routines wait for separate Odin Activities; the second Activity
 finishes first and the first Update finishes last. A typed query returns phase
 `waiting-for-approval` and the last-completed name without resuming the main

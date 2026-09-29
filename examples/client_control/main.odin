@@ -5,6 +5,7 @@ import "core:os"
 import "core:time"
 import temporal_client "../../temporal/client"
 import codec "../../temporal/codec"
+import temporal_failure "../../temporal/failure"
 
 env :: proc(name: string, buffer: []u8) -> string {
 	return os.get_env(buffer, name)
@@ -39,6 +40,11 @@ Greeting_Update_Output :: struct {
 	previous_name: string,
 	current_name:  string,
 	caller:        string,
+}
+
+Failure_Details :: struct {
+	dependency: string,
+	code:       int,
 }
 
 add_client_context :: proc(headers: ^temporal_client.Headers) -> temporal_client.Error {
@@ -194,10 +200,10 @@ run :: proc() -> int {
 			output.caller,
 		)
 		return 0
-	case "update", "update-timeout":
+	case "update", "update-timeout", "update-failure":
 		update_name := env("TEMPORAL_CLIENT_UPDATE_NAME", name_buffer[:])
 		if len(update_name) == 0 {
-			update_name = "set_greeting_name"
+			update_name = action == "update-failure" ? "fail_greeting_name" : "set_greeting_name"
 		}
 		new_name := env("TEMPORAL_CLIENT_UPDATE_INPUT", input_buffer[:])
 		if len(new_name) == 0 {
@@ -245,6 +251,42 @@ run :: proc() -> int {
 			}
 		} else {
 			operation_error = temporal_client.wait_update_json(&update_handle, &output)
+		}
+		if action == "update-failure" {
+			if operation_error.kind != .Workflow_Update_Failed {
+				print_error("structured Update failure", &operation_error)
+				return 1
+			}
+			decoded_failure, decode_error := temporal_client.decode_error_failure(&operation_error)
+			defer temporal_failure.failure_free(&decoded_failure)
+			activity_node := temporal_failure.find_kind(&decoded_failure, .Activity)
+			application_node := temporal_failure.find_kind(&decoded_failure, .Application)
+			valid := decode_error == .None && activity_node != nil && application_node != nil
+			if valid {
+				valid = activity_node.activity.activity_id == "update-failure-activity" &&
+				        activity_node.activity.activity_type == "failure_details" &&
+				        activity_node.activity.retry_state == .Maximum_Attempts_Reached &&
+				        application_node.application.type == "DependencyRejected" &&
+				        application_node.application.has_next_retry_delay &&
+				        application_node.application.next_retry_delay == 250 * time.Millisecond &&
+				        len(application_node.application.details) == 1
+			}
+			if valid {
+				details: Failure_Details
+				detail_error := codec.decode_json(
+					codec.payload_view(&application_node.application.details[0]),
+					&details,
+				)
+				valid = detail_error == .None && details.dependency == "billing" && details.code == 409
+				delete(details.dependency)
+			}
+			if !valid {
+				print_error("structured Update failure validation", &operation_error)
+				return 1
+			}
+			temporal_client.error_free(&operation_error)
+			fmt.println("Workflow Update preserved the structured Activity failure tree")
+			return 0
 		}
 		if operation_error.message != nil {
 			print_error(action, &operation_error)

@@ -58,7 +58,11 @@ identity. The Client exposes owned Update handles that separate acceptance from
 waiting for the result. Existing accepted Updates can be reattached by their
 Workflow/run/Update IDs. Result waiting accepts a monotonic timeout and a
 thread-safe Core cancellation token; either stops only the local long poll and
-does not cancel the durable Update. Concurrent handler close semantics now match the
+does not cancel the durable Update. If an unhandled Activity failure terminates
+an accepted Update handler, the Update outcome preserves Core's complete
+recursive `ActivityFailure -> ApplicationFailure` tree rather than flattening
+it; the Workflow Execution remains open and can continue handling work.
+Concurrent handler close semantics now match the
 established language SDKs: unfinished Update routines are abandoned with a
 warning by default, registration can suppress that warning, and
 `workflow.await_all_handlers_finished` explicitly keeps the main Workflow open.
