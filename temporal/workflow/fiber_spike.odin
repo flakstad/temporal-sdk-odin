@@ -13,11 +13,16 @@ import temporal_failure "../failure"
 import temporal_headers "../headers"
 import fiber_raw "fiber/raw"
 
+Condition_Predicate :: proc(data: rawptr) -> bool
+
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
 // operations, not a general worker/client handle. This remains an experiment.
 Fiber_Context :: struct {
 	instance:       ^Fiber_Instance,
 	update_context: ^Update_Context,
+	waiting_condition_data: rawptr,
+	waiting_condition_predicate: Condition_Predicate,
+	waiting_condition_cancellation_token_id: u32,
 	waiting_mutex:  ^Mutex,
 	waiting_mutex_cancellation_token_id: u32,
 	mutex_granted:  bool,
@@ -524,6 +529,7 @@ Owned_Continue_As_New_Options :: struct {
 
 Fiber_Phase :: enum {
 	Ready,
+	Waiting_Condition,
 	Waiting_Mutex,
 	Waiting_Activity,
 	Waiting_Child_Workflow_Start,
@@ -7836,6 +7842,91 @@ sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	outbound_sleep_chain(&state, &input)
 }
 
+condition_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	if ctx == nil || ctx.instance == nil {
+		return
+	}
+	ctx.instance.failure_message = message
+	ctx.instance.failure_type = "OdinWorkflowConditionError"
+	ctx.instance.phase = .Failed
+}
+
+condition_should_resume :: proc(ctx: ^Fiber_Context) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.waiting_condition_predicate == nil {
+		return false
+	}
+	if ctx.waiting_condition_predicate(ctx.waiting_condition_data) {
+		return true
+	}
+	return cancellation_token_is_requested_id(
+		ctx.instance,
+		ctx.waiting_condition_cancellation_token_id,
+	)
+}
+
+await_condition_raw :: proc(
+	ctx: ^Fiber_Context,
+	data: rawptr,
+	predicate: Condition_Predicate,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || data == nil || predicate == nil ||
+	   ctx.instance.phase != .Ready || ctx.waiting_condition_predicate != nil {
+		condition_fail(ctx, "invalid Workflow condition wait")
+		return false
+	}
+	instance := ctx.instance
+	for {
+		if predicate(data) {
+			return true
+		}
+		if current_cancellation_applies(instance) {
+			return false
+		}
+		ctx.waiting_condition_data = data
+		ctx.waiting_condition_predicate = predicate
+		ctx.waiting_condition_cancellation_token_id = current_cancellation_token_id(instance)
+		instance.phase = .Waiting_Condition
+		yield_result := fiber_raw.yield(instance.fiber)
+		ctx.waiting_condition_data = nil
+		ctx.waiting_condition_predicate = nil
+		ctx.waiting_condition_cancellation_token_id = 0
+		if yield_result != .Success || instance.phase != .Ready {
+			condition_fail(ctx, "could not resume Workflow condition wait")
+			return false
+		}
+	}
+}
+
+// await_condition suspends the current Workflow fiber until a deterministic,
+// side-effect-free predicate over run-owned state becomes true. It returns false
+// when the cancellation token selected at the start of the wait is requested.
+// The state and predicate are borrowed for the stackful call and must not escape
+// the Workflow run.
+await_condition :: proc(
+	ctx: ^Fiber_Context,
+	state: ^$State,
+	predicate: proc(state: ^State) -> bool,
+) -> bool {
+	Callback :: #type proc(state: ^State) -> bool
+	Data :: struct {
+		state:     ^State,
+		predicate: Callback,
+	}
+	if state == nil || predicate == nil {
+		condition_fail(ctx, "Workflow condition requires state and predicate")
+		return false
+	}
+	data := Data{state = state, predicate = predicate}
+	return await_condition_raw(
+		ctx,
+		&data,
+		proc(condition_data: rawptr) -> bool {
+			condition := cast(^Data)condition_data
+			return condition.predicate(condition.state)
+		},
+	)
+}
+
 mutex_fail :: proc(ctx: ^Fiber_Context, message: string) {
 	if ctx == nil || ctx.instance == nil {
 		return
@@ -8992,6 +9083,8 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		routine.current_cancellation_token_id,
 	)
 	switch routine.phase {
+	case .Waiting_Condition:
+		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
 	case .Waiting_Activity:
@@ -9352,6 +9445,8 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		routine.current_cancellation_token_id,
 	)
 	switch routine.phase {
+	case .Waiting_Condition:
+		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
 	case .Waiting_Activity:
@@ -9422,6 +9517,8 @@ resume_main_workflow_if_ready :: proc(
 	}
 	should_resume := false
 	switch instance.phase {
+	case .Waiting_Condition:
+		should_resume = condition_should_resume(&instance.workflow_context)
 	case .Waiting_Mutex:
 		should_resume = instance.workflow_context.mutex_granted ||
 		                current_cancellation_applies(instance)
@@ -9895,6 +9992,8 @@ append_fiber_pending_commands :: proc(
 ) -> Error {
 	append_shared_operation_commands(result, commands, instance, task_queue)
 	switch instance.phase {
+	case .Waiting_Condition:
+		result.waiting_condition = true
 	case .Waiting_Mutex:
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq

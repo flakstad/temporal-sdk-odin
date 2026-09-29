@@ -82,6 +82,7 @@ Process_Result :: struct {
 	unfinished_update_handlers:        int,
 	warned_unfinished_update_handlers: int,
 	waiting_signal:      bool,
+	waiting_condition:   bool,
 	waiting_handlers:    bool,
 	started_timer:      bool,
 	timer_seq:          u32,

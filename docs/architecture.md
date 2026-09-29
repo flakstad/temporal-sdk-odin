@@ -1462,6 +1462,36 @@ strand the scheduler. User code should still pair each successful lock with
 `defer mutex_unlock`; ordinary OS locks would block the worker thread and have
 no replay semantics.
 
+The related `workflow.await_condition` primitive follows the pinned Rust
+runtime's `WorkflowContext::wait_condition` boundary. Core has no condition
+command or durable condition object. Odin stores a type-erased predicate plus a
+borrowed state pointer in the suspended fiber context. The typed public wrapper
+keeps both in a stack-local adapter whose lifetime naturally spans the stackful
+call. The predicate receives no `Fiber_Context`, so it cannot intentionally
+schedule Temporal operations.
+
+The predicate runs once before suspension and is reevaluated by the stable
+Signal -> Update -> main scheduler after activation jobs or another routine may
+have mutated shared state. A condition that becomes true resumes in the same
+activation fixed point. Its captured cancellation-token ID is checked only
+after the predicate, matching upstream's condition-before-cancellation
+priority. Returning `false` therefore means cancellation won while the
+predicate remained false. No explicit language-side notification object is
+needed: Workflow state can only make deterministic progress while activation
+work or a ready fiber is being applied, and the scheduler already drains after
+each such step.
+
+Predicates must be deterministic, side-effect-free, non-blocking, and must not
+retain their borrowed pointer. Eviction destroys the predicate adapter with the
+fiber stack; replay reexecutes the Workflow and reconstructs it. A false
+condition does not itself arrange a future activation, so application code must
+still have an external Signal/Update or a durable Activity/timer/child operation
+that can cause relevant state to change. This entire feature remains above the
+C ABI and adds no protobuf or Core symbol. The live acceptance case blocks the
+main Odin fiber on an approval predicate, delivers a real Temporal Signal, and
+requires the same activation to report the Signal handler and terminal Workflow
+completion through Core.
+
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
 failed operation sequence. Its terminal `UpdateResponse.Rejected` restores the

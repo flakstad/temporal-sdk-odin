@@ -224,10 +224,13 @@ run :: proc() -> int {
 		output: Greeting_Update_Output
 		timeout_probe := action == "update-timeout"
 		if timeout_probe {
+			// Leave enough time for the long poll to be established before its
+			// deadline. Very small deadlines can exercise a tonic/h2 teardown race
+			// instead of the Update wait semantics this example is meant to prove.
 			operation_error = temporal_client.wait_update_json_with_options(
 				&update_handle,
 				&output,
-				{timeout = 20 * time.Millisecond},
+				{timeout = 250 * time.Millisecond},
 			)
 			if operation_error.kind != .Wait_Timed_Out {
 				print_error("bounded Update wait", &operation_error)

@@ -171,6 +171,64 @@ worker_pid=""
 cat "$worker_log"
 grep -q 'multiple Workflow arguments completed end-to-end through Core' "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=condition \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Condition Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+condition_workflow_id="odin-sdk-condition-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$condition_workflow_id" \
+  --type odin_condition_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"order-42"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*waiting_condition=true .*completed=false" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Condition Workflow did not suspend on its predicate" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+temporal workflow signal \
+  --workflow-id "$condition_workflow_id" \
+  --name approve \
+  --input '"Andreas"' \
+  --command-timeout 10s \
+  --output none
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+condition_output="$(<"$workflow_output_file")"
+echo "$condition_output"
+grep -q 'Order order-42 approved by Andreas' <<<"$condition_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=true .*waiting_condition=true .*completed=false" "$worker_log"
+grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_completed=1 .*waiting_condition=false .*completed=true" "$worker_log"
+grep -q "Workflow condition resumed after a Signal and replayed on a fresh stack" "$worker_log"
+echo "Workflow condition resumed through Core and Temporal Server"
+
 TEMPORAL_ODIN_SCENARIO=multiple-signal-arguments \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

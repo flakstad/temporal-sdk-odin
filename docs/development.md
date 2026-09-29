@@ -175,6 +175,17 @@ and terminal completions after eviction and fresh-stack replay. A focused unit
 test separately cancels a queued waiter through its selected Workflow
 cancellation token and proves that the owner remains live and can release the
 lock normally.
+The Workflow-condition property varies four threshold partitions and both
+Signal/Update waiter-start orders. Main, Signal, and Update fibers suspend on
+typed state predicates; each pre-threshold activation must leave the waiters
+blocked, the threshold activation must resume both handlers in the deterministic
+fixed point, and eviction/fresh-stack replay must reproduce every completion
+byte-for-byte. A focused unit test separately proves cancellation and the
+upstream-compatible rule that a true predicate wins over cancellation observed
+in the same scheduler pass.
+The CLI-devserver suite also starts `odin_condition_workflow`, waits until the
+Worker reports `waiting_condition=true`, sends an `approve` Signal through the
+Temporal CLI, and requires the predicate-resumed result plus clean eviction.
 PBT is a
 test-only dependency. The Update handler suite additionally generates 1,000
 close/await/cancel/drain/late-event traces and checks them against an independent

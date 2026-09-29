@@ -65,6 +65,30 @@ the Workflow; in an Update routine it rejects that Update. Use
 `defer mutex_unlock` after every successful acquisition. Host synchronization
 primitives remain invalid inside Workflow code because they are not replay-aware.
 
+`await_condition` waits for a deterministic predicate over Workflow-owned
+state without polling wall time or emitting a Temporal command:
+
+```odin
+if !workflow.await_condition(
+	ctx,
+	&state,
+	proc(state: ^Order_State) -> bool {
+		return state.approved || state.rejected
+	},
+) {
+	return .Canceled
+}
+```
+
+The predicate is evaluated immediately and again after activation jobs or other
+ready handlers may have changed state. It must be deterministic,
+side-effect-free, non-blocking, and must not retain the borrowed state pointer.
+The wait inherits the cancellation token selected by the current cancellation
+scope and returns `false` when that token is requested. If the predicate becomes
+true in the same scheduler pass as cancellation, the condition wins, matching
+the pinned Rust runtime. Conditions are local scheduler state: eviction drops
+the suspended stack and replay reconstructs the wait from history.
+
 `workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
 stack sizes independently when the Worker is created. Zero selects the 128 KiB
 default; explicit sizes are validated between 32 KiB and 16 MiB. Replay Workers

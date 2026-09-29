@@ -1414,6 +1414,29 @@ while holding a mutex fail deterministically. Main/Signal failures fail the
 Workflow; an Update-handler failure rejects that Update. OS mutexes and other
 host synchronization are not safe substitutes in replaying Workflow code.
 
+Workflow-state predicates can be awaited directly from the main Workflow or a
+stackful Signal/Update handler:
+
+```odin
+ready := workflow.await_condition(
+    ctx,
+    &state,
+    proc(state: ^Order_State) -> bool {
+        return state.payment_received && state.inventory_reserved
+    },
+)
+```
+
+`await_condition` emits no command and does not poll host time. The predicate
+must be deterministic, side-effect-free, and non-blocking. It is checked after
+activation jobs and handler progress in the scheduler's stable order. The wait
+inherits the selected Workflow cancellation token; a simultaneous true
+predicate takes precedence over cancellation, as in the pinned Rust runtime.
+External Signals/Updates or another durable operation must still provide an
+activation capable of changing the state—conditions are not server-side events.
+The CLI-devserver suite starts a Workflow blocked on such a predicate, delivers
+an approval Signal, and observes completion through Core and Temporal Server.
+
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child
 deadline adds its own timer, while a later one adds no redundant command.
