@@ -163,6 +163,7 @@ grep -q "Odin client completed repeated-argument workflow_id=$repeated_workflow_
 grep -q 'result="Odin:42:true"' <<<"$repeated_workflow_output"
 grep -q 'Client start interceptor observed three Workflow arguments' <<<"$repeated_workflow_output"
 grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$repeated_workflow_output"
+grep -q 'Client connection mutation interceptor observed metadata and API-key updates' <<<"$repeated_workflow_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

@@ -33,21 +33,35 @@ update_rpc_metadata :: proc(
 	metadata: []RPC_Metadata_Entry,
 	binary_metadata: []RPC_Metadata_Entry = nil,
 ) -> Error {
-	if client == nil || client.connection == nil {
-		return error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	input := Client_Connection_Mutation_Input{
+		client = client,
+		kind = .RPC_Metadata,
+		metadata = metadata,
+		binary_metadata = binary_metadata,
 	}
-	core_error := temporal_core.client_update_metadata(client.connection, metadata, binary_metadata)
-	if core_error.message != nil {
-		return error_from_core(&core_error, .Invalid_Argument)
-	}
-	return {}
+	return client_connection_mutation_chain(&Client_Interceptor_State{client = client}, &input)
 }
 
 update_api_key :: proc(client: ^Client, api_key: string) -> Error {
-	if client == nil || client.connection == nil {
+	input := Client_Connection_Mutation_Input{client = client, kind = .API_Key, api_key = api_key}
+	return client_connection_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+}
+
+connection_mutation_terminal :: proc(input: ^Client_Connection_Mutation_Input) -> Error {
+	if input == nil || input.client == nil || input.client.connection == nil {
 		return error_from_string(.Invalid_Argument, "Temporal client is not connected")
 	}
-	core_error := temporal_core.client_update_api_key(client.connection, api_key)
+	core_error: temporal_core.Error
+	switch input.kind {
+	case .RPC_Metadata:
+		core_error = temporal_core.client_update_metadata(
+			input.client.connection,
+			input.metadata,
+			input.binary_metadata,
+		)
+	case .API_Key:
+		core_error = temporal_core.client_update_api_key(input.client.connection, input.api_key)
+	}
 	if core_error.message != nil {
 		return error_from_core(&core_error, .Invalid_Argument)
 	}

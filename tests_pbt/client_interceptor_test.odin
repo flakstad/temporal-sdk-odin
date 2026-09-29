@@ -221,10 +221,24 @@ client_interceptor_property_schedule_mutation :: proc(user_data: rawptr, input: 
 	return result
 }
 
+client_interceptor_property_connection_mutation :: proc(user_data: rawptr, input: ^temporal_client.Client_Connection_Mutation_Input, next: temporal_client.Client_Connection_Mutation_Next) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
+	if node.id > 1 && input.api_key != "generated API key" {
+		return temporal_client.error_from_string(.Invalid_Argument, "connection interceptor input mutation was not propagated")
+	}
+	input.api_key = "generated API key"
+	result: temporal_client.Error
+	if node.short_circuit do result = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	else do result = temporal_client.client_connection_mutation_next(next, input)
+	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
+	return result
+}
+
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 12))
+	operation := pbt.draw(t, pbt.int_range(0, 13))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -235,8 +249,9 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 4, 5.0, "Workflow result")
 	pbt.cover(t, operation == 5, 5.0, "Workflow Visibility list")
 	pbt.cover(t, operation == 6, 5.0, "Workflow Visibility count")
-	pbt.cover(t, operation >= 7, 20.0, "Schedule read operation")
-	pbt.cover(t, operation >= 11, 10.0, "Schedule mutation operation")
+	pbt.cover(t, operation >= 7 && operation <= 10, 20.0, "Schedule read operation")
+	pbt.cover(t, operation == 11 || operation == 12, 10.0, "Schedule mutation operation")
+	pbt.cover(t, operation == 13, 5.0, "connection mutation operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -280,6 +295,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.create_schedule = client_interceptor_property_create_schedule
 		case 12:
 			interceptor.schedule_mutation = client_interceptor_property_schedule_mutation
+		case 13:
+			interceptor.connection_mutation = client_interceptor_property_connection_mutation
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -372,6 +389,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		temporal_client.schedule_handle_free(&created)
 	case 12:
 		operation_error = temporal_client.pause_schedule(&schedule_handle, "property pause")
+	case 13:
+		operation_error = temporal_client.update_api_key(&client, "caller API key")
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

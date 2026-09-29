@@ -29,6 +29,11 @@ Typed_Greeting_Output :: struct {
 	heartbeat_timeout_milliseconds: i64,
 }
 
+Connection_Interceptor_State :: struct {
+	metadata_updates: u32,
+	api_key_updates:  u32,
+}
+
 start_workflow_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Start_Workflow_Input,
@@ -178,6 +183,21 @@ count_workflows_interceptor :: proc(
 	return result, count_error
 }
 
+connection_mutation_interceptor :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Connection_Mutation_Input,
+	next: temporal_client.Client_Connection_Mutation_Next,
+) -> temporal_client.Error {
+	state := cast(^Connection_Interceptor_State)user_data
+	switch input.kind {
+	case .RPC_Metadata:
+		state.metadata_updates += 1
+	case .API_Key:
+		state.api_key_updates += 1
+	}
+	return temporal_client.client_connection_mutation_next(next, input)
+}
+
 run :: proc() -> int {
 	connection_metadata := [?]temporal_client.RPC_Metadata_Entry{{
 		key = "x-odin-sdk",
@@ -203,7 +223,9 @@ run :: proc() -> int {
 	connection_dns := temporal_client.DNS_Load_Balancing_Options{
 		resolution_interval = 30 * time.Second,
 	}
+	connection_interceptor_state := Connection_Interceptor_State{}
 	interceptors := [?]temporal_client.Client_Interceptor{{
+		user_data = &connection_interceptor_state,
 		start_workflow = start_workflow_interceptor,
 		signal_with_start = signal_with_start_interceptor,
 		signal_workflow = signal_workflow_interceptor,
@@ -212,6 +234,7 @@ run :: proc() -> int {
 		get_result = get_result_interceptor,
 		list_workflows = list_workflows_interceptor,
 		count_workflows = count_workflows_interceptor,
+		connection_mutation = connection_mutation_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",
@@ -259,6 +282,11 @@ run :: proc() -> int {
 		temporal_client.error_free(&api_key_error)
 		return 1
 	}
+	if connection_interceptor_state.metadata_updates != 1 || connection_interceptor_state.api_key_updates != 2 {
+		fmt.eprintln("Client connection mutation interceptor did not observe all updates")
+		return 1
+	}
+	fmt.println("Client connection mutation interceptor observed metadata and API-key updates")
 
 	env_buffer: [128]u8
 	workflow_id := os.get_env(env_buffer[:], "TEMPORAL_CLIENT_WORKFLOW_ID")

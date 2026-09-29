@@ -1537,15 +1537,18 @@ list/count and the complete Schedule surface expose their semantic inputs and
 preserve the existing allocator-owned result contract through typed
 continuations. Schedule Create returns its owned handle directly; the six
 Error-returning mutations share a discriminated semantic input while retaining
-operation-specific fields.
+operation-specific fields. Dynamic RPC-metadata and API-key replacement share
+a connection-mutation input and remain direct Core ABI calls at the terminal;
+all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks thirteen nested operation families and arbitrary
+A 500-case property checks fourteen nested operation families and arbitrary
 short-circuit depth. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. Live start, Signal-With-Start, Signal, Query,
 result, Update, cancellation, termination, Visibility list/count, and every
-Schedule path cross Service/Core. Connection mutation is not yet intercepted.
+Schedule path cross Service/Core. The live Client example also proves metadata
+replacement plus API-key set/clear interception before later RPCs.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.
 The Worker copies configured `workflow.Outbound_Interceptor` records into every

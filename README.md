@@ -264,7 +264,9 @@ Query, result waiting, Update start, cancellation, termination, and Workflow
 Visibility list/count plus Schedule Describe/List/Count/Matching-Times; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
-Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`:
+Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`.
+Live RPC-metadata and API-key replacement share a corresponding
+`Connection_Mutation_Kind` input:
 
 ```odin
 propagate_signal :: proc(
@@ -289,7 +291,9 @@ client, err := temporal_client.connect_with_options({
 Interceptor records are copied at connect time, while `user_data` remains
 application-owned until `client.close`. Headers are cloned per call: interceptor
 mutations reach the RPC but never mutate the caller-owned builder. Shared
-mutable `user_data` must be safe for concurrent Client calls.
+mutable `user_data` must be safe for concurrent Client calls. Connection
+mutation inputs borrow their buffers only for the synchronous chain. API keys
+are secrets and telemetry interceptors must not record their value.
 
 Workflow outbound interception is registered on the Worker. The callbacks are
 part of deterministic Workflow execution: do not read wall-clock time, perform
