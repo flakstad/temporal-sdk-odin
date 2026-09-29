@@ -1691,6 +1691,48 @@ grep -Eq "replay=true .*signal=true signal_handlers_started=1 signal_handlers_co
 grep -Eq "replay=true .*updates_accepted=1 updates_rejected=0 updates_completed=0 .*started_timer=true .*waiting_signal=true" "$worker_log"
 grep -q "Workflow scheduler drained cancellation across Signal, Update, and main fibers" "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=cancellation-deadline \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Cancellation-deadline Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+  echo "Cancellation-deadline Worker did not become ready" >&2
+  cat "$worker_log" >&2
+  exit 1
+fi
+
+cancellation_deadline_workflow_id="odin-sdk-cancellation-deadline-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$cancellation_deadline_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"cancellation-deadline"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+cancellation_deadline_output="$(<"$workflow_output_file")"
+echo "$cancellation_deadline_output"
+grep -q '"status": "COMPLETED"' <<<"$cancellation_deadline_output"
+grep -q '"result": "Cancellation deadline completed"' <<<"$cancellation_deadline_output"
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*started_timer=true .*completed=false" "$worker_log"
+grep -Eq "replay=false .*canceled_timer=true .*completed=true" "$worker_log"
+grep -q "Workflow cancellation deadline used a durable replay-safe timer" "$worker_log"
+
 run_workflow_cancellation_case() {
   local scenario="$1"
   local input="$2"

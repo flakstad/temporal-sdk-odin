@@ -220,8 +220,7 @@ now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
-**not** yet provide propagated cancellation deadlines,
-guard-page/growable stack protection, client
+**not** yet provide guard-page/growable stack protection, client
 cancellation of an accepted Update,
 in-process panic containment, or a stable public API.
 Do not use it in production.
@@ -361,9 +360,10 @@ The fiber experiment also builds pinned
 [minicoro](https://github.com/edubart/minicoro) through a seven-symbol local C
 shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
-payload/failure contracts, activation races, and all six orderings of
-Signal-start/Update-start/token-cancel jobs, and verifies byte-identical replay
-completions. A pinned [statecharts](https://github.com/flakstad/statecharts)
+payload/failure contracts, activation races, all six orderings of
+Signal-start/Update-start/token-cancel jobs, and 300 inherited deadline trees,
+and verifies byte-identical replay completions. A pinned
+[statecharts](https://github.com/flakstad/statecharts)
 model independently checks Update close/await/late-event lifecycle traces.
 
 Clone submodules and build the pinned Core bridge:
@@ -1341,6 +1341,27 @@ later-scheduled fiber therefore wakes earlier Signal/timer waiters, completes
 their handler responses, and can release `await_all_handlers_finished` in the
 same activation. Activity options using `Wait_Cancellation_Completed` remain
 suspended until Core delivers the terminal Activity resolution.
+
+Deadline tokens use Temporal timers and the activation timestamp rather than
+the host clock. Children inherit the earlier parent deadline; a shorter child
+deadline adds its own timer, while a later one adds no redundant command.
+Detached deadline trees remain independent of root Workflow cancellation:
+
+```odin
+branch := workflow.cancellation_child_with_timeout(
+    workflow.cancellation_root(ctx),
+    30 * time.Second,
+)
+deadline, has_deadline := workflow.cancellation_deadline(branch)
+scope := workflow.cancellation_scope(ctx, branch)
+defer workflow.cancellation_scope_end(&scope)
+workflow.sleep(ctx, 24 * time.Hour) // returns when the branch deadline fires
+```
+
+Absolute variants are `cancellation_child_with_deadline` and
+`cancellation_detached_with_deadline`; detached timeouts use
+`cancellation_detached_with_timeout`. Expired deadlines cancel immediately and
+emit no timer command. Deadline state and commands are replay-identical.
 
 Returning from the Workflow while root cancellation is pending acknowledges it
 with `CancelWorkflowExecution`; the return value is not completed successfully.

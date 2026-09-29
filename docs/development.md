@@ -1069,6 +1069,12 @@ that token. The same Workflow Activation must cancel the timer, finish both
 handlers, return the Update result, release main's handler drain, and complete
 the Workflow. This is the live fixed-point scheduler acceptance case.
 
+`TEMPORAL_ODIN_SCENARIO=cancellation-deadline` creates a child token with a
+one-second timeout, then starts a 24-hour durable sleep inside that scope. Core
+fires the deadline timer; the same activation cancels the sleep timer, resumes
+the main fiber, and completes successfully. The test proves the deadline uses
+Temporal history rather than a host-clock/background-thread shortcut.
+
 ## Child, external, Continue-As-New, and patch acceptance test
 
 `examples/child_workflow` registers successful, failing, and cancellation-aware

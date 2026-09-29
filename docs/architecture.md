@@ -1601,8 +1601,7 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are propagated cancellation deadlines,
-client cancellation of an accepted Update,
+The remaining Update-runtime risks are client cancellation of an accepted Update,
 shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
@@ -1792,10 +1791,20 @@ activation completions reproduce byte-for-byte after eviction. A separate
 Activity trace proves that `Wait_Cancellation_Completed` emits the cancellation
 request but does not resume user code until `ResolveActivity(Cancelled)` arrives.
 
-The token tree has no deadline propagation yet. There is also no separate
-protocol for canceling an already accepted Update; root Workflow cancellation
-and the handler's operation scope determine whether that routine can finish
-before close.
+Cancellation tokens now support absolute deadlines and relative timeouts. The
+runtime derives relative deadlines from Core's deterministic activation
+timestamp, represents the winning deadline as a durable Temporal timer, and
+propagates the earlier effective deadline to descendants. A later child
+deadline emits no redundant timer; an earlier child deadline owns a separate
+timer and cancels only its branch when fired. Detached deadline roots remain
+independent of root Workflow cancellation. Expired deadlines cancel
+immediately without emitting a command. Unit and generated-value tests evict
+the run and require byte-identical deadline timer/completion commands on a
+fresh-stack replay.
+
+There is no separate protocol for canceling an already accepted Update. Root
+Workflow cancellation and the handler's operation scope determine whether that
+routine can finish before close.
 
 The post-job scheduler drains Signal routines, Update routines, and the main
 Workflow fiber in that stable order until no fiber can advance. A later routine
@@ -1878,6 +1887,11 @@ Signal jobs inside one activation. Every ordering must drain both handler
 fibers and main to completion without emitting the timer that was created and
 canceled before command encoding. Eviction and fresh-stack replay must produce
 the same initialization and terminal completion bytes.
+
+The deadline property generates 300 parent/child timeout pairs. It covers the
+parent, child, and equal-deadline cases; requires only the minimal one or two
+durable timer commands; fires the winning timer; and checks branch-local
+cancellation plus exact completion bytes after eviction and replay.
 
 The pinned, test-only
 [flakstad/statecharts](https://github.com/flakstad/statecharts) library now
@@ -2075,8 +2089,8 @@ Workflows are enabled.
    detached Update/Activity cleanup, Child Workflows, external Workflow
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It
    now proves downward-only nested cancellation-token trees across Activities,
-   timers, Signal waits, main/Signal/Update fibers, and replay. It does not yet
-   prove cancellation deadlines, client cancellation of accepted Updates,
+   timers, Signal waits, main/Signal/Update fibers, propagated durable
+   deadlines, and replay. It does not yet prove client cancellation of accepted Updates,
    panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, guard-page/growable stack protection, or
    a production deterministic scheduler.
@@ -2096,9 +2110,9 @@ Workflows are enabled.
    flags, and callback-authored cancellation Payloads through a
    `Wait_Cancellation_Completed` Workflow result. Nested token/scope trees now
    isolate child, sibling, and detached Activity branches; fixed-point handler
-   scheduling now covers token-driven timer and Signal wakeups. The remaining
-   work is propagated deadline support rather than
-   information loss at the Activity boundary. The Activity API now models typed success, retryability, failure type,
+   scheduling now covers token-driven timer and Signal wakeups, and inherited
+   deadline timers cancel their branch deterministically. The Activity API now
+   models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
    Policy, and prior heartbeat details, but still needs a process-isolation
    policy for panics. Typed JSON decode/encode errors
@@ -2145,7 +2159,8 @@ Retry Policy, deadline derivation, and heartbeat-detail redelivery are also
 proven. The PBT suites generate 500 Payload values, 500
 Application Failure contracts, 500 typed Workflow replay cases, 500 remote
 Activity-option command/replay cases, and 500 Local Activity-option
-command/replay cases, plus 500 Activity deadline combinations,
+command/replay cases, plus 500 Activity deadline combinations and 300 Workflow
+cancellation-deadline trees,
 500 Client close-event/result round trips, 500 recursive Failure chains,
 500 Client start request (including static UserMetadata and eager-start intent)
 round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
@@ -2216,16 +2231,17 @@ Core eviction, and fresh-stack replay are tested. Dynamic registration and
 late buffered dispatch are now covered offline, generatively, and through the
 live server. Handler failure is also covered through failed completion, Core
 `LANG_FAIL` eviction, fresh-stack replay, server history, and continued Worker
-service. Shared-state policy and timer/cancellation behavior remain before this
-API can be called stable.
+service. A documented shared-state policy remains before this API can be called
+stable.
 
 Update cancellation through root Workflow cancellation is now proven while a
 handler awaits an Activity: the detached operation survives, explicit draining
 prevents early close, the Update response precedes cancellation acknowledgement,
 and late resolution/replay are deterministic. The public token/tree abstraction
 now covers deterministic child/detached scopes and Activity cancellation.
-Remaining cancellation work is timer/signal coverage across handlers, and
-any future client-facing policy for canceling an accepted Update.
+Remaining cancellation work is any future client-facing policy for canceling
+an accepted Update; the current Temporal protocol does not expose that as a
+language-token operation.
 
 Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
 containment should be designed as subprocess isolation unless Odin gains
@@ -2236,8 +2252,8 @@ In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
 dependency. The Update routine table now has explicit ownership, replay tests,
 a defined Workflow-close policy, and a live cancellation/drain path. The public
-cancellation model remains experimental while cross-handler wakeups and
-deadlines are incomplete.
+cancellation model remains experimental while API naming and accepted-Update
+policy are unresolved.
 
 The C bridge remains the recommended foundation. It now handles both Activity
 Tasks and multi-activation Workflow execution end-to-end, including replay and

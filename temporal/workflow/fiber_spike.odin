@@ -837,6 +837,9 @@ Fiber_Cancellation_Node :: struct {
 	linked_to_root:         bool,
 	cancellation_requested: bool,
 	reason:                 string,
+	has_deadline:           bool,
+	deadline:               time.Time,
+	deadline_timer_seq:     u32,
 }
 
 // Query_Context exists only for the synchronous query callback. Its identity,
@@ -3777,6 +3780,22 @@ find_cancellation_node :: proc(
 	return nil, false
 }
 
+find_cancellation_node_by_deadline_timer :: proc(
+	instance: ^Fiber_Instance,
+	timer_seq: u32,
+) -> (^Fiber_Cancellation_Node, bool) {
+	if instance == nil || timer_seq == 0 {
+		return nil, false
+	}
+	for index in 0..<len(instance.cancellation_nodes) {
+		node := &instance.cancellation_nodes[index]
+		if node.deadline_timer_seq == timer_seq {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
 current_cancellation_token_id :: proc(instance: ^Fiber_Instance) -> u32 {
 	if instance == nil {
 		return 0
@@ -4533,6 +4552,8 @@ new_cancellation_token :: proc(
 	}
 	if parent_id != 0 {
 		parent, _ := find_cancellation_node(instance, parent_id)
+		node.has_deadline = parent.has_deadline
+		node.deadline = parent.deadline
 		if parent.cancellation_requested {
 			node.cancellation_requested = true
 			node.reason = parent.reason
@@ -4558,6 +4579,138 @@ cancellation_child :: proc(parent: Cancellation_Token) -> Cancellation_Token {
 		return {}
 	}
 	return new_cancellation_token(parent.instance, parent.id, false)
+}
+
+cancellation_deadline_reason :: proc() -> string {
+	return "Workflow cancellation deadline exceeded"
+}
+
+set_cancellation_token_deadline :: proc(
+	token: Cancellation_Token,
+	deadline: time.Time,
+) -> bool {
+	instance := token.instance
+	if instance == nil || token.id == 0 || instance.phase != .Ready ||
+	   !instance.has_activation_time {
+		return false
+	}
+	node, found := find_cancellation_node(instance, token.id)
+	if !found {
+		return false
+	}
+	deadline_ns := time.time_to_unix_nano(deadline)
+	if node.has_deadline && time.time_to_unix_nano(node.deadline) <= deadline_ns {
+		return true
+	}
+	now_ns := time.time_to_unix_nano(instance.activation_time)
+	if deadline_ns > now_ns && now_ns < 0 && deadline_ns > max(i64) + now_ns {
+		return false
+	}
+	node.has_deadline = true
+	node.deadline = deadline
+	if node.cancellation_requested {
+		return true
+	}
+	remaining_ns := deadline_ns - now_ns
+	if remaining_ns <= 0 {
+		return request_cancellation_token(instance, token.id, cancellation_deadline_reason())
+	}
+	instance.next_timer_seq += 1
+	node.deadline_timer_seq = instance.next_timer_seq
+	append(
+		&instance.timers,
+		Fiber_Timer_Operation{
+			seq = node.deadline_timer_seq,
+			duration = time.Duration(remaining_ns),
+			state = .Scheduled,
+			detached_from_root_cancellation = !node.linked_to_root,
+			cancellation_token_id = token.id,
+		},
+	)
+	return true
+}
+
+// cancellation_child_with_deadline creates a child whose effective deadline
+// is the earlier of its requested deadline and its parent's deadline. The
+// deadline is driven by a durable Temporal timer and therefore replays.
+cancellation_child_with_deadline :: proc(
+	parent: Cancellation_Token,
+	deadline: time.Time,
+) -> Cancellation_Token {
+	if parent.instance == nil || parent.id == 0 ||
+	   !parent.instance.has_activation_time {
+		return {}
+	}
+	token := cancellation_child(parent)
+	if token.id == 0 || !set_cancellation_token_deadline(token, deadline) {
+		return {}
+	}
+	return token
+}
+
+// cancellation_child_with_timeout derives an absolute deadline from the
+// current Workflow activation timestamp. It never reads the host clock.
+cancellation_child_with_timeout :: proc(
+	parent: Cancellation_Token,
+	timeout: time.Duration,
+) -> Cancellation_Token {
+	if parent.instance == nil || timeout <= 0 || !parent.instance.has_activation_time {
+		return {}
+	}
+	now_ns := time.time_to_unix_nano(parent.instance.activation_time)
+	if now_ns > max(i64) - i64(timeout) {
+		return {}
+	}
+	return cancellation_child_with_deadline(
+		parent,
+		time.time_add(parent.instance.activation_time, timeout),
+	)
+}
+
+// cancellation_detached_with_deadline creates an independent deadline tree
+// that is not canceled by the Workflow root token.
+cancellation_detached_with_deadline :: proc(
+	ctx: ^Fiber_Context,
+	deadline: time.Time,
+) -> Cancellation_Token {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.has_activation_time {
+		return {}
+	}
+	token := cancellation_detached(ctx)
+	if token.id == 0 || !set_cancellation_token_deadline(token, deadline) {
+		return {}
+	}
+	return token
+}
+
+cancellation_detached_with_timeout :: proc(
+	ctx: ^Fiber_Context,
+	timeout: time.Duration,
+) -> Cancellation_Token {
+	if ctx == nil || ctx.instance == nil || timeout <= 0 ||
+	   !ctx.instance.has_activation_time {
+		return {}
+	}
+	now_ns := time.time_to_unix_nano(ctx.instance.activation_time)
+	if now_ns > max(i64) - i64(timeout) {
+		return {}
+	}
+	return cancellation_detached_with_deadline(
+		ctx,
+		time.time_add(ctx.instance.activation_time, timeout),
+	)
+}
+
+// cancellation_deadline returns the token's effective inherited deadline.
+cancellation_deadline :: proc(token: Cancellation_Token) -> (time.Time, bool) {
+	if token.instance == nil || token.id == 0 {
+		return {}, false
+	}
+	node, found := find_cancellation_node(token.instance, token.id)
+	if !found || !node.has_deadline {
+		return {}, false
+	}
+	return node.deadline, true
 }
 
 cancellation_requested :: proc(token: Cancellation_Token) -> bool {
@@ -10469,6 +10622,19 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				return
 			}
 			timer_operation.state = .Resolved
+			deadline_token, is_deadline_timer := find_cancellation_node_by_deadline_timer(
+				instance,
+				variant.value.seq,
+			)
+			if is_deadline_timer &&
+			   !request_cancellation_token(
+				instance,
+				deadline_token.id,
+				cancellation_deadline_reason(),
+			   ) {
+				process_error(&result, activation.run_id, "could not apply Workflow cancellation deadline")
+				return
+			}
 			local_activity, is_backoff_timer := find_local_activity_by_backoff_timer(
 				instance,
 				variant.value.seq,

@@ -3398,6 +3398,82 @@ fiber_token_wait_cancellation_activity_test_workflow :: proc(
 	return "wait-cancellation-completed-ok"
 }
 
+fiber_cancellation_deadline_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	name: string,
+) -> string {
+	activation_time, has_time := workflow.now(ctx)
+	if !has_time {
+		return "missing activation time"
+	}
+	root := workflow.cancellation_root(ctx)
+	parent := workflow.cancellation_child_with_timeout(root, 2 * time.Hour)
+	later_child := workflow.cancellation_child_with_timeout(parent, 3 * time.Hour)
+	earlier_child := workflow.cancellation_child_with_timeout(later_child, time.Minute)
+	detached := workflow.cancellation_detached_with_deadline(
+		ctx,
+		time.time_add(activation_time, 4 * time.Hour),
+	)
+	parent_deadline, parent_has_deadline := workflow.cancellation_deadline(parent)
+	later_deadline, later_has_deadline := workflow.cancellation_deadline(later_child)
+	earlier_deadline, earlier_has_deadline := workflow.cancellation_deadline(earlier_child)
+	detached_deadline, detached_has_deadline := workflow.cancellation_deadline(detached)
+	activation_ns := time.time_to_unix_nano(activation_time)
+	if parent.id == 0 || later_child.id == 0 || earlier_child.id == 0 || detached.id == 0 ||
+	   !parent_has_deadline || !later_has_deadline || !earlier_has_deadline ||
+	   !detached_has_deadline ||
+	   time.time_to_unix_nano(parent_deadline) != activation_ns + i64(2 * time.Hour) ||
+	   time.time_to_unix_nano(later_deadline) != activation_ns + i64(2 * time.Hour) ||
+	   time.time_to_unix_nano(earlier_deadline) != activation_ns + i64(time.Minute) ||
+	   time.time_to_unix_nano(detached_deadline) != activation_ns + i64(4 * time.Hour) {
+		return "invalid effective cancellation deadlines"
+	}
+	scope := workflow.cancellation_scope(ctx, earlier_child)
+	future := workflow.start_activity_json_with_options(
+		ctx,
+		"deadline-activity",
+		name,
+		{
+			start_to_close_timeout = time.Hour,
+			cancellation_type = .Try_Cancel,
+		},
+	)
+	workflow.cancellation_scope_end(&scope)
+	result := workflow.await_activity_result(ctx, future)
+	if result.status != .Canceled || !workflow.cancellation_requested(earlier_child) ||
+	   workflow.cancellation_token_reason(earlier_child) != "Workflow cancellation deadline exceeded" ||
+	   workflow.cancellation_requested(parent) || workflow.cancellation_requested(later_child) ||
+	   workflow.cancellation_requested(detached) {
+		return "deadline cancellation did not remain in its branch"
+	}
+	_ = workflow.await_signal(ctx, "finish-deadline-workflow")
+	return "deadline-cancellation-ok"
+}
+
+fiber_expired_cancellation_deadline_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	activation_time, has_time := workflow.now(ctx)
+	if !has_time {
+		return "missing activation time"
+	}
+	token := workflow.cancellation_child_with_deadline(
+		workflow.cancellation_root(ctx),
+		activation_time,
+	)
+	deadline, has_deadline := workflow.cancellation_deadline(token)
+	if token.id == 0 || !has_deadline || deadline != activation_time ||
+	   !workflow.cancellation_requested(token) ||
+	   workflow.cancellation_token_reason(token) != "Workflow cancellation deadline exceeded" {
+		return "expired deadline was not immediate"
+	}
+	scope := workflow.cancellation_scope(ctx, token)
+	workflow.sleep(ctx, time.Hour)
+	workflow.cancellation_scope_end(&scope)
+	return "expired-deadline-ok"
+}
+
 Query_Test_State :: struct {
 	phase: string,
 	count: int,
@@ -16856,6 +16932,264 @@ workflow_token_cancellation_waits_for_activity_acknowledgement_and_replays :: pr
 	testing.expectf(t, processed.error.message == nil, "waiting Activity acknowledgement replay failed: %s", string(processed.error.message))
 	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
 	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_cancellation_deadlines_inherit_cancel_and_replay :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_cancellation_deadline_workflow",
+		"test-queue",
+		fiber_cancellation_deadline_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_cancellation_deadline_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	initial_timestamp := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_000_000,
+		nanos = 123_456_789,
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-cancellation-deadline-run",
+		history_length = 3,
+		timestamp = &initial_timestamp,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline initialization failed: %s", string(processed.error.message))
+	testing.expect(t, processed.scheduled_activity && processed.started_timer && !processed.completed)
+	testing.expect_value(t, processed.timer_seq, u32(3))
+	testing.expect_value(t, processed.waiting_activity_seq, u32(1))
+	initial_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, initial_inspection.decoded)
+	testing.expect_value(t, initial_inspection.command_count, 4)
+	testing.expect_value(t, initial_inspection.scheduled_activity_seq, u32(1))
+	delete(initial_inspection.failure_message)
+	delete(initial_inspection.completion_result)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	fire_deadline := proto.Coresdk_Workflow_Activation_FireTimer{seq = 2}
+	fire_timestamp := proto.Google_Protobuf_Timestamp{
+		seconds = initial_timestamp.seconds + 60,
+		nanos = initial_timestamp.nanos,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	activation.timestamp = &fire_timestamp
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_deadline,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline firing failed: %s", string(processed.error.message))
+	testing.expectf(
+		t,
+		processed.requested_activity_cancellation && !processed.completed && processed.waiting_signal,
+		"deadline result requested_cancel=%v completed=%v waiting_activity=%d error=%q",
+		processed.requested_activity_cancellation,
+		processed.completed,
+		processed.waiting_activity_seq,
+		string(processed.error.message),
+	)
+	testing.expect_value(t, processed.canceled_activity_seq, u32(1))
+	deadline_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, deadline_inspection.decoded && !deadline_inspection.completed)
+	testing.expect_value(t, deadline_inspection.command_count, 1)
+	testing.expect_value(t, deadline_inspection.canceled_activity_seq, u32(1))
+	delete(deadline_inspection.failure_message)
+	delete(deadline_inspection.completion_result)
+	deadline_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	finish_input, finish_input_error := codec.encode_json("finish")
+	testing.expect(t, finish_input_error == .None)
+	defer codec.payload_free(&finish_input)
+	finish_input_proto := proto.encode_payload(codec.payload_view(&finish_input))
+	defer delete(finish_input_proto.metadata)
+	defer delete(finish_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "finish-deadline-workflow",
+	}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, finish_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline Workflow finish failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	terminal_inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal_inspection.decoded && terminal_inspection.completed)
+	testing.expect_value(t, terminal_inspection.command_count, 1)
+	testing.expect_value(
+		t,
+		string(terminal_inspection.completion_result),
+		`"deadline-cancellation-ok"`,
+	)
+	delete(terminal_inspection.failure_message)
+	delete(terminal_inspection.completion_result)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil && processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 3
+	activation.timestamp = &initial_timestamp
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline initialization replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	activation.timestamp = &fire_timestamp
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+				value = &fire_deadline,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline firing replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(deadline_completion[:], processed.completion[:]))
+	delete(deadline_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "deadline Workflow finish replay failed: %s", string(processed.error.message))
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_expired_cancellation_deadline_is_immediate_and_commandless :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_expired_cancellation_deadline_workflow",
+		"test-queue",
+		fiber_expired_cancellation_deadline_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect(t, workflow_input_error == .None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_expired_cancellation_deadline_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	timestamp := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-expired-cancellation-deadline-run",
+		history_length = 3,
+		timestamp = &timestamp,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "expired deadline failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed && !processed.started_timer)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, inspection.decoded && inspection.completed)
+	testing.expect_value(t, inspection.command_count, 1)
+	testing.expect_value(t, string(inspection.completion_result), `"expired-deadline-ok"`)
+	delete(inspection.failure_message)
+	delete(inspection.completion_result)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }
