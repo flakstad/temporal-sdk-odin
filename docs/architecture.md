@@ -689,20 +689,31 @@ native packages additionally cover Linux musl and Windows variants. This does
 not mean upstream publishes a reusable generic C binary; it builds and bundles
 the bridge inside its NuGet artifacts.
 
-For Odin, the near-term distribution plan should be:
+The distribution plan, with its current status, is:
 
-1. Pin one tested sdk-rust commit and the wrapper `Cargo.lock`.
-2. Build four CI artifacts from source with the pinned Rust toolchain.
-3. Give each artifact a platform/architecture manifest and checksum.
-4. Bundle or fetch exactly one matching dynamic library during SDK setup.
-5. Set `@rpath` on macOS and `$ORIGIN`/rpath policy on Linux; verify with
-   `otool -L`/`readelf -d`.
-6. Run ABI, init/shutdown, and CLI-devserver smoke tests on every artifact.
+1. Done: pin one tested sdk-rust commit and the wrapper `Cargo.lock`.
+2. Defined in CI: build four artifacts from source with the pinned toolchain;
+   both arm64 targets have also been executed locally.
+3. Done: give each artifact a platform/architecture manifest and checksum.
+4. Pending: fetch/select exactly one matching dynamic library during SDK setup.
+5. Partial: set `@rpath` on macOS and supply an application rpath on Linux;
+   complete `otool -L`/`readelf -d` policy checks on all hosted targets.
+6. Defined in CI: run ABI and init/shutdown smoke tests on every artifact;
+   retain the deeper CLI-devserver suite as a separate integration gate.
+
+`scripts/package-native.sh` emits one target-named archive containing Core's
+dynamic library, the static fiber shim, the exact C header, licenses, and a
+version/checksum manifest. `scripts/verify-native-package.sh --smoke` extracts
+that archive and links the real Core runtime lifecycle test against its library
+directory. The four-platform GitHub Actions matrix performs the build, full
+unit/property suite, example compilation, packaging, and packaged-ABI smoke.
+The explicit `native/sdk-core-revision.txt` pin also lets the build work from a
+complete source archive where Git submodule metadata is unavailable.
 
 The verified macOS arm64 release dylib is about 32 MiB and depends only on
 system frameworks/libraries (IOKit, CoreFoundation, Security, iconv, and
-libSystem). Linux still needs target-specific validation, including glibc vs
-musl policy and certificate-store behavior. Static linking would require an
+libSystem). The first Linux packages target glibc; musl and certificate-store
+policy remain separate validation work. Static linking would require an
 upstream/project modification and is not part of this spike.
 
 The Workflow fiber experiment adds a separate, project-owned static archive,
@@ -763,9 +774,10 @@ copy + temporal_core_byte_array_free
 client_free -> runtime_free
 ```
 
-Verified environment:
+Original live-server verification environment:
 
-- Odin `dev-2026-05:ea5175d86`;
+- Odin `dev-2026-05:ea5175d86` (the current build matrix uses
+  `dev-2026-09:a2fb372b7`);
 - Temporal CLI 1.5.1, dev server 1.29.1;
 - macOS arm64;
 - Core C bridge pinned at `399cb7a`;
@@ -2094,8 +2106,14 @@ Workflows are enabled.
    panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, guard-page/growable stack protection, or
    a production deterministic scheduler.
-5. **Cross-platform artifacts.** Only macOS arm64 was executed. Linux and all
-   other architectures need CI proof before claiming support.
+5. **Cross-platform artifacts.** macOS arm64 and a clean Ubuntu 24.04 arm64
+   container are locally executed through unit/property tests, all example
+   builds, packaging, and packaged-runtime smoke. The repository defines the
+   same jobs for macOS and Linux glibc x86_64, but those targets still require a
+   hosted green run before all four can be claimed as supported. Musl and
+   Windows are out of the initial scope.
+   Public binary releases additionally need complete transitive Rust license
+   notices/SBOM and a macOS signing/notarization policy.
 6. **Core version skew.** Server compatibility is broad, but Core-local
    protobuf schemas and C structs are coupled to the exact native library.
    Generated Odin types and the native artifact must ship as one versioned unit.

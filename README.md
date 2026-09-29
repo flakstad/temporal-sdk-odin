@@ -350,7 +350,7 @@ Odin raw bindings -> generated Core protobuf types -> worker registry/run loop
 
 Prerequisites:
 
-- Odin (tested with `dev-2026-05:ea5175d86`)
+- Odin (tested with `dev-2026-09:a2fb372b7`)
 - Rust toolchain 1.94 and Cargo
 - `protoc`
 - Temporal CLI (tested with CLI 1.5.1 / Server 1.29.1)
@@ -378,6 +378,20 @@ Build all Odin examples in one pass with:
 ```bash
 ./scripts/build-examples.sh
 ```
+
+Build a host-specific native runtime archive and verify that the packaged Core
+ABI can initialize and shut down:
+
+```bash
+./scripts/package-native.sh
+./scripts/verify-native-package.sh \
+  dist/temporal-sdk-odin-native-macos-arm64.tar.gz --smoke
+```
+
+Use the archive matching the host: `macos-arm64`, `macos-x86_64`,
+`linux-arm64`, or `linux-x86_64`. See
+[native distribution](docs/native-distribution.md) for archive contents and
+linking details. CI builds and smoke-tests all four target artifacts.
 
 In one terminal, start the recommended local development server:
 

@@ -6,6 +6,8 @@ The repository pins `temporalio/sdk-rust` as the `native/sdk-core` submodule at
 commit `399cb7adb40f45eefbef90149e212743e474142c`. That upstream release commit
 contains `sdk-core` crate 0.9.0 and client/common crates 1.0.0, and is pinned by
 `sdk-dotnet` main as inspected on 2026-09-25.
+The same commit is recorded in `native/sdk-core-revision.txt` so source archives
+without Git metadata retain a machine-readable native dependency identity.
 
 Property tests pin `flakstad/pbt` at
 `3b465330bd3a11c45990ef2d7f44f1cf25a18145` as the `test-deps/pbt`
@@ -54,6 +56,45 @@ macOS and the standard compiler toolchain on Linux.
 
 The first native build is substantial because it compiles Core and its Rust
 dependency graph. Incremental builds are fast.
+
+## Native packages and platform CI
+
+Create the package for the current host with:
+
+```bash
+./scripts/package-native.sh
+```
+
+This builds Core unless `TEMPORAL_ODIN_SKIP_BUILD=1`, then writes a target-named
+archive and archive checksum under `dist/`. The archive contains the Core
+shared library, static fiber shim, exact generated C header, license texts,
+linking notes, and a manifest with the Core revision, crate versions, build
+toolchains, and per-file SHA-256 checksums. It intentionally does not duplicate
+the Odin source packages: generated protobuf code, raw bindings, and this
+native artifact must come from the same SDK repository revision.
+
+Verify both archive structure and the packaged ABI with:
+
+```bash
+./scripts/verify-native-package.sh \
+  dist/temporal-sdk-odin-native-macos-arm64.tar.gz --smoke
+```
+
+Use the archive name for the current host. Smoke mode links only the runtime
+init/shutdown test against the unpacked archive, rather than the build-tree
+libraries. Verification rejects target mismatch, unsafe archive paths, missing
+files, and checksum changes.
+
+`.github/workflows/ci.yml` runs the full unit/property suite, builds all
+examples, packages, and smoke-tests on macOS arm64/x86_64 and Linux glibc
+arm64/x86_64. Actions are commit-pinned; Odin `dev-2026-09`, Rust 1.94, and
+protoc 36.0 are explicit inputs. The build scripts also accept a complete
+source archive without `.git`, while a Git checkout verifies
+`native/sdk-core-revision.txt` against its sdk-core gitlink before compiling.
+Before publishing these artifacts as releases, generate and audit third-party
+license notices for Core's complete Rust dependency graph and decide the macOS
+code-signing/notarization policy. The current archives are CI/development
+artifacts, not a completed binary-release pipeline.
 
 ## Protobuf generation
 
@@ -1519,6 +1560,11 @@ after real Activity round trips.
 ## Current platform evidence
 
 Milestones 1–3 and the stackful-fiber experiment were built and run end-to-end
-on macOS arm64. Linux source/build paths and minicoro assembly targets are
-present but were not executed in this environment. Cross-platform release
-packaging is intentionally deferred.
+on macOS arm64. Native packaging and packaged-runtime smoke verification also
+run locally there. A clean Ubuntu 24.04 arm64 container has also built Core from
+a Git-free complete source archive, run all 135 unit tests and 42 property
+tests, built every example, and passed runtime init/shutdown against the
+packaged Linux arm64 artifact. The repository now has a four-target hosted CI
+matrix for macOS arm64/x86_64 and Linux glibc arm64/x86_64. The two x86_64
+targets still require a green hosted run before support is claimed; musl and
+Windows are not part of this first distribution set.

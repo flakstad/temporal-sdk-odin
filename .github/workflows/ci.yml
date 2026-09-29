@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ODIN_RELEASE: dev-2026-09
+  PROTOC_VERSION: "36.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: ${{ matrix.target }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: macos-x86_64
+          - runner: macos-latest
+            target: macos-arm64
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out pinned submodules
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: recursive
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential clang pkg-config
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.94"
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Odin
+        uses: laytan/setup-odin@8536d8fa450ec6f1bd9ddc84bbaaf16296c0051d
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: ${{ env.ODIN_RELEASE }}
+
+      - name: Verify toolchain pins
+        shell: bash
+        run: |
+          odin version | tee odin-version.txt
+          grep -q "$ODIN_RELEASE" odin-version.txt
+          rustc --version | grep -q '^rustc 1\.94\.'
+          protoc --version | grep -q '36\.0'
+
+      - name: Run unit and property suites
+        run: ./scripts/test.sh
+
+      - name: Build every example
+        run: ./scripts/build-examples.sh
+
+      - name: Package native runtime
+        env:
+          TEMPORAL_ODIN_SKIP_BUILD: "1"
+        run: ./scripts/package-native.sh dist
+
+      - name: Verify packaged ABI and lifecycle
+        run: ./scripts/verify-native-package.sh "dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz" --smoke
+
+      - name: Upload native package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: temporal-sdk-odin-native-${{ matrix.target }}
+          path: |
+            dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz
+            dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
