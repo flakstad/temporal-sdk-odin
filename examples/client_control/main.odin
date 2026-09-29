@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:time"
 import temporal_client "../../temporal/client"
 import codec "../../temporal/codec"
 
@@ -193,7 +194,7 @@ run :: proc() -> int {
 			output.caller,
 		)
 		return 0
-	case "update":
+	case "update", "update-timeout":
 		update_name := env("TEMPORAL_CLIENT_UPDATE_NAME", name_buffer[:])
 		if len(update_name) == 0 {
 			update_name = "set_greeting_name"
@@ -215,7 +216,36 @@ run :: proc() -> int {
 		}
 		defer temporal_client.update_handle_free(&update_handle)
 		output: Greeting_Update_Output
-		operation_error = temporal_client.wait_update_json(&update_handle, &output)
+		timeout_probe := action == "update-timeout"
+		if timeout_probe {
+			operation_error = temporal_client.wait_update_json_with_options(
+				&update_handle,
+				&output,
+				{timeout = 20 * time.Millisecond},
+			)
+			if operation_error.kind != .Wait_Timed_Out {
+				print_error("bounded Update wait", &operation_error)
+				return 1
+			}
+			temporal_client.error_free(&operation_error)
+			attached, attach_error := temporal_client.get_update_handle(
+				&client,
+				update_handle.workflow_id,
+				update_handle.run_id,
+				update_handle.update_id,
+			)
+			if attach_error.message != nil {
+				print_error("Update handle attachment", &attach_error)
+				return 1
+			}
+			defer temporal_client.update_handle_free(&attached)
+			operation_error = temporal_client.wait_update_json(&attached, &output)
+			if operation_error.message == nil {
+				fmt.println("Update result wait timed out locally and reattached without canceling the durable Update")
+			}
+		} else {
+			operation_error = temporal_client.wait_update_json(&update_handle, &output)
+		}
 		if operation_error.message != nil {
 			print_error(action, &operation_error)
 			return 1

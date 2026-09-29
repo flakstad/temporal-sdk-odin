@@ -144,6 +144,18 @@ get_result_interceptor :: proc(
 	return result, result_error
 }
 
+wait_update_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Wait_Update_Input,
+	next: temporal_client.Client_Wait_Update_Next,
+) -> (codec.Payload, temporal_client.Error) {
+	result, wait_error := temporal_client.client_wait_update_next(next, input)
+	if wait_error.kind == .Wait_Canceled {
+		fmt.println("Client Update wait interceptor observed local cancellation")
+	}
+	return result, wait_error
+}
+
 list_workflows_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_List_Workflows_Input,
@@ -231,6 +243,7 @@ run :: proc() -> int {
 		signal_workflow = signal_workflow_interceptor,
 		query_workflow = query_workflow_interceptor,
 		start_update = start_update_interceptor,
+		wait_update = wait_update_interceptor,
 		get_result = get_result_interceptor,
 		list_workflows = list_workflows_interceptor,
 		count_workflows = count_workflows_interceptor,
@@ -287,6 +300,36 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.println("Client connection mutation interceptor observed metadata and API-key updates")
+	wait_token := temporal_client.client_cancellation_token_create()
+	defer temporal_client.client_cancellation_token_close(&wait_token)
+	temporal_client.client_cancellation_token_cancel(&wait_token)
+	detached_update, detached_error := temporal_client.get_update_handle(
+		&client,
+		"odin-client-canceled-wait-probe",
+		"",
+		"odin-client-canceled-wait-probe",
+	)
+	if detached_error.message != nil {
+		fmt.eprintf("Could not create detached Update handle: %s\n", string(detached_error.message))
+		temporal_client.error_free(&detached_error)
+		return 1
+	}
+	defer temporal_client.update_handle_free(&detached_update)
+	_, canceled_wait_error := temporal_client.wait_update_payload_with_options(
+		&detached_update,
+		{cancellation_token = &wait_token},
+	)
+	if canceled_wait_error.kind != .Wait_Canceled {
+		fmt.eprintf(
+			"Canceled Update wait returned kind=%v message=%s\n",
+			canceled_wait_error.kind,
+			string(canceled_wait_error.message),
+		)
+		temporal_client.error_free(&canceled_wait_error)
+		return 1
+	}
+	temporal_client.error_free(&canceled_wait_error)
+	fmt.println("Core cancellation token stopped a local Update result wait")
 
 	env_buffer: [128]u8
 	workflow_id := os.get_env(env_buffer[:], "TEMPORAL_CLIENT_WORKFLOW_ID")

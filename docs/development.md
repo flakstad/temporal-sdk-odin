@@ -716,10 +716,26 @@ Wait long-polls `PollWorkflowExecutionUpdate` for `COMPLETED`. The successful
 Payload is caller-owned. Update failure returns
 `.Workflow_Update_Failed`; `Error.message` owns the Temporal failure message and
 `Error.details` owns the encoded Failure protobuf.
+`wait_update_payload_with_options` and `wait_update_json_with_options` accept a
+monotonic total timeout plus an optional Core-backed cancellation token. They
+return `.Wait_Timed_Out` or `.Wait_Canceled` without changing the durable
+Update. A token can be canceled from another thread, is borrowed until the
+blocking wait returns, and must then be explicitly closed. `get_update_handle`
+clones Workflow/run/Update IDs so an accepted Update can be polled after a
+process reconnect.
 If start returns an immediate completed outcome (notably validator rejection),
 the handle owns that outcome and wait returns it without an extra poll. The raw
 RPC protobuf buffer stays alive until all decoder-borrowed Update IDs, strings,
 and Payload bytes have been cloned.
+
+The `client_start` dev-server probe pre-cancels a Core token, enters
+`PollWorkflowExecutionUpdate` through an attached handle, requires
+`.Wait_Canceled`, and then completes an ordinary Workflow RPC on the same
+connection. Unit tests cover token cancel/close idempotence, invalid lifetime
+use, negative timeouts, and identifier ownership. The concurrent-Update live
+scenario bounds the slow Update wait to 20 ms, receives `.Wait_Timed_Out`,
+reattaches from copied stable IDs, and then obtains the eventual result—proving
+that local timeout did not cancel the durable Update.
 
 Workflow code uses `set_update_handler_json` or
 `set_validated_update_handler_json` for immediate handlers. The
@@ -1432,7 +1448,7 @@ metadata, external details, headers, and deterministic request bytes.
 ### Client outbound interceptor chain
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
-for Workflow start, Signal-With-Start, Signal, Query, Update start,
+for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
 cancellation, termination, Workflow result waiting, Visibility list/count, and
 Schedule Describe/List/Count/Matching-Times. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
@@ -1458,6 +1474,9 @@ operation-specific handle or Payload.
 long poll. Its mutable `follow_runs` field controls whether the terminal follows
 Continue-As-New and retry runs. A successful continuation returns an owned
 Payload; an interceptor that replaces it must follow the same ownership rule.
+`wait_update` similarly surrounds the complete Update result long poll. Its
+mutable `Update_Wait_Options` can narrow the timeout or replace the borrowed
+cancellation token, and its successful continuation returns an owned Payload.
 
 Before the chain runs, the SDK clones existing headers into a per-call owned
 `Headers` value. Workflow-start headers are adapted from `Start_Metadata`; the
@@ -1473,11 +1492,13 @@ application-level synchronization.
 The unit and 500-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
 Visibility queries, and the complete Schedule surface. The generative chain
-now varies fourteen operation families. The `workflow-properties` live scenario
+now varies fifteen operation families. The `workflow-properties` live scenario
 wraps both Visibility RPCs; the Schedule lifecycle wraps every read RPC and
 all seven create/mutation paths through Core. Every `client_start` live scenario
 also replaces RPC metadata, sets an API key, clears it, and requires the
 connection-mutation continuation to observe all three Core calls.
+The same example routes its pre-canceled Update wait through the result-bearing
+interceptor and requires unwind after Core returns `.Wait_Canceled`.
 `client_start` injects start and Signal-With-Start headers solely through its
 interceptors; `client_control` does the same for Signal, Query, and Update. The
 full dev-server suite requires those headers to arrive in Workflow code,

@@ -770,6 +770,28 @@ Rpc_Result :: struct {
 	error:    Error,
 }
 
+// Rpc_Cancellation_Token owns Core's thread-safe cancellation handle. It may be
+// canceled from another thread, but must outlive every client_rpc_call that
+// borrows it and must be closed exactly once after those calls return.
+Rpc_Cancellation_Token :: struct {
+	handle: ^raw.Cancellation_Token,
+}
+
+rpc_cancellation_token_create :: proc() -> Rpc_Cancellation_Token {
+	return {handle = raw.cancellation_token_new()}
+}
+
+rpc_cancellation_token_cancel :: proc(token: ^Rpc_Cancellation_Token) {
+	if token == nil || token.handle == nil do return
+	raw.cancellation_token_cancel(token.handle)
+}
+
+rpc_cancellation_token_close :: proc(token: ^Rpc_Cancellation_Token) {
+	if token == nil || token.handle == nil do return
+	raw.cancellation_token_free(token.handle)
+	token.handle = nil
+}
+
 rpc_callback :: proc "c" (
 	user_data: rawptr,
 	success: ^raw.Byte_Array,
@@ -804,10 +826,15 @@ client_rpc_call :: proc(
 	request: []u8,
 	retry := true,
 	timeout_millis: u32 = 10_000,
+	cancellation_token: ^Rpc_Cancellation_Token = nil,
 ) -> Rpc_Result {
 	result := Rpc_Result{}
 	if client == nil || client.handle == nil || client.runtime == nil {
 		result.error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
+		return result
+	}
+	if cancellation_token != nil && cancellation_token.handle == nil {
+		result.error.message = bytes.clone(transmute([]u8)string("RPC cancellation token is not initialized"))
 		return result
 	}
 
@@ -817,6 +844,7 @@ client_rpc_call :: proc(
 		req = bytes_ref(request),
 		retry = retry,
 		timeout_millis = timeout_millis,
+		cancellation_token = cancellation_token != nil ? cancellation_token.handle : nil,
 	}
 	state := Rpc_State{}
 	raw.client_rpc_call(client.handle, &options, &state, rpc_callback)

@@ -29,6 +29,8 @@ Error_Kind :: enum {
 	Workflow_Continued_As_New,
 	Workflow_Query_Rejected,
 	Workflow_Update_Failed,
+	Wait_Canceled,
+	Wait_Timed_Out,
 }
 
 Error :: struct {
@@ -631,6 +633,27 @@ Update_Workflow_Options :: struct {
 	headers:   ^Headers,
 }
 
+Client_Cancellation_Token :: temporal_core.Rpc_Cancellation_Token
+
+client_cancellation_token_create :: proc() -> Client_Cancellation_Token {
+	return temporal_core.rpc_cancellation_token_create()
+}
+
+client_cancellation_token_cancel :: proc(token: ^Client_Cancellation_Token) {
+	temporal_core.rpc_cancellation_token_cancel(token)
+}
+
+client_cancellation_token_close :: proc(token: ^Client_Cancellation_Token) {
+	temporal_core.rpc_cancellation_token_close(token)
+}
+
+// Update_Wait_Options controls only the local wait for a durable Update. A
+// timeout or cancellation never cancels an Update already accepted by Server.
+Update_Wait_Options :: struct {
+	timeout:            time.Duration,
+	cancellation_token: ^Client_Cancellation_Token,
+}
+
 // Query_Reject_Condition controls whether Temporal may deliver a Query for a
 // closed execution. Unspecified preserves the Service default.
 Query_Reject_Condition :: enum {
@@ -697,6 +720,40 @@ update_handle_free :: proc(handle: ^Update_Handle) {
 	delete(handle.outcome_error.message, heap)
 	delete(handle.outcome_error.details, heap)
 	handle^ = {}
+}
+
+get_update_handle :: proc(
+	client: ^Client,
+	workflow_id, run_id, update_id: string,
+) -> (handle: Update_Handle, error: Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	if len(workflow_id) == 0 || len(update_id) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow and Update IDs must not be empty")
+	}
+	heap := allocator_runtime.heap_allocator()
+	owned_workflow_id, workflow_id_error := strings.clone(workflow_id, heap)
+	if workflow_id_error != nil {
+		return {}, error_from_string(.Malformed_Response, "could not allocate Update handle")
+	}
+	owned_run_id, run_id_error := strings.clone(run_id, heap)
+	if run_id_error != nil {
+		delete(owned_workflow_id, heap)
+		return {}, error_from_string(.Malformed_Response, "could not allocate Update handle")
+	}
+	owned_update_id, update_id_error := strings.clone(update_id, heap)
+	if update_id_error != nil {
+		delete(owned_run_id, heap)
+		delete(owned_workflow_id, heap)
+		return {}, error_from_string(.Malformed_Response, "could not allocate Update handle")
+	}
+	return {
+		client = client,
+		workflow_id = owned_workflow_id,
+		run_id = owned_run_id,
+		update_id = owned_update_id,
+	}, {}
 }
 
 get_workflow_handle :: proc(
@@ -2059,7 +2116,14 @@ update_outcome_payload :: proc(
 poll_update_result_payload :: proc(
 	client: ^Client,
 	workflow_id, run_id, update_id: string,
+	options: Update_Wait_Options = {},
 ) -> (codec.Payload, Error) {
+	if options.timeout < 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update wait timeout must not be negative")
+	}
+	if options.cancellation_token != nil && options.cancellation_token.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update wait cancellation token is not initialized")
+	}
 	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
 		workflow_id = workflow_id,
 		run_id = run_id,
@@ -2071,7 +2135,19 @@ poll_update_result_payload :: proc(
 	wait_policy := proto.Temporal_Api_Update_V1_WaitPolicy{
 		lifecycle_stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
 	}
+	started := time.tick_now()
 	for {
+		timeout_millis: u32
+		if options.timeout > 0 {
+			remaining := options.timeout - time.tick_since(started)
+			if remaining <= 0 {
+				return {}, error_from_string(.Wait_Timed_Out, "Workflow Update result wait timed out")
+			}
+			millis := i64(remaining / time.Millisecond)
+			if remaining % time.Millisecond != 0 do millis += 1
+			if millis > i64(4_294_967_295) do millis = i64(4_294_967_295)
+			timeout_millis = u32(millis)
+		}
 		request := proto.Temporal_Api_Workflowservice_V1_PollWorkflowExecutionUpdateRequest{
 			namespace = client.namespace,
 			update_ref = &update_ref,
@@ -2084,11 +2160,22 @@ poll_update_result_payload :: proc(
 			.Workflow,
 			"PollWorkflowExecutionUpdate",
 			request_bytes[:],
-			timeout_millis = 0,
+			retry = options.timeout == 0,
+			timeout_millis = timeout_millis,
+			cancellation_token = options.cancellation_token,
 		)
 		delete(request_bytes)
 		if rpc_result.error.message != nil {
 			delete(rpc_result.protobuf)
+			if options.timeout > 0 &&
+			   (rpc_result.error.status_code == 4 ||
+			    (rpc_result.error.status_code == 1 && string(rpc_result.error.message) == "Timeout expired")) {
+				return {}, error_from_core(&rpc_result.error, .Wait_Timed_Out)
+			}
+			if options.cancellation_token != nil && rpc_result.error.status_code == 0 &&
+			   string(rpc_result.error.message) == "Cancelled" {
+				return {}, error_from_core(&rpc_result.error, .Wait_Canceled)
+			}
 			return {}, error_from_core(&rpc_result.error)
 		}
 
@@ -2463,9 +2550,22 @@ start_update_json_with_options :: proc(
 	)
 }
 
-wait_update_payload :: proc(handle: ^Update_Handle) -> (codec.Payload, Error) {
+wait_update_payload_terminal :: proc(
+	input: ^Client_Wait_Update_Input,
+) -> (codec.Payload, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update wait input is missing")
+	}
+	handle := input.handle
+	options := input.options
 	if !update_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Workflow Update handle is not initialized")
+	}
+	if options.timeout < 0 {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update wait timeout must not be negative")
+	}
+	if options.cancellation_token != nil && options.cancellation_token.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Workflow Update wait cancellation token is not initialized")
 	}
 	if handle.outcome_present {
 		if handle.outcome_error.message != nil {
@@ -2482,14 +2582,34 @@ wait_update_payload :: proc(handle: ^Update_Handle) -> (codec.Payload, Error) {
 		handle.workflow_id,
 		handle.run_id,
 		handle.update_id,
+		options,
 	)
 }
 
-wait_update_json :: proc(handle: ^Update_Handle, value: ^$Output) -> Error {
+wait_update_payload_with_options :: proc(
+	handle: ^Update_Handle,
+	options: Update_Wait_Options,
+) -> (codec.Payload, Error) {
+	input := Client_Wait_Update_Input{handle = handle, options = options}
+	client: ^Client
+	if handle != nil do client = handle.client
+	state := Client_Interceptor_State{client = client}
+	return client_wait_update_chain(&state, &input)
+}
+
+wait_update_payload :: proc(handle: ^Update_Handle) -> (codec.Payload, Error) {
+	return wait_update_payload_with_options(handle, {})
+}
+
+wait_update_json_with_options :: proc(
+	handle: ^Update_Handle,
+	value: ^$Output,
+	options: Update_Wait_Options,
+) -> Error {
 	if value == nil {
 		return error_from_string(.Invalid_Argument, "Workflow Update output pointer is required")
 	}
-	result, update_error := wait_update_payload(handle)
+	result, update_error := wait_update_payload_with_options(handle, options)
 	if update_error.message != nil {
 		return update_error
 	}
@@ -2498,6 +2618,10 @@ wait_update_json :: proc(handle: ^Update_Handle, value: ^$Output) -> Error {
 		return error_from_string(.Payload_Conversion, "could not decode Workflow Update result")
 	}
 	return {}
+}
+
+wait_update_json :: proc(handle: ^Update_Handle, value: ^$Output) -> Error {
+	return wait_update_json_with_options(handle, value, {})
 }
 
 execute_update_payload :: proc(

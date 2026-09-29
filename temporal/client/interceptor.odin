@@ -150,6 +150,27 @@ Client_Start_Update_Interceptor_Proc :: #type proc(
 	next: Client_Start_Update_Next,
 ) -> (Update_Handle, Error)
 
+Client_Wait_Update_Input :: struct {
+	handle:  ^Update_Handle,
+	options: Update_Wait_Options,
+}
+
+Client_Wait_Update_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Wait_Update_Input,
+) -> (activity_codec.Payload, Error)
+
+Client_Wait_Update_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Wait_Update_Next_Proc,
+}
+
+Client_Wait_Update_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Wait_Update_Input,
+	next: Client_Wait_Update_Next,
+) -> (activity_codec.Payload, Error)
+
 Client_Cancel_Workflow_Input :: struct {
 	handle:     ^Workflow_Handle,
 	reason:     string,
@@ -312,6 +333,7 @@ Client_Interceptor :: struct {
 	query_workflow:     Client_Query_Workflow_Interceptor_Proc,
 	get_result:         Client_Get_Result_Interceptor_Proc,
 	start_update:       Client_Start_Update_Interceptor_Proc,
+	wait_update:        Client_Wait_Update_Interceptor_Proc,
 	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
@@ -381,6 +403,16 @@ client_start_update_next :: proc(
 ) -> (Update_Handle, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Update interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_wait_update_next :: proc(
+	next: Client_Wait_Update_Next,
+	input: ^Client_Wait_Update_Input,
+) -> (activity_codec.Payload, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Update wait interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -633,6 +665,27 @@ client_start_update_chain :: proc(
 		)
 	}
 	return start_update_payload_terminal(input)
+}
+
+client_wait_update_chain :: proc(
+	data: rawptr,
+	input: ^Client_Wait_Update_Input,
+) -> (activity_codec.Payload, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Update wait interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.wait_update == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.wait_update(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_wait_update_chain},
+		)
+	}
+	return wait_update_payload_terminal(input)
 }
 
 client_cancel_workflow_chain :: proc(

@@ -164,6 +164,8 @@ grep -q 'result="Odin:42:true"' <<<"$repeated_workflow_output"
 grep -q 'Client start interceptor observed three Workflow arguments' <<<"$repeated_workflow_output"
 grep -q 'Client result interceptor exited after terminal Workflow result' <<<"$repeated_workflow_output"
 grep -q 'Client connection mutation interceptor observed metadata and API-key updates' <<<"$repeated_workflow_output"
+grep -q 'Core cancellation token stopped a local Update result wait' <<<"$repeated_workflow_output"
+grep -q 'Client Update wait interceptor observed local cancellation' <<<"$repeated_workflow_output"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
@@ -1072,7 +1074,7 @@ echo "$rejected_update_output"
 grep -q 'kind=Workflow_Update_Failed' <<<"$rejected_update_output"
 grep -q 'greeting name is invalid' <<<"$rejected_update_output"
 
-TEMPORAL_CLIENT_ACTION=update \
+TEMPORAL_CLIENT_ACTION=update-timeout \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
   TEMPORAL_CLIENT_UPDATE_NAME=set_greeting_name \
   TEMPORAL_CLIENT_UPDATE_INPUT=Temporal-slow \
@@ -1112,6 +1114,7 @@ echo "$slow_update_output"
 grep -q "Odin client update=set_greeting_name workflow_id=$workflow_id" <<<"$slow_update_output"
 grep -q 'previous="Odin" current="Temporal-slow"' <<<"$slow_update_output"
 grep -q 'caller="odin-client-control"' <<<"$slow_update_output"
+grep -q 'Update result wait timed out locally and reattached without canceling the durable Update' <<<"$slow_update_output"
 
 TEMPORAL_CLIENT_ACTION=query \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \

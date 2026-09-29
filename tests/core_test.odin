@@ -8168,6 +8168,65 @@ client_workflow_handle_owns_identifiers :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_update_handle_attachment_owns_identifiers :: proc(t: ^testing.T) {
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{connection = &connection}
+	workflow_id, _ := strings.clone("owned-update-workflow")
+	run_id, _ := strings.clone("owned-update-run")
+	update_id, _ := strings.clone("owned-update-id")
+	handle, handle_error := temporal_client.get_update_handle(
+		&client,
+		workflow_id,
+		run_id,
+		update_id,
+	)
+	delete(workflow_id)
+	delete(run_id)
+	delete(update_id)
+	defer temporal_client.update_handle_free(&handle)
+	defer temporal_client.error_free(&handle_error)
+	testing.expect(t, handle_error.message == nil)
+	testing.expect_value(t, handle.workflow_id, "owned-update-workflow")
+	testing.expect_value(t, handle.run_id, "owned-update-run")
+	testing.expect_value(t, handle.update_id, "owned-update-id")
+}
+
+@(test)
+client_rpc_cancellation_token_lifecycle_and_wait_validation :: proc(t: ^testing.T) {
+	token := temporal_client.client_cancellation_token_create()
+	testing.expect(t, token.handle != nil)
+	temporal_client.client_cancellation_token_cancel(&token)
+	temporal_client.client_cancellation_token_cancel(&token)
+	temporal_client.client_cancellation_token_close(&token)
+	testing.expect(t, token.handle == nil)
+	temporal_client.client_cancellation_token_close(&token)
+
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{connection = &connection}
+	handle, handle_error := temporal_client.get_update_handle(
+		&client,
+		"workflow-id",
+		"",
+		"update-id",
+	)
+	defer temporal_client.update_handle_free(&handle)
+	defer temporal_client.error_free(&handle_error)
+	testing.expect(t, handle_error.message == nil)
+	_, timeout_error := temporal_client.wait_update_payload_with_options(
+		&handle,
+		{timeout = -time.Millisecond},
+	)
+	defer temporal_client.error_free(&timeout_error)
+	testing.expect_value(t, timeout_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	_, token_error := temporal_client.wait_update_payload_with_options(
+		&handle,
+		{cancellation_token = &token},
+	)
+	defer temporal_client.error_free(&token_error)
+	testing.expect_value(t, token_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+}
+
+@(test)
 client_control_operations_reject_invalid_handles :: proc(t: ^testing.T) {
 	handle := temporal_client.Workflow_Handle{}
 	signal_error := temporal_client.signal_workflow(&handle, "approval")

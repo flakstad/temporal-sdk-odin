@@ -14,6 +14,7 @@ Runtime    :: struct { _opaque: u8 }
 Connection :: struct { _opaque: u8 }
 Worker     :: struct { _opaque: u8 }
 Worker_Replay_Pusher :: struct { _opaque: u8 }
+Cancellation_Token :: struct { _opaque: u8 }
 
 Byte_Array_Ref :: struct {
 	data: ^u8,
@@ -155,7 +156,7 @@ Rpc_Call_Options :: struct {
 	metadata:           Metadata_Ref,
 	binary_metadata:    Metadata_Ref,
 	timeout_millis:      u32,
-	cancellation_token: rawptr,
+	cancellation_token: ^Cancellation_Token,
 }
 
 Client_Rpc_Call_Callback :: #type proc "c" (
@@ -377,6 +378,9 @@ foreign temporal_core {
 	client_update_metadata :: proc(client: ^Connection, metadata: Metadata_Ref) ---
 	client_update_binary_metadata :: proc(client: ^Connection, metadata: Metadata_Ref) ---
 	client_update_api_key :: proc(client: ^Connection, api_key: Byte_Array_Ref) ---
+	cancellation_token_new :: proc() -> ^Cancellation_Token ---
+	cancellation_token_cancel :: proc(token: ^Cancellation_Token) ---
+	cancellation_token_free :: proc(token: ^Cancellation_Token) ---
 	client_rpc_call   :: proc(
 		client: ^Connection,
 		options: ^Rpc_Call_Options,

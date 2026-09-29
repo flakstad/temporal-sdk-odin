@@ -769,6 +769,9 @@ temporal_core_client_free
 temporal_core_client_update_metadata
 temporal_core_client_update_binary_metadata
 temporal_core_client_update_api_key
+temporal_core_cancellation_token_new
+temporal_core_cancellation_token_cancel
+temporal_core_cancellation_token_free
 temporal_core_client_rpc_call
 temporal_core_worker_new
 temporal_core_worker_validate
@@ -1462,15 +1465,33 @@ run, and Update IDs. `wait_update_payload/json` uses
 `execute_update_payloads` and the singular `execute_update_payload/json`
 adapters compose those operations for callers that prefer
 a blocking one-call API.
+`get_update_handle` reconstructs an owned reference from stable IDs for a
+caller reconnecting after acceptance. The option-aware waits pass the pinned C
+bridge's native `CancellationToken` into `RpcCallOptions` and can also apply a
+monotonic total timeout. Timeout disables Core retries for that bounded poll;
+an empty long-poll response recalculates the remaining budget. Cancellation
+selects against the entire Core RPC future, including retries. Both outcomes
+end only the local wait and map to `.Wait_Timed_Out`/`.Wait_Canceled`; the
+accepted server-side Update continues.
+The pinned transport currently reports its request-deadline expiry as gRPC
+status 1 with `Timeout expired` rather than status 4; Odin normalizes both that
+observed form and standard `DEADLINE_EXCEEDED` to `.Wait_Timed_Out`.
 Successful outcomes are cloned out of the protobuf decode arena. Failure
 outcomes become `.Workflow_Update_Failed`, with an owned message and encoded
-Temporal Failure bytes in `Error.details`. No new native ABI symbol is needed.
+Temporal Failure bytes in `Error.details`. No custom native ABI extension is
+needed: polling uses the generic RPC symbol and cancellation uses the three
+existing upstream token lifecycle symbols.
 The generated decoder borrows protobuf strings and byte fields directly from
 the C-bridge RPC response buffer. That buffer therefore remains alive until the
 Update reference and any immediate outcome have been cloned. An outcome already
 returned by the start RPC is owned by `Update_Handle` and served locally by
 `wait_update_*`; this is required for validator rejections, whose completed
 reference is not guaranteed to be pollable as a later accepted Update.
+The Odin token owns exactly one Core allocation. `RpcCallOptions` borrows its
+pointer only for the blocking call; Core clones the internal Rust token before
+spawning the RPC future. The wrapper still requires callers to keep the Odin
+handle alive until the call returns, then close it exactly once (close is
+nil-safe).
 
 The option-aware start variants project the shared owned `Headers` builder into
 `Temporal_Api_Update_V1_Input.header`. Core later exposes that map together with
@@ -1493,7 +1514,8 @@ uses that split rather than one universal hook. The Activity family is now the
 first complete chain: Worker-level interceptors wrap inbound callback execution
 and outbound heartbeat calls through explicit `next` continuations. Client
 outbound now uses the same nesting contract with separate types for Workflow
-start, Signal-With-Start, Signal, Query, Update start, cancellation, and
+start, Signal-With-Start, Signal, Query, Update start/result waiting,
+cancellation, and
 termination, plus the complete Workflow-result wait. Workflow outbound now
 applies that same contract to remote and Local Activity scheduling, Child
 Workflow start/Signal,
@@ -1542,13 +1564,18 @@ a connection-mutation input and remain direct Core ABI calls at the terminal;
 all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks fourteen nested operation families and arbitrary
+A 500-case property checks fifteen nested operation families and arbitrary
 short-circuit depth. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
-runs; its Payload result is owned. Live start, Signal-With-Start, Signal, Query,
-result, Update, cancellation, termination, Visibility list/count, and every
+runs; its Payload result is owned. The Update wait interceptor likewise wraps
+the complete result long poll and returns an owned Payload. Live start,
+Signal-With-Start, Signal, Query, result, Update, cancellation, termination,
+Visibility list/count, and every
 Schedule path cross Service/Core. The live Client example also proves metadata
-replacement plus API-key set/clear interception before later RPCs.
+replacement plus API-key set/clear interception before later RPCs. A
+pre-canceled Update poll proves interceptor unwind through Core; the concurrent
+Update scenario times out a slow poll, reattaches by stable IDs, and receives
+the durable result later.
 
 Workflow outbound interception lives inside the deterministic fiber boundary.
 The Worker copies configured `workflow.Outbound_Interceptor` records into every
@@ -1645,9 +1672,7 @@ Offline tests require byte-identical completions for the same out-of-order
 sequence. Property tests generate both completion orderings in addition to
 validator rejection, immediate completion, and accepted-then-handler-rejection.
 
-The remaining Update-runtime risks are bounded/client-cancellable result polling
-(which must not be presented as cancellation of an already accepted durable
-Update), shared-state races between handlers,
+The remaining Update-runtime risks are shared-state races between handlers,
 structured propagation of Activity failures from an Update, and stack/resource
 limits. These must be fixed before the routine API can be considered stable.
 
@@ -2135,7 +2160,8 @@ Workflows are enabled.
    signal/cancel operations, and Continue-As-New across fresh-stack replay. It
    now proves downward-only nested cancellation-token trees across Activities,
    timers, Signal waits, main/Signal/Update fibers, propagated durable
-   deadlines, and replay. It does not yet prove bounded/client-cancellable Update result waits,
+   deadlines, and replay. Client Update result waits are now bounded and locally
+   cancellable without implying durable Update cancellation. It does not yet prove
    panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, guard-page/growable stack protection, or
    a production deterministic scheduler.
@@ -2292,9 +2318,10 @@ handler awaits an Activity: the detached operation survives, explicit draining
 prevents early close, the Update response precedes cancellation acknowledgement,
 and late resolution/replay are deterministic. The public token/tree abstraction
 now covers deterministic child/detached scopes and Activity cancellation.
-Remaining cancellation work is any future client-facing policy for canceling
-an accepted Update; the current Temporal protocol does not expose that as a
-language-token operation.
+Client-side Update waits can now be canceled through Core's RPC token, but this
+deliberately does not cancel an accepted Update. Any future policy for canceling
+the durable operation itself depends on a server protocol capability; the
+current Temporal protocol does not expose that as a language-token operation.
 
 Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
 containment should be designed as subprocess isolation unless Odin gains

@@ -85,6 +85,28 @@ client_interceptor_property_get_result :: proc(
 	return
 }
 
+client_interceptor_property_wait_update :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Wait_Update_Input,
+	next: temporal_client.Client_Wait_Update_Next,
+) -> (payload: codec.Payload, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.options.timeout != 2 * time.Second {
+		return {}, temporal_client.error_from_string(.Invalid_Argument, "Update wait interceptor input mutation was not propagated")
+	}
+	input.options.timeout = 2 * time.Second
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		payload, error = temporal_client.client_wait_update_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
 client_interceptor_property_cancel :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_Cancel_Workflow_Input,
@@ -238,20 +260,21 @@ client_interceptor_property_connection_mutation :: proc(user_data: rawptr, input
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 13))
+	operation := pbt.draw(t, pbt.int_range(0, 14))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 0, 5.0, "Workflow Signal")
-	pbt.cover(t, operation == 1, 5.0, "Workflow cancellation")
-	pbt.cover(t, operation == 2, 5.0, "Workflow termination")
-	pbt.cover(t, operation == 3, 5.0, "Signal-With-Start")
-	pbt.cover(t, operation == 4, 5.0, "Workflow result")
-	pbt.cover(t, operation == 5, 5.0, "Workflow Visibility list")
-	pbt.cover(t, operation == 6, 5.0, "Workflow Visibility count")
+	pbt.cover(t, operation == 0, 3.0, "Workflow Signal")
+	pbt.cover(t, operation == 1, 3.0, "Workflow cancellation")
+	pbt.cover(t, operation == 2, 3.0, "Workflow termination")
+	pbt.cover(t, operation == 3, 3.0, "Signal-With-Start")
+	pbt.cover(t, operation == 4, 3.0, "Workflow result")
+	pbt.cover(t, operation == 5, 3.0, "Workflow Visibility list")
+	pbt.cover(t, operation == 6, 3.0, "Workflow Visibility count")
 	pbt.cover(t, operation >= 7 && operation <= 10, 20.0, "Schedule read operation")
 	pbt.cover(t, operation == 11 || operation == 12, 10.0, "Schedule mutation operation")
-	pbt.cover(t, operation == 13, 5.0, "connection mutation operation")
+	pbt.cover(t, operation == 13, 3.0, "connection mutation operation")
+	pbt.cover(t, operation == 14, 3.0, "Update wait operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -297,6 +320,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.schedule_mutation = client_interceptor_property_schedule_mutation
 		case 13:
 			interceptor.connection_mutation = client_interceptor_property_connection_mutation
+		case 14:
+			interceptor.wait_update = client_interceptor_property_wait_update
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -317,6 +342,11 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	temporal_client.error_free(&caller_error)
 	handle := temporal_client.Workflow_Handle{client = &client, id = "property-workflow"}
 	schedule_handle := temporal_client.Schedule_Handle{client = &client, id = "property-schedule"}
+	update_handle := temporal_client.Update_Handle{
+		client = &client,
+		workflow_id = "property-workflow",
+		update_id = "property-update",
+	}
 	operation_error: temporal_client.Error
 	switch operation {
 	case 0:
@@ -391,6 +421,10 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		operation_error = temporal_client.pause_schedule(&schedule_handle, "property pause")
 	case 13:
 		operation_error = temporal_client.update_api_key(&client, "caller API key")
+	case 14:
+		result: codec.Payload
+		result, operation_error = temporal_client.wait_update_payload(&update_handle)
+		codec.payload_free(&result)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

@@ -55,7 +55,10 @@ mutate Workflow-owned state, return a typed result in a later activation, and
 replay without rerunning validators. Two accepted Updates can now remain live
 at once, resolve their Activities out of order, and replay with stable protocol
 identity. The Client exposes owned Update handles that separate acceptance from
-waiting for the result. Concurrent handler close semantics now match the
+waiting for the result. Existing accepted Updates can be reattached by their
+Workflow/run/Update IDs. Result waiting accepts a monotonic timeout and a
+thread-safe Core cancellation token; either stops only the local long poll and
+does not cancel the durable Update. Concurrent handler close semantics now match the
 established language SDKs: unfinished Update routines are abandoned with a
 warning by default, registration can suppress that warning, and
 `workflow.await_all_handlers_finished` explicitly keeps the main Workflow open.
@@ -230,10 +233,10 @@ now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
-**not** yet provide guard-page/growable stack protection, bounded or
-client-cancellable Update-result polling, in-process panic containment, or a
-stable public API. Canceling a Client wait would not cancel an already accepted
-durable Update; the current Temporal Service exposes no such operation.
+**not** yet provide guard-page/growable stack protection, in-process panic
+containment, or a stable public API. Canceling a Client wait does not cancel an
+already accepted durable Update; the current Temporal Service exposes no such
+operation.
 Do not use it in production.
 
 ```odin
@@ -260,7 +263,8 @@ trace_activity :: proc(
 
 Client connections accept an ordered `[]Client_Interceptor`. The current
 typesafe outbound surface wraps Workflow start, Signal-With-Start, Signal,
-Query, result waiting, Update start, cancellation, termination, and Workflow
+Query, Workflow result waiting, Update start/result waiting, cancellation,
+termination, and Workflow
 Visibility list/count plus Schedule Describe/List/Count/Matching-Times; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
@@ -803,6 +807,13 @@ update, err := temporal_client.start_update_json_with_options(
 )
 defer temporal_client.update_handle_free(&update)
 err = temporal_client.wait_update_json(&update, &updated)
+wait_token := temporal_client.client_cancellation_token_create()
+defer temporal_client.client_cancellation_token_close(&wait_token)
+err = temporal_client.wait_update_json_with_options(
+    &update,
+    &updated,
+    {timeout = 30 * time.Second, cancellation_token = &wait_token},
+)
 update_args := [?]codec.Payload_View{
     codec.payload_view(&name),
     codec.payload_view(&options),
@@ -822,7 +833,11 @@ err = temporal_client.cancel_workflow(&handle, "customer canceled")
 variants are available when callers need custom Payloads or propagation headers.
 The plural `start_update_payloads[_with_options]` and
 `execute_update_payloads` forms preserve Temporal's complete ordered argument
-list.
+list. `get_update_handle` reconstructs an owned handle after reconnect.
+`Update_Wait_Options` bounds or locally cancels only the result wait; a
+`.Wait_Timed_Out` or `.Wait_Canceled` error does not cancel the accepted Update.
+The cancellation token may be triggered from another thread, must outlive the
+wait call, and is released explicitly with `client_cancellation_token_close`.
 
 Terminal Workflow and Update errors may carry a complete Temporal Failure:
 
