@@ -1485,9 +1485,12 @@ the selected Signal payload/metadata views remain borrowed from the Workflow
 run. The CLI-devserver suite live-proves an Activity/Timer race, fresh-stack
 replay, and explicit timer cancellation.
 
-`start_timer` does not yet traverse the outbound `sleep` interceptor; that
-interceptor represents the suspending operation. A future timer-start
-interceptor must preserve non-suspending Future creation semantics.
+`start_timer` traverses the distinct outbound `start_timer` interceptor and
+returns its `Timer_Future` without suspending. An interceptor may replace the
+duration before calling `workflow.outbound_start_timer_next`. `sleep` first
+traverses the stackful `sleep` chain and then the timer-start chain: code after
+a timer-start continuation runs as soon as the Future is created, while code
+after a sleep continuation runs only after the timer fires or is canceled.
 
 Already-started durable operations can also be joined without hidden result
 allocations:

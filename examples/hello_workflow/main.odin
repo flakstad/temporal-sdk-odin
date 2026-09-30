@@ -413,6 +413,26 @@ workflow_activity_interceptor :: proc(
 	return result
 }
 
+workflow_timer_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Start_Timer_Input,
+	next: workflow.Outbound_Start_Timer_Next,
+) -> workflow.Timer_Future {
+	is_probe := input.duration == 30 * time.Second
+	if is_probe {
+		fmt.println("Workflow Timer interceptor entered before command")
+		input.duration = 31 * time.Second
+	}
+	future := workflow.outbound_start_timer_next(next, input)
+	if is_probe {
+		fmt.printf(
+			"Workflow Timer interceptor exited after Future creation seq=%d\n",
+			future.seq,
+		)
+	}
+	return future
+}
+
 workflow_execute_interceptor :: proc(
 	_: rawptr,
 	input: ^workflow.Inbound_Execute_Workflow_Input,
@@ -1594,7 +1614,10 @@ main :: proc() {
 	}
 	workflow_interceptor_error := worker.add_workflow_interceptor(
 		&activity_worker,
-		{start_activity = workflow_activity_interceptor},
+		{
+			start_activity = workflow_activity_interceptor,
+			start_timer = workflow_timer_interceptor,
+		},
 	)
 	if workflow_interceptor_error.message != nil {
 		fmt.eprintf(

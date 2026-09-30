@@ -261,8 +261,10 @@ worker_pid=""
 cat "$worker_log"
 grep -Eq "replay=false .*started_timer=true .*waiting_selector=true .*completed=false" "$worker_log"
 grep -Eq "resolved=1 .*canceled_timer=true .*waiting_selector=false .*completed=true" "$worker_log"
+grep -q "Workflow Timer interceptor entered before command" "$worker_log"
+grep -q "Workflow Timer interceptor exited after Future creation seq=1" "$worker_log"
 grep -q "Workflow selector chose the ready Activity and canceled its losing timer" "$worker_log"
-echo "Workflow selector raced an Activity and timer through Core and Temporal Server"
+echo "Workflow selector raced an Activity and intercepted timer through Core and Temporal Server"
 
 TEMPORAL_ODIN_SCENARIO=join-all \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

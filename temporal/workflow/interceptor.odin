@@ -63,6 +63,7 @@ Outbound_Interceptor :: struct {
 	signal_external_workflow: Outbound_Signal_External_Workflow_Interceptor_Proc,
 	cancel_external_workflow: Outbound_Cancel_External_Workflow_Interceptor_Proc,
 	continue_as_new:          Outbound_Continue_As_New_Interceptor_Proc,
+	start_timer:              Outbound_Start_Timer_Interceptor_Proc,
 	sleep:                    Outbound_Sleep_Interceptor_Proc,
 	cancel_child_workflow:    Outbound_Cancel_Child_Workflow_Interceptor_Proc,
 }
@@ -75,6 +76,7 @@ outbound_interceptor_has_operation :: proc(interceptor: Outbound_Interceptor) ->
 	       interceptor.signal_external_workflow != nil ||
 	       interceptor.cancel_external_workflow != nil ||
 	       interceptor.continue_as_new != nil ||
+	       interceptor.start_timer != nil ||
 	       interceptor.sleep != nil ||
 	       interceptor.cancel_child_workflow != nil
 }

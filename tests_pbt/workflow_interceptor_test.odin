@@ -131,6 +131,24 @@ workflow_interceptor_property_sleep :: proc(
 	node.state.event_count += 1
 }
 
+workflow_interceptor_property_timer :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Start_Timer_Input,
+	next: workflow.Outbound_Start_Timer_Next,
+) -> workflow.Timer_Future {
+	node := cast(^Workflow_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	input.duration += time.Duration(node.id)
+	result := workflow.Timer_Future{}
+	if !node.short_circuit {
+		result = workflow.outbound_start_timer_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
 workflow_interceptor_property_cancel_child :: proc(
 	user_data: rawptr,
 	input: ^workflow.Outbound_Cancel_Child_Workflow_Input,
@@ -236,21 +254,22 @@ workflow_interceptor_property_update_handler :: proc(
 workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 11))
+	operation := pbt.draw(t, pbt.int_range(0, 12))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 1, 5.0, "Child Workflow start")
-	pbt.cover(t, operation == 2, 5.0, "Child Workflow Signal")
-	pbt.cover(t, operation == 3, 5.0, "external Workflow Signal")
-	pbt.cover(t, operation == 4, 5.0, "external Workflow cancellation")
-	pbt.cover(t, operation == 5, 5.0, "Workflow sleep")
-	pbt.cover(t, operation == 6, 5.0, "Child Workflow cancellation")
-	pbt.cover(t, operation == 7, 5.0, "Workflow execution")
-	pbt.cover(t, operation == 8, 5.0, "Workflow Query")
-	pbt.cover(t, operation == 9, 5.0, "Workflow Signal")
-	pbt.cover(t, operation == 10, 5.0, "Workflow Update validator")
-	pbt.cover(t, operation == 11, 5.0, "Workflow Update handler")
+	pbt.cover(t, operation == 1, 4.0, "Child Workflow start")
+	pbt.cover(t, operation == 2, 4.0, "Child Workflow Signal")
+	pbt.cover(t, operation == 3, 4.0, "external Workflow Signal")
+	pbt.cover(t, operation == 4, 4.0, "external Workflow cancellation")
+	pbt.cover(t, operation == 5, 4.0, "Workflow sleep")
+	pbt.cover(t, operation == 6, 4.0, "Child Workflow cancellation")
+	pbt.cover(t, operation == 7, 4.0, "Workflow execution")
+	pbt.cover(t, operation == 8, 4.0, "Workflow Query")
+	pbt.cover(t, operation == 9, 4.0, "Workflow Signal")
+	pbt.cover(t, operation == 10, 4.0, "Workflow Update validator")
+	pbt.cover(t, operation == 11, 4.0, "Workflow Update handler")
+	pbt.cover(t, operation == 12, 4.0, "Workflow Timer start")
 
 	state := Workflow_Interceptor_Property_State{}
 	nodes: [12]Workflow_Interceptor_Property_Node
@@ -288,6 +307,7 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 				signal_child_workflow = workflow_interceptor_property_signal_child,
 				signal_external_workflow = workflow_interceptor_property_signal_external,
 				cancel_external_workflow = workflow_interceptor_property_cancel_external,
+				start_timer = workflow_interceptor_property_timer,
 				sleep = workflow_interceptor_property_sleep,
 				cancel_child_workflow = workflow_interceptor_property_cancel_child,
 			},
@@ -415,6 +435,9 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			update = &update,
 		}
 		_ = workflow.inbound_handle_update_handler_chain(&inbound_chain, &input)
+	case 12:
+		input := workflow.Outbound_Start_Timer_Input{ctx = &ctx, duration = time.Second}
+		_ = workflow.outbound_start_timer_chain(&chain, &input)
 	}
 	reached := short_index + 1
 	if state.event_count != reached * 2 {

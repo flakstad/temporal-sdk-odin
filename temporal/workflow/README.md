@@ -119,10 +119,27 @@ ready cases. Losing operations are left live; callers must explicitly await or
 cancel them. The case slice and its Signal names are borrowed until selection
 returns. Selected Signal values and metadata are borrowed run-arena views.
 
-Direct `start_timer` currently bypasses the outbound `sleep` interceptor,
-because that interceptor models a complete suspending sleep call rather than
-Future creation. This gap is explicit while the timer-start interceptor shape
-is designed.
+Direct `start_timer` traverses the outbound `start_timer` interceptor without
+suspending. The input exposes the duration and the continuation returns the
+created `Timer_Future`, so an interceptor can deterministically replace the
+duration or Future:
+
+```odin
+timer_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Start_Timer_Input,
+	next: workflow.Outbound_Start_Timer_Next,
+) -> workflow.Timer_Future {
+	input.duration *= 2
+	return workflow.outbound_start_timer_next(next, input)
+}
+```
+
+`sleep` has a separate stackful interceptor because it models the complete
+suspending call. It traverses the sleep chain first and the timer-start chain
+when its terminal continuation creates the timer. Code after timer `next`
+runs immediately after Future creation; code after sleep `next` runs only when
+the wait resolves.
 
 `join_all` waits for every already-started durable operation in a borrowed case
 slice. It allocates no result collection: after `.Ready`, the existing typed

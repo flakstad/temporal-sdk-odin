@@ -3,6 +3,27 @@ package workflow
 import "core:time"
 import codec "../codec"
 
+Outbound_Start_Timer_Input :: struct {
+	ctx:      ^Fiber_Context,
+	duration: time.Duration,
+}
+
+Outbound_Start_Timer_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Outbound_Start_Timer_Input,
+) -> Timer_Future
+
+Outbound_Start_Timer_Next :: struct {
+	data:   rawptr,
+	invoke: Outbound_Start_Timer_Next_Proc,
+}
+
+Outbound_Start_Timer_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Outbound_Start_Timer_Input,
+	next: Outbound_Start_Timer_Next,
+) -> Timer_Future
+
 Outbound_Sleep_Input :: struct {
 	ctx:      ^Fiber_Context,
 	duration: time.Duration,
@@ -165,6 +186,17 @@ Outbound_Continue_As_New_Interceptor_Proc :: #type proc(
 	next: Outbound_Continue_As_New_Next,
 ) -> !
 
+outbound_start_timer_next :: proc(
+	next: Outbound_Start_Timer_Next,
+	input: ^Outbound_Start_Timer_Input,
+) -> Timer_Future {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Workflow Timer interceptor continuation")
+		return {}
+	}
+	return next.invoke(next.data, input)
+}
+
 outbound_sleep_next :: proc(
 	next: Outbound_Sleep_Next,
 	input: ^Outbound_Sleep_Input,
@@ -246,6 +278,28 @@ outbound_continue_as_new_next :: proc(
 		)
 	}
 	next.invoke(next.data, input)
+}
+
+outbound_start_timer_chain :: proc(
+	data: rawptr,
+	input: ^Outbound_Start_Timer_Input,
+) -> Timer_Future {
+	state := cast(^Outbound_Interceptor_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil || input == nil {
+		if input != nil do workflow_interceptor_failure(input.ctx, "invalid Workflow Timer interceptor state")
+		return {}
+	}
+	for index := state.index; index < len(state.instance.runtime.outbound_interceptors); index += 1 {
+		entry := &state.instance.runtime.outbound_interceptors[index]
+		if entry.start_timer == nil do continue
+		next_state := Outbound_Interceptor_State{instance = state.instance, index = index + 1}
+		return entry.start_timer(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = outbound_start_timer_chain},
+		)
+	}
+	return start_timer_unintercepted(input.ctx, input.duration)
 }
 
 outbound_sleep_chain :: proc(

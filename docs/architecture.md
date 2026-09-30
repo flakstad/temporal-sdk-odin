@@ -1716,13 +1716,32 @@ preserves its non-returning `-> !` contract through every continuation. The
 caller-owned builder is never mutated, and call-scoped inputs/continuations
 cannot safely be retained.
 
-Sleep interception deliberately wraps the entire stackful wait rather than
-only `StartTimer` command construction: code after `next` resumes only when the
-timer fires or cancellation unwinds the wait. This matches .NET's outbound
-`DelayAsync` boundary. Explicit Child cancellation is a separate Odin hook
-because Odin exposes a procedural Future API rather than an extensible child
-handle object; its continuation owns the same reason mutation and command-state
-transition as `cancel_child_workflow`.
+Sleep interception deliberately wraps the entire stackful wait: code after
+`next` resumes only when the timer fires or cancellation unwinds the wait.
+Timer creation has a second, non-suspending `start_timer` chain. Its terminal
+continuation creates the durable operation and immediately returns a
+`Timer_Future`; `sleep` reaches it only after the outer sleep interceptors have
+mutated their input. Thus a sleep call composes both boundaries without making
+direct `start_timer` pretend to suspend.
+
+This distinction follows pinned Core revision
+`399cb7adb40f45eefbef90149e212743e474142c`: Rust
+`WorkflowInterceptor::start_timer` accepts `StartTimerInput`/`TimerOptions` and
+returns `CancellableWorkflowOutboundFuture<TimerResult>`, while
+`WorkflowContext::timer` calls that chain before preparing the Future. Odin's
+source evidence is in
+`crates/workflow/src/workflow_interceptors.rs` and
+`crates/workflow/src/workflow_context.rs`. Odin's current public timer surface
+exposes duration plus the selected cancellation scope, so the
+interceptor input presently exposes the mutable duration; Core-internal token
+selection remains derived from the active Odin cancellation scope. Timer
+summary/event-group fields can be added when the public Odin timer options grow.
+
+This differs from .NET's stackful outbound `DelayAsync` boundary, which is the
+closest analogue for Odin `sleep`. Explicit Child cancellation is a separate
+Odin hook because Odin exposes a procedural Future API rather than an
+extensible child handle object; its continuation owns the same reason mutation
+and command-state transition as `cancel_child_workflow`.
 
 The chain intentionally executes again during replay. Its code must therefore
 obey the same determinism rules as Workflow code; logging may duplicate and
@@ -2383,12 +2402,13 @@ Signal-handler buffer/order/replay cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The declaration-biased Workflow selector, allocation-free `join_all`, and
-public Timer future are now implemented and live-proven. Two independent
+The declaration-biased Workflow selector, allocation-free `join_all`, public
+Timer future, and distinct non-suspending timer-start interceptor are now
+implemented and live-proven. Two independent
 180-trace properties cover selector case/job order and join job/split order with
-fresh-stack replay. The next smallest runtime slice is a distinct
-non-suspending timer-start interceptor, plus generative Child start/completion
-and cancellation coverage for selector/join. None requires a new C ABI symbol.
+fresh-stack replay. The next smallest runtime slice is generative Child
+start/completion and cancellation coverage for selector/join, followed by the
+remaining public Timer options. Neither requires a new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for

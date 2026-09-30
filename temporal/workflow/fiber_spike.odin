@@ -8268,11 +8268,15 @@ start_timer_unintercepted :: proc(ctx: ^Fiber_Context, duration: time.Duration) 
 	return {seq = operation.seq}
 }
 
-// start_timer creates a durable timer Future without suspending. Timer-start
-// interceptor coverage is pending; sleep continues through the existing
-// outbound sleep interceptor chain.
+// start_timer creates a durable timer Future without suspending. Its outbound
+// interceptor may inspect or replace Future creation but does not await it.
 start_timer :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
-	return start_timer_unintercepted(ctx, duration)
+	if ctx == nil || ctx.instance == nil {
+		return {}
+	}
+	input := Outbound_Start_Timer_Input{ctx = ctx, duration = duration}
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_start_timer_chain(&state, &input)
 }
 
 cancel_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> bool {
@@ -8338,10 +8342,10 @@ sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 	if current_cancellation_applies(instance) {
 		return
 	}
-	future := start_timer_unintercepted(ctx, duration)
-	if future.seq != 0 {
-		_ = await_timer(ctx, future)
-	}
+	// Sleep remains a suspending operation, while Timer creation traverses its
+	// own non-suspending interceptor chain.
+	future := start_timer(ctx, duration)
+	_ = await_timer(ctx, future)
 }
 
 sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {

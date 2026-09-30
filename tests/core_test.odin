@@ -2738,8 +2738,12 @@ workflow_cancel_child_test_interceptor :: proc(
 }
 
 Workflow_Sleep_Test_State :: struct {
-	entered: int,
-	exited:  int,
+	entered:              int,
+	exited:               int,
+	timer_entered:        int,
+	timer_exited:         int,
+	timer_input_duration: time.Duration,
+	timer_future_seq:     u32,
 }
 
 Workflow_Inbound_Interceptor_Test_State :: struct {
@@ -2853,6 +2857,21 @@ workflow_sleep_test_interceptor :: proc(
 	input.duration *= 2
 	workflow.outbound_sleep_next(next, input)
 	state.exited += 1
+}
+
+workflow_timer_test_interceptor :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Start_Timer_Input,
+	next: workflow.Outbound_Start_Timer_Next,
+) -> workflow.Timer_Future {
+	state := cast(^Workflow_Sleep_Test_State)user_data
+	state.timer_entered += 1
+	state.timer_input_duration = input.duration
+	input.duration += 3 * time.Millisecond
+	future := workflow.outbound_start_timer_next(next, input)
+	state.timer_future_seq = future.seq
+	state.timer_exited += 1
+	return future
 }
 
 workflow_continue_as_new_test_interceptor :: proc(
@@ -12079,7 +12098,11 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	}
 	interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
 		&runtime,
-		{user_data = &sleep_state, sleep = workflow_sleep_test_interceptor},
+		{
+			user_data = &sleep_state,
+			start_timer = workflow_timer_test_interceptor,
+			sleep = workflow_sleep_test_interceptor,
+		},
 	)
 	testing.expect(t, interceptor_error.message == nil)
 	workflow.error_free(&interceptor_error)
@@ -12117,6 +12140,8 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.activity_seq, u32(1))
 	testing.expect_value(t, sleep_state.entered, 0)
 	testing.expect_value(t, sleep_state.exited, 0)
+	testing.expect_value(t, sleep_state.timer_entered, 0)
+	testing.expect_value(t, sleep_state.timer_exited, 0)
 	testing.expect_value(t, inbound_state.event_count, 2)
 	testing.expect_value(t, inbound_state.events[0], 1)
 	testing.expect_value(t, inbound_state.events[1], 2)
@@ -12159,9 +12184,86 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.timer_seq, u32(1))
 	testing.expect_value(t, sleep_state.entered, 1)
 	testing.expect_value(t, sleep_state.exited, 0)
+	testing.expect_value(t, sleep_state.timer_entered, 1)
+	testing.expect_value(t, sleep_state.timer_exited, 1)
+	testing.expect_value(t, sleep_state.timer_input_duration, 2 * time.Millisecond)
+	testing.expect_value(t, sleep_state.timer_future_seq, u32(1))
 	testing.expect_value(t, inbound_state.event_count, 2)
 	timer_inspection := inspect_workflow_completion(processed.completion[:])
-	testing.expect_value(t, timer_inspection.started_timer_duration, 2 * time.Millisecond)
+	testing.expect_value(t, timer_inspection.started_timer_duration, 5 * time.Millisecond)
+
+	// Rebuild the suspended Workflow on a fresh stack and require the composed
+	// sleep/start-timer interceptor chains to emit identical command bytes.
+	replay_runtime := workflow.Fiber_Runtime{}
+	replay_init_error := workflow.fiber_runtime_init(
+		&replay_runtime,
+		"odin_chain_workflow",
+		"test-queue",
+		fiber_chain_test_workflow,
+	)
+	testing.expect(t, replay_init_error.message == nil)
+	defer workflow.error_free(&replay_init_error)
+	defer workflow.fiber_runtime_close(&replay_runtime)
+	replay_sleep_state := Workflow_Sleep_Test_State{}
+	replay_interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&replay_runtime,
+		{
+			user_data = &replay_sleep_state,
+			start_timer = workflow_timer_test_interceptor,
+			sleep = workflow_sleep_test_interceptor,
+		},
+	)
+	testing.expect(t, replay_interceptor_error.message == nil)
+	workflow.error_free(&replay_interceptor_error)
+
+	replay_initialize_activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-chain-run",
+		history_length = 3,
+		is_replaying = true,
+	}
+	append(
+		&replay_initialize_activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&replay_runtime, &replay_initialize_activation)
+	testing.expect(t, replayed.error.message == nil)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+	delete(replay_initialize_activation.jobs)
+
+	replay_resolve_activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-chain-run",
+		history_length = 9,
+		is_replaying = true,
+	}
+	append(
+		&replay_resolve_activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+				value = &resolve_first,
+			},
+		},
+	)
+	replayed = process_fiber_test_activation(&replay_runtime, &replay_resolve_activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, bytes.equal(processed.completion[:], replayed.completion[:]))
+	testing.expect_value(t, replay_sleep_state.entered, 1)
+	testing.expect_value(t, replay_sleep_state.exited, 0)
+	testing.expect_value(t, replay_sleep_state.timer_entered, 1)
+	testing.expect_value(t, replay_sleep_state.timer_exited, 1)
+	testing.expect_value(
+		t,
+		replay_sleep_state.timer_input_duration,
+		2 * time.Millisecond,
+	)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+	delete(replay_resolve_activation.jobs)
+
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 
@@ -12183,6 +12285,8 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, processed.activity_seq, u32(2))
 	testing.expect_value(t, sleep_state.entered, 1)
 	testing.expect_value(t, sleep_state.exited, 1)
+	testing.expect_value(t, sleep_state.timer_entered, 1)
+	testing.expect_value(t, sleep_state.timer_exited, 1)
 	testing.expect_value(t, inbound_state.event_count, 2)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
