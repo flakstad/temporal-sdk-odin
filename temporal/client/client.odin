@@ -30,6 +30,10 @@ Error_Kind :: enum {
 	Workflow_Continued_As_New,
 	Workflow_Query_Rejected,
 	Workflow_Update_Failed,
+	Nexus_Operation_Failed,
+	Nexus_Operation_Canceled,
+	Nexus_Operation_Terminated,
+	Nexus_Operation_Timed_Out,
 	Wait_Canceled,
 	Wait_Timed_Out,
 }
@@ -53,8 +57,8 @@ error_free :: proc(error: ^Error) {
 }
 
 // decode_error_failure decodes the complete recursive Temporal Failure kept in
-// Error.details. Workflow execution and Workflow Update failures populate this
-// field; other error kinds return No_Data.
+// Error.details. Workflow execution, Workflow Update, and standalone Nexus
+// operation failures populate this field; other error kinds return No_Data.
 decode_error_failure :: proc(
 	error: ^Error,
 	allocator := context.allocator,

@@ -22909,3 +22909,260 @@ workflow_replayer_batches_histories_in_order_on_one_core_worker :: proc(t: ^test
 	testing.expect(t, results[1].activations_processed >= 2)
 	testing.expect(t, results[3].activations_processed >= 2)
 }
+
+@(test)
+standalone_nexus_start_request_round_trips_exact_upstream_wire_shape :: proc(t: ^testing.T) {
+	timeout := proto.Google_Protobuf_Duration{seconds = 90, nanos = 123}
+	input := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`{"name":"Odin"}`),
+	}
+	callback_nexus := proto.Temporal_Api_Common_V1_Callback_Nexus{
+		url = "https://callbacks.invalid/complete",
+	}
+	defer delete(callback_nexus.header)
+	append(&callback_nexus.header, proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry{
+		key = "callback-key",
+		value = "callback-value",
+	})
+	callback := proto.Temporal_Api_Common_V1_Callback{
+		variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus{value = &callback_nexus},
+	}
+	callback_execution := proto.Temporal_Api_Common_V1_Execution{
+		type = .EXECUTION_TYPE_NEXUS_OPERATION,
+		business_id = "linked-operation",
+		run_id = "linked-run",
+	}
+	callback_link := proto.Temporal_Api_Common_V1_Link_Callback{
+		namespace = "linked-namespace",
+		execution = &callback_execution,
+		request_id = "linked-request",
+	}
+	defer delete(callback_link.component_path)
+	append(&callback_link.component_path, "Update")
+	append(&callback_link.component_path, "update-1")
+	link := proto.Temporal_Api_Common_V1_Link{
+		variant = proto.Temporal_Api_Common_V1_Link_Variant_Callback{value = &callback_link},
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest{
+		namespace = "orders",
+		identity = "odin-client",
+		request_id = "request-1",
+		operation_id = "operation-1",
+		endpoint = "payments",
+		service = "payment-service",
+		operation = "charge",
+		schedule_to_close_timeout = &timeout,
+		input = &input,
+		id_reuse_policy = .NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		id_conflict_policy = .NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL,
+	}
+	defer delete(request.nexus_header)
+	defer delete(request.completion_callbacks)
+	defer delete(request.links)
+	append(&request.nexus_header, proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest_NexusHeaderEntry{
+		key = "traceparent",
+		value = "00-probe",
+	})
+	append(&request.completion_callbacks, callback)
+	append(&request.links, link)
+
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest(&request)
+	defer delete(encoded)
+	testing.expect(t, len(encoded) > 0)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest{}
+	decode_ok := proto.decode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest(
+		encoded[:],
+		&decoded,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decode_ok)
+	if !decode_ok do return
+
+	testing.expect_value(t, decoded.namespace, "orders")
+	testing.expect_value(t, decoded.operation_id, "operation-1")
+	testing.expect_value(t, decoded.endpoint, "payments")
+	testing.expect_value(t, decoded.service, "payment-service")
+	testing.expect_value(t, decoded.operation, "charge")
+	testing.expect(t, decoded.schedule_to_close_timeout != nil)
+	if decoded.schedule_to_close_timeout != nil {
+		testing.expect_value(t, decoded.schedule_to_close_timeout.seconds, i64(90))
+		testing.expect_value(t, decoded.schedule_to_close_timeout.nanos, i32(123))
+	}
+	testing.expect(t, decoded.input != nil)
+	if decoded.input != nil {
+		testing.expect(t, bytes.equal(decoded.input.data, input.data))
+	}
+	testing.expect_value(t, decoded.id_reuse_policy, proto.Temporal_Api_Enums_V1_NexusOperationIdReusePolicy.NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE)
+	testing.expect_value(t, decoded.id_conflict_policy, proto.Temporal_Api_Enums_V1_NexusOperationIdConflictPolicy.NEXUS_OPERATION_ID_CONFLICT_POLICY_FAIL)
+	testing.expect_value(t, len(decoded.nexus_header), 1)
+	testing.expect_value(t, len(decoded.completion_callbacks), 1)
+	testing.expect_value(t, len(decoded.links), 1)
+	if len(decoded.nexus_header) == 1 {
+		testing.expect_value(t, decoded.nexus_header[0].key, "traceparent")
+		testing.expect_value(t, decoded.nexus_header[0].value, "00-probe")
+	}
+	if len(decoded.completion_callbacks) == 1 {
+		nexus_callback, ok := decoded.completion_callbacks[0].variant.(proto.Temporal_Api_Common_V1_Callback_Variant_Nexus)
+		testing.expect(t, ok && nexus_callback.value != nil)
+		if ok && nexus_callback.value != nil {
+			testing.expect_value(t, nexus_callback.value.url, "https://callbacks.invalid/complete")
+			testing.expect_value(t, len(nexus_callback.value.header), 1)
+		}
+	}
+	if len(decoded.links) == 1 {
+		decoded_link, ok := decoded.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Callback)
+		testing.expect(t, ok && decoded_link.value != nil)
+		if ok && decoded_link.value != nil {
+			testing.expect_value(t, decoded_link.value.request_id, "linked-request")
+			testing.expect_value(t, len(decoded_link.value.component_path), 2)
+		}
+	}
+}
+
+@(test)
+standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"Odin"`))
+	defer codec.payload_free(&input)
+	metadata_error := codec.payload_add_metadata(
+		&input,
+		"encoding",
+		transmute([]u8)string("json/plain"),
+	)
+	testing.expect_value(t, metadata_error, codec.Error.None)
+	headers := [?]temporal_client.Nexus_Operation_Header{{key = "traceparent", value = "00-odin"}}
+	request_bytes, request_error := temporal_client.encode_start_nexus_operation_request(
+		"orders",
+		"odin-client",
+		codec.payload_view(&input),
+		{
+			id = "standalone-1",
+			request_id = "request-1",
+			endpoint = "payments",
+			service = "payment-service",
+			operation = "charge",
+			schedule_to_close_timeout = time.Minute,
+			schedule_to_start_timeout = 5 * time.Second,
+			start_to_close_timeout = 30 * time.Second,
+			id_reuse_policy = .Reject_Duplicate,
+			id_conflict_policy = .Use_Existing,
+			headers = headers[:],
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Nexus start encode failed: %s", string(request_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	if decoded {
+		testing.expect_value(t, request.namespace, "orders")
+		testing.expect_value(t, request.identity, "odin-client")
+		testing.expect_value(t, request.operation_id, "standalone-1")
+		testing.expect_value(t, request.endpoint, "payments")
+		testing.expect_value(t, request.id_conflict_policy, proto.Temporal_Api_Enums_V1_NexusOperationIdConflictPolicy.NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING)
+		testing.expect_value(t, len(request.nexus_header), 1)
+		testing.expect(t, request.input != nil && bytes.equal(request.input.data, input.data))
+	}
+	virtual.arena_destroy(&decode_arena)
+
+	started_response := proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse{
+		run_id = "run-1",
+		wait_stage = .NEXUS_OPERATION_WAIT_STAGE_STARTED,
+		operation_token = "durable-token",
+	}
+	started_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse(&started_response)
+	started, empty, started_error := temporal_client.decode_nexus_operation_poll_response(
+		started_bytes[:],
+		.Started,
+	)
+	delete(started_bytes)
+	defer temporal_client.nexus_operation_poll_result_free(&started)
+	defer temporal_client.error_free(&started_error)
+	testing.expect(t, started_error.message == nil && !empty)
+	testing.expect_value(t, started.wait_stage, temporal_client.Nexus_Operation_Wait_Stage.Started)
+	testing.expect_value(t, started.operation_token, "durable-token")
+
+	result_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"charged"`)}
+	closed_response := proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse{
+		run_id = "run-1",
+		wait_stage = .NEXUS_OPERATION_WAIT_STAGE_CLOSED,
+		outcome = proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse_Outcome_Result{
+			value = &result_payload,
+		},
+	}
+	closed_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse(&closed_response)
+	closed, closed_empty, closed_error := temporal_client.decode_nexus_operation_poll_response(
+		closed_bytes[:],
+		.Closed,
+	)
+	delete(closed_bytes)
+	defer temporal_client.nexus_operation_poll_result_free(&closed)
+	defer temporal_client.error_free(&closed_error)
+	testing.expect(t, closed_error.message == nil && !closed_empty && closed.has_result)
+	testing.expect(t, bytes.equal(closed.result.data, result_payload.data))
+
+	canceled_info := proto.Temporal_Api_Failure_V1_CanceledFailureInfo{}
+	canceled_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "standalone operation canceled",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{
+			value = &canceled_info,
+		},
+	}
+	nexus_failure_info := proto.Temporal_Api_Failure_V1_NexusOperationFailureInfo{
+		endpoint = "payments",
+		service = "payment-service",
+		operation = "charge",
+		operation_token = "durable-token",
+	}
+	failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Nexus operation failed",
+		cause = &canceled_failure,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Operation_Execution_Failure_Info{
+			value = &nexus_failure_info,
+		},
+	}
+	failed_response := proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse{
+		run_id = "run-1",
+		wait_stage = .NEXUS_OPERATION_WAIT_STAGE_CLOSED,
+		outcome = proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse_Outcome_Failure{
+			value = &failure,
+		},
+	}
+	failed_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse(&failed_response)
+	failed, failed_empty, operation_error := temporal_client.decode_nexus_operation_poll_response(
+		failed_bytes[:],
+		.Closed,
+	)
+	delete(failed_bytes)
+	defer temporal_client.nexus_operation_poll_result_free(&failed)
+	defer temporal_client.error_free(&operation_error)
+	testing.expect(t, !failed_empty)
+	testing.expect_value(t, operation_error.kind, temporal_client.Error_Kind.Nexus_Operation_Canceled)
+	testing.expect(t, len(operation_error.details) > 0)
+
+	empty_response := proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse{}
+	empty_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse(&empty_response)
+	empty_result, is_empty, empty_error := temporal_client.decode_nexus_operation_poll_response(
+		empty_bytes[:],
+		.Closed,
+	)
+	delete(empty_bytes)
+	defer temporal_client.nexus_operation_poll_result_free(&empty_result)
+	defer temporal_client.error_free(&empty_error)
+	testing.expect(t, is_empty && empty_error.message == nil)
+}

@@ -539,6 +539,61 @@ and `Callback` are encoding-only because upstream has no Nexus URL converter
 for them. Outbound metrics are not implemented. The
 outbound interceptor and selector/join integration are implemented.
 
+### Standalone Nexus operation Client boundary
+
+The upgraded pinned API and C bridge also carry the pre-release standalone
+Nexus operation RPC family. This is a Client-side execution model: no caller
+Workflow is required, but the operation is still routed through the same Nexus
+endpoint, task queue, Core Nexus poll, and Odin handler registry described
+above. It adds no raw C symbol. Odin serializes the exact WorkflowService
+request and invokes Core's existing generic `temporal_core_client_rpc_call`
+with these verified method names:
+
+- `StartNexusOperationExecution`;
+- `PollNexusOperationExecution`;
+- `RequestCancelNexusOperationExecution`.
+
+`temporal/client/nexus_operation.odin` now exposes an owned
+`Nexus_Operation_Handle`, borrowed start options, codec-neutral and typed JSON
+start/result helpers, Started/Closed polling, monotonic local wait timeouts,
+Core cancellation tokens, and cancellation requests. Starts carry all three
+operation timeouts, ID reuse/conflict policies, Nexus string headers, generic
+Links, and completion callbacks. Search Attributes, UI summary/details, and
+on-conflict attachment options remain to be added. Describe/list/count,
+terminate, and delete are also still outside this first slice.
+
+The server compatibility boundary was measured rather than inferred:
+
+| Temporal dev Server | Probe result | Meaning |
+| --- | --- | --- |
+| 1.29.1 from CLI 1.5.1 | gRPC 12 `UNIMPLEMENTED`, unknown method | Standalone Nexus is unavailable |
+| 1.32.0 from CLI 1.9.1 with `nexusoperation.enableStandalone=true` | gRPC 5 `NOT_FOUND` for a deliberately absent endpoint | RPC is registered and the request reached endpoint lookup |
+
+The complete established integration matrix remains green on Server 1.29.1.
+When run wholesale against 1.32.0, an older Workflow-originated Nexus timeout
+case observes 11 tasks/no Core-local handler cancellation instead of the
+1.29.1 baseline's 12 tasks/one cancellation. The standalone-focused suite is
+green on 1.32.0, but the broader Nexus behavior change must be understood
+before 1.32.0 replaces 1.29.1 as the repository-wide baseline.
+
+Against Server 1.32.0 the live slice creates a real endpoint, starts the
+existing Odin `hello` Nexus handler directly from the Odin Client, waits with
+`PollNexusOperationExecution`, and owns/decodes the JSON result after Core's
+callback buffer and protobuf arena are gone. A second async handler returns an
+operation token; the Client requests cancellation, Server dispatches
+`CancelOperation`, and the registered Odin cancel handler verifies the same
+token. `RequestCancelNexusOperationExecution` means that cancellation was
+requested, not that the asynchronous operation is already in a terminal
+canceled state. Terminal outcome still comes from the handler/callback path.
+
+The poll RPC may return a successful empty response when a server long poll
+expires. Odin treats that as a repoll signal, recomputes the remaining
+monotonic client deadline, and returns `Wait_Timed_Out` only when that complete
+budget is exhausted. Result Payloads, operation tokens, IDs, and encoded
+recursive Failures are cloned before the decode arena is destroyed. The handle
+owns its IDs using the heap and must be freed before its borrowed Client is
+closed.
+
 Memory ownership follows the existing poll boundary. The C callback lends a
 Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
 `temporal_core_byte_array_free` immediately. Generated decoding then borrows
@@ -2778,15 +2833,16 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The next smallest vertical milestone is a capability probe for the new
-standalone Nexus-operation WorkflowService RPCs carried by the upgraded schema.
-First generate only the request/response graph needed for
-`StartNexusOperationExecution`, call it through Core's generic RPC dispatcher
-against `temporal server start-dev`, and record whether CLI Server 1.29.1
-supports it. If supported, add an owned handle plus start/poll/cancel as one
-vertical Client slice. If the server rejects it as unimplemented, retain exact
-wire tests and defer the public API until the supported-server matrix has a
-live target. The selector/join branch, async
+The capability probe and owned standalone Nexus start/poll/cancel slice are now
+complete. The next smallest vertical milestone is the read/control half of
+that same execution model: generate `DescribeNexusOperationExecution`, expose
+an owned description including status, cancellation state, input/outcome and
+long-poll token, then add terminate/delete. This gives cancellation callers an
+authoritative state view and lets the integration suite clean up deliberately
+unfinished async probes. List/count and Search Attribute/UI metadata support
+can then reuse the established Visibility and start-metadata patterns.
+
+The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,
 and/or property-tested as applicable; selector ordering and all four
 cancellation-policy transitions are also property-tested.

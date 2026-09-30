@@ -165,6 +165,18 @@ temporal operator nexus endpoint delete \
   --output none
 nexus_endpoint_name=""
 
+standalone_nexus_probe="$(TEMPORAL_CORE_STANDALONE_NEXUS_PROBE=1 \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-core-connect.sh")"
+echo "$standalone_nexus_probe"
+if grep -q 'Standalone Nexus operation RPC is recognized' <<<"$standalone_nexus_probe"; then
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+    "$repo_root/scripts/standalone-nexus-integration-test.sh"
+else
+  grep -q 'Standalone Nexus operation RPC is unavailable' <<<"$standalone_nexus_probe"
+  echo "Skipping standalone Nexus integration: the connected Temporal Service does not expose the pre-release RPCs."
+fi
+
 metrics_port=$((19000 + $$ % 1000))
 metrics_address="127.0.0.1:${metrics_port}"
 TEMPORAL_CORE_PROMETHEUS_BIND_ADDRESS="$metrics_address" \

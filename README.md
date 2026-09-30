@@ -9,6 +9,12 @@ bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
 sends typed signals, requests cancellation, and terminates executions. It now
+starts, polls, and requests cancellation of standalone Nexus operations through
+an owned Odin handle. This pre-release server feature is live-proven against
+Temporal Server 1.32.0 with `nexusoperation.enableStandalone=true`; the
+repository's established CLI 1.5.1/Server 1.29.1 baseline correctly
+capability-probes as unsupported. The same Odin Nexus Worker handles both
+Workflow-originated and standalone operations. The Client now
 preserves terminal Workflow and Update Failure protobufs and decodes all ten
 current Temporal Failure variants into an allocator-owned recursive Odin tree.
 The live suite proves an unhandled `ActivityFailure -> ApplicationFailure`
@@ -1852,6 +1858,7 @@ examples/replay_history/  offline binary-history compatibility corpus runner
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker
+examples/standalone_nexus_client/ standalone start/poll/cancel Client proof
 examples/hello_nexus_workflow/ all-Odin Workflow-to-Nexus and replay proof
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 examples/child_workflow/  child and external Workflow operation proofs

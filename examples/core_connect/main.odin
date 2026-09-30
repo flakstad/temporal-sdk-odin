@@ -4,6 +4,68 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import temporal_core "../../temporal/core"
+import proto "../../temporal/core/proto"
+
+probe_standalone_nexus :: proc(client: ^temporal_core.Client) {
+	timeout := proto.Google_Protobuf_Duration{seconds = 5}
+	request := proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest{
+		namespace = "default",
+		identity = "temporal-sdk-odin-capability-probe",
+		request_id = "00000000-0000-4000-8000-000000000001",
+		operation_id = "temporal-sdk-odin-capability-probe",
+		endpoint = "odin-standalone-nexus-probe-missing",
+		service = "odin-probe-service",
+		operation = "probe",
+		schedule_to_close_timeout = &timeout,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest(
+		&request,
+	)
+	defer delete(request_bytes)
+
+	result := temporal_core.client_rpc_call(
+		client,
+		.Workflow,
+		"StartNexusOperationExecution",
+		request_bytes[:],
+		retry = false,
+		timeout_millis = 5_000,
+	)
+	defer delete(result.protobuf)
+	if result.error.message == nil {
+		response := proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionResponse{}
+		if !proto.decode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionResponse(
+			result.protobuf,
+			&response,
+		) {
+			fmt.eprintln("Standalone Nexus operation RPC returned an undecodable response.")
+			return
+		}
+		fmt.printf(
+			"Standalone Nexus operation RPC succeeded unexpectedly (run_id=%s, started=%v).\n",
+			response.run_id,
+			response.started,
+		)
+		return
+	}
+
+	status_code := result.error.status_code
+	message := string(result.error.message)
+	if status_code == 12 {
+		fmt.printf(
+			"Standalone Nexus operation RPC is unavailable on this Temporal Service (status=%d): %s\n",
+			status_code,
+			message,
+		)
+	} else {
+		fmt.printf(
+			"Standalone Nexus operation RPC is recognized by the Temporal Service (status=%d): %s\n",
+			status_code,
+			message,
+		)
+	}
+	temporal_core.error_free(&result.error)
+}
 
 main :: proc() {
 	// On POSIX, os.get_env uses this buffer for both the key and the value.
@@ -16,6 +78,11 @@ main :: proc() {
 	)
 	log_filter_buffer: [256]u8
 	log_filter := os.get_env(log_filter_buffer[:], "TEMPORAL_CORE_LOG_FILTER")
+	standalone_nexus_probe_buffer: [64]u8
+	standalone_nexus_probe := os.get_env(
+		standalone_nexus_probe_buffer[:],
+		"TEMPORAL_CORE_STANDALONE_NEXUS_PROBE",
+	)
 	runtime_options := temporal_core.runtime_options_default()
 	prometheus_options := temporal_core.Runtime_Prometheus_Options{}
 	logging_options := temporal_core.Runtime_Logging_Options{}
@@ -47,6 +114,9 @@ main :: proc() {
 		os.exit(1)
 	}
 	defer temporal_core.client_close(&client)
+	if standalone_nexus_probe == "1" {
+		probe_standalone_nexus(&client)
+	}
 
 	if nexus_spike == "1" {
 		options := temporal_core.worker_options_default()

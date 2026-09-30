@@ -17,6 +17,25 @@ hello :: proc(ctx: ^nexus.Context, name: string) -> string {
 	return fmt.aprintf("Hello %s", name)
 }
 
+wait_for_cancel :: proc(ctx: ^nexus.Context, _: string) -> nexus.Result(string) {
+	operation_info := nexus.info(ctx)
+	token := fmt.aprintf("standalone-%s", operation_info.request_id)
+	defer delete(token)
+	return nexus.result_async_copy(string, token)
+}
+
+cancel_wait :: proc(ctx: ^nexus.Context, operation_token: string) -> nexus.Cancel_Result {
+	operation_info := nexus.info(ctx)
+	if len(operation_token) == 0 || operation_info.operation_token != operation_token {
+		return nexus.cancel_handler_error(
+			"standalone cancellation token mismatch",
+			"BAD_REQUEST",
+			.Non_Retryable,
+		)
+	}
+	return nexus.cancel_complete()
+}
+
 main :: proc() {
 	runtime, runtime_error := temporal_core.runtime_create()
 	if runtime_error.message != nil {
@@ -57,9 +76,39 @@ main :: proc() {
 		_ = worker.close(&nexus_worker)
 		os.exit(1)
 	}
+	cancel_mode_buffer: [64]u8
+	cancel_mode := os.get_env(cancel_mode_buffer[:], "TEMPORAL_NEXUS_STANDALONE_CANCEL") == "1"
+	max_tasks := 1
+	if cancel_mode {
+		max_tasks = 2
+		wait_error := worker.register_json_nexus_operation_result(
+			&nexus_worker,
+			"odin-greeting-service",
+			"wait-for-cancel",
+			wait_for_cancel,
+		)
+		if wait_error.message != nil {
+			fmt.eprintf("Nexus async operation registration failed: %s\n", string(wait_error.message))
+			worker.error_free(&wait_error)
+			_ = worker.close(&nexus_worker)
+			os.exit(1)
+		}
+		cancel_error := worker.register_nexus_cancel_handler(
+			&nexus_worker,
+			"odin-greeting-service",
+			"wait-for-cancel",
+			cancel_wait,
+		)
+		if cancel_error.message != nil {
+			fmt.eprintf("Nexus cancel handler registration failed: %s\n", string(cancel_error.message))
+			worker.error_free(&cancel_error)
+			_ = worker.close(&nexus_worker)
+			os.exit(1)
+		}
+	}
 
 	fmt.println("Odin Nexus Worker is polling task queue odin-hello-nexus")
-	stats, run_error := worker.run(&nexus_worker, {max_nexus_tasks = 1})
+	stats, run_error := worker.run(&nexus_worker, {max_nexus_tasks = max_tasks})
 	close_error := worker.close(&nexus_worker)
 	if run_error.message != nil {
 		fmt.eprintf("Nexus Worker failed: %s\n", string(run_error.message))
@@ -72,7 +121,8 @@ main :: proc() {
 		worker.error_free(&close_error)
 		os.exit(1)
 	}
-	if stats.nexus_tasks_completed != 1 || stats.nexus_executions_peak_owned != 1 {
+	if stats.nexus_tasks_completed != max_tasks || stats.nexus_executions_peak_owned < 1 ||
+	   stats.nexus_executions_peak_owned > max_tasks {
 		fmt.eprintf(
 			"Unexpected Nexus Worker stats: completed=%d peak=%d\n",
 			stats.nexus_tasks_completed,
@@ -80,5 +130,16 @@ main :: proc() {
 		)
 		os.exit(1)
 	}
-	fmt.println("one synchronous Nexus operation completed and worker shut down cleanly")
+	if cancel_mode {
+		if stats.nexus_cancel_operations_received != 1 {
+			fmt.eprintf(
+				"Expected one standalone Nexus cancellation, observed %d\n",
+				stats.nexus_cancel_operations_received,
+			)
+			os.exit(1)
+		}
+		fmt.println("one asynchronous Nexus operation was canceled and worker shut down cleanly")
+	} else {
+		fmt.println("one synchronous Nexus operation completed and worker shut down cleanly")
+	}
 }

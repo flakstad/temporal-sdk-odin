@@ -1088,6 +1088,56 @@ and finalizes the worker. No endpoint is needed because this test proves the
 bridge symbol, Worker options, Service validation, poll stream, and memory-safe
 shutdown independently of handler dispatch.
 
+It also runs an opt-in standalone Nexus capability probe:
+
+```bash
+TEMPORAL_CORE_STANDALONE_NEXUS_PROBE=1 ./scripts/run-core-connect.sh
+```
+
+The probe sends a valid `StartNexusOperationExecution` request to a deliberately
+missing endpoint. Server 1.29.1 reports gRPC status 12/`UNIMPLEMENTED`; Server
+1.32.0 recognizes the RPC and reports status 5/`NOT_FOUND`. The latter is the
+expected positive capability result. Standalone Nexus is pre-release in Server
+1.32.0 and is disabled by default. A local compatible server can be started
+with Temporal CLI 1.9.1 or later:
+
+```bash
+temporal server start-dev \
+  --headless \
+  --dynamic-config-value 'nexusoperation.enableStandalone=true'
+```
+
+Run the focused 1.32 integration separately with:
+
+```bash
+./scripts/standalone-nexus-integration-test.sh
+```
+
+When the connected Service recognizes the RPC, the main integration script
+also invokes this focused script. It creates an endpoint targeting
+`odin-hello-nexus` and exercises two paths:
+
+```text
+Odin Client start -> Server 1.32 -> Core Nexus poll -> Odin hello handler
+Odin Client poll  <- durable result <- Core completion <- JSON Payload
+
+Odin Client cancel -> Server 1.32 -> Core CancelOperation -> Odin cancel handler
+```
+
+On older Services the exact capability probe remains required and this focused
+branch is skipped; all existing Workflow-to-Nexus integration still runs.
+`RequestCancelNexusOperationExecution` acknowledges the request, not terminal
+operation cancellation. The async integration therefore asserts handler-side
+cancel dispatch/token identity rather than claiming an immediate terminal
+outcome.
+
+The established complete suite is green on Server 1.29.1. A wholesale run on
+1.32.0 currently exposes a separate Workflow-originated Nexus timeout behavior
+change before the conditional standalone branch: the worker sees 11 Nexus
+tasks/no Core-local cancellation instead of 12/one. Keep the focused standalone
+test and the 1.29.1 full-regression run as distinct matrix entries until that
+upstream behavior is classified.
+
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
 Odin Worker runs the stackful caller Workflow, three completer Workflows, and

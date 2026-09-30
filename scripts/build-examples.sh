@@ -22,6 +22,7 @@ build_example client_control temporal-odin-client-control
 build_example schedule_lifecycle temporal-odin-schedule-lifecycle
 build_example hello_activity temporal-odin-hello-activity
 build_example hello_nexus temporal-odin-hello-nexus
+build_example standalone_nexus_client temporal-odin-standalone-nexus-client
 build_example hello_nexus_workflow temporal-odin-hello-nexus-workflow
 build_example hello_workflow temporal-odin-hello-workflow
 build_example eager_workflow temporal-odin-eager-workflow
