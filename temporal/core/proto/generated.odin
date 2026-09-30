@@ -79,6 +79,13 @@ Coresdk_Workflow_Commands_ActivityCancellationType :: enum i32 {
 	ABANDON = 2,
 }
 
+Temporal_Api_Enums_V1_ActivityTaskFailedCause :: enum i32 {
+	ACTIVITY_TASK_FAILED_CAUSE_UNSPECIFIED = 0,
+	ACTIVITY_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE = 1,
+	ACTIVITY_TASK_FAILED_CAUSE_EXTERNAL_STORAGE_FAILURE = 2,
+	ACTIVITY_TASK_FAILED_CAUSE_ACTIVITY_WORKER_UNHANDLED_FAILURE = 3,
+}
+
 Temporal_Api_Enums_V1_ApplicationErrorCategory :: enum i32 {
 	APPLICATION_ERROR_CATEGORY_UNSPECIFIED = 0,
 	APPLICATION_ERROR_CATEGORY_BENIGN = 1,
@@ -181,6 +188,13 @@ Temporal_Api_Enums_V1_EventType :: enum i32 {
 	EVENT_TYPE_WORKFLOW_EXECUTION_PAUSED = 58,
 	EVENT_TYPE_WORKFLOW_EXECUTION_UNPAUSED = 59,
 	EVENT_TYPE_WORKFLOW_EXECUTION_TIME_SKIPPING_TRANSITIONED = 60,
+}
+
+Temporal_Api_Enums_V1_ExecutionType :: enum i32 {
+	EXECUTION_TYPE_UNSPECIFIED = 0,
+	EXECUTION_TYPE_WORKFLOW = 1,
+	EXECUTION_TYPE_ACTIVITY = 2,
+	EXECUTION_TYPE_NEXUS_OPERATION = 3,
 }
 
 Temporal_Api_Enums_V1_HistoryEventFilterType :: enum i32 {
@@ -613,9 +627,11 @@ Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status :: union {
 
 Temporal_Api_Common_V1_Callback_Variant_Nexus :: struct { value: ^Temporal_Api_Common_V1_Callback_Nexus }
 Temporal_Api_Common_V1_Callback_Variant_Internal :: struct { value: ^Temporal_Api_Common_V1_Callback_Internal }
+Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler :: struct { value: ^Temporal_Api_Common_V1_Callback_NexusHandler }
 Temporal_Api_Common_V1_Callback_Variant :: union {
 	Temporal_Api_Common_V1_Callback_Variant_Nexus,
 	Temporal_Api_Common_V1_Callback_Variant_Internal,
+	Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler,
 }
 
 Temporal_Api_Common_V1_Link_Variant_Workflow_Event :: struct { value: ^Temporal_Api_Common_V1_Link_WorkflowEvent }
@@ -623,12 +639,14 @@ Temporal_Api_Common_V1_Link_Variant_Batch_Job :: struct { value: ^Temporal_Api_C
 Temporal_Api_Common_V1_Link_Variant_Activity :: struct { value: ^Temporal_Api_Common_V1_Link_Activity }
 Temporal_Api_Common_V1_Link_Variant_Nexus_Operation :: struct { value: ^Temporal_Api_Common_V1_Link_NexusOperation }
 Temporal_Api_Common_V1_Link_Variant_Workflow :: struct { value: ^Temporal_Api_Common_V1_Link_Workflow }
+Temporal_Api_Common_V1_Link_Variant_Callback :: struct { value: ^Temporal_Api_Common_V1_Link_Callback }
 Temporal_Api_Common_V1_Link_Variant :: union {
 	Temporal_Api_Common_V1_Link_Variant_Workflow_Event,
 	Temporal_Api_Common_V1_Link_Variant_Batch_Job,
 	Temporal_Api_Common_V1_Link_Variant_Activity,
 	Temporal_Api_Common_V1_Link_Variant_Nexus_Operation,
 	Temporal_Api_Common_V1_Link_Variant_Workflow,
+	Temporal_Api_Common_V1_Link_Variant_Callback,
 }
 
 Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref :: struct { value: ^Temporal_Api_Common_V1_Link_WorkflowEvent_EventReference }
@@ -1468,9 +1486,22 @@ Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry :: struct {
 	value: string,
 }
 
+Temporal_Api_Common_V1_Callback_NexusHandler :: struct {
+	task_queue_name: string,
+	service: string,
+	operation: string,
+	source_context: ^Temporal_Api_Common_V1_Payload,
+}
+
 Temporal_Api_Common_V1_DataBlob :: struct {
 	encoding_type: Temporal_Api_Enums_V1_EncodingType,
 	data: []u8,
+}
+
+Temporal_Api_Common_V1_Execution :: struct {
+	type: Temporal_Api_Enums_V1_ExecutionType,
+	business_id: string,
+	run_id: string,
 }
 
 Temporal_Api_Common_V1_FastForwardConfig :: struct {
@@ -1499,6 +1530,13 @@ Temporal_Api_Common_V1_Link_Activity :: struct {
 
 Temporal_Api_Common_V1_Link_BatchJob :: struct {
 	job_id: string,
+}
+
+Temporal_Api_Common_V1_Link_Callback :: struct {
+	namespace: string,
+	execution: ^Temporal_Api_Common_V1_Execution,
+	component_path: [dynamic]string,
+	request_id: string,
 }
 
 Temporal_Api_Common_V1_Link_NexusOperation :: struct {
@@ -1759,6 +1797,7 @@ Temporal_Api_History_V1_ActivityTaskFailedEventAttributes :: struct {
 	identity: string,
 	retry_state: Temporal_Api_Enums_V1_RetryState,
 	worker_version: ^Temporal_Api_Common_V1_WorkerVersionStamp,
+	cause: Temporal_Api_Enums_V1_ActivityTaskFailedCause,
 }
 
 Temporal_Api_History_V1_ActivityTaskScheduledEventAttributes :: struct {
@@ -2637,6 +2676,7 @@ Temporal_Api_Workflow_V1_CallbackInfo :: struct {
 	last_attempt_failure: ^Temporal_Api_Failure_V1_Failure,
 	next_attempt_schedule_time: ^Google_Protobuf_Timestamp,
 	blocked_reason: string,
+	request_id: string,
 }
 
 Temporal_Api_Workflow_V1_CallbackInfo_Trigger :: struct {
@@ -3219,6 +3259,7 @@ Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedByIdRequest :: struct {
 	identity: string,
 	last_heartbeat_details: ^Temporal_Api_Common_V1_Payloads,
 	resource_id: string,
+	cause: Temporal_Api_Enums_V1_ActivityTaskFailedCause,
 }
 
 Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedRequest :: struct {
@@ -3231,6 +3272,7 @@ Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedRequest :: struct {
 	worker_version: ^Temporal_Api_Common_V1_WorkerVersionStamp,
 	deployment: ^Temporal_Api_Deployment_V1_Deployment,
 	deployment_options: ^Temporal_Api_Deployment_V1_WorkerDeploymentOptions,
+	cause: Temporal_Api_Enums_V1_ActivityTaskFailedCause,
 }
 
 Temporal_Api_Workflowservice_V1_SignalWithStartWorkflowExecutionRequest :: struct {
@@ -8130,6 +8172,18 @@ decode_Temporal_Api_Common_V1_Callback :: proc(data: []u8, value: ^Temporal_Api_
 			if !decode_Temporal_Api_Common_V1_Callback_Internal(raw, nested) { return false }
 			temp = nested
 			value.variant = Temporal_Api_Common_V1_Callback_Variant_Internal{value = temp}
+		case 4:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			temp: ^Temporal_Api_Common_V1_Callback_NexusHandler
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			nested := new(Temporal_Api_Common_V1_Callback_NexusHandler)
+			if !decode_Temporal_Api_Common_V1_Callback_NexusHandler(raw, nested) { return false }
+			temp = nested
+			value.variant = Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler{value = temp}
 		case 100:
 			if wire_type != 2 {
 				if !protobuf.skip_value(&decoder, wire_type) { return false }
@@ -8232,6 +8286,53 @@ decode_Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry :: proc(data: []u8, val
 	return decoder.ok
 }
 
+decode_Temporal_Api_Common_V1_Callback_NexusHandler :: proc(data: []u8, value: ^Temporal_Api_Common_V1_Callback_NexusHandler) -> bool {
+	decoder := protobuf.decoder(data)
+	for protobuf.has_more(&decoder) {
+		field_number, wire_type, key_ok := protobuf.read_key(&decoder)
+		if !key_ok { return false }
+		switch field_number {
+		case 1:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.task_queue_name = string(raw)
+		case 2:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.service = string(raw)
+		case 3:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.operation = string(raw)
+		case 4:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			nested := new(Temporal_Api_Common_V1_Payload)
+			if !decode_Temporal_Api_Common_V1_Payload(raw, nested) { return false }
+			value.source_context = nested
+		case:
+			if !protobuf.skip_value(&decoder, wire_type) { return false }
+		}
+	}
+	return decoder.ok
+}
+
 decode_Temporal_Api_Common_V1_DataBlob :: proc(data: []u8, value: ^Temporal_Api_Common_V1_DataBlob) -> bool {
 	decoder := protobuf.decoder(data)
 	for protobuf.has_more(&decoder) {
@@ -8254,6 +8355,43 @@ decode_Temporal_Api_Common_V1_DataBlob :: proc(data: []u8, value: ^Temporal_Api_
 			raw, value_ok := protobuf.read_bytes(&decoder)
 			if !value_ok { return false }
 			value.data = raw
+		case:
+			if !protobuf.skip_value(&decoder, wire_type) { return false }
+		}
+	}
+	return decoder.ok
+}
+
+decode_Temporal_Api_Common_V1_Execution :: proc(data: []u8, value: ^Temporal_Api_Common_V1_Execution) -> bool {
+	decoder := protobuf.decoder(data)
+	for protobuf.has_more(&decoder) {
+		field_number, wire_type, key_ok := protobuf.read_key(&decoder)
+		if !key_ok { return false }
+		switch field_number {
+		case 1:
+			if wire_type != 0 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_varint(&decoder)
+			if !value_ok { return false }
+			value.type = Temporal_Api_Enums_V1_ExecutionType(raw)
+		case 2:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.business_id = string(raw)
+		case 3:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.run_id = string(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -8414,6 +8552,18 @@ decode_Temporal_Api_Common_V1_Link :: proc(data: []u8, value: ^Temporal_Api_Comm
 			if !decode_Temporal_Api_Common_V1_Link_Workflow(raw, nested) { return false }
 			temp = nested
 			value.variant = Temporal_Api_Common_V1_Link_Variant_Workflow{value = temp}
+		case 6:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			temp: ^Temporal_Api_Common_V1_Link_Callback
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			nested := new(Temporal_Api_Common_V1_Link_Callback)
+			if !decode_Temporal_Api_Common_V1_Link_Callback(raw, nested) { return false }
+			temp = nested
+			value.variant = Temporal_Api_Common_V1_Link_Variant_Callback{value = temp}
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -8472,6 +8622,55 @@ decode_Temporal_Api_Common_V1_Link_BatchJob :: proc(data: []u8, value: ^Temporal
 			raw, value_ok := protobuf.read_bytes(&decoder)
 			if !value_ok { return false }
 			value.job_id = string(raw)
+		case:
+			if !protobuf.skip_value(&decoder, wire_type) { return false }
+		}
+	}
+	return decoder.ok
+}
+
+decode_Temporal_Api_Common_V1_Link_Callback :: proc(data: []u8, value: ^Temporal_Api_Common_V1_Link_Callback) -> bool {
+	decoder := protobuf.decoder(data)
+	for protobuf.has_more(&decoder) {
+		field_number, wire_type, key_ok := protobuf.read_key(&decoder)
+		if !key_ok { return false }
+		switch field_number {
+		case 1:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.namespace = string(raw)
+		case 2:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			nested := new(Temporal_Api_Common_V1_Execution)
+			if !decode_Temporal_Api_Common_V1_Execution(raw, nested) { return false }
+			value.execution = nested
+		case 3:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			temp: string
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			temp = string(raw)
+			append(&value.component_path, temp)
+		case 4:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.request_id = string(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -10278,6 +10477,14 @@ decode_Temporal_Api_History_V1_ActivityTaskFailedEventAttributes :: proc(data: [
 			nested := new(Temporal_Api_Common_V1_WorkerVersionStamp)
 			if !decode_Temporal_Api_Common_V1_WorkerVersionStamp(raw, nested) { return false }
 			value.worker_version = nested
+		case 7:
+			if wire_type != 0 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_varint(&decoder)
+			if !value_ok { return false }
+			value.cause = Temporal_Api_Enums_V1_ActivityTaskFailedCause(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -17470,6 +17677,14 @@ decode_Temporal_Api_Workflow_V1_CallbackInfo :: proc(data: []u8, value: ^Tempora
 			raw, value_ok := protobuf.read_bytes(&decoder)
 			if !value_ok { return false }
 			value.blocked_reason = string(raw)
+		case 10:
+			if wire_type != 2 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_bytes(&decoder)
+			if !value_ok { return false }
+			value.request_id = string(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -21795,6 +22010,14 @@ decode_Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedByIdRequest :: p
 			raw, value_ok := protobuf.read_bytes(&decoder)
 			if !value_ok { return false }
 			value.resource_id = string(raw)
+		case 9:
+			if wire_type != 0 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_varint(&decoder)
+			if !value_ok { return false }
+			value.cause = Temporal_Api_Enums_V1_ActivityTaskFailedCause(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -21890,6 +22113,14 @@ decode_Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedRequest :: proc(
 			nested := new(Temporal_Api_Deployment_V1_WorkerDeploymentOptions)
 			if !decode_Temporal_Api_Deployment_V1_WorkerDeploymentOptions(raw, nested) { return false }
 			value.deployment_options = nested
+		case 10:
+			if wire_type != 0 {
+				if !protobuf.skip_value(&decoder, wire_type) { return false }
+				continue
+			}
+			raw, value_ok := protobuf.read_varint(&decoder)
+			if !value_ok { return false }
+			value.cause = Temporal_Api_Enums_V1_ActivityTaskFailedCause(raw)
 		case:
 			if !protobuf.skip_value(&decoder, wire_type) { return false }
 		}
@@ -24851,6 +25082,10 @@ encode_Temporal_Api_Common_V1_Callback :: proc(value: ^Temporal_Api_Common_V1_Ca
 		nested := encode_Temporal_Api_Common_V1_Callback_Internal(variant.value)
 		protobuf.append_bytes_field(&result, 3, nested[:])
 		delete(nested)
+	case Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler:
+		nested := encode_Temporal_Api_Common_V1_Callback_NexusHandler(variant.value)
+		protobuf.append_bytes_field(&result, 4, nested[:])
+		delete(nested)
 	}
 	return result
 }
@@ -24887,6 +25122,25 @@ encode_Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry :: proc(value: ^Tempora
 	return result
 }
 
+encode_Temporal_Api_Common_V1_Callback_NexusHandler :: proc(value: ^Temporal_Api_Common_V1_Callback_NexusHandler) -> [dynamic]u8 {
+	result := make([dynamic]u8)
+	if len(value.task_queue_name) > 0 {
+		protobuf.append_string_field(&result, 1, value.task_queue_name)
+	}
+	if len(value.service) > 0 {
+		protobuf.append_string_field(&result, 2, value.service)
+	}
+	if len(value.operation) > 0 {
+		protobuf.append_string_field(&result, 3, value.operation)
+	}
+	if value.source_context != nil {
+		nested := encode_Temporal_Api_Common_V1_Payload(value.source_context)
+		protobuf.append_bytes_field(&result, 4, nested[:])
+		delete(nested)
+	}
+	return result
+}
+
 encode_Temporal_Api_Common_V1_DataBlob :: proc(value: ^Temporal_Api_Common_V1_DataBlob) -> [dynamic]u8 {
 	result := make([dynamic]u8)
 	if i32(value.encoding_type) != 0 {
@@ -24894,6 +25148,20 @@ encode_Temporal_Api_Common_V1_DataBlob :: proc(value: ^Temporal_Api_Common_V1_Da
 	}
 	if len(value.data) > 0 {
 		protobuf.append_bytes_field(&result, 2, value.data)
+	}
+	return result
+}
+
+encode_Temporal_Api_Common_V1_Execution :: proc(value: ^Temporal_Api_Common_V1_Execution) -> [dynamic]u8 {
+	result := make([dynamic]u8)
+	if i32(value.type) != 0 {
+		protobuf.append_varint_field(&result, 1, u64(i64(value.type)))
+	}
+	if len(value.business_id) > 0 {
+		protobuf.append_string_field(&result, 2, value.business_id)
+	}
+	if len(value.run_id) > 0 {
+		protobuf.append_string_field(&result, 3, value.run_id)
 	}
 	return result
 }
@@ -24957,6 +25225,10 @@ encode_Temporal_Api_Common_V1_Link :: proc(value: ^Temporal_Api_Common_V1_Link) 
 		nested := encode_Temporal_Api_Common_V1_Link_Workflow(variant.value)
 		protobuf.append_bytes_field(&result, 5, nested[:])
 		delete(nested)
+	case Temporal_Api_Common_V1_Link_Variant_Callback:
+		nested := encode_Temporal_Api_Common_V1_Link_Callback(variant.value)
+		protobuf.append_bytes_field(&result, 6, nested[:])
+		delete(nested)
 	}
 	return result
 }
@@ -24979,6 +25251,25 @@ encode_Temporal_Api_Common_V1_Link_BatchJob :: proc(value: ^Temporal_Api_Common_
 	result := make([dynamic]u8)
 	if len(value.job_id) > 0 {
 		protobuf.append_string_field(&result, 1, value.job_id)
+	}
+	return result
+}
+
+encode_Temporal_Api_Common_V1_Link_Callback :: proc(value: ^Temporal_Api_Common_V1_Link_Callback) -> [dynamic]u8 {
+	result := make([dynamic]u8)
+	if len(value.namespace) > 0 {
+		protobuf.append_string_field(&result, 1, value.namespace)
+	}
+	if value.execution != nil {
+		nested := encode_Temporal_Api_Common_V1_Execution(value.execution)
+		protobuf.append_bytes_field(&result, 2, nested[:])
+		delete(nested)
+	}
+	for index in 0..<len(value.component_path) {
+		protobuf.append_string_field(&result, 3, value.component_path[index])
+	}
+	if len(value.request_id) > 0 {
+		protobuf.append_string_field(&result, 4, value.request_id)
 	}
 	return result
 }
@@ -25699,6 +25990,9 @@ encode_Temporal_Api_History_V1_ActivityTaskFailedEventAttributes :: proc(value: 
 		nested := encode_Temporal_Api_Common_V1_WorkerVersionStamp(value.worker_version)
 		protobuf.append_bytes_field(&result, 6, nested[:])
 		delete(nested)
+	}
+	if i32(value.cause) != 0 {
+		protobuf.append_varint_field(&result, 7, u64(i64(value.cause)))
 	}
 	return result
 }
@@ -28622,6 +28916,9 @@ encode_Temporal_Api_Workflow_V1_CallbackInfo :: proc(value: ^Temporal_Api_Workfl
 	if len(value.blocked_reason) > 0 {
 		protobuf.append_string_field(&result, 9, value.blocked_reason)
 	}
+	if len(value.request_id) > 0 {
+		protobuf.append_string_field(&result, 10, value.request_id)
+	}
 	return result
 }
 
@@ -30445,6 +30742,9 @@ encode_Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedByIdRequest :: p
 	if len(value.resource_id) > 0 {
 		protobuf.append_string_field(&result, 8, value.resource_id)
 	}
+	if i32(value.cause) != 0 {
+		protobuf.append_varint_field(&result, 9, u64(i64(value.cause)))
+	}
 	return result
 }
 
@@ -30486,6 +30786,9 @@ encode_Temporal_Api_Workflowservice_V1_RespondActivityTaskFailedRequest :: proc(
 		nested := encode_Temporal_Api_Deployment_V1_WorkerDeploymentOptions(value.deployment_options)
 		protobuf.append_bytes_field(&result, 8, nested[:])
 		delete(nested)
+	}
+	if i32(value.cause) != 0 {
+		protobuf.append_varint_field(&result, 10, u64(i64(value.cause)))
 	}
 	return result
 }

@@ -30,13 +30,14 @@ property, replay, and live Service-history tests cover this boundary.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
-`temporalio/sdk-rust@399cb7adb40f45eefbef90149e212743e474142c`, the upstream
-release commit pinned by the inspected `sdk-dotnet` main branch (`sdk-core`
-crate 0.9.0; client/common crates 1.0.0). We also inspected
-`sdk-rust` main at `0eb03f213079e539c18fb738c32a70bc191aadf4` and
-`sdk-dotnet` at `f8b622e45ec553cbfeee8c508c4a7a989a1292c6` to detect newer
-direction. The generated C header and C-bridge Cargo manifest were byte-for-byte
-unchanged between the selected pin and that newer sdk-rust main snapshot.
+`temporalio/sdk-rust@e163abd6dc19040064986a63c8b8cf4756ffd320`, upstream main
+as inspected on 2026-09-30 and the revision pinned by `sdk-python` commit
+`5bb461265e6c1af29c5f25dbb871a7e67448c61e`. It contains `sdk-core` crate
+0.9.0 and client/common crates 1.0.0, ten commits after the `core-v0.9.0`
+release baseline `399cb7adb40f45eefbef90149e212743e474142c`. The generated C
+header and C-bridge Cargo manifest are byte-for-byte unchanged from that
+baseline; the upgrade changes Core behavior, Rust dependencies, and protobuf
+schemas without changing Odin's raw ABI layout.
 
 ## Decision
 
@@ -69,7 +70,7 @@ artifacts. We must pin, build, test, and package it as part of this SDK.
 
 ## What upstream says a language SDK does
 
-Core's own [architecture document](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/ARCHITECTURE.md)
+Core's own [architecture document](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/ARCHITECTURE.md)
 defines a Core-based SDK as two layers. Core communicates with the Temporal
 Service, polls tasks, processes history, advances Temporal state machines, and
 accepts completions. The language layer polls Core, invokes user code, returns
@@ -149,9 +150,9 @@ input to this ABI and is not part of the current replay path.
 ## The C bridge that exists today
 
 The bridge source is
-[`crates/sdk-core-c-bridge`](https://github.com/temporalio/sdk-rust/tree/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core-c-bridge).
+[`crates/sdk-core-c-bridge`](https://github.com/temporalio/sdk-rust/tree/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core-c-bridge).
 Its generated
-[`temporal-sdk-core-c-bridge.h`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h)
+[`temporal-sdk-core-c-bridge.h`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h)
 is the ABI source of truth.
 
 The bridge exposes opaque handles plus C-layout options and callback APIs:
@@ -393,9 +394,10 @@ Ordinary Workflow start additionally exposes the Service protobuf's repeated
 Each entry maps exactly to `temporal.api.common.v1.Callback.Nexus`: URL plus
 string header map and optional Temporal Links. Ordinary start options can
 attach the same links to the new Workflow. The public tagged `Link` model maps
-all five variants in the pinned common schema: `WorkflowEvent`, `BatchJob`,
-`Activity`, `NexusOperation`, and `Workflow`. `WorkflowEvent` supports both
-event-ID and request-ID references. Odin validates each variant, constructs the
+all six variants in the pinned common schema: `WorkflowEvent`, `BatchJob`,
+`Activity`, `NexusOperation`, `Workflow`, and `Callback`. Callback links include
+an execution kind and identity, optional component path, and dispatch request
+ID. `WorkflowEvent` supports both event-ID and request-ID references. Odin validates each variant, constructs the
 temporary protobuf graph, and discards it immediately after synchronous
 encoding. The Service, not Core or the Odin process, invokes that URL when the
 started Workflow reaches a terminal result. `SignalWithStartWorkflowExecution`
@@ -420,12 +422,11 @@ live suite, whose authority is nonempty and whose event reference omits the
 `referenceType` field. Parsed strings are allocated with the caller-selected
 allocator and must be released once with `link_free`; caller-constructed Link
 strings remain borrowed for synchronous request encoding. The pinned schema's
-`BatchJob` variant is encoding-only because upstream defines no Nexus URL
-mapping for it. The current Python SDK's generated common API at commit
+`BatchJob` and `Callback` variants are encoding-only because upstream defines
+no Nexus URL mapping for them. The current Python SDK's generated common API at commit
 [`5bb4612`](https://github.com/temporalio/sdk-python/blob/5bb461265e6c1af29c5f25dbb871a7e67448c61e/temporalio/api/common/v1/message_pb2.pyi)
-shows a subsequently added `Callback` Link variant. It is absent from pinned
-Core `core-v0.9.0`; that is an explicit version-skew item rather than a locally
-invented extension.
+and the pinned Core schema are the source for the `Callback` shape; the Odin
+SDK does not invent a URL form that the upstream converter does not define.
 
 ### Worker and activity tasks
 
@@ -433,14 +434,14 @@ invented extension.
 Separate poll calls exist for workflow activations, activity tasks, and Nexus
 tasks. The language layer controls poll concurrency and dispatch.
 
-An [`ActivityTask`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/activity_task/activity_task.proto)
+An [`ActivityTask`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/activity_task/activity_task.proto)
 contains a task token and a `oneof`: start or cancel. A start includes activity
 type, workflow identity, inputs/headers as Temporal `Payload`s, attempt and
 timeout data, heartbeat details, retry policy, priority, and local/remote state.
 The language layer looks up the registered Odin procedure and executes it.
 
 The result is an
-[`ActivityTaskCompletion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/core_interface.proto)
+[`ActivityTaskCompletion`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/core_interface.proto)
 with the original task token and an `ActivityExecutionResult`: completed,
 failed, cancelled, or asynchronously completing. Heartbeats are a separate
 protobuf call. Core sends the correct server RPC and manages server-facing
@@ -533,9 +534,9 @@ response. Async success through a Workflow completion callback and all four
 cancellation policies are live-proven. The handler also
 preserves Core's raw Nexus links, parses all four upstream URL/type forms into
 the generic pinned Link model, and attaches those values to callbacks and
-ordinary Workflow starts. All five pinned protobuf variants encode; `BatchJob`
-is encoding-only because upstream has no Nexus URL converter for it. Outbound
-metrics are not implemented. The
+ordinary Workflow starts. All six pinned protobuf variants encode; `BatchJob`
+and `Callback` are encoding-only because upstream has no Nexus URL converter
+for them. Outbound metrics are not implemented. The
 outbound interceptor and selector/join integration are implemented.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
@@ -625,14 +626,14 @@ than only an in-process codec round trip.
 
 ### Workflow activations and completions
 
-[`WorkflowActivation`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto)
+[`WorkflowActivation`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto)
 has a run ID, workflow time, replay flag, deterministic history length, and an
 ordered list of jobs. Jobs include initialization, timer firing, activity
 resolution, signal/query/update delivery, child/external workflow resolution,
 random seed changes, patch notification, Nexus resolution, and cache eviction.
 
 The language runtime consumes all jobs for an activation and returns a
-[`WorkflowActivationCompletion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_completion/workflow_completion.proto).
+[`WorkflowActivationCompletion`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_completion/workflow_completion.proto).
 A success carries ordered `WorkflowCommand`s—start/cancel timer, schedule/cancel
 activity, complete/fail/cancel workflow, child/external operations, queries,
 updates, memo property modifications, Search Attribute upserts, and more. A
@@ -986,7 +987,7 @@ Original live-server verification environment:
   `dev-2026-09:a2fb372b7`);
 - Temporal CLI 1.5.1, dev server 1.29.1;
 - macOS arm64;
-- Core C bridge pinned at `399cb7a`;
+- Core C bridge pinned at `e163abd`;
 - runtime lifecycle tests green;
 - end-to-end `GetSystemInfo` green through a directly started
   `temporal server start-dev --headless` process.
@@ -1328,7 +1329,7 @@ growable table. Command protobuf objects are activation-arena-owned until the
 completion is encoded, allowing one completion to contain multiple commands.
 This shape follows two current upstream boundaries: the pinned Rust Workflow
 runtime [applies every activation job and returns their results before routines
-are polled](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/instance.rs),
+are polled](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/runtime/instance.rs),
 while the TypeScript runtime keeps
 [seq-keyed completion maps and an activation command buffer](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
 
@@ -1503,12 +1504,12 @@ await. A second test covers the direct path where a fiber already in
 ### Read-only Workflow queries
 
 Queries cross two distinct protobuf boundaries. The public Client sends
-[`QueryWorkflowRequest`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/api_upstream/temporal/api/workflowservice/v1/request_response.proto#L1179)
+[`QueryWorkflowRequest`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/api_upstream/temporal/api/workflowservice/v1/request_response.proto#L1185)
 through the C bridge's generic WorkflowService RPC call. Core then delivers a
-[`QueryWorkflow`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L282)
+[`QueryWorkflow`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L282)
 activation job with query ID/type, repeated argument Payloads, and headers. The
 language SDK must return a
-[`QueryResult`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L179)
+[`QueryResult`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L179)
 command with the same ID and either one success Payload or a Temporal Failure.
 Core owns query transport and server coordination; handler registration,
 dispatch, codec conversion, state access, and failure construction belong to
@@ -1581,7 +1582,7 @@ only at Client start/Describe today.
 ### Workflow Update routines
 
 Core delivers durable Updates as
-[`DoUpdate`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L343)
+[`DoUpdate`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_activation/workflow_activation.proto#L343)
 jobs. The user-visible Update ID and Core's `protocol_instance_id` are distinct;
 every language response must echo the protocol instance ID. The completion
 contract is stricter than queries:
@@ -1596,7 +1597,7 @@ contract is stricter than queries:
   state mutation, and still emits the same `Accepted` plus terminal sequence.
 
 These rules come directly from
-[`UpdateResponse`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L346)
+[`UpdateResponse`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/workflow_commands/workflow_commands.proto#L355)
 and Core's Update state machine, which explicitly supports immediate
 accept-and-complete. Update responses are emitted before ordinary Workflow
 commands so an activation that also closes the Workflow cannot place its
@@ -1618,9 +1619,9 @@ the existing Temporal-aware primitives operate unchanged while preventing an
 Update wait from replacing the main Workflow's wait.
 
 This matches the pinned Rust language runtime's separation between
-[`RoutineKind::Update` and `UpdateRoutineCompletion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/types.rs)
+[`RoutineKind::Update` and `UpdateRoutineCompletion`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/runtime/types.rs)
 and its creation of a separately polled routine after inline validation in
-[`start_update_routine`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/instance.rs).
+[`start_update_routine`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/runtime/instance.rs).
 
 Activation jobs are applied first. Ready Update routines are then resumed in
 registration order before the main Workflow fiber, matching Core's documented
@@ -1640,7 +1641,7 @@ all accepted handlers. It suspends only the main fiber; Update completions are
 emitted before the main fiber resumes and closes. Calling it from an Update
 handler is rejected because the handler would wait on itself. This follows
 Core's Rust
-[`WorkflowContext::all_handlers_finished`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/workflow_context.rs#L2302-L2312)
+[`WorkflowContext::all_handlers_finished`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/workflow_context.rs#L2302-L2312)
 condition and the same opt-in waiting model documented for
 [Python message handlers](https://docs.temporal.io/develop/python/message-passing#ensure-your-handlers-finish-before-the-workflow-completes)
 and Go's
@@ -1954,7 +1955,7 @@ mutated their input. Thus a sleep call composes both boundaries without making
 direct `start_timer` pretend to suspend.
 
 This distinction follows pinned Core revision
-`399cb7adb40f45eefbef90149e212743e474142c`: Rust
+`e163abd6dc19040064986a63c8b8cf4756ffd320`: Rust
 `WorkflowInterceptor::start_timer` accepts `StartTimerInput`/`TimerOptions` and
 returns `CancellableWorkflowOutboundFuture<TimerResult>`, while
 `WorkflowContext::timer` calls that chain before preparing the Future. Odin's
@@ -2060,7 +2061,7 @@ remain before the routine API can be considered stable.
 ### Workflow Signal handlers
 
 The pinned Rust runtime represents every asynchronous Signal invocation as a
-[`RoutineKind::Signal`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/runtime/types.rs#L70-L82).
+[`RoutineKind::Signal`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/runtime/types.rs#L70-L82).
 `start_signal_routine` decodes the input, starts a separately polled handler,
 and tracks it in the same active-handler count used by
 `all_handlers_finished`. Unlike an Update, a Signal has no accepted/completed
@@ -2113,7 +2114,7 @@ Handler failure now has an explicit Core/language lifecycle test. A handler
 failure produces a failed `WorkflowActivationCompletion` with
 `WorkflowWorkerUnhandledFailure`; it does not directly fail the Workflow
 Execution. Pinned Core
-[`failed_completion`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core/src/worker/workflow/managed_run.rs#L598-L680)
+[`failed_completion`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core/src/worker/workflow/managed_run.rs#L598-L680)
 requests language cache eviction and reports the Workflow Task failure only for
 the first task attempt. Odin keeps the failed fiber routable only until the
 corresponding `RemoveFromCache(LANG_FAIL)`, then destroys it. The retry rebuilds
@@ -2172,7 +2173,7 @@ and the TypeScript runtime's
 [root cancellation-scope handling](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/internals.ts).
 
 The pinned Rust Workflow crate confirms the intended split. It owns a root
-[`WorkflowCancellationToken`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/workflow/src/cancellation.rs),
+[`WorkflowCancellationToken`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/workflow/src/cancellation.rs),
 cancels it from `notify_cancel`, and lets operation options override the root
 with another token. A newly created token is detached; a child token inherits
 its parent. This policy lives above the Core C bridge: Core delivers
@@ -2361,7 +2362,7 @@ Core's architecture assigns task dispatch and concurrency to the language SDK:
 the language layer continuously polls each enabled task kind, invokes user
 code, and returns completions, using language-appropriate threads or
 coroutines. The pinned
-[Core architecture document](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/ARCHITECTURE.md)
+[Core architecture document](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/ARCHITECTURE.md)
 is explicit that this concurrency is not supplied by Core.
 
 The first reusable Odin worker implements this boundary:
@@ -2621,7 +2622,7 @@ The language boundary has three materially different failure outcomes:
 | Bridge/protocol invariant prevents any valid completion | Poll/decode/routing/Core completion error | Stop `worker.run` and initiate shutdown |
 
 The second row matches the pinned Rust SDK's
-[`worker_handles_unknown_workflow_types_gracefully`](https://github.com/temporalio/sdk-rust/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core/tests/integ_tests/worker_tests.rs)
+[`worker_handles_unknown_workflow_types_gracefully`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core/tests/integ_tests/worker_tests.rs)
 behavior. It is intentionally a retryable Workflow Task failure, not a terminal
 Workflow Execution failure. Core follows the failed completion with
 `RemoveFromCache`; Odin keeps a small rejected-run table so it can acknowledge
@@ -2745,9 +2746,9 @@ Workflows are enabled.
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Callback
    completion and generic pinned-schema Link encoding are implemented; four
-   upstream Nexus URL/type forms parse with explicit ownership. `BatchJob` has
-   no upstream URL mapping, and current upstream's newer `Callback` Link waits
-   on a deliberate Core/schema upgrade. Outbound metrics remain. Async token
+   upstream Nexus URL/type forms parse with explicit ownership. All six pinned
+   variants encode, while `BatchJob` and `Callback` have no upstream URL
+   mapping. Outbound metrics remain. Async token
    handoff, Workflow-backed callback
    completion, caller/completer linking, and every cancellation policy are
    live-proven. Runtime state transitions for those policies are also
@@ -2777,15 +2778,15 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The next smallest vertical milestone is a bounded pinned-Core upgrade
-assessment. Generic Links exposed the first concrete schema skew: current
-upstream has a `Callback` Link variant that pinned Core `core-v0.9.0` does not.
-The assessment should update Core and generated protos on an isolated branch,
-compile every raw ABI symbol, run the full unit/property/live suite, and record
-only behavior or ABI changes that affect Odin. If that upgrade remains small,
-land it before adding APIs that would otherwise freeze an already-old schema;
-if it is disruptive, retain the pin and publish an explicit compatibility
-matrix. The selector/join branch, async
+The next smallest vertical milestone is a capability probe for the new
+standalone Nexus-operation WorkflowService RPCs carried by the upgraded schema.
+First generate only the request/response graph needed for
+`StartNexusOperationExecution`, call it through Core's generic RPC dispatcher
+against `temporal server start-dev`, and record whether CLI Server 1.29.1
+supports it. If supported, add an owned handle plus start/poll/cancel as one
+vertical Client slice. If the server rejects it as unimplemented, retain exact
+wire tests and defer the public API until the supported-server matrix has a
+live target. The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,
 and/or property-tested as applicable; selector ordering and all four
 cancellation-policy transitions are also property-tested.
@@ -3207,7 +3208,7 @@ leaving the Workflow Execution running so a compatible deployment can repair
 it, matching Temporal's
 [execution-failure guidance](https://github.com/temporalio/documentation/blob/main/docs/troubleshooting/execution-failures.mdx).
 The pinned C bridge's
-[`WorkerOptions` conversion](https://github.com/temporalio/sdk-core/blob/399cb7adb40f45eefbef90149e212743e474142c/crates/sdk-core-c-bridge/src/worker.rs)
+[`WorkerOptions` conversion](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core-c-bridge/src/worker.rs)
 exposes two inputs on `TemporalCoreWorkerOptions`:
 `nondeterminism_as_workflow_fail` applies terminal failure globally, while
 `nondeterminism_as_workflow_fail_for_types` applies it to named Workflow types.

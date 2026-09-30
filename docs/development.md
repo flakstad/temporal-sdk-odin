@@ -3,9 +3,11 @@
 ## Toolchain and pinned dependency
 
 The repository pins `temporalio/sdk-rust` as the `native/sdk-core` submodule at
-commit `399cb7adb40f45eefbef90149e212743e474142c`. That upstream release commit
-contains `sdk-core` crate 0.9.0 and client/common crates 1.0.0, and is pinned by
-`sdk-dotnet` main as inspected on 2026-09-25.
+commit `e163abd6dc19040064986a63c8b8cf4756ffd320`. This immutable upstream-main
+snapshot was inspected on 2026-09-30 and is also the Core revision pinned by
+`sdk-python` commit `5bb461265e6c1af29c5f25dbb871a7e67448c61e`. It contains
+`sdk-core` crate 0.9.0 and client/common crates 1.0.0 plus ten commits after the
+`core-v0.9.0` release baseline.
 The same commit is recorded in `native/sdk-core-revision.txt` so source archives
 without Git metadata retain a machine-readable native dependency identity.
 
@@ -29,6 +31,40 @@ When changing the Core pin:
 3. Diff the generated C header against `temporal/core/raw/raw.odin`.
 4. Update ABI size/offset assertions and run all tests on every supported target.
 5. Review Core protobuf schema changes before regenerating language types.
+
+### Core upgrade record: 2026-09-30
+
+The current pin advances ten upstream commits from release baseline
+`399cb7adb40f45eefbef90149e212743e474142c` to
+`e163abd6dc19040064986a63c8b8cf4756ffd320`. The latter was `sdk-rust/main`
+when selected and is also consumed by the inspected `sdk-python` revision.
+The comparison produced these concrete results:
+
+- the generated C header has the same SHA-256 at both revisions,
+  `d0f7f6a53c7d8dd0e55ce1006b3fb2bc69ba0ee7b2328f714d4b0b3ba6ee2b25`,
+  so no Odin raw binding, size, offset, symbol, or ownership contract changed;
+- the generated Odin protobuf graph grows additively with Activity failure
+  causes, execution identity, `Callback.NexusHandler`, `Link.Callback`, and
+  related callback/request metadata;
+- the wrapper lockfile records upstream's `wit-bindgen` 0.61.1 update;
+- Core fixes transient poll-target reduction, non-sticky polling under sticky
+  saturation, repeated oversized Workflow-task failure reporting, and Local
+  Activity resolution ordering during replay.
+
+The repository generator tests, three Rust generator tests, 179 Odin unit
+tests, and 57 property tests pass on the new pin. The complete CLI-devserver
+integration suite also exits successfully, covering Core lifecycle, Client
+RPCs, Nexus, Activity and Workflow workers, cache/eviction, Local Activities,
+Child Workflows, updates/signals/queries, deployment versioning, and offline
+replay. The `macos-arm64` native archive builds with the new revision in its
+manifest and passes the packaged ABI init/shutdown smoke test. This is therefore
+a tested pin upgrade, not schema-only adoption.
+
+The upgrade exposed and fixed a build-integrity bug in `build-core.sh`. Its old
+check compared the revision file with the superproject's committed `HEAD`, even
+when a different indexed and checked-out submodule was being compiled. It now
+requires the revision file, indexed gitlink, and actual submodule `HEAD` to be
+identical before Cargo runs.
 
 ## Build
 

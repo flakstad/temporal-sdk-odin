@@ -7,9 +7,11 @@ sdk_core_revision_file="$repo_root/native/sdk-core-revision.txt"
 if git -C "$repo_root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git -C "$repo_root" submodule update --init --recursive
   expected_sdk_core_revision="$(tr -d '[:space:]' <"$sdk_core_revision_file")"
-  actual_sdk_core_revision="$(git -C "$repo_root" rev-parse HEAD:native/sdk-core)"
-  if [[ "$actual_sdk_core_revision" != "$expected_sdk_core_revision" ]]; then
-    echo "native/sdk-core-revision.txt does not match the pinned sdk-core gitlink" >&2
+  checked_out_sdk_core_revision="$(git -C "$repo_root/native/sdk-core" rev-parse HEAD)"
+  indexed_sdk_core_revision="$(git -C "$repo_root" ls-files --stage -- native/sdk-core | cut -d' ' -f2)"
+  if [[ "$checked_out_sdk_core_revision" != "$expected_sdk_core_revision" ||
+        "$indexed_sdk_core_revision" != "$expected_sdk_core_revision" ]]; then
+    echo "native/sdk-core-revision.txt, the checked-out Core, and its gitlink must match" >&2
     exit 1
   fi
 elif [[ ! -f "$repo_root/native/sdk-core/crates/sdk-core-c-bridge/Cargo.toml" ||

@@ -11,6 +11,7 @@ NEXUS_LINK_TYPE_BATCH_JOB :: "temporal.api.common.v1.Link.BatchJob"
 NEXUS_LINK_TYPE_ACTIVITY :: "temporal.api.common.v1.Link.Activity"
 NEXUS_LINK_TYPE_NEXUS_OPERATION :: "temporal.api.common.v1.Link.NexusOperation"
 NEXUS_LINK_TYPE_WORKFLOW :: "temporal.api.common.v1.Link.Workflow"
+NEXUS_LINK_TYPE_CALLBACK :: "temporal.api.common.v1.Link.Callback"
 
 Workflow_Event_Reference_Kind :: enum {
 	None,
@@ -24,6 +25,14 @@ Link_Kind :: enum {
 	Activity,
 	Nexus_Operation,
 	Workflow,
+	Callback,
+}
+
+Execution_Kind :: enum i32 {
+	Unspecified,
+	Workflow,
+	Activity,
+	Nexus_Operation,
 }
 
 Batch_Job_Link :: struct {
@@ -49,7 +58,16 @@ Workflow_Link :: struct {
 	reason:      string,
 }
 
-// Link mirrors the five variants in the pinned common.v1.Link protobuf. Values
+Callback_Link :: struct {
+	namespace:      string,
+	execution_kind: Execution_Kind,
+	business_id:    string,
+	run_id:         string,
+	component_path: []string,
+	request_id:     string,
+}
+
+// Link mirrors the six variants in the pinned common.v1.Link protobuf. Values
 // constructed by callers are borrowed during synchronous request encoding.
 // Values returned by link_from_nexus own decoded strings and must be released
 // with link_free.
@@ -60,6 +78,7 @@ Link :: struct {
 	activity:        Activity_Link,
 	nexus_operation: Nexus_Operation_Link,
 	workflow:        Workflow_Link,
+	callback:        Callback_Link,
 	owner_allocator: allocator_runtime.Allocator,
 	owned_strings:   [4]string,
 	owned_count:     int,
@@ -278,6 +297,8 @@ link_from_nexus :: proc(
 		expected_parts = 6
 	case NEXUS_LINK_TYPE_BATCH_JOB:
 		return {}, error_from_string(.Invalid_Argument, "BatchJob links have no upstream Nexus URL mapping")
+	case NEXUS_LINK_TYPE_CALLBACK:
+		return {}, error_from_string(.Invalid_Argument, "Callback links have no upstream Nexus URL mapping")
 	case:
 		return {}, error_from_string(.Invalid_Argument, "Nexus link has an unsupported Temporal link type")
 	}
@@ -361,6 +382,8 @@ link_from_nexus :: proc(
 		}
 	case .Batch_Job:
 		unreachable()
+	case .Callback:
+		unreachable()
 	}
 	succeeded = true
 	return result, {}
@@ -387,6 +410,17 @@ link_error :: proc(link: Link) -> string {
 		   len(link.workflow.run_id) == 0 {
 			return "Workflow links require namespace, Workflow ID, and Run ID"
 		}
+	case .Callback:
+		if len(link.callback.namespace) == 0 || link.callback.execution_kind == .Unspecified ||
+		   i32(link.callback.execution_kind) < i32(Execution_Kind.Unspecified) ||
+		   i32(link.callback.execution_kind) > i32(Execution_Kind.Nexus_Operation) ||
+		   len(link.callback.business_id) == 0 || len(link.callback.run_id) == 0 ||
+		   len(link.callback.request_id) == 0 {
+			return "Callback links require namespace, execution kind, business ID, Run ID, and request ID"
+		}
+		for component in link.callback.component_path {
+			if len(component) == 0 do return "Callback link component paths must not contain empty values"
+		}
 	case:
 		return "Temporal links require a known Link kind"
 	}
@@ -401,6 +435,9 @@ Encoded_Link_Storage :: struct {
 	activities:       []proto.Temporal_Api_Common_V1_Link_Activity,
 	nexus_operations: []proto.Temporal_Api_Common_V1_Link_NexusOperation,
 	workflows:        []proto.Temporal_Api_Common_V1_Link_Workflow,
+	callbacks:        []proto.Temporal_Api_Common_V1_Link_Callback,
+	executions:       []proto.Temporal_Api_Common_V1_Execution,
+	callback_paths:   [][dynamic]string,
 	cursor:           int,
 }
 
@@ -413,6 +450,9 @@ encoded_link_storage_make :: proc(count: int) -> Encoded_Link_Storage {
 		activities = make([]proto.Temporal_Api_Common_V1_Link_Activity, count),
 		nexus_operations = make([]proto.Temporal_Api_Common_V1_Link_NexusOperation, count),
 		workflows = make([]proto.Temporal_Api_Common_V1_Link_Workflow, count),
+		callbacks = make([]proto.Temporal_Api_Common_V1_Link_Callback, count),
+		executions = make([]proto.Temporal_Api_Common_V1_Execution, count),
+		callback_paths = make([][dynamic]string, count),
 	}
 }
 
@@ -425,6 +465,10 @@ encoded_link_storage_free :: proc(storage: ^Encoded_Link_Storage) {
 	delete(storage.activities)
 	delete(storage.nexus_operations)
 	delete(storage.workflows)
+	delete(storage.callbacks)
+	delete(storage.executions)
+	for path in storage.callback_paths do delete(path)
+	delete(storage.callback_paths)
 	storage^ = {}
 }
 
@@ -490,6 +534,20 @@ encode_link :: proc(link: Link, storage: ^Encoded_Link_Storage) -> proto.Tempora
 			reason = link.workflow.reason,
 		}
 		return {variant = proto.Temporal_Api_Common_V1_Link_Variant_Workflow{value = &storage.workflows[index]}}
+	case .Callback:
+		storage.executions[index] = {
+			type = transmute(proto.Temporal_Api_Enums_V1_ExecutionType)link.callback.execution_kind,
+			business_id = link.callback.business_id,
+			run_id = link.callback.run_id,
+		}
+		append(&storage.callback_paths[index], ..link.callback.component_path)
+		storage.callbacks[index] = {
+			namespace = link.callback.namespace,
+			execution = &storage.executions[index],
+			component_path = storage.callback_paths[index],
+			request_id = link.callback.request_id,
+		}
+		return {variant = proto.Temporal_Api_Common_V1_Link_Variant_Callback{value = &storage.callbacks[index]}}
 	}
 	return {}
 }

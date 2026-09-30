@@ -5148,21 +5148,25 @@ nondeterminism_policy_preserves_generated_abi_values :: proc(t: ^testing.T) {
 }
 
 temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
-	kind_index := pbt.draw(t, pbt.int_range(0, 4))
+	kind_index := pbt.draw(t, pbt.int_range(0, 5))
 	identifier := pbt.draw(t, pbt.string_alphabet("abcdefghijklmnopqrstuvwxyz0123456789-", 1, 32))
 	reference_is_request := pbt.draw(t, pbt.boolean())
 	event_id := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
 	event_type_number := pbt.draw(t, pbt.int_range(1, 60))
 	event_type := cast(temporal_client.Workflow_Event_Type)event_type_number
-	pbt.cover(t, kind_index == 0, 15.0, "WorkflowEvent link")
-	pbt.cover(t, kind_index == 1, 15.0, "BatchJob link")
-	pbt.cover(t, kind_index == 2, 15.0, "Activity link")
-	pbt.cover(t, kind_index == 3, 15.0, "NexusOperation link")
-	pbt.cover(t, kind_index == 4, 15.0, "Workflow link")
+	execution_kind_number := pbt.draw(t, pbt.int_range(1, 3))
+	execution_kind := cast(temporal_client.Execution_Kind)execution_kind_number
+	pbt.cover(t, kind_index == 0, 12.0, "WorkflowEvent link")
+	pbt.cover(t, kind_index == 1, 12.0, "BatchJob link")
+	pbt.cover(t, kind_index == 2, 12.0, "Activity link")
+	pbt.cover(t, kind_index == 3, 12.0, "NexusOperation link")
+	pbt.cover(t, kind_index == 4, 12.0, "Workflow link")
+	pbt.cover(t, kind_index == 5, 12.0, "Callback link")
 	pbt.cover(t, kind_index == 0 && reference_is_request, 5.0, "request-ID reference")
 	pbt.cover(t, kind_index == 0 && !reference_is_request, 5.0, "event-ID reference")
 
 	link: temporal_client.Link
+	callback_path := [?]string{"Component", identifier}
 	switch kind_index {
 	case 0:
 		link = {
@@ -5205,6 +5209,18 @@ temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
 				workflow_id = identifier,
 				run_id = "generated-run",
 				reason = "generated reason",
+			},
+		}
+	case 5:
+		link = {
+			kind = .Callback,
+			callback = {
+				namespace = "generated",
+				execution_kind = execution_kind,
+				business_id = identifier,
+				run_id = "generated-run",
+				component_path = callback_path[:],
+				request_id = "generated-callback-request",
 			},
 		}
 	}
@@ -5283,6 +5299,15 @@ temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
 		if !ok || value.value == nil || value.value.workflow_id != identifier ||
 		   value.value.reason != "generated reason" {
 			return pbt.fail("Workflow identity changed during encoding")
+		}
+	case 5:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Callback)
+		if !ok || value.value == nil || value.value.namespace != "generated" ||
+		   value.value.execution == nil || value.value.execution.business_id != identifier ||
+		   i32(value.value.execution.type) != i32(execution_kind) ||
+		   len(value.value.component_path) != 2 || value.value.component_path[1] != identifier ||
+		   value.value.request_id != "generated-callback-request" {
+			return pbt.fail("Callback identity changed during encoding")
 		}
 	}
 	return pbt.pass()

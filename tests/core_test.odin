@@ -8468,6 +8468,7 @@ client_translates_generic_nexus_links :: proc(t: ^testing.T) {
 			temporal_client.NEXUS_LINK_TYPE_WORKFLOW_EVENT,
 		},
 		{"temporal:///batch-jobs/job-1", temporal_client.NEXUS_LINK_TYPE_BATCH_JOB},
+		{"temporal:///callbacks/request-1", temporal_client.NEXUS_LINK_TYPE_CALLBACK},
 		{"temporal:///unknown", "example.Unknown"},
 	}
 	for invalid in invalid_links {
@@ -8518,6 +8519,17 @@ client_encodes_every_pinned_temporal_link_variant :: proc(t: ^testing.T) {
 				workflow_id = "target",
 				run_id = "target-run",
 				reason = "accepted update",
+			},
+		},
+		{
+			kind = .Callback,
+			callback = {
+				namespace = "orders",
+				execution_kind = .Nexus_Operation,
+				business_id = "standalone-operation",
+				run_id = "standalone-operation-run",
+				component_path = []string{"Update", "update-7"},
+				request_id = "callback-request-7",
 			},
 		},
 	}
@@ -8594,6 +8606,34 @@ client_encodes_every_pinned_temporal_link_variant :: proc(t: ^testing.T) {
 		testing.expect_value(t, workflow_link.value.workflow_id, "target")
 		testing.expect_value(t, workflow_link.value.reason, "accepted update")
 	}
+	callback_link, callback_ok := request.links[5].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Callback)
+	testing.expect(t, callback_ok && callback_link.value != nil)
+	if callback_ok && callback_link.value != nil {
+		testing.expect_value(t, callback_link.value.namespace, "orders")
+		testing.expect(t, callback_link.value.execution != nil)
+		if callback_link.value.execution != nil {
+			testing.expect(
+				t,
+				callback_link.value.execution.type == .EXECUTION_TYPE_NEXUS_OPERATION,
+			)
+			testing.expect_value(
+				t,
+				callback_link.value.execution.business_id,
+				"standalone-operation",
+			)
+			testing.expect_value(
+				t,
+				callback_link.value.execution.run_id,
+				"standalone-operation-run",
+			)
+		}
+		testing.expect_value(t, len(callback_link.value.component_path), 2)
+		if len(callback_link.value.component_path) == 2 {
+			testing.expect_value(t, callback_link.value.component_path[0], "Update")
+			testing.expect_value(t, callback_link.value.component_path[1], "update-7")
+		}
+		testing.expect_value(t, callback_link.value.request_id, "callback-request-7")
+	}
 
 	invalid_kind_links := [?]temporal_client.Link{{
 		kind = cast(temporal_client.Link_Kind)99,
@@ -8638,6 +8678,36 @@ client_encodes_every_pinned_temporal_link_variant :: proc(t: ^testing.T) {
 	defer delete(invalid_event_bytes)
 	defer temporal_client.error_free(&invalid_event_error)
 	testing.expect_value(t, invalid_event_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+
+	invalid_callback_links := [?]temporal_client.Link{{
+		kind = .Callback,
+		callback = {
+			namespace = "orders",
+			execution_kind = .Workflow,
+			business_id = "caller",
+			run_id = "caller-run",
+			component_path = []string{""},
+			request_id = "callback-request",
+		},
+	}}
+	invalid_callback_bytes, invalid_callback_error := temporal_client.encode_start_workflow_request(
+		"orders",
+		"link_workflow",
+		codec.payload_view(&input),
+		{
+			id = "invalid-callback-link",
+			task_queue = "links",
+			request_id = "invalid-callback-link-request",
+			links = invalid_callback_links[:],
+		},
+	)
+	defer delete(invalid_callback_bytes)
+	defer temporal_client.error_free(&invalid_callback_error)
+	testing.expect_value(
+		t,
+		invalid_callback_error.kind,
+		temporal_client.Error_Kind.Invalid_Argument,
+	)
 }
 
 @(test)
