@@ -208,6 +208,7 @@ Worker :: struct {
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
+	graceful_shutdown_period: time.Duration,
 	versioning:             Worker_Versioning_Options,
 	nondeterminism_policy:  Nondeterminism_Policy,
 	workflow_stacks:        workflow.Stack_Options,
@@ -327,6 +328,7 @@ create :: proc(
 	versioning := Worker_Versioning_Options{},
 	nondeterminism_policy := Nondeterminism_Policy{},
 	workflow_stacks := workflow.Stack_Options{},
+	graceful_shutdown_period := temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		return {}, error_from_string("client is not initialized")
@@ -339,6 +341,12 @@ create :: proc(
 	}
 	if max_concurrent_activities <= 0 {
 		return {}, error_from_string("max concurrent activities must be positive")
+	}
+	_, shutdown_period_error := temporal_core.worker_graceful_shutdown_period_millis(
+		graceful_shutdown_period,
+	)
+	if shutdown_period_error.message != nil {
+		return {}, error_from_core(&shutdown_period_error)
 	}
 	versioning_error := temporal_core.worker_versioning_options_validate(versioning)
 	if versioning_error.message != nil {
@@ -393,6 +401,7 @@ create :: proc(
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = max_concurrent_activities
+	worker.graceful_shutdown_period = graceful_shutdown_period
 	worker.versioning = versioning
 	worker.versioning.build_id = owned_build_id
 	worker.versioning.deployment_name = owned_deployment_name
@@ -2318,6 +2327,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		enable_local_activities = poll_local_activities,
 		enable_remote_activities = poll_remote_activities,
 		max_activity_slots = worker.max_concurrent_activities,
+		graceful_shutdown_period = worker.graceful_shutdown_period,
 		versioning = worker.versioning,
 		nondeterminism_policy = worker.nondeterminism_policy,
 	)
@@ -2450,6 +2460,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.task_queue = ""
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
+	worker.graceful_shutdown_period = 0
 	worker.versioning = {}
 	worker.nondeterminism_policy = {}
 	worker.workflow_stacks = {}

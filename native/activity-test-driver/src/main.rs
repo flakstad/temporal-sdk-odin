@@ -157,6 +157,30 @@ impl ActivityLoadDriverWorkflow {
 
 #[workflow]
 #[derive(Default)]
+struct ActivityShutdownDriverWorkflow;
+
+#[workflow_methods]
+impl ActivityShutdownDriverWorkflow {
+    #[run(name = "odin_activity_shutdown_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let result = ctx
+            .execute_activity(
+                HelloActivity,
+                "shutdown-wait".to_string(),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                    .retry_policy(RetryPolicy::builder().maximum_attempts(1).build())
+                    .build(),
+            )
+            .await;
+        match result {
+            Ok(value) => Ok(format!("unexpected Activity success: {value}")),
+            Err(_) => Ok("Workflow observed Worker shutdown Activity failure".to_string()),
+        }
+    }
+}
+
+#[workflow]
+#[derive(Default)]
 struct TypedActivityDriverWorkflow;
 
 #[workflow_methods]
@@ -237,10 +261,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let expect_failure = std::env::var_os("ACTIVITY_EXPECT_FAILURE").is_some();
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
     let load = std::env::var_os("ACTIVITY_LOAD").is_some();
+    let shutdown_case = std::env::var_os("ACTIVITY_SHUTDOWN").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
-    let expected = if load {
+    let expected = if shutdown_case {
+        "Workflow observed Worker shutdown Activity failure".to_string()
+    } else if load {
         format!("completed {ACTIVITY_LOAD_TASKS} load Activities")
     } else if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
@@ -257,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<FailureDriverWorkflow>()?
         .register_workflow::<ConcurrentActivityDriverWorkflow>()?
         .register_workflow::<ActivityLoadDriverWorkflow>()?
+        .register_workflow::<ActivityShutdownDriverWorkflow>()?
         .register_workflow::<TypedActivityDriverWorkflow>()?
         .register_workflow::<RetryActivityDriverWorkflow>()?
         .register_workflow::<AsyncActivityDriverWorkflow>()?
@@ -397,6 +425,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .start_workflow(
                     FailureDriverWorkflow::run,
                     input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await?
+        } else if shutdown_case {
+            let handle = client
+                .start_workflow(
+                    ActivityShutdownDriverWorkflow::run,
+                    (),
                     WorkflowStartOptions::new(queue, workflow_id).build(),
                 )
                 .await?;

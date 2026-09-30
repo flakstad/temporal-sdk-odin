@@ -767,6 +767,29 @@ worker_pid=""
 cat "$worker_log"
 grep -Eq "24 Activity callbacks drained with callback_peak=3 route_peak=[34] slots=3" "$worker_log"
 
+ACTIVITY_EXPECT_SHUTDOWN=1 \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Shutdown-test Odin Activity Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+ACTIVITY_SHUTDOWN=1 cargo run --quiet \
+  --manifest-path "$repo_root/native/Cargo.toml" \
+  --package activity-test-driver
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "Activity observed Worker_Shutdown after grace period and drained cleanly" "$worker_log"
+
 TEMPORAL_ODIN_SCENARIO=typed-payload \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

@@ -112,3 +112,57 @@ client_connection_options_preserve_generated_transport_values :: proc(t: ^testin
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+worker_shutdown_duration_property :: proc(t: ^pbt.T) -> pbt.Result {
+	sub_millisecond := pbt.draw(t, pbt.boolean())
+	whole_milliseconds := 0
+	if !sub_millisecond {
+		whole_milliseconds = pbt.draw(t, pbt.int_range(1, 1_000_000))
+	}
+	whole_millisecond := pbt.draw(t, pbt.boolean())
+	fractional_nanoseconds := 0
+	if !whole_millisecond {
+		fractional_nanoseconds = pbt.draw(t, pbt.int_range(1, 999_999))
+	}
+	negative := pbt.draw(t, pbt.boolean())
+	pbt.cover(t, sub_millisecond, 30.0, "sub-millisecond grace period")
+	pbt.cover(t, whole_millisecond, 30.0, "whole-millisecond grace period")
+	pbt.cover(t, fractional_nanoseconds > 0, 30.0, "fractional millisecond rounds upward")
+	pbt.cover(t, negative, 40.0, "negative grace period rejected")
+
+	duration := time.Duration(whole_milliseconds) * time.Millisecond +
+		time.Duration(fractional_nanoseconds) * time.Nanosecond
+	if negative {
+		duration = -(duration + time.Nanosecond)
+	}
+	actual, conversion_error := temporal_core.worker_graceful_shutdown_period_millis(duration)
+	defer temporal_core.error_free(&conversion_error)
+	if negative {
+		if conversion_error.message == nil {
+			return pbt.fail("negative generated Worker shutdown duration was accepted")
+		}
+		return pbt.pass()
+	}
+	if conversion_error.message != nil {
+		return pbt.fail("valid generated Worker shutdown duration was rejected")
+	}
+	expected := u64(whole_milliseconds)
+	if fractional_nanoseconds > 0 {
+		expected += 1
+	}
+	if actual != expected {
+		return pbt.fail("generated Worker shutdown duration changed at the C ABI boundary")
+	}
+	return pbt.pass()
+}
+
+@(test)
+worker_shutdown_durations_preserve_generated_c_abi_contract :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Worker shutdown durations preserve the C ABI contract",
+		worker_shutdown_duration_property,
+		{num_tests = 500, seed = 0x5348_5554_444f_574e},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

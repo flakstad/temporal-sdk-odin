@@ -211,7 +211,14 @@ detail flags (`not_found`, `cancelled`, `paused`, `timed_out`,
 `worker_shutdown`, and `reset`). Typed callbacks may return a canceled result
 with a user Payload; a Workflow using `Wait_Cancellation_Completed` can request
 the cancellation explicitly and decode that Payload from the resulting
-`CanceledFailureInfo`. `activity.info(ctx)` now exposes the Core-delivered execution
+`CanceledFailureInfo`. `worker.create` also accepts
+`graceful_shutdown_period` (five seconds by default). After that delay Core
+sends outstanding Activities a `.Worker_Shutdown` cancellation; the live
+suite proves the reason/detail flags, cooperative return, completion flush, and
+clean finalization.
+This period delays cancellation—it is not a force-kill timeout, so an Activity
+that ignores cancellation can still keep shutdown open. `activity.info(ctx)`
+now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor
 headers, and previous heartbeat details as callback-scoped borrowed values; a retry integration test
 recovers typed heartbeat progress on attempt 2. Workers can register ordered

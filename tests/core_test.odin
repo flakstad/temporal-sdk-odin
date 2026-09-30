@@ -6625,6 +6625,11 @@ language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 	testing.expect_value(t, sdk_worker.namespace, "test-namespace")
 	testing.expect_value(t, sdk_worker.task_queue, "delayed-core")
 	testing.expect(t, sdk_worker.lifecycle == .Configuring)
+	testing.expect_value(
+		t,
+		sdk_worker.graceful_shutdown_period,
+		temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
+	)
 	interceptor_error := worker.add_workflow_interceptor(
 		&sdk_worker,
 		{start_activity = workflow_outbound_test_activity},
@@ -6688,6 +6693,56 @@ language_worker_delays_core_construction_until_run :: proc(t: ^testing.T) {
 
 	// The language lifecycle wrapper intentionally makes close idempotent.
 	close_error = worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+}
+
+@(test)
+worker_graceful_shutdown_period_rounds_for_c_abi_and_is_owned_by_worker :: proc(t: ^testing.T) {
+	zero, zero_error := temporal_core.worker_graceful_shutdown_period_millis(0)
+	testing.expect(t, zero_error.message == nil)
+	temporal_core.error_free(&zero_error)
+	testing.expect_value(t, zero, u64(0))
+
+	sub_millisecond, sub_millisecond_error := temporal_core.worker_graceful_shutdown_period_millis(
+		1 * time.Nanosecond,
+	)
+	testing.expect(t, sub_millisecond_error.message == nil)
+	temporal_core.error_free(&sub_millisecond_error)
+	testing.expect_value(t, sub_millisecond, u64(1))
+
+	exact, exact_error := temporal_core.worker_graceful_shutdown_period_millis(
+		275 * time.Millisecond,
+	)
+	testing.expect(t, exact_error.message == nil)
+	temporal_core.error_free(&exact_error)
+	testing.expect_value(t, exact, u64(275))
+
+	_, negative_error := temporal_core.worker_graceful_shutdown_period_millis(-time.Nanosecond)
+	testing.expect(t, negative_error.message != nil)
+	temporal_core.error_free(&negative_error)
+
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	_, invalid_create_error := worker.create(
+		&client,
+		"negative-shutdown-period",
+		graceful_shutdown_period = -time.Millisecond,
+	)
+	testing.expect(t, invalid_create_error.message != nil)
+	worker.error_free(&invalid_create_error)
+
+	sdk_worker, create_error := worker.create(
+		&client,
+		"custom-shutdown-period",
+		graceful_shutdown_period = 275 * time.Millisecond,
+	)
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	testing.expect_value(t, sdk_worker.graceful_shutdown_period, 275 * time.Millisecond)
+	close_error := worker.close(&sdk_worker)
 	testing.expect(t, close_error.message == nil)
 	worker.error_free(&close_error)
 }

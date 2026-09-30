@@ -7,6 +7,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import activity "../../temporal/activity"
 import temporal_client "../../temporal/client"
@@ -20,6 +21,11 @@ load_stats_mutex: sync.Mutex
 load_activities_active: int
 load_activities_peak: int
 load_activities_completed: int
+shutdown_activity_started: bool
+shutdown_activity_observed: bool
+shutdown_activity_reason: activity.Cancel_Reason
+shutdown_activity_details: activity.Cancellation_Details
+shutdown_activity_details_present: bool
 async_task_token: []u8
 async_workflow_id: string
 async_workflow_run_id: string
@@ -82,7 +88,21 @@ async_identity_free :: proc() {
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
-	_ = ctx
+	if name == "shutdown-wait" {
+		sync.atomic_store_explicit(&shutdown_activity_started, true, .Release)
+		for !activity.is_cancellation_requested(ctx) {
+			status := activity.heartbeat(ctx, "waiting for Worker shutdown")
+			if status == .Cancellation_Requested {
+				break
+			}
+			time.sleep(10 * time.Millisecond)
+		}
+		shutdown_activity_reason = activity.cancellation_reason(ctx)
+		shutdown_activity_details,
+		shutdown_activity_details_present = activity.cancellation_details(ctx)
+		shutdown_activity_observed = true
+		return "Worker shutdown acknowledged"
+	}
 	if strings.has_prefix(name, "load-") {
 		sync.mutex_lock(&load_stats_mutex)
 		load_activities_active += 1
@@ -135,6 +155,26 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 		return ""
 	}
 	return greeting
+}
+
+Shutdown_Request_State :: struct {
+	sdk_worker:   ^worker.Worker,
+	activity_started: bool,
+	requested_at: time.Tick,
+}
+
+request_shutdown_after_activity_start :: proc(state: ^Shutdown_Request_State) {
+	// A clean CI checkout may still be linking the cross-SDK Rust driver after
+	// this Worker becomes ready, so readiness must not start a short deadline.
+	for _ in 0 ..< 6_000 {
+		if sync.atomic_load_explicit(&shutdown_activity_started, .Acquire) {
+			state.activity_started = true
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	state.requested_at = time.tick_now()
+	worker.request_shutdown(state.sdk_worker)
 }
 
 typed_greeting :: proc(_: ^activity.Context, input: Greeting_Input) -> Greeting_Output {
@@ -266,11 +306,15 @@ main :: proc() {
 	concurrency_case := concurrency_value != ""
 	load_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_LOAD")
 	load_case := load_value != ""
+	shutdown_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_SHUTDOWN")
+	shutdown_case := shutdown_value != ""
 	activity_slots := load_case ? 3 : 10
+	graceful_shutdown_period := shutdown_case ? 200 * time.Millisecond : temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD
 	activity_worker, create_error := worker.create(
 		&client,
 		"odin-hello-activity",
 		max_concurrent_activities = activity_slots,
+		graceful_shutdown_period = graceful_shutdown_period,
 	)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
@@ -331,13 +375,32 @@ main :: proc() {
 	max_tasks := 1
 	if load_case {
 		max_tasks = 24
+	} else if shutdown_case {
+		max_tasks = 0
 	} else if concurrency_case || retry_case {
 		max_tasks = 2
+	}
+	shutdown_state := Shutdown_Request_State{sdk_worker = &activity_worker}
+	shutdown_thread: ^thread.Thread
+	if shutdown_case {
+		shutdown_thread = thread.create_and_start_with_poly_data(
+			&shutdown_state,
+			request_shutdown_after_activity_start,
+		)
+		if shutdown_thread == nil {
+			fmt.eprintln("Could not start Activity shutdown coordinator")
+			_ = worker.close(&activity_worker)
+			os.exit(1)
+		}
 	}
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{max_activity_tasks = max_tasks},
 	)
+	if shutdown_thread != nil {
+		thread.join(shutdown_thread)
+		thread.destroy(shutdown_thread)
+	}
 	close_error := worker.close(&activity_worker)
 	if run_error.message != nil {
 		fmt.eprintf("Worker failed: %s\n", string(run_error.message))
@@ -459,7 +522,35 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
-	if load_case {
+	if shutdown_case {
+		shutdown_elapsed := time.tick_since(shutdown_state.requested_at)
+		details := shutdown_activity_details
+		if !shutdown_state.activity_started || !shutdown_activity_observed ||
+		   shutdown_activity_reason != .Worker_Shutdown ||
+		   !shutdown_activity_details_present || !details.is_worker_shutdown ||
+		   details.is_not_found || details.is_cancelled || details.is_paused ||
+		   details.is_timed_out || details.is_reset ||
+		   shutdown_elapsed < 150 * time.Millisecond ||
+		   shutdown_elapsed > 5 * time.Second ||
+		   run_stats.activity_tasks_completed != 1 ||
+		   run_stats.activity_cancellations_received != 1 {
+			fmt.eprintf(
+				"Activity shutdown invariant failed: started=%v observed=%v reason=%v details=%v elapsed=%v completed=%d cancellations=%d\n",
+				shutdown_state.activity_started,
+				shutdown_activity_observed,
+				shutdown_activity_reason,
+				details,
+				shutdown_elapsed,
+				run_stats.activity_tasks_completed,
+				run_stats.activity_cancellations_received,
+			)
+			os.exit(1)
+		}
+		fmt.printf(
+			"Activity observed Worker_Shutdown after grace period and drained cleanly elapsed=%v\n",
+			shutdown_elapsed,
+		)
+	} else if load_case {
 		sync.mutex_lock(&load_stats_mutex)
 		active := load_activities_active
 		peak := load_activities_peak

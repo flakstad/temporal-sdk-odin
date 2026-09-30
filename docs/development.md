@@ -309,6 +309,18 @@ route high-water mark is returned as
 a second Core slot count.
 `worker.request_shutdown` is safe to call from a coordinating thread;
 `worker.close` must only be called after `run` returns.
+`worker.create(..., graceful_shutdown_period = ...)` controls Core's delay
+between shutdown initiation and cooperative cancellation of outstanding
+Activities. The default is five seconds and zero requests cancellation
+immediately. The C bridge accepts milliseconds, so positive fractional
+milliseconds round upward; negative values are rejected during language Worker
+construction. A 500-case property covers this conversion in the PBT layer. The
+dev-server scenario uses 200 ms, keeps one callback alive
+with heartbeats, initiates shutdown from another Odin thread, and verifies that
+the callback receives only `.Worker_Shutdown` after the grace period. Its
+cancellation completion reaches the server before `run` and `close` finish.
+Core does not terminate callback code after another timeout: an Activity that
+ignores cooperative cancellation can keep Worker shutdown waiting indefinitely.
 
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.

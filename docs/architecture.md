@@ -2254,6 +2254,18 @@ registered task types select `WorkerTaskTypes.enable_workflows` and
 `enable_remote_activities` exactly. The public API no longer exposes either
 Core capability flag.
 
+The Worker-owned `graceful_shutdown_period` maps directly to the C bridge's
+`graceful_shutdown_period_millis`. Odin defaults it to five seconds, rejects
+negative durations, preserves explicit zero, and rounds positive fractional
+milliseconds upward. Upstream Core defines this as a delay before issuing
+`WorkerShutdown` cancellations to every outstanding Activity and Nexus task;
+it is not a deadline that forcibly kills language callbacks. The live test
+keeps an Activity heartbeating, initiates shutdown from a coordinating Odin
+thread, receives the exact `Worker_Shutdown` primary reason and sole detail
+flag after 200 ms, returns cooperatively, and verifies Core flushes its terminal
+completion before finalization. An uncooperative callback can therefore still
+hold shutdown open, which is intentional and must remain explicit in the API.
+
 This creates an explicit ownership boundary. The Odin worker owns cloned
 namespace/task-queue strings, registrations, Workflow runtimes, and eventually
 the Core worker handle. It only borrows the client pointer; the client and Core
@@ -2321,9 +2333,11 @@ Workflows are enabled.
    500-case route property exercises 1–64 opaque binary tokens, embedded zero
    bytes, duplicate rejection, and forward/reverse drain order. A live 24-task
    fan-out saturates three Core slots, verifies a hard callback peak of three,
-   bounds the completion-handoff route set to four, and drains cleanly. The
-   remaining risks are process-level panic containment and shutdown-timeout
-   stress tests.
+   bounds the completion-handoff route set to four, and drains cleanly. A live
+   shutdown case also validates the configurable grace delay, concurrent
+   heartbeats, exact Core cancellation flags, completion flush, and clean
+   finalization. The remaining concurrency risk is process-level panic and
+   uncooperative-callback containment.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -2510,10 +2524,9 @@ deliberately does not cancel an accepted Update. Any future policy for canceling
 the durable operation itself depends on a server protocol capability; the
 current Temporal protocol does not expose that as a language-token operation.
 
-Also stress pool shutdown/cancel/heartbeat/failure interleavings. Panic
-containment should be designed as subprocess isolation unless Odin gains
-supported recovery. A
-statechart oracle can later expand to retry/cancellation/shutdown interleavings.
+Panic and uncooperative-callback containment should be designed as subprocess
+isolation unless Odin gains supported recovery. A statechart oracle can later
+expand the now-live graceful-shutdown path to retry/failure races.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

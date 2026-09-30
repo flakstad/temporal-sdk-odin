@@ -40,6 +40,7 @@ Replay_Worker :: struct {
 }
 
 DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
+DEFAULT_GRACEFUL_SHUTDOWN_PERIOD :: 5 * time.Second
 
 Worker_Versioning_Mode :: enum {
 	Unversioned,
@@ -353,6 +354,21 @@ nondeterminism_policy_raw :: proc(
 	return policy.fail_all_workflows, result
 }
 
+// The C bridge accepts whole milliseconds. Round positive fractions upward so
+// a configured grace period never expires earlier than the Odin duration.
+worker_graceful_shutdown_period_millis :: proc(
+	period: time.Duration,
+) -> (millis: u64, error: Error) {
+	if period < 0 {
+		return 0, client_option_error("graceful shutdown period must not be negative")
+	}
+	millis = u64(period / time.Millisecond)
+	if period % time.Millisecond != 0 {
+		millis += 1
+	}
+	return
+}
+
 worker_create :: proc(
 	client: ^Client,
 	task_queue: string,
@@ -363,6 +379,7 @@ worker_create :: proc(
 	max_activity_slots := 10,
 	versioning := Worker_Versioning_Options{},
 	nondeterminism_policy := Nondeterminism_Policy{},
+	graceful_shutdown_period := DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
@@ -375,6 +392,12 @@ worker_create :: proc(
 	if max_activity_slots <= 0 {
 		error.message = bytes.clone(transmute([]u8)string("max activity slots must be positive"))
 		return
+	}
+	graceful_shutdown_period_ms, shutdown_period_error := worker_graceful_shutdown_period_millis(
+		graceful_shutdown_period,
+	)
+	if shutdown_period_error.message != nil {
+		return {}, shutdown_period_error
 	}
 	versioning_error := worker_versioning_options_validate(versioning)
 	if versioning_error.message != nil {
@@ -411,7 +434,7 @@ worker_create :: proc(
 		},
 		max_heartbeat_throttle_interval_ms     = 60_000,
 		default_heartbeat_throttle_interval_ms = 1_000,
-		graceful_shutdown_period_ms            = 5_000,
+		graceful_shutdown_period_ms            = graceful_shutdown_period_ms,
 		nonsticky_to_sticky_poll_ratio         = 0.2,
 		nondeterminism_as_workflow_fail         = fail_all_workflows,
 		nondeterminism_as_workflow_fail_for_types = fail_workflow_types,
