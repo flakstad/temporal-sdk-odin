@@ -326,10 +326,11 @@ The stackful Workflow runtime now emits `ScheduleNexusOperation`, consumes the
 separate start/result activation jobs, preserves recursive failures, and offers
 Payload, JSON, and string `start`/`await`/`execute` APIs. The integration suite
 creates a real CLI-devserver endpoint, runs both caller Workflow and operation
-handler in Odin, observes `Hello Odin`, fetches the server history, and replays
-it through Core. User-defined async operation handlers, cancel-operation
-handlers, Nexus outbound interceptors, and selector branches are not yet
-implemented.
+handlers in Odin, preserves a non-retryable handler failure and a
+schedule-to-close timeout as recursive Failure trees, then observes
+`Hello Odin`, fetches the server history, and replays it through Core.
+User-defined async operation handlers, cancel-operation handlers, Nexus
+outbound interceptors, and selector branches are not yet implemented.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {

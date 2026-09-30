@@ -450,8 +450,9 @@ The implementation now crosses that boundary for synchronous operations:
   distinct `ResolveNexusOperationStart` and `ResolveNexusOperation` jobs, and
   exposes Payload, typed JSON, and string `start`/`await`/`execute` forms.
 - `examples/hello_nexus_workflow` runs the caller Workflow and synchronous
-  handler in one Odin Worker, fetches its server history, and passes that
-  history through Core's offline replayer.
+  handlers in one Odin Worker. It live-proves success, a non-retryable handler
+  failure, and schedule-to-close timeout/cancellation, then fetches the server
+  history and passes all three branches through Core's offline replayer.
 
 This proves the complete synchronous route from a Temporal Workflow through
 Service, Core, the C ABI, and an Odin operation callback and back. Unknown
@@ -2664,8 +2665,10 @@ Workflows are enabled.
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Async operation
    handlers, user cancel handlers, callback completion, links, outbound
-   interceptors, selector branches, deadline enforcement, and cancellation
-   after callback handoff remain. A bounded run
+   interceptors, selector branches, and explicit operation cancellation after
+   callback handoff remain. Schedule-to-close deadline enforcement and Core's
+   cooperative timeout cancellation of a running synchronous Odin handler are
+   live-proven. A bounded run
    stops polling after its requested task count, so cancellation of that final
    in-flight task is only meaningful for unbounded production runs; tests must
    not confuse the bounded example control with production cancellation.
@@ -2686,9 +2689,10 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: live-test start failure, operation failure, timeout, and all four
-cancellation policies; add the Workflow outbound-interceptor hook and selector
-branch; and property-test activation order/duplicate delivery. After that,
+boundary: live-test all four cancellation policies; add the Workflow
+outbound-interceptor hook and selector branch; and property-test activation
+order/duplicate delivery. Handler failure and pre-start timeout classification
+are now wire-, unit-, live-, and replay-tested. After that,
 implement durable async Odin operation tokens, callback completion, and
 user-defined cancel handlers as a separate vertical slice. Activity Worker is
 no longer the next milestone: it is already implemented and extensively

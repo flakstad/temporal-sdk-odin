@@ -1050,11 +1050,14 @@ shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
-Odin Worker runs the stackful caller Workflow and the registered
-`odin-greeting-service/hello` handler. The result must be the JSON string
-`"Hello Odin"`; the example then fetches its server history and replays it
-offline through Core before the endpoint is deleted. This proves the real
-synchronous route in both directions without a second language SDK:
+Odin Worker runs the stackful caller Workflow and three registered operations.
+It first observes a non-retryable handler failure, then forces a one-second
+schedule-to-close timeout and verifies that Core cooperatively cancels the
+running Odin callback, and finally requires `odin-greeting-service/hello` to
+return the JSON string `"Hello Odin"`. The example fetches the resulting server
+history and replays all branches offline through Core before the endpoint is
+deleted. This proves the real synchronous route in both directions without a
+second language SDK:
 
 ```text
 Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback

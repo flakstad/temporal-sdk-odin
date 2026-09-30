@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import temporal_client "../../temporal/client"
+import temporal_failure "../../temporal/failure"
 import nexus "../../temporal/nexus"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
@@ -32,10 +33,64 @@ hello :: proc(ctx: ^nexus.Context, name: string) -> string {
 	return fmt.aprintf("Hello %s", name)
 }
 
+fail :: proc(_: ^nexus.Context, name: string) -> nexus.Result(string) {
+	return nexus.result_handler_error(
+		string,
+		fmt.aprintf("cannot greet %s", name),
+		"BAD_REQUEST",
+		.Non_Retryable,
+	)
+}
+
+slow :: proc(ctx: ^nexus.Context, _: string) -> string {
+	for !nexus.is_cancellation_requested(ctx) {
+		time.sleep(10 * time.Millisecond)
+	}
+	if nexus.cancellation_reason(ctx) == .Timed_Out {
+		return "handler observed its request deadline"
+	}
+	return "handler observed Worker shutdown"
+}
+
 hello_nexus_workflow :: proc(ctx: ^workflow.Fiber_Context, endpoint: string) -> string {
 	headers := [?]workflow.Nexus_Header{
 		{key = "x-odin-sdk", value = "hello-nexus-workflow"},
 	}
+	failure_result := workflow.execute_nexus_operation_json_result(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		"fail",
+		"Odin",
+		string,
+		{
+			schedule_to_close_timeout = 20 * time.Second,
+			start_to_close_timeout = 10 * time.Second,
+		},
+	)
+	if failure_result.status != .Failed || failure_result.failure == nil ||
+	   temporal_failure.find_kind(failure_result.failure, .Nexus_Operation) == nil ||
+	   temporal_failure.find_kind(failure_result.failure, .Nexus_Handler) == nil {
+		return "Nexus handler failure was not preserved"
+	}
+
+	timeout_result := workflow.execute_nexus_operation_json_result(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		"slow",
+		"Odin",
+		string,
+		{
+			schedule_to_close_timeout = time.Second,
+			start_to_close_timeout = 5 * time.Second,
+		},
+	)
+	if timeout_result.status != .Timed_Out || timeout_result.failure == nil ||
+	   temporal_failure.find_kind(timeout_result.failure, .Timeout) == nil {
+		return "Nexus timeout was not preserved"
+	}
+
 	return workflow.execute_nexus_operation_json(
 		ctx,
 		endpoint,
@@ -130,6 +185,34 @@ run :: proc() -> int {
 		worker.error_free(&nexus_error)
 		return 1
 	}
+	failure_registration_error := worker.register_json_nexus_operation_result(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"fail",
+		fail,
+	)
+	if failure_registration_error.message != nil {
+		fmt.eprintf(
+			"Nexus failure registration failed: %s\n",
+			string(failure_registration_error.message),
+		)
+		worker.error_free(&failure_registration_error)
+		return 1
+	}
+	slow_registration_error := worker.register_nexus_operation(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"slow",
+		slow,
+	)
+	if slow_registration_error.message != nil {
+		fmt.eprintf(
+			"Nexus timeout registration failed: %s\n",
+			string(slow_registration_error.message),
+		)
+		worker.error_free(&slow_registration_error)
+		return 1
+	}
 
 	id_buffer: [256]u8
 	workflow_id := os.get_env(id_buffer[:], "TEMPORAL_NEXUS_WORKFLOW_ID")
@@ -147,7 +230,6 @@ run :: proc() -> int {
 	stats, run_error := worker.run(
 		&sdk_worker,
 		{
-			max_nexus_tasks = 1,
 			max_workflow_executions = 1,
 			on_ready = start_when_worker_ready,
 			on_ready_data = &state,
@@ -163,11 +245,13 @@ run :: proc() -> int {
 		return 1
 	}
 	defer temporal_client.workflow_handle_free(&state.handle)
-	if stats.workflow_executions_completed != 1 || stats.nexus_tasks_completed != 1 {
+	if stats.workflow_executions_completed != 1 || stats.nexus_tasks_completed != 3 ||
+	   stats.nexus_cancellations_received != 1 {
 		fmt.eprintf(
-			"Unexpected Worker stats: workflows=%d Nexus=%d\n",
+			"Unexpected Worker stats: workflows=%d Nexus=%d cancellations=%d\n",
 			stats.workflow_executions_completed,
 			stats.nexus_tasks_completed,
+			stats.nexus_cancellations_received,
 		)
 		return 1
 	}
@@ -232,6 +316,7 @@ run :: proc() -> int {
 		result,
 		state.handle.id,
 	)
+	fmt.println("Nexus handler failure and schedule-to-close timeout retained structured Failure trees")
 	fmt.printf(
 		"Nexus Workflow history replayed offline through Core activations=%d\n",
 		replay_result.activations_processed,

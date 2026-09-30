@@ -13158,6 +13158,110 @@ workflow_nexus_cancellation_emits_once_and_honors_wait_policy :: proc(t: ^testin
 }
 
 @(test)
+workflow_nexus_start_failure_classifies_timeout_and_cancellation :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	instance := workflow.Fiber_Instance{}
+	instance.odin_context = context
+	instance.nexus_operations = make([dynamic]workflow.Fiber_Nexus_Operation)
+	append(
+		&instance.nexus_operations,
+		workflow.Fiber_Nexus_Operation{
+			seq = 1,
+			start_state = .Pending,
+			state = .Commanded,
+		},
+		workflow.Fiber_Nexus_Operation{
+			seq = 2,
+			start_state = .Pending,
+			state = .Commanded,
+		},
+	)
+
+	timeout_info := proto.Temporal_Api_Failure_V1_TimeoutFailureInfo{
+		timeout_type = .TIMEOUT_TYPE_SCHEDULE_TO_CLOSE,
+	}
+	timeout_cause := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Nexus operation timed out",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Timeout_Failure_Info{
+			value = &timeout_info,
+		},
+	}
+	nexus_info := proto.Temporal_Api_Failure_V1_NexusOperationFailureInfo{
+		endpoint = "test-endpoint",
+		service = "test-service",
+		operation = "slow",
+	}
+	timeout_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Nexus operation completed unsuccessfully",
+		cause = &timeout_cause,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Operation_Execution_Failure_Info{
+			value = &nexus_info,
+		},
+	}
+	timeout_resolution := proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart_Status_Failed{
+			value = &timeout_failure,
+		},
+	}
+	timeout_result := workflow.Process_Result{}
+	timeout_error := workflow.apply_nexus_operation_start_resolution(
+		&instance,
+		&timeout_resolution,
+		&timeout_result,
+	)
+	testing.expect_value(t, timeout_error, "")
+	testing.expect(t, instance.nexus_operations[0].state == .Timed_Out)
+	testing.expect(t, timeout_result.resolved_nexus_operation_timed_out)
+	testing.expect(t, !timeout_result.resolved_nexus_operation_failed)
+	testing.expect(
+		t,
+		temporal_failure.find_kind(instance.nexus_operations[0].failure, .Timeout) != nil,
+	)
+
+	canceled_info := proto.Temporal_Api_Failure_V1_CanceledFailureInfo{}
+	canceled_cause := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Nexus operation canceled",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{
+			value = &canceled_info,
+		},
+	}
+	canceled_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Nexus operation completed unsuccessfully",
+		cause = &canceled_cause,
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Operation_Execution_Failure_Info{
+			value = &nexus_info,
+		},
+	}
+	canceled_resolution := proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart{
+		seq = 2,
+		status = proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart_Status_Failed{
+			value = &canceled_failure,
+		},
+	}
+	canceled_result := workflow.Process_Result{}
+	canceled_error := workflow.apply_nexus_operation_start_resolution(
+		&instance,
+		&canceled_resolution,
+		&canceled_result,
+	)
+	testing.expect_value(t, canceled_error, "")
+	testing.expect(t, instance.nexus_operations[1].state == .Canceled)
+	testing.expect(t, canceled_result.resolved_nexus_operation_canceled)
+	testing.expect(t, !canceled_result.resolved_nexus_operation_failed)
+	testing.expect(
+		t,
+		temporal_failure.find_kind(instance.nexus_operations[1].failure, .Canceled) != nil,
+	)
+}
+
+@(test)
 generated_protobuf_rejects_truncated_bytes :: proc(t: ^testing.T) {
 	malformed := [3]u8{0x0a, 0x05, 0x01}
 	decoded := proto.Coresdk_ActivityTaskCompletion{}

@@ -660,6 +660,35 @@ preserve_nexus_operation_failure :: proc(
 	return true
 }
 
+nexus_operation_apply_failure_state :: proc(
+	operation: ^Fiber_Nexus_Operation,
+	result: ^Process_Result,
+) {
+	if operation == nil {
+		return
+	}
+	if operation.failure != nil &&
+	   temporal_failure.find_kind(operation.failure, .Canceled) != nil {
+		operation.state = .Canceled
+		if result != nil {
+			result.resolved_nexus_operation_canceled = true
+		}
+		return
+	}
+	if operation.failure != nil &&
+	   temporal_failure.find_kind(operation.failure, .Timeout) != nil {
+		operation.state = .Timed_Out
+		if result != nil {
+			result.resolved_nexus_operation_timed_out = true
+		}
+		return
+	}
+	operation.state = .Failed
+	if result != nil {
+		result.resolved_nexus_operation_failed = true
+	}
+}
+
 apply_nexus_operation_start_resolution :: proc(
 	instance: ^Fiber_Instance,
 	resolution: ^proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart,
@@ -700,8 +729,7 @@ apply_nexus_operation_start_resolution :: proc(
 			return "could not preserve Nexus operation start failure"
 		}
 		operation.start_state = .Failed
-		operation.state = .Failed
-		result.resolved_nexus_operation_failed = true
+		nexus_operation_apply_failure_state(operation, result)
 	}
 	if !handled {
 		return "Nexus operation start result is unsupported"

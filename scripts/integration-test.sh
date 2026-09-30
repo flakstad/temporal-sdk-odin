@@ -152,6 +152,7 @@ NEXUS_ENDPOINT="$nexus_endpoint_name" \
 nexus_workflow_output="$(<"$workflow_output_file")"
 echo "$nexus_workflow_output"
 grep -q 'Odin Workflow called Odin Nexus operation through Temporal: Hello Odin' <<<"$nexus_workflow_output"
+grep -q 'Nexus handler failure and schedule-to-close timeout retained structured Failure trees' <<<"$nexus_workflow_output"
 grep -q 'Nexus Workflow history replayed offline through Core activations=' <<<"$nexus_workflow_output"
 temporal operator nexus endpoint delete \
   --name "$nexus_endpoint_name" \
