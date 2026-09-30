@@ -15,6 +15,7 @@ import raw "../temporal/core/raw"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import temporal_failure "../temporal/failure"
+import nexus "../temporal/nexus"
 import protobuf "../temporal/protobuf"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
@@ -7160,6 +7161,265 @@ nexus_task_and_completion_round_trip_the_pinned_core_contract :: proc(t: ^testin
 			}
 		}
 	}
+}
+
+@(test)
+nexus_adapter_decodes_start_and_core_cancellation_tasks :: proc(t: ^testing.T) {
+	input_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"Odin"`),
+	}
+	append(
+		&input_payload.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	defer delete(input_payload.metadata)
+	start := proto.Temporal_Api_Nexus_V1_StartOperationRequest{
+		service = "greeting-service",
+		operation = "say-hello",
+		request_id = "request-42",
+		callback = "http://callback.invalid/complete",
+		payload = &input_payload,
+	}
+	append(
+		&start.callback_header,
+		proto.Temporal_Api_Nexus_V1_StartOperationRequest_CallbackHeaderEntry{
+			key = "callback-key",
+			value = "callback-value",
+		},
+	)
+	defer delete(start.callback_header)
+	scheduled_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000, nanos = 456}
+	request := proto.Temporal_Api_Nexus_V1_Request{
+		scheduled_time = &scheduled_time,
+		endpoint = "request-endpoint",
+		variant = proto.Temporal_Api_Nexus_V1_Request_Variant_Start_Operation{value = &start},
+	}
+	append(
+		&request.header,
+		proto.Temporal_Api_Nexus_V1_Request_HeaderEntry{
+			key = "traceparent",
+			value = "00-test",
+		},
+	)
+	defer delete(request.header)
+	poll := proto.Temporal_Api_Workflowservice_V1_PollNexusTaskQueueResponse{
+		task_token = []u8{0x00, 0xff, 0x41, 0x00},
+		request = &request,
+	}
+	deadline := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 123}
+	exact := proto.Coresdk_Nexus_NexusTask{
+		request_deadline = &deadline,
+		endpoint = "core-endpoint",
+		variant = proto.Coresdk_Nexus_NexusTask_Variant_Task{value = &poll},
+	}
+	encoded := proto.encode_Coresdk_Nexus_NexusTask(&exact)
+	defer delete(encoded)
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	task, decode_error := proto.decode_nexus_task(encoded[:])
+	context.allocator = previous_allocator
+	testing.expect_value(t, decode_error, proto.Nexus_Decode_Error.None)
+	testing.expect_value(t, task.kind, proto.Nexus_Task_Kind.Start_Operation)
+	testing.expect(t, bytes.equal(task.task_token, poll.task_token))
+	testing.expect_value(t, task.service, "greeting-service")
+	testing.expect_value(t, task.operation, "say-hello")
+	testing.expect_value(t, task.request_id, "request-42")
+	testing.expect_value(t, task.callback_url, "http://callback.invalid/complete")
+	testing.expect_value(t, task.endpoint, "core-endpoint")
+	testing.expect_value(t, task.input.encoding, "json/plain")
+	testing.expect(t, bytes.equal(task.input.data, input_payload.data))
+	testing.expect_value(t, len(task.headers), 1)
+	testing.expect_value(t, task.headers[0].key, "traceparent")
+	testing.expect_value(t, task.headers[0].value, "00-test")
+	testing.expect_value(t, len(task.callback_headers), 1)
+	testing.expect_value(t, task.callback_headers[0].key, "callback-key")
+	testing.expect_value(t, task.callback_headers[0].value, "callback-value")
+	testing.expect(t, task.scheduled_time.present)
+	testing.expect(t, task.request_deadline.present)
+	testing.expect_value(t, task.scheduled_time.value, time.unix(1_700_000_000, 456))
+	testing.expect_value(t, task.request_deadline.value, time.unix(1_800_000_000, 123))
+
+	cancel_exact := proto.Coresdk_Nexus_NexusTask{
+		variant = proto.Coresdk_Nexus_NexusTask_Variant_Cancel_Task{
+			value = &proto.Coresdk_Nexus_CancelNexusTask{
+				task_token = poll.task_token,
+				reason = .WORKER_SHUTDOWN,
+			},
+		},
+	}
+	cancel_encoded := proto.encode_Coresdk_Nexus_NexusTask(&cancel_exact)
+	defer delete(cancel_encoded)
+	context.allocator = virtual.arena_allocator(&arena)
+	cancel_task, cancel_error := proto.decode_nexus_task(cancel_encoded[:])
+	context.allocator = previous_allocator
+	testing.expect_value(t, cancel_error, proto.Nexus_Decode_Error.None)
+	testing.expect_value(t, cancel_task.kind, proto.Nexus_Task_Kind.Cancel_Task)
+	testing.expect_value(
+		t,
+		cancel_task.cancel_reason,
+		proto.Coresdk_Nexus_NexusTaskCancelReason.WORKER_SHUTDOWN,
+	)
+	testing.expect(t, bytes.equal(cancel_task.task_token, poll.task_token))
+}
+
+@(test)
+nexus_completion_helpers_encode_the_exact_core_contract :: proc(t: ^testing.T) {
+	task_token := []u8{0x00, 0xff, 0x42, 0x00}
+	result := codec.payload_create(transmute([]u8)string(`"Hello Odin"`))
+	defer codec.payload_free(&result)
+	testing.expect_value(
+		t,
+		codec.payload_add_metadata(
+			&result,
+			"encoding",
+			transmute([]u8)string("json/plain"),
+		),
+		codec.Error.None,
+	)
+	encoded_success := proto.encode_nexus_sync_success(task_token, codec.payload_view(&result))
+	defer delete(encoded_success)
+	encoded_failure := proto.encode_nexus_handler_failure(
+		task_token,
+		"try another worker",
+		"UNAVAILABLE",
+		.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE,
+	)
+	defer delete(encoded_failure)
+	encoded_cancel := proto.encode_nexus_ack_cancel(task_token)
+	defer delete(encoded_cancel)
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	success := proto.Coresdk_Nexus_NexusTaskCompletion{}
+	success_ok := proto.decode_Coresdk_Nexus_NexusTaskCompletion(encoded_success[:], &success)
+	context.allocator = previous_allocator
+	testing.expect(t, success_ok)
+	testing.expect(t, bytes.equal(success.task_token, task_token))
+	completed, completed_ok := success.status.(proto.Coresdk_Nexus_NexusTaskCompletion_Status_Completed)
+	testing.expect(t, completed_ok && completed.value != nil)
+	if completed_ok && completed.value != nil {
+		start_response, response_ok := completed.value.variant.(proto.Temporal_Api_Nexus_V1_Response_Variant_Start_Operation)
+		testing.expect(t, response_ok && start_response.value != nil)
+		if response_ok && start_response.value != nil {
+			sync_response, sync_ok := start_response.value.variant.(proto.Temporal_Api_Nexus_V1_StartOperationResponse_Variant_Sync_Success)
+			testing.expect(t, sync_ok && sync_response.value != nil && sync_response.value.payload != nil)
+			if sync_ok && sync_response.value != nil && sync_response.value.payload != nil {
+				testing.expect(t, bytes.equal(sync_response.value.payload.data, result.data))
+			}
+		}
+	}
+
+	context.allocator = virtual.arena_allocator(&arena)
+	failure := proto.Coresdk_Nexus_NexusTaskCompletion{}
+	failure_ok := proto.decode_Coresdk_Nexus_NexusTaskCompletion(encoded_failure[:], &failure)
+	context.allocator = previous_allocator
+	testing.expect(t, failure_ok)
+	failed, failed_ok := failure.status.(proto.Coresdk_Nexus_NexusTaskCompletion_Status_Failure)
+	testing.expect(t, failed_ok && failed.value != nil)
+	if failed_ok && failed.value != nil {
+		testing.expect_value(t, failed.value.message, "try another worker")
+		testing.expect_value(t, failed.value.source, "OdinSDK")
+		handler, handler_ok := failed.value.failure_info.(proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Nexus_Handler_Failure_Info)
+		testing.expect(t, handler_ok && handler.value != nil)
+		if handler_ok && handler.value != nil {
+			testing.expect_value(t, handler.value.type, "UNAVAILABLE")
+			testing.expect_value(
+				t,
+				handler.value.retry_behavior,
+				proto.Temporal_Api_Enums_V1_NexusHandlerErrorRetryBehavior.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE,
+			)
+		}
+	}
+
+	context.allocator = virtual.arena_allocator(&arena)
+	cancel := proto.Coresdk_Nexus_NexusTaskCompletion{}
+	cancel_ok := proto.decode_Coresdk_Nexus_NexusTaskCompletion(encoded_cancel[:], &cancel)
+	context.allocator = previous_allocator
+	testing.expect(t, cancel_ok)
+	ack, ack_ok := cancel.status.(proto.Coresdk_Nexus_NexusTaskCompletion_Status_Ack_Cancel)
+	testing.expect(t, ack_ok && ack.value)
+}
+
+nexus_registration_test_handler :: proc(ctx: ^nexus.Context, input: string) -> string {
+	return input
+}
+
+@(test)
+nexus_registration_owns_names_and_rejects_duplicates :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	sdk_worker, create_error := worker.create(&client, "nexus-registration-worker")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	service, service_error := strings.clone("owned-service")
+	operation, operation_error := strings.clone("owned-operation")
+	testing.expect(t, service_error == nil && operation_error == nil)
+	registration_error := worker.register_nexus_operation(
+		&sdk_worker,
+		service,
+		operation,
+		nexus_registration_test_handler,
+	)
+	delete(service)
+	delete(operation)
+	testing.expect(t, registration_error.message == nil)
+	worker.error_free(&registration_error)
+	testing.expect_value(t, len(sdk_worker.nexus_operation_registrations), 1)
+	testing.expect_value(t, sdk_worker.nexus_operation_registrations[0].service, "owned-service")
+	testing.expect_value(t, sdk_worker.nexus_operation_registrations[0].operation, "owned-operation")
+
+	duplicate_error := worker.register_nexus_operation(
+		&sdk_worker,
+		"owned-service",
+		"owned-operation",
+		nexus_registration_test_handler,
+	)
+	testing.expect(t, duplicate_error.message != nil)
+	worker.error_free(&duplicate_error)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+	testing.expect(t, sdk_worker.nexus_operation_registrations == nil)
+}
+
+@(test)
+nexus_context_exposes_headers_and_atomic_cancellation :: proc(t: ^testing.T) {
+	headers := [?]nexus.Header{{key = "traceparent", value = "00-test"}}
+	callback_headers := [?]nexus.Header{{key = "callback-key", value = "callback-value"}}
+	ctx := nexus.Context{}
+	nexus.context_init(
+		&ctx,
+		{
+			service = "service",
+			operation = "operation",
+			headers = headers[:],
+			callback_headers = callback_headers[:],
+		},
+	)
+	value, found := nexus.header(&ctx, "traceparent")
+	testing.expect(t, found)
+	testing.expect_value(t, value, "00-test")
+	callback_value, callback_found := nexus.callback_header(&ctx, "callback-key")
+	testing.expect(t, callback_found)
+	testing.expect_value(t, callback_value, "callback-value")
+	testing.expect(t, !nexus.is_cancellation_requested(&ctx))
+	testing.expect_value(t, nexus.cancellation_reason(&ctx), nexus.Cancel_Reason.None)
+	nexus.context_request_cancellation(&ctx, .Worker_Shutdown)
+	testing.expect(t, nexus.is_cancellation_requested(&ctx))
+	testing.expect_value(t, nexus.cancellation_reason(&ctx), nexus.Cancel_Reason.Worker_Shutdown)
 }
 
 @(test)

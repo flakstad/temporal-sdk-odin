@@ -8,7 +8,7 @@ publish = false
 temporalio-client = { path = "../sdk-core/crates/client", default-features = false }
 temporalio-common = { path = "../sdk-core/crates/common", default-features = false }
 temporalio-macros = { path = "../sdk-core/crates/macros" }
-temporalio-sdk = { path = "../sdk-core/crates/sdk", default-features = false }
+temporalio-sdk = { path = "../sdk-core/crates/sdk", default-features = false, features = ["experimental"] }
 temporalio-workflow = { path = "../sdk-core/crates/workflow" }
 tokio = { version = "1.47", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 serde_json.workspace = true

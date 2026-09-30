@@ -248,8 +248,8 @@ resource-based tuner supersedes `max_concurrent_activities` for Activity
 capacity and uses conservative default maxima of ten remote and ten local
 Activities; use `resource_based_activity_tuner_with_options` to set exact
 minimum, maximum, and ramp-throttle values. Workflow and Nexus suppliers remain
-fixed because their Odin executors do not yet implement corresponding
-concurrency. The identity and all other referenced strings are owned by the
+fixed; the Nexus executor honors `max_concurrent_nexus_tasks`, but is not yet
+integrated with Core's resource-based supplier. The identity and all other referenced strings are owned by the
 Odin Worker until `worker.close`.
 
 The dev-server suite proves both cache modes: cache-disabled execution rebuilds
@@ -316,13 +316,29 @@ independent sizes, shared by online execution and offline replay. It does
 containment, or a stable public API. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
-The first Nexus foundation is also in place. The raw/Core packages bind the
-pinned bridge's Nexus poll and completion functions, generate the exact Nexus
-task/completion protobuf graph, map fixed slots and poller behavior, and prove
-worker validation plus poll-stream shutdown against `temporal server
-start-dev`. There is not yet a public Nexus service/operation registration API,
-task dispatcher, or Workflow-side Nexus caller, so this is transport evidence
-rather than usable Nexus support.
+Synchronous Nexus operation handling is now a live-proven vertical slice. The
+raw/Core packages bind the pinned bridge's separate Nexus poll and completion
+functions, while `temporal/nexus` and the public Worker own operation context,
+service/operation registration, typed JSON adapters, bounded concurrent
+dispatch, cooperative Core cancellation, and exact handler-failure mapping.
+The integration suite creates a real CLI-devserver Nexus endpoint, invokes the
+Odin handler from a Temporal Workflow, and observes its result. Async operation
+tokens, user-defined cancel-operation handlers, and an Odin Workflow-side Nexus
+caller are not implemented yet.
+
+```odin
+hello :: proc(ctx: ^nexus.Context, name: string) -> string {
+    return fmt.aprintf("Hello %s", name)
+}
+
+_ = worker.register_nexus_operation(
+    &sdk_worker,
+    "odin-greeting-service",
+    "hello",
+    hello,
+)
+_, _ = worker.run(&sdk_worker)
+```
 
 Do not use it in production.
 
@@ -1774,7 +1790,8 @@ temporal/core/            blocking ownership/lifecycle wrapper
 temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
-temporal/worker/          Activity/Workflow registry and concurrent Core polling
+temporal/nexus/           synchronous Nexus operation context and results
+temporal/worker/          Activity/Workflow/Nexus registry and concurrent polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
 temporal/workflow/        explicit-state and stackful-fiber experiments
@@ -1788,6 +1805,7 @@ examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
+examples/hello_nexus/     synchronous Odin Nexus operation Worker
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 examples/child_workflow/  child and external Workflow operation proofs
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests

@@ -6,11 +6,14 @@ use temporalio_client::{
     Client, ClientOptions, Connection, ConnectionOptions, Url, WorkflowGetResultOptions,
     WorkflowStartOptions,
 };
+use temporalio_common::protos::{
+    coresdk::nexus::nexus_operation_result, temporal::api::common::v1::Payload,
+};
 use temporalio_common::{ActivityDefinition, RetryPolicy};
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
-    ActivityCancellationType, ActivityOptions, CancellableFuture, Runtime, Worker, WorkerOptions,
-    WorkflowContext, WorkflowResult,
+    ActivityCancellationType, ActivityOptions, CancellableFuture, NexusOperationOptions, Runtime,
+    Worker, WorkerOptions, WorkflowContext, WorkflowResult,
 };
 
 struct HelloActivity;
@@ -65,6 +68,47 @@ impl ActivityDefinition for AsyncHelloActivity {
 
     fn name(&self) -> &str {
         "async_hello"
+    }
+}
+
+#[workflow]
+#[derive(Default)]
+struct NexusDriverWorkflow;
+
+#[workflow_methods]
+impl NexusDriverWorkflow {
+    #[run(name = "odin_nexus_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>, endpoint: String) -> WorkflowResult<String> {
+        let mut input = Payload {
+            data: serde_json::to_vec("Odin").expect("static Nexus input must encode"),
+            ..Default::default()
+        };
+        input
+            .metadata
+            .insert("encoding".to_string(), b"json/plain".to_vec());
+        let operation = match ctx
+            .start_nexus_operation(
+                NexusOperationOptions::builder()
+                    .endpoint(endpoint)
+                    .service("odin-greeting-service")
+                    .operation("hello")
+                    .input(input)
+                    .schedule_to_close_timeout(Duration::from_secs(20))
+                    .build(),
+            )
+            .await
+        {
+            Ok(operation) => operation,
+            Err(failure) => panic!("Nexus operation failed to start: {failure:?}"),
+        };
+        let result = operation.result().await;
+        match result.status {
+            Some(nexus_operation_result::Status::Completed(payload)) => {
+                Ok(serde_json::from_slice(&payload.data)
+                    .expect("Odin Nexus result must contain JSON string"))
+            }
+            status => panic!("unexpected Nexus operation result: {status:?}"),
+        }
     }
 }
 
@@ -265,6 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
+    let nexus_endpoint = std::env::var("NEXUS_ENDPOINT").ok();
     let expected = if shutdown_case {
         "Workflow observed Worker shutdown Activity failure".to_string()
     } else if load {
@@ -288,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<TypedActivityDriverWorkflow>()?
         .register_workflow::<RetryActivityDriverWorkflow>()?
         .register_workflow::<AsyncActivityDriverWorkflow>()?
+        .register_workflow::<NexusDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -296,6 +342,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow_id = std::env::var("ACTIVITY_WORKFLOW_ID")
         .unwrap_or_else(|_| format!("odin-sdk-activity-spike-{}-{unique}", std::process::id()));
     let driver = async move {
+        if let Some(endpoint) = nexus_endpoint {
+            let handle = client
+                .start_workflow(
+                    NexusDriverWorkflow::run,
+                    endpoint,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != "Hello Odin" {
+                return Err(format!("unexpected Nexus operation result: {result}").into());
+            }
+            println!("Workflow observed Odin Nexus operation result: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if let Some(async_mode) = async_mode {
             let activity_input = if async_mode == "id-cancel" {
                 "__cancel__".to_string()

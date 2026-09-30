@@ -354,8 +354,10 @@ because the C bridge creates one shared resource controller and rejects mixed
 resource options. The Odin callback pool is sized from the enabled suppliers'
 maximums so Core never grants work without matching executor capacity. Workflow
 and Nexus remain fixed-size, and custom suppliers are not exposed yet. The
-public Worker stores validated Nexus slot and poller settings for the next
-handler slice, while only the lower Core adapter can enable/poll Nexus today.
+public Nexus executor sizes its callback pool from
+`max_concurrent_nexus_tasks`; it enables polling only when an operation is
+registered and uses the configured Nexus poller behavior. Resource-based Nexus
+capacity is not exposed yet.
 Prefer fixed slots for ordinary Workers; Temporal recommends resource-based
 tuning when resource protection or workload-specific scaling warrants it.
 Pairing it with `worker.poller_autoscaling` avoids excessive pollers at low
@@ -1044,8 +1046,37 @@ It creates and validates a Nexus-enabled Core worker, enters the actual Nexus
 poll path, initiates shutdown, requires the poll callback's shutdown sentinel,
 and finalizes the worker. No endpoint is needed because this test proves the
 bridge symbol, Worker options, Service validation, poll stream, and memory-safe
-shutdown rather than handler dispatch. Public service/operation registration is
-not implemented yet.
+shutdown independently of handler dispatch.
+
+The suite next creates a uniquely named Nexus endpoint targeting
+`odin-hello-nexus`, starts `examples/hello_nexus`, and invokes
+`odin-greeting-service/hello` from a small Workflow in the Rust integration
+driver. The result must be the JSON string `"Hello Odin"`; the endpoint is then
+deleted. This proves the real synchronous route in both directions:
+
+```text
+Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback
+         <- Temporal result   <- Core completion <- Odin Payload
+```
+
+To exercise the worker manually after building the examples:
+
+```bash
+temporal operator nexus endpoint create \
+  --name odin-nexus-local \
+  --target-namespace default \
+  --target-task-queue odin-hello-nexus
+
+TEMPORAL_ODIN_SKIP_BUILD=1 ./scripts/run-hello-nexus.sh
+```
+
+The example intentionally handles one operation and exits. Invoke it from a
+Workflow while it is polling; `scripts/integration-test.sh` is the canonical
+repeatable harness. Endpoint names permit letters, digits, and hyphens, but not
+underscores. The current public slice supports synchronous starts only. Core
+cancel tasks are routed cooperatively, while protocol `CancelOperation`
+requests return `NOT_IMPLEMENTED` until durable async operation tokens and
+cancel handlers exist.
 
 The same script then runs `examples/hello_activity` for several focused cases.
 A small workflow-only driver under `native/activity-test-driver` uses the

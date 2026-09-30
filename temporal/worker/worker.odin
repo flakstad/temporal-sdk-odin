@@ -13,6 +13,7 @@ import activity "../activity"
 import codec "../codec"
 import temporal_core "../core"
 import proto "../core/proto"
+import nexus "../nexus"
 import workflow "../workflow"
 
 String_Activity_Proc :: #type proc(ctx: ^activity.Context, input: string) -> string
@@ -29,6 +30,16 @@ Activity_Invoke_Proc :: #type proc(
 	ctx: ^activity.Context,
 	inputs: []codec.Payload_View,
 ) -> activity.Payload_Result
+
+Payload_Nexus_Operation_Proc :: #type proc(
+	ctx: ^nexus.Context,
+	input: codec.Payload_View,
+) -> nexus.Payload_Result
+Nexus_Operation_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^nexus.Context,
+	input: codec.Payload_View,
+) -> nexus.Payload_Result
 
 // Activity interceptors are registered on a Worker and form a real nested
 // chain. Registration order is outermost-first. An interceptor may inspect or
@@ -112,6 +123,13 @@ Activity_Registration :: struct {
 	invoke:        Activity_Invoke_Proc,
 }
 
+Nexus_Operation_Registration :: struct {
+	service:       string,
+	operation:     string,
+	callback_data: rawptr,
+	invoke:        Nexus_Operation_Invoke_Proc,
+}
+
 Workflow_Registration :: struct {
 	name:    string,
 	runtime: workflow.Fiber_Runtime,
@@ -133,6 +151,7 @@ Run_Options :: struct {
 	// Zero means no bound. These limits exist for tests and examples; production
 	// workers normally run until request_shutdown is called.
 	max_activity_tasks:       int,
+	max_nexus_tasks:          int,
 	max_workflow_executions: int,
 	disable_activity_polling: bool,
 	// Local Activity polling is opt-in while its cancellation/shutdown
@@ -154,6 +173,9 @@ Run_Stats :: struct {
 	// result is reaped, so completion handoff may briefly add one above the
 	// configured Core slot count.
 	activity_executions_peak_owned:        int,
+	nexus_tasks_completed:                  int,
+	nexus_cancellations_received:           int,
+	nexus_executions_peak_owned:            int,
 	workflow_activations_completed:       int,
 	workflow_activation_failures:         int,
 	workflow_executions_completed:        int,
@@ -260,6 +282,7 @@ Worker :: struct {
 	namespace:              string,
 	task_queue:             string,
 	activity_registrations: [dynamic]Activity_Registration,
+	nexus_operation_registrations: [dynamic]Nexus_Operation_Registration,
 	activity_interceptors:  [dynamic]Activity_Interceptor,
 	workflow_inbound_interceptors: [dynamic]workflow.Inbound_Interceptor,
 	workflow_interceptors:  [dynamic]workflow.Outbound_Interceptor,
@@ -521,6 +544,7 @@ create_with_options :: proc(
 	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
 	worker.workflow_stacks = resolved_stacks
 	worker.activity_registrations = make([dynamic]Activity_Registration)
+	worker.nexus_operation_registrations = make([dynamic]Nexus_Operation_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
 	worker.workflow_interceptors = make([dynamic]workflow.Outbound_Interceptor)
@@ -569,6 +593,7 @@ create_replayer :: proc(
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
 	worker.activity_registrations = make([dynamic]Activity_Registration)
+	worker.nexus_operation_registrations = make([dynamic]Nexus_Operation_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
 	worker.workflow_inbound_interceptors = make([dynamic]workflow.Inbound_Interceptor)
 	worker.workflow_interceptors = make([dynamic]workflow.Outbound_Interceptor)
@@ -897,6 +922,181 @@ register_activity :: proc(worker: ^Worker, name: string, callback: String_Activi
 	)
 }
 
+register_nexus_operation_invoker :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback_data: rawptr,
+	invoke: Nexus_Operation_Invoke_Proc,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("Nexus operations cannot be registered after worker.run starts")
+	}
+	if len(service) == 0 || len(operation) == 0 || callback_data == nil || invoke == nil {
+		return error_from_string("Nexus service, operation, and callback are required")
+	}
+	for registration in worker.nexus_operation_registrations {
+		if registration.service == service && registration.operation == operation {
+			return error_from_string("Nexus operation is already registered")
+		}
+	}
+	owned_service, service_error := strings.clone(service)
+	if service_error != nil {
+		return error_from_string("could not allocate Nexus service name")
+	}
+	owned_operation, operation_error := strings.clone(operation)
+	if operation_error != nil {
+		delete(owned_service)
+		return error_from_string("could not allocate Nexus operation name")
+	}
+	append(
+		&worker.nexus_operation_registrations,
+		Nexus_Operation_Registration{
+			service = owned_service,
+			operation = owned_operation,
+			callback_data = callback_data,
+			invoke = invoke,
+		},
+	)
+	return {}
+}
+
+register_payload_nexus_operation :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback: Payload_Nexus_Operation_Proc,
+) -> Error {
+	if callback == nil {
+		return error_from_string("Nexus service, operation, and callback are required")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Payload_Nexus_Operation_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Nexus operation callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_nexus_operation_invoker(
+		worker,
+		service,
+		operation,
+		owned_callback,
+		proc(data: rawptr, ctx: ^nexus.Context, input: codec.Payload_View) -> nexus.Payload_Result {
+			callback := cast(^Payload_Nexus_Operation_Proc)data
+			return callback^(ctx, input)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_json_nexus_operation :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback: proc(ctx: ^nexus.Context, input: $Input) -> $Output,
+) -> Error {
+	Callback :: #type proc(ctx: ^nexus.Context, input: Input) -> Output
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Callback, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Nexus operation callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_nexus_operation_invoker(
+		worker,
+		service,
+		operation,
+		owned_callback,
+		proc(data: rawptr, ctx: ^nexus.Context, input: codec.Payload_View) -> nexus.Payload_Result {
+			value: Input
+			decode_error := codec.decode_json(input, &value)
+			if decode_error != .None {
+				return nexus.payload_handler_error(
+					"Nexus operation input is not valid json/plain for its Odin type",
+					error_type = "BAD_REQUEST",
+					retry_behavior = .Non_Retryable,
+				)
+			}
+			callback := cast(^Callback)data
+			output := callback^(ctx, value)
+			payload, encode_error := codec.encode_json(output)
+			if encode_error != .None {
+				return nexus.payload_handler_error(
+					"could not encode Nexus operation result as json/plain",
+					retry_behavior = .Non_Retryable,
+				)
+			}
+			return nexus.payload_complete(payload)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_json_nexus_operation_result :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback: proc(ctx: ^nexus.Context, input: $Input) -> nexus.Result($Output),
+) -> Error {
+	Callback :: #type proc(ctx: ^nexus.Context, input: Input) -> nexus.Result(Output)
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Callback, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Nexus operation callback")
+	}
+	owned_callback^ = callback
+	registration_error := register_nexus_operation_invoker(
+		worker,
+		service,
+		operation,
+		owned_callback,
+		proc(data: rawptr, ctx: ^nexus.Context, input: codec.Payload_View) -> nexus.Payload_Result {
+			value: Input
+			decode_error := codec.decode_json(input, &value)
+			if decode_error != .None {
+				return nexus.payload_handler_error(
+					"Nexus operation input is not valid json/plain for its Odin type",
+					error_type = "BAD_REQUEST",
+					retry_behavior = .Non_Retryable,
+				)
+			}
+			callback := cast(^Callback)data
+			result := callback^(ctx, value)
+			if result.status == .Handler_Error {
+				return {
+					status = .Handler_Error,
+					handler_error = result.handler_error,
+				}
+			}
+			payload, encode_error := codec.encode_json(result.value)
+			if encode_error != .None {
+				return nexus.payload_handler_error(
+					"could not encode Nexus operation result as json/plain",
+					retry_behavior = .Non_Retryable,
+				)
+			}
+			return nexus.payload_complete(payload)
+		},
+	)
+	if registration_error.message != nil {
+		free(owned_callback, allocator)
+	}
+	return registration_error
+}
+
+register_nexus_operation :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback: proc(ctx: ^nexus.Context, input: $Input) -> $Output,
+) -> Error {
+	return register_json_nexus_operation(worker, service, operation, callback)
+}
+
 workflow_runtime_namespace :: proc(worker: ^Worker) -> string {
 	if worker != nil && len(worker.namespace) > 0 {
 		return worker.namespace
@@ -1149,6 +1349,18 @@ register_json_workflow :: proc(
 find_activity :: proc(worker: ^Worker, name: string) -> (^Activity_Registration, bool) {
 	for &registration in worker.activity_registrations {
 		if registration.name == name {
+			return &registration, true
+		}
+	}
+	return nil, false
+}
+
+find_nexus_operation :: proc(
+	worker: ^Worker,
+	service, operation: string,
+) -> (^Nexus_Operation_Registration, bool) {
+	for &registration in worker.nexus_operation_registrations {
+		if registration.service == service && registration.operation == operation {
 			return &registration, true
 		}
 	}
@@ -2003,6 +2215,430 @@ run_activity_loop :: proc(
 	return completed, cancellations, peak_in_flight, reap_error
 }
 
+Nexus_Info_Owner :: struct {
+	info:             nexus.Info,
+	owned_strings:    [dynamic]string,
+	headers:          [dynamic]nexus.Header,
+	callback_headers: [dynamic]nexus.Header,
+}
+
+nexus_info_owner_clone_string :: proc(
+	owner: ^Nexus_Info_Owner,
+	value: string,
+) -> (owned: string, ok: bool) {
+	if len(value) == 0 {
+		return "", true
+	}
+	cloned, allocation_error := strings.clone(value, allocator_runtime.heap_allocator())
+	if allocation_error != nil {
+		return "", false
+	}
+	append(&owner.owned_strings, cloned)
+	return cloned, true
+}
+
+nexus_info_owner_destroy :: proc(owner: ^Nexus_Info_Owner) {
+	if owner == nil {
+		return
+	}
+	for value in owner.owned_strings {
+		delete(value, allocator_runtime.heap_allocator())
+	}
+	delete(owner.owned_strings)
+	delete(owner.headers)
+	delete(owner.callback_headers)
+	owner^ = {}
+}
+
+nexus_info_owner_init :: proc(
+	owner: ^Nexus_Info_Owner,
+	worker: ^Worker,
+	task: ^proto.Nexus_Task,
+	task_token: []u8,
+) -> Error {
+	if owner == nil || worker == nil || task == nil {
+		return error_from_string("could not initialize Nexus operation info")
+	}
+	heap := allocator_runtime.heap_allocator()
+	owner.owned_strings = make([dynamic]string, heap)
+	owner.headers = make([dynamic]nexus.Header, heap)
+	owner.callback_headers = make([dynamic]nexus.Header, heap)
+	clone_ok: bool
+	owner.info.service, clone_ok = nexus_info_owner_clone_string(owner, task.service)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.operation, clone_ok = nexus_info_owner_clone_string(owner, task.operation)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.request_id, clone_ok = nexus_info_owner_clone_string(owner, task.request_id)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.callback_url, clone_ok = nexus_info_owner_clone_string(owner, task.callback_url)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.endpoint, clone_ok = nexus_info_owner_clone_string(owner, task.endpoint)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.namespace, clone_ok = nexus_info_owner_clone_string(owner, worker.namespace)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.task_queue, clone_ok = nexus_info_owner_clone_string(owner, worker.task_queue)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.task_token = task_token
+	owner.info.scheduled_time = task.scheduled_time.value
+	owner.info.has_scheduled_time = task.scheduled_time.present
+	owner.info.deadline = task.request_deadline.value
+	owner.info.has_deadline = task.request_deadline.present
+	for entry in task.headers {
+		key, key_ok := nexus_info_owner_clone_string(owner, entry.key)
+		value, value_ok := nexus_info_owner_clone_string(owner, entry.value)
+		if !key_ok || !value_ok {
+			return error_from_string("could not allocate Nexus request header")
+		}
+		append(&owner.headers, nexus.Header{key = key, value = value})
+	}
+	for entry in task.callback_headers {
+		key, key_ok := nexus_info_owner_clone_string(owner, entry.key)
+		value, value_ok := nexus_info_owner_clone_string(owner, entry.value)
+		if !key_ok || !value_ok {
+			return error_from_string("could not allocate Nexus callback header")
+		}
+		append(&owner.callback_headers, nexus.Header{key = key, value = value})
+	}
+	owner.info.headers = owner.headers[:]
+	owner.info.callback_headers = owner.callback_headers[:]
+	return {}
+}
+
+Nexus_Execution :: struct {
+	worker:        ^Worker,
+	callback_data: rawptr,
+	invoke:        Nexus_Operation_Invoke_Proc,
+	task_token:    []u8,
+	input:         codec.Payload,
+	info_owner:    Nexus_Info_Owner,
+	ctx:           nexus.Context,
+	error:         Error,
+}
+
+Nexus_Execution_Routes :: map[string]^Nexus_Execution
+
+nexus_execution_route_find :: proc(
+	routes: Nexus_Execution_Routes,
+	task_token: []u8,
+) -> (^Nexus_Execution, bool) {
+	execution, found := routes[string(task_token)]
+	return execution, found
+}
+
+nexus_execution_route_add :: proc(
+	routes: ^Nexus_Execution_Routes,
+	execution: ^Nexus_Execution,
+) -> bool {
+	if routes == nil || execution == nil || len(execution.task_token) == 0 {
+		return false
+	}
+	key := string(execution.task_token)
+	if _, found := routes^[key]; found {
+		return false
+	}
+	routes^[key] = execution
+	return true
+}
+
+nexus_execution_route_remove :: proc(
+	routes: ^Nexus_Execution_Routes,
+	execution: ^Nexus_Execution,
+) -> bool {
+	if routes == nil || execution == nil || len(execution.task_token) == 0 {
+		return false
+	}
+	key := string(execution.task_token)
+	routed, found := routes^[key]
+	if !found || routed != execution {
+		return false
+	}
+	delete_key(routes, key)
+	return true
+}
+
+nexus_retry_behavior :: proc(
+	value: nexus.Retry_Behavior,
+) -> proto.Temporal_Api_Enums_V1_NexusHandlerErrorRetryBehavior {
+	switch value {
+	case .Retryable:
+		return .NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_RETRYABLE
+	case .Non_Retryable:
+		return .NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE
+	case .Unspecified:
+		return .NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_UNSPECIFIED
+	}
+	return .NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_UNSPECIFIED
+}
+
+nexus_execution_main :: proc(execution: ^Nexus_Execution) {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		execution.error = error_from_string("could not initialize Nexus operation allocation arena")
+		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	result := execution.invoke(
+		execution.callback_data,
+		&execution.ctx,
+		codec.payload_view(&execution.input),
+	)
+	context.allocator = previous_allocator
+	defer nexus.payload_result_free(&result)
+
+	completion: [dynamic]u8
+	if nexus.is_cancellation_requested(&execution.ctx) {
+		completion = proto.encode_nexus_ack_cancel(execution.task_token)
+	} else if result.status == .Handler_Error {
+		error_type := result.handler_error.type
+		if len(error_type) == 0 {
+			error_type = "INTERNAL"
+		}
+		completion = proto.encode_nexus_handler_failure(
+			execution.task_token,
+			result.handler_error.message,
+			error_type,
+			nexus_retry_behavior(result.handler_error.retry_behavior),
+		)
+	} else {
+		completion = proto.encode_nexus_sync_success(
+			execution.task_token,
+			codec.payload_view(&result.payload),
+		)
+	}
+	defer delete(completion)
+	core_error := temporal_core.worker_complete_nexus(&execution.worker.core, completion[:])
+	if core_error.message != nil {
+		execution.error = error_from_core(&core_error)
+		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+	}
+}
+
+nexus_execution_task :: proc(task: thread.Task) {
+	nexus_execution_main(cast(^Nexus_Execution)task.data)
+}
+
+nexus_execution_destroy :: proc(execution: ^Nexus_Execution) {
+	if execution == nil {
+		return
+	}
+	delete(execution.task_token)
+	codec.payload_free(&execution.input)
+	nexus_info_owner_destroy(&execution.info_owner)
+	error_free(&execution.error)
+	free(execution)
+}
+
+nexus_complete_handler_failure :: proc(
+	worker: ^Worker,
+	task_token: []u8,
+	message, error_type: string,
+	retry_behavior := nexus.Retry_Behavior.Unspecified,
+) -> Error {
+	completion := proto.encode_nexus_handler_failure(
+		task_token,
+		message,
+		error_type,
+		nexus_retry_behavior(retry_behavior),
+	)
+	defer delete(completion)
+	core_error := temporal_core.worker_complete_nexus(&worker.core, completion[:])
+	return error_from_core(&core_error)
+}
+
+nexus_execution_start :: proc(
+	worker: ^Worker,
+	pool: ^thread.Pool,
+	task: ^proto.Nexus_Task,
+) -> (execution: ^Nexus_Execution, error: Error) {
+	registration, found := find_nexus_operation(worker, task.service, task.operation)
+	if !found {
+		message := fmt.aprintf(
+			"Nexus operation %q on service %q is not registered",
+			task.operation,
+			task.service,
+		)
+		defer delete(message)
+		return nil, nexus_complete_handler_failure(
+			worker,
+			task.task_token,
+			message,
+			"NOT_FOUND",
+			.Non_Retryable,
+		)
+	}
+
+	execution = new(Nexus_Execution)
+	execution.worker = worker
+	execution.callback_data = registration.callback_data
+	execution.invoke = registration.invoke
+	execution.task_token = bytes.clone(task.task_token)
+	owned_input, clone_error := proto.clone_payload_view(
+		task.input,
+		allocator_runtime.heap_allocator(),
+	)
+	if clone_error != .None {
+		nexus_execution_destroy(execution)
+		return nil, error_from_string("could not allocate Nexus operation input Payload")
+	}
+	execution.input = owned_input
+	info_error := nexus_info_owner_init(
+		&execution.info_owner,
+		worker,
+		task,
+		execution.task_token,
+	)
+	if info_error.message != nil {
+		nexus_execution_destroy(execution)
+		return nil, info_error
+	}
+	nexus.context_init(&execution.ctx, execution.info_owner.info)
+	thread.pool_add_task(pool, context.allocator, nexus_execution_task, execution)
+	return execution, {}
+}
+
+reap_nexus_executions :: proc(
+	routes: ^Nexus_Execution_Routes,
+	pool: ^thread.Pool,
+) -> (completed: int, error: Error) {
+	for {
+		task, done := thread.pool_pop_done(pool)
+		if !done {
+			break
+		}
+		execution := cast(^Nexus_Execution)task.data
+		if !nexus_execution_route_remove(routes, execution) {
+			nexus_execution_destroy(execution)
+			if error.message == nil {
+				error = error_from_string("Nexus executor returned an unknown task")
+			}
+			continue
+		}
+		if execution.error.message != nil {
+			if error.message == nil {
+				error = execution.error
+				execution.error = {}
+			}
+		} else {
+			completed += 1
+		}
+		nexus_execution_destroy(execution)
+	}
+	return
+}
+
+run_nexus_loop :: proc(
+	worker: ^Worker,
+	max_tasks, executor_threads: int,
+) -> (completed: int, cancellations: int, peak_in_flight: int, error: Error) {
+	routes := make(Nexus_Execution_Routes, executor_threads, allocator_runtime.heap_allocator())
+	defer delete(routes)
+	pool := thread.Pool{}
+	thread.pool_init(&pool, allocator_runtime.heap_allocator(), executor_threads)
+	thread.pool_start(&pool)
+	pool_finished := false
+	defer {
+		if !pool_finished {
+			thread.pool_finish(&pool)
+			_, cleanup_error := reap_nexus_executions(&routes, &pool)
+			error_free(&cleanup_error)
+		}
+		thread.pool_destroy(&pool)
+	}
+	started := 0
+	for max_tasks <= 0 || started < max_tasks {
+		reaped, reap_error := reap_nexus_executions(&routes, &pool)
+		completed += reaped
+		if reap_error.message != nil {
+			return completed, cancellations, peak_in_flight, reap_error
+		}
+		poll := temporal_core.worker_poll_nexus(&worker.core)
+		if poll.error.message != nil {
+			return completed, cancellations, peak_in_flight, error_from_core(&poll.error)
+		}
+		if poll.shutdown {
+			break
+		}
+
+		decode_arena: virtual.Arena
+		if virtual.arena_init_growing(&decode_arena) != nil {
+			delete(poll.protobuf)
+			return completed, cancellations, peak_in_flight, error_from_string("could not initialize Nexus protobuf decode arena")
+		}
+		previous_allocator := context.allocator
+		context.allocator = virtual.arena_allocator(&decode_arena)
+		task, decode_error := proto.decode_nexus_task(poll.protobuf)
+		context.allocator = previous_allocator
+		if decode_error != .None {
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned a malformed NexusTask protobuf")
+		}
+		if task.kind == .Cancel_Task {
+			execution, found := nexus_execution_route_find(routes, task.task_token)
+			if found {
+				reason := nexus.Cancel_Reason.Timed_Out
+				if task.cancel_reason == .WORKER_SHUTDOWN {
+					reason = .Worker_Shutdown
+				}
+				nexus.context_request_cancellation(&execution.ctx, reason)
+				cancellations += 1
+			}
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			continue
+		}
+		if task.kind == .Cancel_Operation {
+			cancel_error := nexus_complete_handler_failure(
+				worker,
+				task.task_token,
+				"synchronous Odin Nexus operations do not expose a cancel handler",
+				"NOT_IMPLEMENTED",
+				.Non_Retryable,
+			)
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			if cancel_error.message != nil {
+				return completed, cancellations, peak_in_flight, cancel_error
+			}
+			completed += 1
+			started += 1
+			continue
+		}
+		if task.kind != .Start_Operation {
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned an unsupported Nexus task")
+		}
+		if _, duplicate := nexus_execution_route_find(routes, task.task_token); duplicate {
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned a duplicate Nexus task token")
+		}
+		execution, execute_error := nexus_execution_start(worker, &pool, &task)
+		virtual.arena_destroy(&decode_arena)
+		delete(poll.protobuf)
+		if execute_error.message != nil {
+			return completed, cancellations, peak_in_flight, execute_error
+		}
+		started += 1
+		if execution == nil {
+			completed += 1
+		} else if !nexus_execution_route_add(&routes, execution) {
+			return completed, cancellations, peak_in_flight, error_from_string("could not route Nexus execution task token")
+		} else {
+			peak_in_flight = max(peak_in_flight, len(routes))
+		}
+	}
+	thread.pool_finish(&pool)
+	pool_finished = true
+	reaped, reap_error := reap_nexus_executions(&routes, &pool)
+	completed += reaped
+	return completed, cancellations, peak_in_flight, reap_error
+}
+
 record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
 	stats.workflow_activations_completed += 1
 	if processed.activation_failed {
@@ -2390,6 +3026,16 @@ Workflow_Thread_State :: struct {
 	error:   Error,
 }
 
+Nexus_Thread_State :: struct {
+	worker:         ^Worker,
+	max_tasks:      int,
+	executor_threads: int,
+	completed:      int,
+	cancellations:  int,
+	peak_in_flight: int,
+	error:          Error,
+}
+
 activity_thread_main :: proc(state: ^Activity_Thread_State) {
 	state.completed,
 	state.cancellations,
@@ -2402,6 +3048,16 @@ activity_thread_main :: proc(state: ^Activity_Thread_State) {
 
 workflow_thread_main :: proc(state: ^Workflow_Thread_State) {
 	state.stats, state.error = run_workflow_loop(state.worker, state.options)
+	if state.error.message != nil {
+		temporal_core.worker_initiate_shutdown(&state.worker.core)
+	}
+}
+
+nexus_thread_main :: proc(state: ^Nexus_Thread_State) {
+	state.completed,
+	state.cancellations,
+	state.peak_in_flight,
+	state.error = run_nexus_loop(state.worker, state.max_tasks, state.executor_threads)
 	if state.error.message != nil {
 		temporal_core.worker_initiate_shutdown(&state.worker.core)
 	}
@@ -2420,7 +3076,8 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if worker.mode == .Replay {
 		return {}, error_from_string("replay workers must use replay_history")
 	}
-	if options.max_activity_tasks < 0 || options.max_workflow_executions < 0 {
+	if options.max_activity_tasks < 0 || options.max_nexus_tasks < 0 ||
+	   options.max_workflow_executions < 0 {
 		return {}, error_from_string("worker run limits must not be negative")
 	}
 	poll_workflows := len(worker.workflow_registrations) > 0
@@ -2428,6 +3085,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	poll_local_activities := len(worker.activity_registrations) > 0 && poll_workflows &&
 		!options.disable_activity_polling && options.enable_local_activities
 	poll_activities := poll_remote_activities || poll_local_activities
+	poll_nexus := len(worker.nexus_operation_registrations) > 0
 	activity_executor_threads := 0
 	if poll_remote_activities {
 		activity_executor_threads += worker.max_concurrent_activities
@@ -2435,7 +3093,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if poll_local_activities {
 		activity_executor_threads += worker.max_concurrent_local_activities
 	}
-	if !poll_activities && !poll_workflows {
+	if !poll_activities && !poll_workflows && !poll_nexus {
 		return {}, error_from_string("worker has no enabled registered task types")
 	}
 	if worker.client == nil || worker.client.handle == nil || worker.client.runtime == nil {
@@ -2450,6 +3108,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		enable_workflows = poll_workflows,
 		enable_local_activities = poll_local_activities,
 		enable_remote_activities = poll_remote_activities,
+		enable_nexus = poll_nexus,
 		versioning = worker.versioning,
 		nondeterminism_policy = worker.nondeterminism_policy,
 	)
@@ -2471,15 +3130,22 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		return {}, error_from_string("worker ready callback failed")
 	}
 
-	if poll_activities && !poll_workflows {
+	if poll_activities && !poll_workflows && !poll_nexus {
 		stats.activity_tasks_completed,
 		stats.activity_cancellations_received,
 		stats.activity_executions_peak_owned,
 		error = run_activity_loop(worker, options.max_activity_tasks, activity_executor_threads)
 		return
 	}
-	if poll_workflows && !poll_activities {
+	if poll_workflows && !poll_activities && !poll_nexus {
 		return run_workflow_loop(worker, options)
+	}
+	if poll_nexus && !poll_activities && !poll_workflows {
+		stats.nexus_tasks_completed,
+		stats.nexus_cancellations_received,
+		stats.nexus_executions_peak_owned,
+		error = run_nexus_loop(worker, options.max_nexus_tasks, worker.max_concurrent_nexus_tasks)
+		return
 	}
 
 	activity_state := Activity_Thread_State{
@@ -2488,39 +3154,84 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		executor_threads = activity_executor_threads,
 	}
 	workflow_state := Workflow_Thread_State{worker = worker, options = options}
-	workflow_thread := thread.create_and_start_with_poly_data(&workflow_state, workflow_thread_main)
-	if workflow_thread == nil {
-		return {}, error_from_string("could not start Workflow poll thread")
+	nexus_state := Nexus_Thread_State{
+		worker = worker,
+		max_tasks = options.max_nexus_tasks,
+		executor_threads = worker.max_concurrent_nexus_tasks,
 	}
-	activity_thread := thread.create_and_start_with_poly_data(&activity_state, activity_thread_main)
-	if activity_thread == nil {
-		temporal_core.worker_initiate_shutdown(&worker.core)
+	workflow_thread: ^thread.Thread
+	activity_thread: ^thread.Thread
+	nexus_thread: ^thread.Thread
+	if poll_workflows {
+		workflow_thread = thread.create_and_start_with_poly_data(&workflow_state, workflow_thread_main)
+		if workflow_thread == nil {
+			return {}, error_from_string("could not start Workflow poll thread")
+		}
+	}
+	if poll_activities {
+		activity_thread = thread.create_and_start_with_poly_data(&activity_state, activity_thread_main)
+		if activity_thread == nil {
+			temporal_core.worker_initiate_shutdown(&worker.core)
+			if workflow_thread != nil {
+				thread.join(workflow_thread)
+				thread.destroy(workflow_thread)
+				error_free(&workflow_state.error)
+			}
+			return {}, error_from_string("could not start Activity poll thread")
+		}
+	}
+	if poll_nexus {
+		nexus_thread = thread.create_and_start_with_poly_data(&nexus_state, nexus_thread_main)
+		if nexus_thread == nil {
+			temporal_core.worker_initiate_shutdown(&worker.core)
+			if workflow_thread != nil {
+				thread.join(workflow_thread)
+				thread.destroy(workflow_thread)
+				error_free(&workflow_state.error)
+			}
+			if activity_thread != nil {
+				thread.join(activity_thread)
+				thread.destroy(activity_thread)
+				error_free(&activity_state.error)
+			}
+			return {}, error_from_string("could not start Nexus poll thread")
+		}
+	}
+	if workflow_thread != nil {
 		thread.join(workflow_thread)
-		thread.destroy(workflow_thread)
-		error_free(&workflow_state.error)
-		return {}, error_from_string("could not start Activity poll thread")
+		// A bounded Workflow run is an example/test facility. Once its target
+		// has evicted, stop otherwise-unbounded Activity and Nexus polls so all
+		// enabled streams can join. Task-count limits only stop their own stream.
+		if options.max_workflow_executions > 0 && workflow_state.error.message == nil {
+			temporal_core.worker_initiate_shutdown(&worker.core)
+		}
 	}
-	thread.join(workflow_thread)
-	// Bounded Workflow runs are an example/test facility. Once that target has
-	// evicted, stop the otherwise-unbounded Activity poll so both loops can join.
-	if options.max_workflow_executions > 0 && workflow_state.error.message == nil {
-		temporal_core.worker_initiate_shutdown(&worker.core)
-	}
-	thread.join(activity_thread)
-	thread.destroy(workflow_thread)
-	thread.destroy(activity_thread)
+	if activity_thread != nil do thread.join(activity_thread)
+	if nexus_thread != nil do thread.join(nexus_thread)
+	if workflow_thread != nil do thread.destroy(workflow_thread)
+	if activity_thread != nil do thread.destroy(activity_thread)
+	if nexus_thread != nil do thread.destroy(nexus_thread)
 
 	stats = workflow_state.stats
 	stats.activity_tasks_completed = activity_state.completed
 	stats.activity_cancellations_received = activity_state.cancellations
 	stats.activity_executions_peak_owned = activity_state.peak_in_flight
+	stats.nexus_tasks_completed = nexus_state.completed
+	stats.nexus_cancellations_received = nexus_state.cancellations
+	stats.nexus_executions_peak_owned = nexus_state.peak_in_flight
 	if workflow_state.error.message != nil {
 		error = workflow_state.error
 		error_free(&activity_state.error)
+		error_free(&nexus_state.error)
 		return
 	}
 	if activity_state.error.message != nil {
 		error = activity_state.error
+		error_free(&nexus_state.error)
+		return
+	}
+	if nexus_state.error.message != nil {
+		error = nexus_state.error
 		return
 	}
 	return
@@ -2548,6 +3259,11 @@ close :: proc(worker: ^Worker) -> Error {
 		free(registration.callback_data, allocator_runtime.heap_allocator())
 		delete(registration.name)
 	}
+	for registration in worker.nexus_operation_registrations {
+		free(registration.callback_data, allocator_runtime.heap_allocator())
+		delete(registration.service)
+		delete(registration.operation)
+	}
 	for &registration in worker.workflow_registrations {
 		workflow.fiber_runtime_close(&registration.runtime)
 		delete(registration.name)
@@ -2559,6 +3275,7 @@ close :: proc(worker: ^Worker) -> Error {
 		delete(rejected_run.run_id)
 	}
 	delete(worker.activity_registrations)
+	delete(worker.nexus_operation_registrations)
 	delete(worker.activity_interceptors)
 	delete(worker.workflow_inbound_interceptors)
 	delete(worker.workflow_interceptors)
@@ -2572,6 +3289,7 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.versioning.deployment_name)
 	owned_string_slice_free(worker.nondeterminism_policy.fail_workflow_types)
 	worker.activity_registrations = nil
+	worker.nexus_operation_registrations = nil
 	worker.activity_interceptors = nil
 	worker.workflow_inbound_interceptors = nil
 	worker.workflow_interceptors = nil
