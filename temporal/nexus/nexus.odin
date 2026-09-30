@@ -1,6 +1,7 @@
 // Package nexus contains values available while handling a Nexus operation.
-// The initial surface supports synchronous operations. Context values are
-// borrowed and valid only for the duration of the handler call.
+// Start handlers may complete synchronously or return a durable async operation
+// token; separately registered cancel handlers receive that token. Context
+// values are borrowed and valid only for the duration of the handler call.
 package nexus
 
 import "core:sync"
@@ -28,6 +29,7 @@ Info :: struct {
 	service:          string,
 	operation:        string,
 	request_id:       string,
+	operation_token:  string,
 	callback_url:     string,
 	endpoint:         string,
 	namespace:        string,
@@ -106,6 +108,7 @@ callback_header :: proc(ctx: ^Context, key: string) -> (value: string, found: bo
 
 Result_Status :: enum {
 	Completed,
+	Started_Async,
 	Handler_Error,
 }
 
@@ -116,13 +119,21 @@ Handler_Error :: struct {
 }
 
 Result :: struct(T: typeid) {
-	status:        Result_Status,
-	value:         T,
-	handler_error: Handler_Error,
+	status:          Result_Status,
+	value:           T,
+	operation_token: string,
+	handler_error:   Handler_Error,
 }
 
 result_success :: proc(value: $T) -> Result(T) {
 	return {status = .Completed, value = value}
+}
+
+// result_async acknowledges a durable asynchronous operation. The handler must
+// arrange eventual completion through the callback URL and headers in Info.
+// operation_token is borrowed until the handler returns and must be nonempty.
+result_async :: proc($T: typeid, operation_token: string) -> Result(T) {
+	return {status = .Started_Async, operation_token = operation_token}
 }
 
 result_handler_error :: proc(
@@ -142,13 +153,18 @@ result_handler_error :: proc(
 }
 
 Payload_Result :: struct {
-	status:        Result_Status,
-	payload:       codec.Payload,
-	handler_error: Handler_Error,
+	status:          Result_Status,
+	payload:         codec.Payload,
+	operation_token: string,
+	handler_error:   Handler_Error,
 }
 
 payload_complete :: proc(payload: codec.Payload) -> Payload_Result {
 	return {status = .Completed, payload = payload}
+}
+
+payload_async :: proc(operation_token: string) -> Payload_Result {
+	return {status = .Started_Async, operation_token = operation_token}
 }
 
 payload_handler_error :: proc(
@@ -172,4 +188,33 @@ payload_result_free :: proc(result: ^Payload_Result) {
 	}
 	codec.payload_free(&result.payload)
 	result^ = {}
+}
+
+Cancel_Result_Status :: enum {
+	Completed,
+	Handler_Error,
+}
+
+Cancel_Result :: struct {
+	status:        Cancel_Result_Status,
+	handler_error: Handler_Error,
+}
+
+cancel_complete :: proc() -> Cancel_Result {
+	return {status = .Completed}
+}
+
+cancel_handler_error :: proc(
+	message: string,
+	error_type := "INTERNAL",
+	retry_behavior := Retry_Behavior.Unspecified,
+) -> Cancel_Result {
+	return {
+		status = .Handler_Error,
+		handler_error = {
+			message = message,
+			type = error_type,
+			retry_behavior = retry_behavior,
+		},
+	}
 }

@@ -424,7 +424,8 @@ acknowledgement, or Temporal Failure. A synchronous successful operation
 returns exactly one Temporal Payload; an asynchronous start returns the durable
 operation token through the upstream Nexus response union.
 
-The implementation now crosses that boundary for synchronous operations:
+The implementation now crosses that boundary for synchronous results, async
+token starts, protocol cancellation, and Core-local task cancellation:
 
 - `temporal/core/raw` binds `temporal_core_worker_poll_nexus_task` and
   `temporal_core_worker_complete_nexus_task`;
@@ -434,12 +435,13 @@ The implementation now crosses that boundary for synchronous operations:
   slots and poller behavior, and drains the enabled stream before worker
   finalization;
 - `temporal/nexus` defines a callback-scoped borrowed context, header/deadline
-  views, atomic cooperative cancellation, synchronous results, and handler
-  errors;
+  views, atomic cooperative cancellation, synchronous results, async start
+  tokens, cancel results, and handler errors;
 - `temporal/worker` owns cloned service/operation registrations, enables Nexus
   only when that registry is nonempty, copies every value that outlives the
   decode arena, routes opaque binary task tokens, and executes handlers through
-  a bounded pool sized by `max_concurrent_nexus_tasks`;
+  a bounded pool sized by `max_concurrent_nexus_tasks`; async operations may add
+  a distinct cancel handler to the same registration;
 - `examples/core_connect` validates a Nexus-enabled worker against the CLI dev
   server, begins the real Core poll path, initiates shutdown, observes the
   shutdown sentinel, and finalizes cleanly.
@@ -449,11 +451,13 @@ The implementation now crosses that boundary for synchronous operations:
   emits `ScheduleNexusOperation`/`RequestCancelNexusOperation`, consumes Core's
   distinct `ResolveNexusOperationStart` and `ResolveNexusOperation` jobs, and
   exposes Payload, typed JSON, and string `start`/`await`/`execute` forms.
-- `examples/hello_nexus_workflow` runs the caller Workflow and synchronous
-  handlers in one Odin Worker. It live-proves success, a non-retryable handler
+- `examples/hello_nexus_workflow` runs the caller Workflow and Nexus handlers in
+  one Odin Worker. It live-proves success, a non-retryable handler
   failure, schedule-to-close timeout/cancellation, and two concurrent successful
   calls composed with selector/join, then fetches the server history and passes
-  every branch through Core's offline replayer.
+  every branch through Core's offline replayer. An async start returns a
+  durable token, then `Wait_Cancellation_Requested` routes `CancelOperation` to
+  the registered Odin cancel handler with that identical token.
 
 This proves the complete synchronous route from a Temporal Workflow through
 Service, Core, the C ABI, and an Odin operation callback and back. Unknown
@@ -473,12 +477,13 @@ the Workflow and reproduces the exact command bytes. Core remains responsible
 for endpoint routing, Nexus state machines, history interpretation, timeouts,
 and translating server events into the two activation-job forms.
 
-The remaining boundary is intentionally explicit. `CancelOperation` receives a
-non-retryable `NOT_IMPLEMENTED` handler failure because this first slice exposes
-no durable async operation token or user cancel handler. Async starts, callback
-completion, links, metrics, and stronger cancellation/deadline live cases are
-not implemented. The outbound interceptor and selector/join integration are
-now implemented. The caller does
+The remaining boundary is intentionally explicit. Start handlers may now return
+a durable operation token, and `CancelOperation` routes an owned copy through a
+separately registered handler before emitting the exact cancel response.
+Registrations without that handler retain a non-retryable `NOT_IMPLEMENTED`
+response. Callback completion, links, metrics, and the remaining cancellation
+policy live cases are not implemented. The outbound interceptor and
+selector/join integration are implemented. The caller does
 accept Core's async start-token activation shape internally, but no Odin handler
 can produce such a token yet and that path is not claimed as live-proven.
 
@@ -2676,15 +2681,16 @@ Workflows are enabled.
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
 9. **Nexus language semantics.** Core's transport, exact task/completion schema,
-   one public synchronous Odin handler path, and the stackful Workflow caller
+   public synchronous/async-start Odin handler paths, registered cancel handlers,
+   and the stackful Workflow caller
    are pinned, generated, replay-tested, and live-tested against a real
    endpoint. Handler errors have the exact
    `NexusHandlerFailureInfo` envelope, and all callback-visible data is owned
    beyond the poll arena. Workflow operation state, results, recursive failures,
-   and optional operation tokens are owned by the run arena. Async operation
-   handlers, user cancel handlers, callback completion, links, outbound
-   metrics and explicit operation cancellation after
-   callback handoff remain. The Workflow outbound interceptor is implemented
+   and optional operation tokens are owned by the run arena. Callback
+   completion, links, outbound metrics, and full cancellation-policy coverage
+   remain. Async token handoff and `Wait_Cancellation_Requested` are live-proven.
+   The Workflow outbound interceptor is implemented
    and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
    cooperative timeout cancellation of a running synchronous Odin handler are
    live-proven. A bounded run
@@ -2708,14 +2714,15 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: live-test all four cancellation policies, then property-test duplicate
-delivery. The selector/join branch is unit-, property-, live-, and replay-tested.
+boundary: implement callback completion, live-test the three remaining
+cancellation policies, then property-test duplicate delivery. The selector/join
+branch and async cancel-token handoff are unit-, live-, and replay-tested;
+selector ordering is also property-tested.
 The Workflow outbound
 interceptor and handler failure/pre-start timeout classification are now
 wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
-and timeout also run through the live server. After that,
-implement durable async Odin operation tokens, callback completion, and
-user-defined cancel handlers as a separate vertical slice. Activity Worker is
+and timeout also run through the live server. After that, implement callback
+completion as the next async Nexus vertical slice. Activity Worker is
 no longer the next milestone: it is already implemented and extensively
 live-tested.
 

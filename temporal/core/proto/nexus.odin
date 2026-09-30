@@ -138,6 +138,30 @@ encode_nexus_sync_success :: proc(task_token: []u8, result: codec.Payload_View) 
 	return encode_Coresdk_Nexus_NexusTaskCompletion(&completion)
 }
 
+encode_nexus_async_success :: proc(task_token: []u8, operation_token: string) -> [dynamic]u8 {
+	async_result := Temporal_Api_Nexus_V1_StartOperationResponse_Async{
+		// operation_id is deprecated but populated for compatibility with older
+		// Temporal Services. Modern callers identify the operation by token.
+		operation_id = operation_token,
+		operation_token = operation_token,
+	}
+	start_response := Temporal_Api_Nexus_V1_StartOperationResponse{
+		variant = Temporal_Api_Nexus_V1_StartOperationResponse_Variant_Async_Success{
+			value = &async_result,
+		},
+	}
+	response := Temporal_Api_Nexus_V1_Response{
+		variant = Temporal_Api_Nexus_V1_Response_Variant_Start_Operation{
+			value = &start_response,
+		},
+	}
+	completion := Coresdk_Nexus_NexusTaskCompletion{
+		task_token = task_token,
+		status = Coresdk_Nexus_NexusTaskCompletion_Status_Completed{value = &response},
+	}
+	return encode_Coresdk_Nexus_NexusTaskCompletion(&completion)
+}
+
 encode_nexus_cancel_success :: proc(task_token: []u8) -> [dynamic]u8 {
 	cancel_response := Temporal_Api_Nexus_V1_CancelOperationResponse{}
 	response := Temporal_Api_Nexus_V1_Response{

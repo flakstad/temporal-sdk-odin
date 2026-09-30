@@ -40,6 +40,15 @@ Nexus_Operation_Invoke_Proc :: #type proc(
 	ctx: ^nexus.Context,
 	input: codec.Payload_View,
 ) -> nexus.Payload_Result
+Nexus_Cancel_Operation_Proc :: #type proc(
+	ctx: ^nexus.Context,
+	operation_token: string,
+) -> nexus.Cancel_Result
+Nexus_Cancel_Operation_Invoke_Proc :: #type proc(
+	callback_data: rawptr,
+	ctx: ^nexus.Context,
+	operation_token: string,
+) -> nexus.Cancel_Result
 
 // Activity interceptors are registered on a Worker and form a real nested
 // chain. Registration order is outermost-first. An interceptor may inspect or
@@ -124,10 +133,12 @@ Activity_Registration :: struct {
 }
 
 Nexus_Operation_Registration :: struct {
-	service:       string,
-	operation:     string,
-	callback_data: rawptr,
-	invoke:        Nexus_Operation_Invoke_Proc,
+	service:              string,
+	operation:            string,
+	callback_data:        rawptr,
+	invoke:               Nexus_Operation_Invoke_Proc,
+	cancel_callback_data: rawptr,
+	cancel_invoke:        Nexus_Cancel_Operation_Invoke_Proc,
 }
 
 Workflow_Registration :: struct {
@@ -1073,6 +1084,9 @@ register_json_nexus_operation_result :: proc(
 					handler_error = result.handler_error,
 				}
 			}
+			if result.status == .Started_Async {
+				return nexus.payload_async(result.operation_token)
+			}
 			payload, encode_error := codec.encode_json(result.value)
 			if encode_error != .None {
 				return nexus.payload_handler_error(
@@ -1095,6 +1109,45 @@ register_nexus_operation :: proc(
 	callback: proc(ctx: ^nexus.Context, input: $Input) -> $Output,
 ) -> Error {
 	return register_json_nexus_operation(worker, service, operation, callback)
+}
+
+register_nexus_cancel_handler :: proc(
+	worker: ^Worker,
+	service, operation: string,
+	callback: Nexus_Cancel_Operation_Proc,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("Nexus cancel handlers cannot be registered after worker.run starts")
+	}
+	if callback == nil {
+		return error_from_string("Nexus cancel callback is required")
+	}
+	registration, found := find_nexus_operation(worker, service, operation)
+	if !found {
+		return error_from_string("Nexus operation must be registered before its cancel handler")
+	}
+	if registration.cancel_invoke != nil {
+		return error_from_string("Nexus cancel handler is already registered")
+	}
+	allocator := allocator_runtime.heap_allocator()
+	owned_callback, allocation_error := new(Nexus_Cancel_Operation_Proc, allocator)
+	if allocation_error != nil {
+		return error_from_string("could not allocate Nexus cancel callback")
+	}
+	owned_callback^ = callback
+	registration.cancel_callback_data = owned_callback
+	registration.cancel_invoke = proc(
+		data: rawptr,
+		ctx: ^nexus.Context,
+		operation_token: string,
+	) -> nexus.Cancel_Result {
+		registered := cast(^Nexus_Cancel_Operation_Proc)data
+		return registered^(ctx, operation_token)
+	}
+	return {}
 }
 
 workflow_runtime_namespace :: proc(worker: ^Worker) -> string {
@@ -2270,6 +2323,8 @@ nexus_info_owner_init :: proc(
 	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
 	owner.info.request_id, clone_ok = nexus_info_owner_clone_string(owner, task.request_id)
 	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
+	owner.info.operation_token, clone_ok = nexus_info_owner_clone_string(owner, task.operation_token)
+	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
 	owner.info.callback_url, clone_ok = nexus_info_owner_clone_string(owner, task.callback_url)
 	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
 	owner.info.endpoint, clone_ok = nexus_info_owner_clone_string(owner, task.endpoint)
@@ -2305,14 +2360,18 @@ nexus_info_owner_init :: proc(
 }
 
 Nexus_Execution :: struct {
-	worker:        ^Worker,
-	callback_data: rawptr,
-	invoke:        Nexus_Operation_Invoke_Proc,
-	task_token:    []u8,
-	input:         codec.Payload,
-	info_owner:    Nexus_Info_Owner,
-	ctx:           nexus.Context,
-	error:         Error,
+	worker:               ^Worker,
+	kind:                 proto.Nexus_Task_Kind,
+	callback_data:        rawptr,
+	invoke:               Nexus_Operation_Invoke_Proc,
+	cancel_callback_data: rawptr,
+	cancel_invoke:        Nexus_Cancel_Operation_Invoke_Proc,
+	task_token:           []u8,
+	operation_token:      string,
+	input:                codec.Payload,
+	info_owner:           Nexus_Info_Owner,
+	ctx:                  nexus.Context,
+	error:                Error,
 }
 
 Nexus_Execution_Routes :: map[string]^Nexus_Execution
@@ -2380,6 +2439,36 @@ nexus_execution_main :: proc(execution: ^Nexus_Execution) {
 	defer virtual.arena_destroy(&arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&arena)
+	if execution.kind == .Cancel_Operation {
+		result := execution.cancel_invoke(
+			execution.cancel_callback_data,
+			&execution.ctx,
+			execution.operation_token,
+		)
+		context.allocator = previous_allocator
+		completion: [dynamic]u8
+		if nexus.is_cancellation_requested(&execution.ctx) {
+			completion = proto.encode_nexus_ack_cancel(execution.task_token)
+		} else if result.status == .Handler_Error {
+			error_type := result.handler_error.type
+			if len(error_type) == 0 do error_type = "INTERNAL"
+			completion = proto.encode_nexus_handler_failure(
+				execution.task_token,
+				result.handler_error.message,
+				error_type,
+				nexus_retry_behavior(result.handler_error.retry_behavior),
+			)
+		} else {
+			completion = proto.encode_nexus_cancel_success(execution.task_token)
+		}
+		defer delete(completion)
+		core_error := temporal_core.worker_complete_nexus(&execution.worker.core, completion[:])
+		if core_error.message != nil {
+			execution.error = error_from_core(&core_error)
+			temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		}
+		return
+	}
 	result := execution.invoke(
 		execution.callback_data,
 		&execution.ctx,
@@ -2402,6 +2491,20 @@ nexus_execution_main :: proc(execution: ^Nexus_Execution) {
 			error_type,
 			nexus_retry_behavior(result.handler_error.retry_behavior),
 		)
+	} else if result.status == .Started_Async {
+		if len(result.operation_token) == 0 {
+			completion = proto.encode_nexus_handler_failure(
+				execution.task_token,
+				"asynchronous Nexus operation returned an empty operation token",
+				"INTERNAL",
+				.NEXUS_HANDLER_ERROR_RETRY_BEHAVIOR_NON_RETRYABLE,
+			)
+		} else {
+			completion = proto.encode_nexus_async_success(
+				execution.task_token,
+				result.operation_token,
+			)
+		}
 	} else {
 		completion = proto.encode_nexus_sync_success(
 			execution.task_token,
@@ -2425,6 +2528,7 @@ nexus_execution_destroy :: proc(execution: ^Nexus_Execution) {
 		return
 	}
 	delete(execution.task_token)
+	delete(execution.operation_token, allocator_runtime.heap_allocator())
 	codec.payload_free(&execution.input)
 	nexus_info_owner_destroy(&execution.info_owner)
 	error_free(&execution.error)
@@ -2472,18 +2576,43 @@ nexus_execution_start :: proc(
 
 	execution = new(Nexus_Execution)
 	execution.worker = worker
+	execution.kind = task.kind
 	execution.callback_data = registration.callback_data
 	execution.invoke = registration.invoke
+	execution.cancel_callback_data = registration.cancel_callback_data
+	execution.cancel_invoke = registration.cancel_invoke
 	execution.task_token = bytes.clone(task.task_token)
-	owned_input, clone_error := proto.clone_payload_view(
-		task.input,
-		allocator_runtime.heap_allocator(),
-	)
-	if clone_error != .None {
-		nexus_execution_destroy(execution)
-		return nil, error_from_string("could not allocate Nexus operation input Payload")
+	if task.kind == .Cancel_Operation {
+		if registration.cancel_invoke == nil {
+			nexus_execution_destroy(execution)
+			return nil, nexus_complete_handler_failure(
+				worker,
+				task.task_token,
+				"Odin Nexus operation does not expose a cancel handler",
+				"NOT_IMPLEMENTED",
+				.Non_Retryable,
+			)
+		}
+		operation_token, token_error := strings.clone(
+			task.operation_token,
+			allocator_runtime.heap_allocator(),
+		)
+		if token_error != nil {
+			nexus_execution_destroy(execution)
+			return nil, error_from_string("could not allocate Nexus operation token")
+		}
+		execution.operation_token = operation_token
+	} else {
+		owned_input, clone_error := proto.clone_payload_view(
+			task.input,
+			allocator_runtime.heap_allocator(),
+		)
+		if clone_error != .None {
+			nexus_execution_destroy(execution)
+			return nil, error_from_string("could not allocate Nexus operation input Payload")
+		}
+		execution.input = owned_input
 	}
-	execution.input = owned_input
 	info_error := nexus_info_owner_init(
 		&execution.info_owner,
 		worker,
@@ -2590,24 +2719,7 @@ run_nexus_loop :: proc(
 			delete(poll.protobuf)
 			continue
 		}
-		if task.kind == .Cancel_Operation {
-			cancel_error := nexus_complete_handler_failure(
-				worker,
-				task.task_token,
-				"synchronous Odin Nexus operations do not expose a cancel handler",
-				"NOT_IMPLEMENTED",
-				.Non_Retryable,
-			)
-			virtual.arena_destroy(&decode_arena)
-			delete(poll.protobuf)
-			if cancel_error.message != nil {
-				return completed, cancellations, peak_in_flight, cancel_error
-			}
-			completed += 1
-			started += 1
-			continue
-		}
-		if task.kind != .Start_Operation {
+		if task.kind != .Start_Operation && task.kind != .Cancel_Operation {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
 			return completed, cancellations, peak_in_flight, error_from_string("Core returned an unsupported Nexus task")
@@ -3261,6 +3373,9 @@ close :: proc(worker: ^Worker) -> Error {
 	}
 	for registration in worker.nexus_operation_registrations {
 		free(registration.callback_data, allocator_runtime.heap_allocator())
+		if registration.cancel_callback_data != nil {
+			free(registration.cancel_callback_data, allocator_runtime.heap_allocator())
+		}
 		delete(registration.service)
 		delete(registration.operation)
 	}

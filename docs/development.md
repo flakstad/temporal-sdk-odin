@@ -1054,16 +1054,19 @@ shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
-Odin Worker runs the stackful caller Workflow and three registered operation
-types across four Nexus tasks.
+Odin Worker runs the stackful caller Workflow and four registered operation
+types across six Nexus tasks.
 It first observes a non-retryable handler failure, then forces a one-second
 schedule-to-close timeout and verifies that Core cooperatively cancels the
 running Odin callback. Finally it starts two concurrent
 `odin-greeting-service/hello` calls, wakes through the Nexus selector, joins
 both Futures, and requires both to return the JSON string `"Hello Odin"`. The
 example fetches the resulting server history and replays all branches offline
-through Core before the endpoint is deleted. This proves the real synchronous
-route in both directions without a second language SDK:
+through Core before the endpoint is deleted. It also starts an asynchronous
+operation, yields until Core records its token, requests cancellation with
+`Wait_Cancellation_Requested`, and verifies that the registered cancel handler
+receives the same token. This proves both synchronous and async-cancel routes
+without a second language SDK:
 
 ```text
 Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback
@@ -1083,12 +1086,15 @@ NEXUS_ENDPOINT=odin-nexus-local \
   ./scripts/run-hello-nexus-workflow.sh
 ```
 
-The example starts one Workflow, handles one operation, validates the result,
+The example starts one Workflow, handles the operation matrix, validates the result,
 replays the fetched history, and exits. `scripts/integration-test.sh` is the
 canonical repeatable harness. Endpoint names permit letters, digits, and
-hyphens, but not underscores. Core cancel tasks are routed cooperatively, while
-protocol `CancelOperation` requests return `NOT_IMPLEMENTED` until durable
-async operation tokens and cancel handlers exist.
+hyphens, but not underscores. Core cancel tasks are routed cooperatively.
+Protocol `CancelOperation` requests invoke an explicitly registered handler;
+registrations without one return a non-retryable `NOT_IMPLEMENTED` response.
+`nexus.result_async(Output, token)` populates both the modern operation token
+and deprecated operation ID for compatibility. Eventual success/failure of an
+async operation still needs the pending Client callback-completion API.
 
 The same script then runs `examples/hello_activity` for several focused cases.
 A small workflow-only driver under `native/activity-test-driver` uses the

@@ -335,8 +335,12 @@ operation, input Payload, timeouts, cancellation policy, and Nexus headers
 before the terminal continuation copies them into run ownership; nested order
 and byte-identical fresh-stack replay are tested. Nexus operation Futures are
 also valid `selector_select` and allocation-free `join_all` cases.
-User-defined async operation handlers, cancel-operation handlers, Nexus
-and live coverage of all cancellation policies are not yet implemented.
+Start handlers can now return a durable async operation token with
+`nexus.result_async`, and a separately registered cancel handler receives the
+same owned token when Core dispatches `CancelOperation`. The live suite proves
+`Wait_Cancellation_Requested` through both Odin handlers. The
+callback-completion Client surface and live coverage of the other three
+cancellation policies are not yet implemented.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
@@ -1815,7 +1819,7 @@ temporal/core/            blocking ownership/lifecycle wrapper
 temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
-temporal/nexus/           synchronous Nexus operation context and results
+temporal/nexus/           sync/async Nexus operation context and results
 temporal/worker/          Activity/Workflow/Nexus registry and concurrent polling
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
