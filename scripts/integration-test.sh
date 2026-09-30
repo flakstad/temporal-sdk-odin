@@ -229,6 +229,41 @@ grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_c
 grep -q "Workflow condition resumed after a Signal and replayed on a fresh stack" "$worker_log"
 echo "Workflow condition resumed through Core and Temporal Server"
 
+TEMPORAL_ODIN_SCENARIO=selector \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Selector Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+selector_workflow_id="odin-sdk-selector-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$selector_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"selector"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+selector_output="$(<"$workflow_output_file")"
+echo "$selector_output"
+grep -q 'Hello selector' <<<"$selector_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*started_timer=true .*waiting_selector=true .*completed=false" "$worker_log"
+grep -Eq "resolved=1 .*canceled_timer=true .*waiting_selector=false .*completed=true" "$worker_log"
+grep -q "Workflow selector chose the ready Activity and canceled its losing timer" "$worker_log"
+echo "Workflow selector raced an Activity and timer through Core and Temporal Server"
+
 TEMPORAL_ODIN_SCENARIO=multiple-signal-arguments \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

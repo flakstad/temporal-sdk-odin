@@ -1502,6 +1502,32 @@ main Odin fiber on an approval predicate, delivers a real Temporal Signal, and
 requires the same activation to report the Signal handler and terminal Workflow
 completion through Core.
 
+The Workflow selector is another language-runtime-only boundary. The pinned
+Rust SDK documents its `select!` as deterministic and biased, polling branches
+in declaration order through `futures_util::select_biased!`. Odin mirrors that
+contract with `Selector_Case` values for Activity, Timer, Signal, Child
+Workflow start, and Child Workflow completion futures. Core still supplies the
+durable resolutions; it does not select among language futures and no C ABI or
+protobuf addition is involved.
+
+All jobs in one activation are applied before the stable Workflow scheduler is
+drained. Consequently, when several cases become ready in the same activation,
+the case slice order wins regardless of Core job order. Cancellation is an
+implicit fallback after ready cases, matching the existing condition-first
+rule. Losing operations remain live and are never canceled implicitly: their
+handles continue to belong to Workflow code and must be awaited or explicitly
+canceled. Case slices and Signal-name strings are borrowed across the stackful
+call only; selected Signal payload and metadata views borrow the run arena.
+Eviction drops the suspended selector with the fiber, and replay reconstructs
+it from the same command sequence.
+
+The unit suite covers Activity/Activity ordering and a Signal/Timer tie. A
+180-trace property crosses all six case permutations with all six Core-job
+permutations and requires byte-identical fresh-stack replay. The CLI dev-server
+case starts a real Activity and Timer, observes `waiting_selector=true`, lets
+the Activity win, emits `CancelTimer`, and completes through Core and Temporal
+Server after Core has also forced a replay on a fresh Odin stack.
+
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
 failed operation sequence. Its terminal `UpdateResponse.Rejected` restores the
@@ -2233,7 +2259,8 @@ Workflows are enabled.
    unfinished-handler warnings, explicit handler draining, root cancellation,
    synchronous/asynchronous Signal handlers, preemptively detached operations,
    detached Update/Activity cleanup, Child Workflows, external Workflow
-   signal/cancel operations, and Continue-As-New across fresh-stack replay. It
+   signal/cancel operations, Continue-As-New, public Timer futures, and a
+   declaration-biased multi-operation selector across fresh-stack replay. It
    now proves downward-only nested cancellation-token trees across Activities,
    timers, Signal waits, main/Signal/Update fibers, propagated durable
    deadlines, and replay. Client Update result waits are now bounded and locally
@@ -2330,6 +2357,14 @@ truth-table cases, 500 deterministic time/random activation contexts, 500 late
 Signal-handler buffer/order/replay cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
+
+The declaration-biased Workflow selector and public Timer future are now
+implemented and live-proven. A 180-trace property crosses six case orders with
+six Core job orders and fresh-stack replay. The next smallest concurrency slice
+is deterministic `join`/`join_all` over the same Future handles, plus a distinct
+non-suspending timer-start interceptor; neither requires a new C ABI symbol.
+Child start/completion selector branches and cancellation should receive the
+same generative coverage before the selector API is considered stable.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for

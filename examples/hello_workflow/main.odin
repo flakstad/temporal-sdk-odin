@@ -807,6 +807,23 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "selector" {
+		activity_future := workflow.start_activity(ctx, "hello", name)
+		timer_future := workflow.start_timer(ctx, 30 * time.Second)
+		cases := [?]workflow.Selector_Case{
+			workflow.selector_activity(activity_future),
+			workflow.selector_timer(timer_future),
+		}
+		selected := workflow.selector_select(ctx, cases[:])
+		if selected.status != .Selected || selected.index != 0 ||
+		   selected.kind != .Activity {
+			return "Activity did not win selector"
+		}
+		if !workflow.cancel_timer(ctx, timer_future) {
+			return "could not cancel losing selector timer"
+		}
+		return workflow.await_activity(ctx, activity_future)
+	}
 	if name == "multiple-activity-arguments" {
 		name_payload, name_error := codec.encode_json("Odin")
 		if name_error != .None do return "could not encode first Activity argument"
@@ -1436,7 +1453,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d memo_upserts=%d search_upserts=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_condition=%v waiting_handlers=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d memo_upserts=%d search_upserts=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_condition=%v waiting_selector=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -1471,6 +1488,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.waiting_timer_seq,
 		processed.waiting_signal,
 		processed.waiting_condition,
+		processed.waiting_selector,
 		processed.waiting_handlers,
 		processed.completed,
 		processed.evicted,
@@ -1932,6 +1950,7 @@ main :: proc() {
 	expect_multiple_query_arguments := scenario == "multiple-query-arguments"
 	expect_multiple_update_arguments := scenario == "multiple-update-arguments"
 	expect_condition := scenario == "condition"
+	expect_selector := scenario == "selector"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
@@ -2038,6 +2057,14 @@ main :: proc() {
 			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 0 ||
 			   run_stats.timers_canceled != 0 {
 				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
+				failed = true
+			}
+		} else if expect_selector {
+			if run_stats.activity_tasks_completed != 1 ||
+			   run_stats.workflow_signals_received != 0 ||
+			   run_stats.timers_canceled != 1 ||
+			   run_stats.workflow_replay_activations < 1 {
+				fmt.eprintln("Workflow selector stats did not match")
 				failed = true
 			}
 		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure ||
@@ -2172,6 +2199,8 @@ main :: proc() {
 		fmt.println("Signal handler failure triggered Core eviction and the Worker recovered on a fresh Workflow stack")
 	} else if expect_condition {
 		fmt.println("Workflow condition resumed after a Signal and replayed on a fresh stack")
+	} else if expect_selector {
+		fmt.println("Workflow selector chose the ready Activity and canceled its losing timer")
 	} else {
 		fmt.println("signal won the durable timer race and replay reproduced timer cancellation")
 	}

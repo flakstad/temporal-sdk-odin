@@ -20,6 +20,8 @@ Condition_Predicate :: proc(data: rawptr) -> bool
 Fiber_Context :: struct {
 	instance:       ^Fiber_Instance,
 	update_context: ^Update_Context,
+	waiting_selector_cases: []Selector_Case,
+	waiting_selector_cancellation_token_id: u32,
 	waiting_condition_data: rawptr,
 	waiting_condition_predicate: Condition_Predicate,
 	waiting_condition_cancellation_token_id: u32,
@@ -538,6 +540,7 @@ Fiber_Phase :: enum {
 	Ready,
 	Waiting_Condition,
 	Waiting_Mutex,
+	Waiting_Selector,
 	Waiting_Activity,
 	Waiting_Child_Workflow_Start,
 	Waiting_Child_Workflow,
@@ -577,8 +580,50 @@ Activity_Future :: struct {
 	seq: u32,
 }
 
+Timer_Future :: struct {
+	seq: u32,
+}
+
 Child_Workflow_Future :: struct {
 	seq: u32,
+}
+
+Timer_Result_Status :: enum {
+	Fired,
+	Canceled,
+}
+
+Selector_Case_Kind :: enum {
+	Activity,
+	Timer,
+	Signal,
+	Child_Workflow_Start,
+	Child_Workflow,
+}
+
+// Selector_Case is a borrowed declaration of one deterministic select branch.
+// Signal names and the cases slice must remain valid until selector_select
+// returns; a suspended fiber naturally keeps stack-owned values alive.
+Selector_Case :: struct {
+	kind:           Selector_Case_Kind,
+	activity:       Activity_Future,
+	timer:          Timer_Future,
+	child_workflow: Child_Workflow_Future,
+	signal_name:    string,
+}
+
+Selector_Status :: enum {
+	Selected,
+	Canceled,
+}
+
+Selector_Result :: struct {
+	status: Selector_Status,
+	index:  int,
+	kind:   Selector_Case_Kind,
+	// Populated only for a selected Signal case. Payload views and metadata
+	// borrow the Workflow run.
+	signal: Payloads_Signal,
 }
 
 Workflow_Signal_Status :: enum {
@@ -1396,6 +1441,7 @@ fiber_runtime_init :: proc(
 					"OdinWorkflowPayloadConversionError",
 				)
 			}
+			defer delete(value)
 			callback := cast(^Fiber_Proc)data
 			output := callback^(ctx, value)
 			payload, encode_error := codec.encode_json(output)
@@ -7886,18 +7932,203 @@ await_signal_json_or_timeout :: proc(
 	return {status = .Received, value = value, metadata = payload_result.metadata}
 }
 
-// sleep schedules a durable Temporal timer and suspends the Workflow fiber.
-// It never reads wall-clock time in the language runtime.
-sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
-		if ctx != nil && ctx.instance != nil {
-			ctx.instance.phase = .Failed
-		}
+selector_activity :: proc(future: Activity_Future) -> Selector_Case {
+	return {kind = .Activity, activity = future}
+}
+
+selector_timer :: proc(future: Timer_Future) -> Selector_Case {
+	return {kind = .Timer, timer = future}
+}
+
+selector_signal :: proc(name: string) -> Selector_Case {
+	return {kind = .Signal, signal_name = name}
+}
+
+selector_child_workflow_start :: proc(future: Child_Workflow_Future) -> Selector_Case {
+	return {kind = .Child_Workflow_Start, child_workflow = future}
+}
+
+selector_child_workflow :: proc(future: Child_Workflow_Future) -> Selector_Case {
+	return {kind = .Child_Workflow, child_workflow = future}
+}
+
+selector_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	if ctx == nil || ctx.instance == nil {
 		return
+	}
+	ctx.instance.failure_message = message
+	ctx.instance.failure_type = "OdinWorkflowSelectorError"
+	ctx.instance.phase = .Failed
+}
+
+timer_operation_ready :: proc(operation: ^Fiber_Timer_Operation) -> bool {
+	return operation != nil &&
+	       (operation.state == .Resolved || operation.state == .Cancel_Requested ||
+	        operation.state == .Canceled)
+}
+
+selector_case_ready :: proc(
+	ctx: ^Fiber_Context,
+	selector_case: ^Selector_Case,
+	token_id: u32,
+) -> bool {
+	if ctx == nil || ctx.instance == nil || selector_case == nil {
+		return false
+	}
+	instance := ctx.instance
+	switch selector_case.kind {
+	case .Activity:
+		operation, found := find_activity_operation(instance, selector_case.activity.seq)
+		return found && activity_operation_ready_for_waiter(instance, operation, token_id)
+	case .Timer:
+		operation, found := find_timer_operation(instance, selector_case.timer.seq)
+		return found && timer_operation_ready(operation)
+	case .Signal:
+		_, found := find_buffered_signal(instance, selector_case.signal_name)
+		return found
+	case .Child_Workflow_Start:
+		operation, found := find_child_workflow_operation(instance, selector_case.child_workflow.seq)
+		return found && operation.start_state != .Pending
+	case .Child_Workflow:
+		operation, found := find_child_workflow_operation(instance, selector_case.child_workflow.seq)
+		return found && operation.completion_state != .Pending
+	}
+	return false
+}
+
+selector_ready_index :: proc(
+	ctx: ^Fiber_Context,
+	cases: []Selector_Case,
+	token_id: u32,
+) -> (int, bool) {
+	for &selector_case, index in cases {
+		if selector_case_ready(ctx, &selector_case, token_id) {
+			return index, true
+		}
+	}
+	return -1, false
+}
+
+selector_should_resume :: proc(ctx: ^Fiber_Context) -> bool {
+	if ctx == nil || ctx.instance == nil || len(ctx.waiting_selector_cases) == 0 {
+		return false
+	}
+	_, ready := selector_ready_index(
+		ctx,
+		ctx.waiting_selector_cases,
+		ctx.waiting_selector_cancellation_token_id,
+	)
+	return ready || cancellation_token_is_requested_id(
+		ctx.instance,
+		ctx.waiting_selector_cancellation_token_id,
+	)
+}
+
+selector_cases_valid :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> bool {
+	if ctx == nil || ctx.instance == nil || len(cases) == 0 {
+		return false
+	}
+	instance := ctx.instance
+	for selector_case in cases {
+		switch selector_case.kind {
+		case .Activity:
+			if selector_case.activity.seq == 0 {
+				return false
+			}
+			_, found := find_activity_operation(instance, selector_case.activity.seq)
+			if !found {
+				return false
+			}
+		case .Timer:
+			if selector_case.timer.seq == 0 {
+				return false
+			}
+			_, found := find_timer_operation(instance, selector_case.timer.seq)
+			if !found {
+				return false
+			}
+		case .Signal:
+			if len(selector_case.signal_name) == 0 {
+				return false
+			}
+		case .Child_Workflow_Start, .Child_Workflow:
+			if selector_case.child_workflow.seq == 0 {
+				return false
+			}
+			_, found := find_child_workflow_operation(instance, selector_case.child_workflow.seq)
+			if !found {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+selector_result :: proc(ctx: ^Fiber_Context, cases: []Selector_Case, index: int) -> Selector_Result {
+	selector_case := &cases[index]
+	result := Selector_Result{status = .Selected, index = index, kind = selector_case.kind}
+	if selector_case.kind == .Signal {
+		signal, found := find_buffered_signal(ctx.instance, selector_case.signal_name)
+		if !found {
+			selector_fail(ctx, "selected Workflow Signal was not buffered")
+			return {status = .Canceled, index = -1}
+		}
+		signal.consumed = true
+		result.signal = {
+			values = signal.input_views,
+			metadata = fiber_signal_context(signal),
+		}
+	}
+	return result
+}
+
+// selector_select polls cases in declaration order, matching the pinned Rust
+// SDK's biased deterministic select. Losing operations remain live and must be
+// awaited or canceled explicitly by Workflow code.
+selector_select :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Selector_Result {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(ctx.waiting_selector_cases) != 0 || !selector_cases_valid(ctx, cases) {
+		selector_fail(ctx, "invalid Workflow selector")
+		return {status = .Canceled, index = -1}
+	}
+	instance := ctx.instance
+	token_id := current_cancellation_token_id(instance)
+	if index, ready := selector_ready_index(ctx, cases, token_id); ready {
+		return selector_result(ctx, cases, index)
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
+		return {status = .Canceled, index = -1}
+	}
+
+	ctx.waiting_selector_cases = cases
+	ctx.waiting_selector_cancellation_token_id = token_id
+	defer {
+		ctx.waiting_selector_cases = nil
+		ctx.waiting_selector_cancellation_token_id = 0
+	}
+	instance.phase = .Waiting_Selector
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		selector_fail(ctx, "could not resume Workflow selector")
+		return {status = .Canceled, index = -1}
+	}
+	if index, ready := selector_ready_index(ctx, cases, token_id); ready {
+		return selector_result(ctx, cases, index)
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
+		return {status = .Canceled, index = -1}
+	}
+	selector_fail(ctx, "Workflow selector resumed without a ready case")
+	return {status = .Canceled, index = -1}
+}
+
+start_timer_unintercepted :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
+		selector_fail(ctx, "invalid Workflow timer start")
+		return {}
 	}
 	instance := ctx.instance
 	if current_cancellation_applies(instance) {
-		return
+		return {}
 	}
 	instance.next_timer_seq += 1
 	operation := Fiber_Timer_Operation{
@@ -7911,10 +8142,82 @@ sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
 		cancellation_token_id = current_cancellation_token_id(instance),
 	}
 	append(&instance.timers, operation)
-	instance.waiting_timer_seq = operation.seq
-	instance.phase = .Waiting_Timer
-	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
-		instance.phase = .Failed
+	return {seq = operation.seq}
+}
+
+// start_timer creates a durable timer Future without suspending. Timer-start
+// interceptor coverage is pending; sleep continues through the existing
+// outbound sleep interceptor chain.
+start_timer :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
+	return start_timer_unintercepted(ctx, duration)
+}
+
+cancel_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> bool {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
+		return false
+	}
+	operation, found := find_timer_operation(ctx.instance, future.seq)
+	if !found {
+		return false
+	}
+	switch operation.state {
+	case .Scheduled:
+		operation.state = .Canceled
+	case .Commanded:
+		operation.state = .Cancel_Requested
+	case .Cancel_Requested, .Canceled:
+	case .Resolved, .Failed:
+		return false
+	}
+	return true
+}
+
+await_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> Timer_Result_Status {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
+		selector_fail(ctx, "invalid Workflow timer await")
+		return .Canceled
+	}
+	instance := ctx.instance
+	operation, found := find_timer_operation(instance, future.seq)
+	if !found {
+		selector_fail(ctx, "Workflow timer operation was not found")
+		return .Canceled
+	}
+	if !timer_operation_ready(operation) {
+		instance.waiting_timer_seq = future.seq
+		instance.phase = .Waiting_Timer
+		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+			selector_fail(ctx, "could not resume Workflow timer await")
+			return .Canceled
+		}
+		operation, found = find_timer_operation(instance, future.seq)
+		if !found || !timer_operation_ready(operation) {
+			selector_fail(ctx, "Workflow timer resumed without a resolution")
+			return .Canceled
+		}
+	}
+	if operation.state == .Resolved {
+		return .Fired
+	}
+	return .Canceled
+}
+
+// sleep schedules a durable Temporal timer and suspends the Workflow fiber.
+// It never reads wall-clock time in the language runtime.
+sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
+		return
+	}
+	instance := ctx.instance
+	if current_cancellation_applies(instance) {
+		return
+	}
+	future := start_timer_unintercepted(ctx, duration)
+	if future.seq != 0 {
+		_ = await_timer(ctx, future)
 	}
 }
 
@@ -9198,6 +9501,8 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
+	case .Waiting_Selector:
+		return selector_should_resume(&routine.ctx)
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && activity_operation_ready_for_waiter(
@@ -9560,6 +9865,8 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
+	case .Waiting_Selector:
+		return selector_should_resume(&routine.ctx)
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, routine.waiting_activity_seq)
 		return found && activity_operation_ready_for_waiter(
@@ -9633,6 +9940,8 @@ resume_main_workflow_if_ready :: proc(
 	case .Waiting_Mutex:
 		should_resume = instance.workflow_context.mutex_granted ||
 		                current_cancellation_applies(instance)
+	case .Waiting_Selector:
+		should_resume = selector_should_resume(&instance.workflow_context)
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
 		should_resume = found && activity_operation_ready_for_waiter(
@@ -10106,6 +10415,8 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Condition:
 		result.waiting_condition = true
 	case .Waiting_Mutex:
+	case .Waiting_Selector:
+		result.waiting_selector = true
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
 	case .Waiting_Child_Workflow_Start:

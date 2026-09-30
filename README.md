@@ -1458,6 +1458,37 @@ activation capable of changing the state—conditions are not server-side events
 The CLI-devserver suite starts a Workflow blocked on such a predicate, delivers
 an approval Signal, and observes completion through Core and Temporal Server.
 
+Several durable operations can be raced with the declaration-biased Workflow
+selector. Operations are started explicitly, then represented as borrowed
+cases:
+
+```odin
+activity_future := workflow.start_activity(ctx, "charge", order)
+timer_future := workflow.start_timer(ctx, 30 * time.Second)
+cases := [?]workflow.Selector_Case{
+    workflow.selector_activity(activity_future),
+    workflow.selector_timer(timer_future),
+}
+selected := workflow.selector_select(ctx, cases[:])
+if selected.index == 0 {
+    _ = workflow.cancel_timer(ctx, timer_future)
+    payment := workflow.await_activity(ctx, activity_future)
+}
+```
+
+Ready cases are checked in slice order, independent of the order of jobs inside
+the Core activation. The selector also supports Signals and Child Workflow
+start/completion futures. It does not silently cancel losing operations;
+callers retain their handles and must await or cancel them explicitly. The case
+slice and Signal names are borrowed only until `selector_select` returns, while
+the selected Signal payload/metadata views remain borrowed from the Workflow
+run. The CLI-devserver suite live-proves an Activity/Timer race, fresh-stack
+replay, and explicit timer cancellation.
+
+`start_timer` does not yet traverse the outbound `sleep` interceptor; that
+interceptor represents the suspending operation. A future timer-start
+interceptor must preserve non-suspending Future creation semantics.
+
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child
 deadline adds its own timer, while a later one adds no redundant command.

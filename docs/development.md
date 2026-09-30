@@ -183,9 +183,19 @@ fixed point, and eviction/fresh-stack replay must reproduce every completion
 byte-for-byte. A focused unit test separately proves cancellation and the
 upstream-compatible rule that a true predicate wins over cancellation observed
 in the same scheduler pass.
+The Workflow-selector property crosses all six declaration orders for two
+Activities and one Timer with all six Core activation-job orders. Across 180
+generated traces the first declared ready case must win, and initialize plus
+terminal completions must be byte-identical after eviction and fresh-stack
+replay.
 The CLI-devserver suite also starts `odin_condition_workflow`, waits until the
 Worker reports `waiting_condition=true`, sends an `approve` Signal through the
 Temporal CLI, and requires the predicate-resumed result plus clean eviction.
+It then runs `TEMPORAL_ODIN_SCENARIO=selector`: the Workflow starts one Activity
+and one durable Timer, waits with `waiting_selector=true`, selects the Activity,
+explicitly cancels the losing Timer, and returns `Hello selector`. The worker
+log must show both Core-driven fresh-stack replay and the terminal
+`CancelTimer` command.
 The activation-metadata unit test varies history size, Continue-As-New and
 target-version flags, deployment/build identity, full replay, and query-only
 replay. It queries `__temporal_workflow_metadata`, evicts the run, and requires

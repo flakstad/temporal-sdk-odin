@@ -92,6 +92,38 @@ true in the same scheduler pass as cancellation, the condition wins, matching
 the pinned Rust runtime. Conditions are local scheduler state: eviction drops
 the suspended stack and replay reconstructs the wait from history.
 
+`start_timer` exposes the same durable timer operation used by `sleep` as a
+`Timer_Future`. It can be awaited, canceled, or combined with other operations
+in a declaration-biased selector:
+
+```odin
+activity_future := workflow.start_activity(ctx, "charge", order)
+timer_future := workflow.start_timer(ctx, 30 * time.Second)
+cases := [?]workflow.Selector_Case{
+	workflow.selector_activity(activity_future),
+	workflow.selector_timer(timer_future),
+}
+selected := workflow.selector_select(ctx, cases[:])
+if selected.index == 0 {
+	_ = workflow.cancel_timer(ctx, timer_future)
+	return workflow.await_activity(ctx, activity_future)
+}
+return "timed out"
+```
+
+The selector supports Activity and Timer futures, named Signals, and Child
+Workflow start/completion futures. Every activation job is applied before the
+scheduler chooses the first ready case, so declaration order—not Core job
+order—is the deterministic tie-breaker. Cancellation is considered only after
+ready cases. Losing operations are left live; callers must explicitly await or
+cancel them. The case slice and its Signal names are borrowed until selection
+returns. Selected Signal values and metadata are borrowed run-arena views.
+
+Direct `start_timer` currently bypasses the outbound `sleep` interceptor,
+because that interceptor models a complete suspending sleep call rather than
+Future creation. This gap is explicit while the timer-start interceptor shape
+is designed.
+
 `workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
 stack sizes independently when the Worker is created. Zero selects the 128 KiB
 default; explicit sizes are validated between 32 KiB and 16 MiB. Replay Workers
