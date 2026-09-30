@@ -259,7 +259,21 @@ Start_Workflow_Options :: struct {
 	start_delay:                time.Duration,
 	priority:                   ^Priority,
 	metadata:                   ^Start_Metadata,
+	nexus_completion_callbacks: []Nexus_Completion_Callback,
 	enable_eager_workflow_start: bool,
+}
+
+// Nexus_Completion_Callback is borrowed during synchronous Workflow start
+// encoding. It attaches Temporal's server-owned Nexus callback to the new
+// Workflow so its terminal result completes an asynchronous Nexus operation.
+Nexus_Completion_Callback :: struct {
+	url:     string,
+	headers: []Nexus_Callback_Header,
+}
+
+Nexus_Callback_Header :: struct {
+	key:   string,
+	value: string,
 }
 
 // Signal_With_Start_Options borrows ordinary start options plus the one Header
@@ -912,6 +926,16 @@ start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string 
 	if options.metadata != nil && options.metadata.allocator.procedure == nil {
 		return "Workflow start metadata is not initialized"
 	}
+	for callback in options.nexus_completion_callbacks {
+		if len(callback.url) == 0 {
+			return "Nexus completion callback URL must not be empty"
+		}
+		for header in callback.headers {
+			if len(header.key) == 0 {
+				return "Nexus completion callback header keys must not be empty"
+			}
+		}
+	}
 	return ""
 }
 
@@ -974,6 +998,41 @@ encode_start_workflow_request_payloads :: proc(
 		workflow_id_conflict_policy = workflow_id_conflict_policy_to_proto(options.id_conflict_policy),
 		cron_schedule = options.cron_schedule,
 		request_eager_execution = options.enable_eager_workflow_start,
+	}
+	callback_values := make(
+		[]proto.Temporal_Api_Common_V1_Callback_Nexus,
+		len(options.nexus_completion_callbacks),
+	)
+	callback_headers := make(
+		[][dynamic]proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry,
+		len(options.nexus_completion_callbacks),
+	)
+	defer {
+		for headers in callback_headers do delete(headers)
+		delete(callback_headers)
+		delete(callback_values)
+		delete(request.completion_callbacks)
+	}
+	for callback, index in options.nexus_completion_callbacks {
+		callback_values[index].url = callback.url
+		for header in callback.headers {
+			append(
+				&callback_headers[index],
+				proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry{
+					key = header.key,
+					value = header.value,
+				},
+			)
+		}
+		callback_values[index].header = callback_headers[index]
+		append(
+			&request.completion_callbacks,
+			proto.Temporal_Api_Common_V1_Callback{
+				variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus{
+					value = &callback_values[index],
+				},
+			},
+		)
 	}
 	execution_timeout := duration_proto(options.workflow_execution_timeout)
 	run_timeout := duration_proto(options.workflow_run_timeout)
@@ -1291,6 +1350,9 @@ signal_with_start_options_error :: proc(options: Signal_With_Start_Options) -> s
 	}
 	if start_options.enable_eager_workflow_start {
 		return "Signal-With-Start does not support eager Workflow start"
+	}
+	if len(start_options.nexus_completion_callbacks) > 0 {
+		return "Signal-With-Start cannot attach Nexus completion callbacks"
 	}
 	if start_options.metadata != nil && len(start_options.metadata.headers) > 0 {
 		return "Signal-With-Start cannot represent separate Workflow-start headers; use signal_headers"

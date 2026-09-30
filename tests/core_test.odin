@@ -7957,7 +7957,12 @@ nexus_async_registration_test_handler :: proc(
 	_: ^nexus.Context,
 	_: bool,
 ) -> nexus.Result(string) {
-	return nexus.result_async(string, "async-operation-token")
+	temporary_token, allocation_error := strings.clone("async-operation-token")
+	if allocation_error != nil {
+		return nexus.result_handler_error(string, "could not allocate test token")
+	}
+	defer delete(temporary_token)
+	return nexus.result_async_copy(string, temporary_token)
 }
 
 nexus_cancel_registration_test_handler :: proc(
@@ -8419,6 +8424,15 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 		fairness_key = "customer-42",
 		fairness_weight = 1.5,
 	}
+	callback_headers := [?]temporal_client.Nexus_Callback_Header{
+		{key = "nexus-callback-token", value = "opaque-callback-token"},
+	}
+	completion_callbacks := [?]temporal_client.Nexus_Completion_Callback{
+		{
+			url = "http://temporal.invalid/nexus/callback",
+			headers = callback_headers[:],
+		},
+	}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
 		"orders-namespace",
 		"order_workflow",
@@ -8436,6 +8450,7 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 			start_delay = 3 * time.Second,
 			priority = &priority,
 			metadata = &metadata,
+			nexus_completion_callbacks = completion_callbacks[:],
 			enable_eager_workflow_start = true,
 		},
 	)
@@ -8557,6 +8572,19 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 		)
 		testing.expect_value(t, decoded_details, "Created by the Odin SDK wire-contract test.")
 	}
+	testing.expect_value(t, len(request.completion_callbacks), 1)
+	if len(request.completion_callbacks) == 1 {
+		callback, callback_ok := request.completion_callbacks[0].variant.(proto.Temporal_Api_Common_V1_Callback_Variant_Nexus)
+		testing.expect(t, callback_ok && callback.value != nil)
+		if callback_ok && callback.value != nil {
+			testing.expect_value(t, callback.value.url, "http://temporal.invalid/nexus/callback")
+			testing.expect_value(t, len(callback.value.header), 1)
+			if len(callback.value.header) == 1 {
+				testing.expect_value(t, callback.value.header[0].key, "nexus-callback-token")
+				testing.expect_value(t, callback.value.header[0].value, "opaque-callback-token")
+			}
+		}
+	}
 
 	uninitialized := temporal_client.Start_Metadata{}
 	invalid_bytes, invalid_error := temporal_client.encode_start_workflow_request(
@@ -8568,6 +8596,40 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	defer delete(invalid_bytes)
 	defer temporal_client.error_free(&invalid_error)
 	testing.expect(t, invalid_error.kind == .Invalid_Argument)
+
+	empty_url_callbacks := [?]temporal_client.Nexus_Completion_Callback{{}}
+	empty_url_bytes, empty_url_error := temporal_client.encode_start_workflow_request(
+		"default",
+		"order_workflow",
+		codec.payload_view(&input),
+		{
+			id = "invalid-callback-url",
+			task_queue = "orders",
+			nexus_completion_callbacks = empty_url_callbacks[:],
+		},
+	)
+	defer delete(empty_url_bytes)
+	defer temporal_client.error_free(&empty_url_error)
+	testing.expect(t, empty_url_error.kind == .Invalid_Argument)
+
+	empty_key_headers := [?]temporal_client.Nexus_Callback_Header{{value = "token"}}
+	empty_key_callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+		url = "http://temporal.invalid/nexus/callback",
+		headers = empty_key_headers[:],
+	}}
+	empty_key_bytes, empty_key_error := temporal_client.encode_start_workflow_request(
+		"default",
+		"order_workflow",
+		codec.payload_view(&input),
+		{
+			id = "invalid-callback-header",
+			task_queue = "orders",
+			nexus_completion_callbacks = empty_key_callbacks[:],
+		},
+	)
+	defer delete(empty_key_bytes)
+	defer temporal_client.error_free(&empty_key_error)
+	testing.expect(t, empty_key_error.kind == .Invalid_Argument)
 }
 
 @(test)
@@ -8727,6 +8789,15 @@ client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^te
 	invalid_cases := [?]temporal_client.Signal_With_Start_Options{
 		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Fail}},
 		{start_options = {id = "id", task_queue = "queue", enable_eager_workflow_start = true}},
+		{
+			start_options = {
+				id = "id",
+				task_queue = "queue",
+				nexus_completion_callbacks = []temporal_client.Nexus_Completion_Callback{{
+					url = "http://temporal.invalid/nexus/callback",
+				}},
+			},
+		},
 	}
 	for invalid_options in invalid_cases {
 		invalid_bytes, invalid_error := temporal_client.encode_signal_with_start_workflow_request(

@@ -1054,19 +1054,20 @@ shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
-Odin Worker runs the stackful caller Workflow and four registered operation
-types across six Nexus tasks.
+Odin Worker runs the stackful caller Workflow, two completer Workflows, and five
+registered operation types across seven Nexus tasks.
 It first observes a non-retryable handler failure, then forces a one-second
 schedule-to-close timeout and verifies that Core cooperatively cancels the
-running Odin callback. Finally it starts two concurrent
+running Odin callback. It then starts an asynchronous completer Workflow with
+Temporal's callback URL/headers and requires the Workflow result to resolve the
+waiting Nexus call. A second async operation is canceled; its registered cancel
+handler uses the durable operation token as the backing Workflow ID and calls
+the Odin Client cancellation API. Finally it starts two concurrent
 `odin-greeting-service/hello` calls, wakes through the Nexus selector, joins
 both Futures, and requires both to return the JSON string `"Hello Odin"`. The
 example fetches the resulting server history and replays all branches offline
-through Core before the endpoint is deleted. It also starts an asynchronous
-operation, yields until Core records its token, requests cancellation with
-`Wait_Cancellation_Requested`, and verifies that the registered cancel handler
-receives the same token. This proves both synchronous and async-cancel routes
-without a second language SDK:
+through Core before the endpoint is deleted. This proves synchronous, async
+callback-completion, and async-cancel routes without a second language SDK:
 
 ```text
 Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback
@@ -1093,8 +1094,13 @@ hyphens, but not underscores. Core cancel tasks are routed cooperatively.
 Protocol `CancelOperation` requests invoke an explicitly registered handler;
 registrations without one return a non-retryable `NOT_IMPLEMENTED` response.
 `nexus.result_async(Output, token)` populates both the modern operation token
-and deprecated operation ID for compatibility. Eventual success/failure of an
-async operation still needs the pending Client callback-completion API.
+and deprecated operation ID for compatibility when token storage already
+outlives the handler adapter. `nexus.result_async_copy(Output, token)` preserves
+a temporary token until completion encoding. `Start_Workflow_Options` accepts
+borrowed `nexus_completion_callbacks`; the Service uses those URL/header values
+to deliver the completer Workflow's eventual terminal result to the Nexus
+operation. Signal-With-Start rejects this option because its pinned request
+schema has no completion-callback field.
 
 The same script then runs `examples/hello_activity` for several focused cases.
 A small workflow-only driver under `native/activity-test-driver` uses the

@@ -336,11 +336,17 @@ before the terminal continuation copies them into run ownership; nested order
 and byte-identical fresh-stack replay are tested. Nexus operation Futures are
 also valid `selector_select` and allocation-free `join_all` cases.
 Start handlers can now return a durable async operation token with
-`nexus.result_async`, and a separately registered cancel handler receives the
-same owned token when Core dispatches `CancelOperation`. The live suite proves
-`Wait_Cancellation_Requested` through both Odin handlers. The
-callback-completion Client surface and live coverage of the other three
-cancellation policies are not yet implemented.
+`nexus.result_async`; use `nexus.result_async_copy` when the token is backed by
+temporary storage. A separately registered cancel handler receives the same
+owned token when Core dispatches `CancelOperation`. `Start_Workflow_Options`
+can attach borrowed `nexus_completion_callbacks`, including callback headers,
+to an ordinary Workflow start. The live suite starts an Odin completer
+Workflow with the callback URL and headers supplied to the Nexus handler and
+observes its terminal JSON result complete the original async Nexus operation.
+It also proves `Wait_Cancellation_Requested`: the cancel handler addresses the
+backing Workflow by operation token, requests cancellation through the Odin
+Client, and the caller observes a canceled Nexus result. Links and live
+coverage of the other three cancellation policies remain.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {

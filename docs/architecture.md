@@ -388,6 +388,16 @@ RPC success/failure buffers are copied out of Core and freed through
 `temporal_core_byte_array_free`; gRPC status code and binary status details are
 preserved in the Odin error.
 
+Ordinary Workflow start additionally exposes the Service protobuf's repeated
+`completion_callbacks` field as borrowed `Nexus_Completion_Callback` values.
+Each entry maps exactly to `temporal.api.common.v1.Callback.Nexus`: URL plus
+string header map. Odin validates nonempty URLs and header keys, constructs the
+temporary protobuf graph, and discards it immediately after synchronous
+encoding. The Service, not Core or the Odin process, invokes that URL when the
+started Workflow reaches a terminal result. `SignalWithStartWorkflowExecution`
+has no equivalent field in the pinned schema, so that API rejects completion
+callbacks instead of silently dropping them.
+
 ### Worker and activity tasks
 
 `temporal_core_worker_new` takes a connection and a C `WorkerOptions` struct.
@@ -457,7 +467,11 @@ token starts, protocol cancellation, and Core-local task cancellation:
   calls composed with selector/join, then fetches the server history and passes
   every branch through Core's offline replayer. An async start returns a
   durable token, then `Wait_Cancellation_Requested` routes `CancelOperation` to
-  the registered Odin cancel handler with that identical token.
+  the registered Odin cancel handler with that identical token. A second async
+  operation starts an Odin completer Workflow with the request's callback URL
+  and headers; the Service delivers that Workflow's terminal JSON Payload to
+  the waiting caller. The cancel handler uses its operation token as the
+  backing Workflow ID and requests cancellation through the Odin Client.
 
 This proves the complete synchronous route from a Temporal Workflow through
 Service, Core, the C ABI, and an Odin operation callback and back. Unknown
@@ -477,15 +491,14 @@ the Workflow and reproduces the exact command bytes. Core remains responsible
 for endpoint routing, Nexus state machines, history interpretation, timeouts,
 and translating server events into the two activation-job forms.
 
-The remaining boundary is intentionally explicit. Start handlers may now return
-a durable operation token, and `CancelOperation` routes an owned copy through a
+The remaining boundary is intentionally explicit. Start handlers may return a
+durable operation token, and `CancelOperation` routes an owned copy through a
 separately registered handler before emitting the exact cancel response.
 Registrations without that handler retain a non-retryable `NOT_IMPLEMENTED`
-response. Callback completion, links, metrics, and the remaining cancellation
-policy live cases are not implemented. The outbound interceptor and
-selector/join integration are implemented. The caller does
-accept Core's async start-token activation shape internally, but no Odin handler
-can produce such a token yet and that path is not claimed as live-proven.
+response. Async success through a Workflow completion callback and
+`Wait_Cancellation_Requested` cancellation are live-proven. Links, metrics,
+and the remaining cancellation-policy live cases are not implemented. The
+outbound interceptor and selector/join integration are implemented.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
 Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
@@ -497,6 +510,11 @@ blocking completion call; the bridge decodes them synchronously before its
 callback returns. Core owns Service polling, protocol/state-machine behavior,
 deadlines, and transport. Odin owns handler lookup/execution, Payload codecs,
 language cancellation, handler errors, and the completion it produces.
+`nexus.result_async` borrows its token through the immediate typed adapter;
+`nexus.result_async_copy` heap-copies temporary tokens, transfers that ownership
+to the internal Payload result, and frees it only after completion encoding.
+This distinction is regression-tested because freeing an owned Workflow handle
+inside a handler otherwise corrupts a borrowed token before Worker encoding.
 
 Odin now implements the fourth result variant for remote Activities. A callback
 returning `WillCompleteAsync` releases the worker task without resolving the
@@ -2688,8 +2706,9 @@ Workflows are enabled.
    `NexusHandlerFailureInfo` envelope, and all callback-visible data is owned
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Callback
-   completion, links, outbound metrics, and full cancellation-policy coverage
-   remain. Async token handoff and `Wait_Cancellation_Requested` are live-proven.
+   links, outbound metrics, and full cancellation-policy coverage remain.
+   Async token handoff, Workflow-backed callback completion, and
+   `Wait_Cancellation_Requested` are live-proven.
    The Workflow outbound interceptor is implemented
    and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
    cooperative timeout cancellation of a running synchronous Odin handler are
@@ -2714,15 +2733,16 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: implement callback completion, live-test the three remaining
-cancellation policies, then property-test duplicate delivery. The selector/join
+boundary: add the upstream Workflow-event link to the completer start,
+live-test the three remaining cancellation policies, then property-test
+duplicate callback/result delivery. The selector/join
 branch and async cancel-token handoff are unit-, live-, and replay-tested;
 selector ordering is also property-tested.
 The Workflow outbound
 interceptor and handler failure/pre-start timeout classification are now
 wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
-and timeout also run through the live server. After that, implement callback
-completion as the next async Nexus vertical slice. Activity Worker is
+and timeout also run through the live server. Async callback completion now
+runs through a Workflow started by the Odin handler. Activity Worker is
 no longer the next milestone: it is already implemented and extensively
 live-tested.
 

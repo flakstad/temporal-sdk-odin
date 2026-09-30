@@ -4,6 +4,8 @@
 // values are borrowed and valid only for the duration of the handler call.
 package nexus
 
+import allocator_runtime "base:runtime"
+import "core:strings"
 import "core:sync"
 import "core:time"
 import codec "../codec"
@@ -122,6 +124,7 @@ Result :: struct(T: typeid) {
 	status:          Result_Status,
 	value:           T,
 	operation_token: string,
+	operation_token_owned: bool,
 	handler_error:   Handler_Error,
 }
 
@@ -134,6 +137,40 @@ result_success :: proc(value: $T) -> Result(T) {
 // operation_token is borrowed until the handler returns and must be nonempty.
 result_async :: proc($T: typeid, operation_token: string) -> Result(T) {
 	return {status = .Started_Async, operation_token = operation_token}
+}
+
+// result_async_copy is the safe form for a token backed by temporary storage.
+// The Worker takes ownership of the copied token and releases it after the
+// Nexus completion has been encoded. result_async remains allocation-free for
+// literals and other storage that outlives the handler adapter call.
+result_async_copy :: proc($T: typeid, operation_token: string) -> Result(T) {
+	owned_token, allocation_error := strings.clone(
+		operation_token,
+		allocator_runtime.heap_allocator(),
+	)
+	if allocation_error != nil {
+		return result_handler_error(
+			T,
+			"could not preserve asynchronous Nexus operation token",
+			"INTERNAL",
+			.Retryable,
+		)
+	}
+	return {
+		status = .Started_Async,
+		operation_token = owned_token,
+		operation_token_owned = true,
+	}
+}
+
+result_free :: proc(result: ^Result($T)) {
+	if result == nil {
+		return
+	}
+	if result.operation_token_owned {
+		delete(result.operation_token, allocator_runtime.heap_allocator())
+	}
+	result^ = {}
 }
 
 result_handler_error :: proc(
@@ -156,6 +193,7 @@ Payload_Result :: struct {
 	status:          Result_Status,
 	payload:         codec.Payload,
 	operation_token: string,
+	operation_token_owned: bool,
 	handler_error:   Handler_Error,
 }
 
@@ -187,6 +225,9 @@ payload_result_free :: proc(result: ^Payload_Result) {
 		return
 	}
 	codec.payload_free(&result.payload)
+	if result.operation_token_owned {
+		delete(result.operation_token, allocator_runtime.heap_allocator())
+	}
 	result^ = {}
 }
 

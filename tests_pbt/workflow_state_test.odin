@@ -347,6 +347,9 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	priority_key := i32(pbt.draw(t, pbt.int_range(0, 5)))
 	fairness_key := pbt.draw(t, pbt.string_ascii(0, 64))
 	fairness_weight := f32(pbt.draw(t, pbt.int_range(0, 100_000))) / 100.0
+	callback_path := pbt.draw(t, pbt.string_ascii(1, 48))
+	callback_header_key := pbt.draw(t, pbt.string_ascii(1, 32))
+	callback_header_value := pbt.draw(t, pbt.string_ascii(0, 64))
 	enable_eager_start := pbt.draw(t, pbt.boolean())
 	pbt.cover(t, type_case == 0, 5.0, "Bool Search Attribute metadata")
 	pbt.cover(t, type_case == 6, 5.0, "KeywordList Search Attribute metadata")
@@ -422,6 +425,16 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 		fairness_key = fairness_key,
 		fairness_weight = fairness_weight,
 	}
+	callback_url := fmt.aprintf("http://temporal.invalid/%s", callback_path)
+	defer delete(callback_url)
+	callback_headers := [?]temporal_client.Nexus_Callback_Header{{
+		key = callback_header_key,
+		value = callback_header_value,
+	}}
+	completion_callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+		url = callback_url,
+		headers = callback_headers[:],
+	}}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
 		"generated-namespace",
 		"generated-workflow",
@@ -436,6 +449,7 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 			start_delay = time.Duration(start_delay_ms) * time.Millisecond,
 			priority = &priority,
 			metadata = &metadata,
+			nexus_completion_callbacks = completion_callbacks[:],
 			enable_eager_workflow_start = enable_eager_start,
 		},
 	)
@@ -462,8 +476,15 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.search_attributes == nil || request.user_metadata == nil ||
 	   len(request.header.fields) != 1 ||
 	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 ||
-	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil {
+	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil ||
+	   len(request.completion_callbacks) != 1 {
 		return pbt.fail("generated Client start metadata did not decode")
+	}
+	callback, callback_ok := request.completion_callbacks[0].variant.(proto.Temporal_Api_Common_V1_Callback_Variant_Nexus)
+	if !callback_ok || callback.value == nil || callback.value.url != callback_url ||
+	   len(callback.value.header) != 1 || callback.value.header[0].key != callback_header_key ||
+	   callback.value.header[0].value != callback_header_value {
+		return pbt.fail("generated Nexus completion callback changed across protobuf encoding")
 	}
 	if request.request_eager_execution != enable_eager_start ||
 	   i32(request.workflow_id_reuse_policy) != i32(reuse_case) ||

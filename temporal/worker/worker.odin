@@ -1078,6 +1078,7 @@ register_json_nexus_operation_result :: proc(
 			}
 			callback := cast(^Callback)data
 			result := callback^(ctx, value)
+			defer nexus.result_free(&result)
 			if result.status == .Handler_Error {
 				return {
 					status = .Handler_Error,
@@ -1085,7 +1086,13 @@ register_json_nexus_operation_result :: proc(
 				}
 			}
 			if result.status == .Started_Async {
-				return nexus.payload_async(result.operation_token)
+				payload_result := nexus.payload_async(result.operation_token)
+				if result.operation_token_owned {
+					payload_result.operation_token_owned = true
+					result.operation_token = ""
+					result.operation_token_owned = false
+				}
+				return payload_result
 			}
 			payload, encode_error := codec.encode_json(result.value)
 			if encode_error != .None {
