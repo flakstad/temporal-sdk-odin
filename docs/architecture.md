@@ -2720,7 +2720,9 @@ Workflows are enabled.
    and outbound metrics remain. Async token handoff, Workflow-backed callback
    completion, caller/completer linking, and every cancellation policy are
    live-proven. Runtime state transitions for those policies are also
-   property-tested.
+   property-tested. All four terminal operation states absorb duplicate or
+   conflicting result delivery; in particular, late success cannot replace the
+   immediate canceled result produced by `Abandon` or `Try_Cancel`.
    The Workflow outbound interceptor is implemented
    and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
    cooperative timeout cancellation of a running synchronous Odin handler are
@@ -2744,11 +2746,14 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary against duplicate callback/result delivery. The selector/join
-branch and async cancel-token handoff are unit-, live-, and replay-tested;
-selector ordering and all four cancellation-policy transitions are also
-property-tested.
+The next smallest vertical milestone is expanding the public Nexus Link model
+beyond event-ID `WorkflowEvent` links. The pinned common schema also has
+request-ID Workflow references plus `BatchJob`, `Activity`, `NexusOperation`,
+and general `Workflow` variants; their actual Nexus URL/type forms must be
+verified upstream before adding parsers. The selector/join branch, async
+cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,
+and/or property-tested as applicable; selector ordering and all four
+cancellation-policy transitions are also property-tested.
 The Workflow outbound
 interceptor and handler failure/pre-start timeout classification are now
 wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
@@ -2795,7 +2800,9 @@ property now covers start/completion selectors, start/completion joins,
 explicit cancellation, partial readiness, and four byte-identical replay
 completions. Nexus operation Futures now participate in the same selector/join
 readiness model, with a separate 180-trace biased-order/job-interleaving and
-fresh-stack replay property.
+fresh-stack replay property. Two additional 240-case properties cover all four
+cancellation-policy transitions and require every terminal state to absorb
+duplicate or conflicting result resolution.
 None of these scheduler features requires a new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now

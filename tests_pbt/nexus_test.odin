@@ -329,6 +329,85 @@ workflow_nexus_cancellation_policies_preserve_distinct_transitions :: proc(t: ^t
 	pbt.require_pass(t, result)
 }
 
+nexus_terminal_resolution_property :: proc(t: ^pbt.T) -> pbt.Result {
+	terminal_index := pbt.draw(t, pbt.int_range(0, 3))
+	terminal_states := [?]workflow.Nexus_Operation_State{
+		.Resolved,
+		.Failed,
+		.Canceled,
+		.Timed_Out,
+	}
+	terminal_state := terminal_states[terminal_index]
+	for index in 0..<len(terminal_states) {
+		pbt.cover(t, terminal_index == index, 20.0, "terminal Nexus state")
+	}
+	late_data := pbt.draw(t, pbt.byte_array(0, 128))
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return pbt.error("could not initialize terminal Nexus resolution arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	instance := workflow.Fiber_Instance{}
+	instance.nexus_operations = make([dynamic]workflow.Fiber_Nexus_Operation)
+	append(
+		&instance.nexus_operations,
+		workflow.Fiber_Nexus_Operation{
+			seq = 1,
+			start_state = .Succeeded,
+			state = terminal_state,
+			failure_message = "original terminal outcome",
+		},
+	)
+	late_payload := proto.Temporal_Api_Common_V1_Payload{data = late_data}
+	late_result := proto.Coresdk_Nexus_NexusOperationResult{
+		status = proto.Coresdk_Nexus_NexusOperationResult_Status_Completed{
+			value = &late_payload,
+		},
+	}
+	resolution := proto.Coresdk_Workflow_Activation_ResolveNexusOperation{
+		seq = 1,
+		result = &late_result,
+	}
+
+	for _ in 0..<2 {
+		processed := workflow.Process_Result{}
+		resolution_error := workflow.apply_nexus_operation_resolution(
+			&instance,
+			&resolution,
+			&processed,
+		)
+		if len(resolution_error) > 0 || processed.resolved_nexus_operation_seq != 1 {
+			return pbt.fail("duplicate terminal Nexus resolution was not acknowledged")
+		}
+		operation := &instance.nexus_operations[0]
+		if operation.state != terminal_state ||
+		   operation.failure_message != "original terminal outcome" ||
+		   len(operation.result.data) != 0 {
+			return pbt.fail("late Nexus result replaced a terminal outcome")
+		}
+		if terminal_state == .Canceled && !processed.resolved_nexus_operation_canceled {
+			return pbt.fail("terminal Nexus cancellation lost its acknowledgement")
+		}
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_nexus_terminal_results_are_absorbing :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"terminal Nexus results absorb duplicate or conflicting delivery",
+		nexus_terminal_resolution_property,
+		{num_tests = 240, seed = 0x4e45_5855_535f_4455},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 nexus_selector_property_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	order: string,

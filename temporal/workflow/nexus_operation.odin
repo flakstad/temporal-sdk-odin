@@ -765,6 +765,15 @@ apply_nexus_operation_resolution :: proc(
 		result.resolved_nexus_operation_seq = operation.seq
 		return ""
 	}
+	// Abandon and TryCancel can make cancellation terminal before Core sends its
+	// synthetic Cancelled resolution. Treat that resolution, and any later
+	// duplicate, as an acknowledgement instead of allowing it to replace the
+	// already observed terminal outcome.
+	if operation.state == .Canceled {
+		result.resolved_nexus_operation_seq = operation.seq
+		result.resolved_nexus_operation_canceled = true
+		return ""
+	}
 	handled := false
 	#partial switch status in resolution.result.status {
 	case proto.Coresdk_Nexus_NexusOperationResult_Status_Completed:

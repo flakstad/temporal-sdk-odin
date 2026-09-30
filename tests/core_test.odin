@@ -13759,6 +13759,52 @@ workflow_nexus_cancellation_emits_once_and_honors_wait_policy :: proc(t: ^testin
 }
 
 @(test)
+workflow_nexus_terminal_cancellation_ignores_late_result :: proc(t: ^testing.T) {
+	instance := workflow.Fiber_Instance{}
+	instance.nexus_operations = make([dynamic]workflow.Fiber_Nexus_Operation)
+	defer delete(instance.nexus_operations)
+	append(
+		&instance.nexus_operations,
+		workflow.Fiber_Nexus_Operation{
+			seq = 7,
+			start_state = .Succeeded,
+			state = .Canceled,
+			failure_message = "caller already observed cancellation",
+		},
+	)
+
+	late_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"late success"`),
+	}
+	late_result := proto.Coresdk_Nexus_NexusOperationResult{
+		status = proto.Coresdk_Nexus_NexusOperationResult_Status_Completed{
+			value = &late_payload,
+		},
+	}
+	resolution := proto.Coresdk_Workflow_Activation_ResolveNexusOperation{
+		seq = 7,
+		result = &late_result,
+	}
+	processed := workflow.Process_Result{}
+	resolution_error := workflow.apply_nexus_operation_resolution(
+		&instance,
+		&resolution,
+		&processed,
+	)
+
+	testing.expect_value(t, resolution_error, "")
+	testing.expect(t, instance.nexus_operations[0].state == .Canceled)
+	testing.expect_value(
+		t,
+		instance.nexus_operations[0].failure_message,
+		"caller already observed cancellation",
+	)
+	testing.expect_value(t, len(instance.nexus_operations[0].result.data), 0)
+	testing.expect_value(t, processed.resolved_nexus_operation_seq, u32(7))
+	testing.expect(t, processed.resolved_nexus_operation_canceled)
+}
+
+@(test)
 workflow_nexus_start_failure_classifies_timeout_and_cancellation :: proc(t: ^testing.T) {
 	arena: virtual.Arena
 	testing.expect(t, virtual.arena_init_growing(&arena) == nil)

@@ -1304,7 +1304,10 @@ Payload bytes, endpoint/service/operation strings, string headers, all four
 cancellation policies, and independent schedule-to-close, schedule-to-start,
 and start-to-close timeouts. The focused runtime test additionally forces cache
 eviction and requires byte-identical replay before applying both the synchronous
-start and completed-result jobs in one activation.
+start and completed-result jobs in one activation. Separate 240-case properties
+exercise every cancellation-policy transition and every terminal operation
+state. The latter applies duplicate/conflicting late success results twice and
+requires the first terminal outcome to remain unchanged.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,

@@ -351,7 +351,9 @@ callback. The cancel handler addresses backing Workflows by operation token and
 requests cancellation through the Odin Client. The handler also translates the
 caller's Nexus `temporal://` link to `common.v1.Link.WorkflowEvent` and attaches
 it both to the callback and completer Workflow start, matching the upstream Core
-integration pattern. Other Link variants remain.
+integration pattern. Terminal Nexus outcomes are absorbing: duplicate or late
+conflicting Core resolutions are acknowledged without replacing the result
+already observed by Workflow code. Other Link variants remain.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
