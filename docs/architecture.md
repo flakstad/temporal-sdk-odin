@@ -391,14 +391,41 @@ preserved in the Odin error.
 Ordinary Workflow start additionally exposes the Service protobuf's repeated
 `completion_callbacks` field as borrowed `Nexus_Completion_Callback` values.
 Each entry maps exactly to `temporal.api.common.v1.Callback.Nexus`: URL plus
-string header map and optional Workflow-event links. Ordinary start options can
-attach the same links to the new Workflow. Odin validates nonempty URLs, header
-keys, Workflow identity, and event references, constructs the temporary
-protobuf graph, and discards it immediately after synchronous
+string header map and optional Temporal Links. Ordinary start options can
+attach the same links to the new Workflow. The public tagged `Link` model maps
+all five variants in the pinned common schema: `WorkflowEvent`, `BatchJob`,
+`Activity`, `NexusOperation`, and `Workflow`. `WorkflowEvent` supports both
+event-ID and request-ID references. Odin validates each variant, constructs the
+temporary protobuf graph, and discards it immediately after synchronous
 encoding. The Service, not Core or the Odin process, invokes that URL when the
 started Workflow reaches a terminal result. `SignalWithStartWorkflowExecution`
 has no equivalent field in the pinned schema, so that API rejects completion
 callbacks instead of silently dropping them.
+
+Nexus Link conversion follows the
+[current upstream TypeScript converter](https://github.com/temporalio/sdk-typescript/blob/2ed151670cd91ed3377ce6c9b6cb0c0de878348c/packages/nexus/src/link-converter.ts)
+rather than inferring a URL vocabulary from protobuf names. `link_from_nexus`
+accepts the Link type string plus its `temporal:` URL and parses these identities:
+
+- `WorkflowEvent`: `/namespaces/{namespace}/workflows/{workflow}/{run}/history`,
+  with either `EventReference` or `RequestIdReference` query fields;
+- `NexusOperation`: `/namespaces/{namespace}/nexus-operations/{operation}/{run}/details`;
+- `Activity`: `/namespaces/{namespace}/activities/{activity}/{run}/details`;
+- `Workflow`: `/namespaces/{namespace}/workflows/{workflow}/{run}`, with an
+  optional reason.
+
+Components use URL percent decoding. Query `+` is decoded as a space. The
+parser also accepts the legacy Core/server Workflow-event URL observed by the
+live suite, whose authority is nonempty and whose event reference omits the
+`referenceType` field. Parsed strings are allocated with the caller-selected
+allocator and must be released once with `link_free`; caller-constructed Link
+strings remain borrowed for synchronous request encoding. The pinned schema's
+`BatchJob` variant is encoding-only because upstream defines no Nexus URL
+mapping for it. The current Python SDK's generated common API at commit
+[`5bb4612`](https://github.com/temporalio/sdk-python/blob/5bb461265e6c1af29c5f25dbb871a7e67448c61e/temporalio/api/common/v1/message_pb2.pyi)
+shows a subsequently added `Callback` Link variant. It is absent from pinned
+Core `core-v0.9.0`; that is an explicit version-skew item rather than a locally
+invented extension.
 
 ### Worker and activity tasks
 
@@ -504,10 +531,11 @@ separately registered handler before emitting the exact cancel response.
 Registrations without that handler retain a non-retryable `NOT_IMPLEMENTED`
 response. Async success through a Workflow completion callback and all four
 cancellation policies are live-proven. The handler also
-preserves Core's raw Nexus links, parses the upstream `temporal://.../history`
-form, and attaches the resulting `WorkflowEvent` link to both callback and
-completer start. Other Link variants and outbound metrics are not implemented.
-The
+preserves Core's raw Nexus links, parses all four upstream URL/type forms into
+the generic pinned Link model, and attaches those values to callbacks and
+ordinary Workflow starts. All five pinned protobuf variants encode; `BatchJob`
+is encoding-only because upstream has no Nexus URL converter for it. Outbound
+metrics are not implemented. The
 outbound interceptor and selector/join integration are implemented.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
@@ -2716,8 +2744,11 @@ Workflows are enabled.
    `NexusHandlerFailureInfo` envelope, and all callback-visible data is owned
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Callback
-   completion and Workflow-event linking are implemented; other Link variants
-   and outbound metrics remain. Async token handoff, Workflow-backed callback
+   completion and generic pinned-schema Link encoding are implemented; four
+   upstream Nexus URL/type forms parse with explicit ownership. `BatchJob` has
+   no upstream URL mapping, and current upstream's newer `Callback` Link waits
+   on a deliberate Core/schema upgrade. Outbound metrics remain. Async token
+   handoff, Workflow-backed callback
    completion, caller/completer linking, and every cancellation policy are
    live-proven. Runtime state transitions for those policies are also
    property-tested. All four terminal operation states absorb duplicate or
@@ -2746,11 +2777,15 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The next smallest vertical milestone is expanding the public Nexus Link model
-beyond event-ID `WorkflowEvent` links. The pinned common schema also has
-request-ID Workflow references plus `BatchJob`, `Activity`, `NexusOperation`,
-and general `Workflow` variants; their actual Nexus URL/type forms must be
-verified upstream before adding parsers. The selector/join branch, async
+The next smallest vertical milestone is a bounded pinned-Core upgrade
+assessment. Generic Links exposed the first concrete schema skew: current
+upstream has a `Callback` Link variant that pinned Core `core-v0.9.0` does not.
+The assessment should update Core and generated protos on an isolated branch,
+compile every raw ABI symbol, run the full unit/property/live suite, and record
+only behavior or ABI changes that affect Odin. If that upgrade remains small,
+land it before adding APIs that would otherwise freeze an already-old schema;
+if it is disruptive, retain the pin and publish an explicit compatibility
+matrix. The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,
 and/or property-tested as applicable; selector ordering and all four
 cancellation-policy transitions are also property-tested.

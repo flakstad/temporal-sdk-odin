@@ -5146,3 +5146,155 @@ nondeterminism_policy_preserves_generated_abi_values :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
+	kind_index := pbt.draw(t, pbt.int_range(0, 4))
+	identifier := pbt.draw(t, pbt.string_alphabet("abcdefghijklmnopqrstuvwxyz0123456789-", 1, 32))
+	reference_is_request := pbt.draw(t, pbt.boolean())
+	event_id := i64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	event_type_number := pbt.draw(t, pbt.int_range(1, 60))
+	event_type := cast(temporal_client.Workflow_Event_Type)event_type_number
+	pbt.cover(t, kind_index == 0, 15.0, "WorkflowEvent link")
+	pbt.cover(t, kind_index == 1, 15.0, "BatchJob link")
+	pbt.cover(t, kind_index == 2, 15.0, "Activity link")
+	pbt.cover(t, kind_index == 3, 15.0, "NexusOperation link")
+	pbt.cover(t, kind_index == 4, 15.0, "Workflow link")
+	pbt.cover(t, kind_index == 0 && reference_is_request, 5.0, "request-ID reference")
+	pbt.cover(t, kind_index == 0 && !reference_is_request, 5.0, "event-ID reference")
+
+	link: temporal_client.Link
+	switch kind_index {
+	case 0:
+		link = {
+			kind = .Workflow_Event,
+			workflow_event = {
+				namespace = "generated",
+				workflow_id = identifier,
+				run_id = "generated-run",
+				reference_kind = reference_is_request ? .Request_Id : .Event_Id,
+				event_id = reference_is_request ? 0 : event_id,
+				request_id = reference_is_request ? identifier : "",
+				event_type = event_type,
+			},
+		}
+	case 1:
+		link = {kind = .Batch_Job, batch_job = {job_id = identifier}}
+	case 2:
+		link = {
+			kind = .Activity,
+			activity = {
+				namespace = "generated",
+				activity_id = identifier,
+				run_id = "generated-run",
+			},
+		}
+	case 3:
+		link = {
+			kind = .Nexus_Operation,
+			nexus_operation = {
+				namespace = "generated",
+				operation_id = identifier,
+				run_id = "generated-run",
+			},
+		}
+	case 4:
+		link = {
+			kind = .Workflow,
+			workflow = {
+				namespace = "generated",
+				workflow_id = identifier,
+				run_id = "generated-run",
+				reason = "generated reason",
+			},
+		}
+	}
+	links := [?]temporal_client.Link{link}
+	input := codec.payload_create(transmute([]u8)string("input"))
+	defer codec.payload_free(&input)
+	request_bytes, request_error := temporal_client.encode_start_workflow_request(
+		"generated",
+		"link-workflow",
+		codec.payload_view(&input),
+		{
+			id = "generated-link-workflow",
+			task_queue = "generated-links",
+			request_id = "generated-link-request",
+			links = links[:],
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	if request_error.message != nil {
+		return pbt.fail("generated Temporal Link was rejected")
+	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize Temporal Link decode arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || len(request.links) != 1 {
+		return pbt.fail("generated Temporal Link did not decode")
+	}
+
+	switch kind_index {
+	case 0:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event)
+		if !ok || value.value == nil || value.value.workflow_id != identifier {
+			return pbt.fail("WorkflowEvent identity changed during encoding")
+		}
+		if reference_is_request {
+			reference, reference_ok := value.value.reference.(proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Request_Id_Ref)
+			if !reference_ok || reference.value == nil || reference.value.request_id != identifier ||
+			   i32(reference.value.event_type) != i32(event_type) {
+				return pbt.fail("WorkflowEvent request reference changed during encoding")
+			}
+		} else {
+			reference, reference_ok := value.value.reference.(proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref)
+			if !reference_ok || reference.value == nil || reference.value.event_id != event_id ||
+			   i32(reference.value.event_type) != i32(event_type) {
+				return pbt.fail("WorkflowEvent event reference changed during encoding")
+			}
+		}
+	case 1:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Batch_Job)
+		if !ok || value.value == nil || value.value.job_id != identifier {
+			return pbt.fail("BatchJob identity changed during encoding")
+		}
+	case 2:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Activity)
+		if !ok || value.value == nil || value.value.activity_id != identifier {
+			return pbt.fail("Activity identity changed during encoding")
+		}
+	case 3:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Nexus_Operation)
+		if !ok || value.value == nil || value.value.operation_id != identifier {
+			return pbt.fail("NexusOperation identity changed during encoding")
+		}
+	case 4:
+		value, ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow)
+		if !ok || value.value == nil || value.value.workflow_id != identifier ||
+		   value.value.reason != "generated reason" {
+			return pbt.fail("Workflow identity changed during encoding")
+		}
+	}
+	return pbt.pass()
+}
+
+@(test)
+temporal_links_preserve_generated_variants :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Temporal Links preserve generated variants",
+		temporal_link_encoding_property,
+		{num_tests = 500, seed = 0x5445_4d50_4c49_4e4b},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

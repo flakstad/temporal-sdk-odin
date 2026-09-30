@@ -8399,6 +8399,248 @@ client_translates_nexus_workflow_event_links :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_translates_generic_nexus_links :: proc(t: ^testing.T) {
+	workflow_event, workflow_event_error := temporal_client.link_from_nexus(
+		"temporal:///namespaces/team%20one/workflows/order%2F42/run%201/history?referenceType=RequestIdReference&requestID=req%2F7&eventType=WorkflowTaskCompleted",
+		temporal_client.NEXUS_LINK_TYPE_WORKFLOW_EVENT,
+	)
+	defer temporal_client.link_free(&workflow_event)
+	defer temporal_client.error_free(&workflow_event_error)
+	testing.expect(t, workflow_event_error.message == nil)
+	testing.expect_value(t, workflow_event.kind, temporal_client.Link_Kind.Workflow_Event)
+	testing.expect_value(t, workflow_event.workflow_event.namespace, "team one")
+	testing.expect_value(t, workflow_event.workflow_event.workflow_id, "order/42")
+	testing.expect_value(t, workflow_event.workflow_event.run_id, "run 1")
+	testing.expect_value(
+		t,
+		workflow_event.workflow_event.reference_kind,
+		temporal_client.Workflow_Event_Reference_Kind.Request_Id,
+	)
+	testing.expect_value(t, workflow_event.workflow_event.request_id, "req/7")
+	testing.expect_value(
+		t,
+		workflow_event.workflow_event.event_type,
+		temporal_client.Workflow_Event_Type.Workflow_Task_Completed,
+	)
+
+	nexus_operation, nexus_operation_error := temporal_client.link_from_nexus(
+		"temporal:///namespaces/default/nexus-operations/op%2F1/run-1/details",
+		temporal_client.NEXUS_LINK_TYPE_NEXUS_OPERATION,
+	)
+	defer temporal_client.link_free(&nexus_operation)
+	defer temporal_client.error_free(&nexus_operation_error)
+	testing.expect(t, nexus_operation_error.message == nil)
+	testing.expect_value(t, nexus_operation.kind, temporal_client.Link_Kind.Nexus_Operation)
+	testing.expect_value(t, nexus_operation.nexus_operation.operation_id, "op/1")
+
+	activity, activity_error := temporal_client.link_from_nexus(
+		"temporal:///namespaces/default/activities/activity%2042/run-2/details",
+		temporal_client.NEXUS_LINK_TYPE_ACTIVITY,
+	)
+	defer temporal_client.link_free(&activity)
+	defer temporal_client.error_free(&activity_error)
+	testing.expect(t, activity_error.message == nil)
+	testing.expect_value(t, activity.kind, temporal_client.Link_Kind.Activity)
+	testing.expect_value(t, activity.activity.activity_id, "activity 42")
+
+	workflow, workflow_error := temporal_client.link_from_nexus(
+		"temporal:///namespaces/default/workflows/target/run-3?reason=rejected+update",
+		temporal_client.NEXUS_LINK_TYPE_WORKFLOW,
+	)
+	defer temporal_client.link_free(&workflow)
+	defer temporal_client.error_free(&workflow_error)
+	testing.expect(t, workflow_error.message == nil)
+	testing.expect_value(t, workflow.kind, temporal_client.Link_Kind.Workflow)
+	testing.expect_value(t, workflow.workflow.workflow_id, "target")
+	testing.expect_value(t, workflow.workflow.reason, "rejected update")
+
+	invalid_links := [?]struct {url, link_type: string}{
+		{
+			"temporal:///namespaces/default/activities/id/run/details",
+			temporal_client.NEXUS_LINK_TYPE_WORKFLOW,
+		},
+		{
+			"temporal:///namespaces/default/workflows/id/run/history?referenceType=EventReference&eventID=21&eventType=Unknown",
+			temporal_client.NEXUS_LINK_TYPE_WORKFLOW_EVENT,
+		},
+		{
+			"temporal:///namespaces/default/workflows/%ZZ/run/history",
+			temporal_client.NEXUS_LINK_TYPE_WORKFLOW_EVENT,
+		},
+		{"temporal:///batch-jobs/job-1", temporal_client.NEXUS_LINK_TYPE_BATCH_JOB},
+		{"temporal:///unknown", "example.Unknown"},
+	}
+	for invalid in invalid_links {
+		invalid_link, invalid_error := temporal_client.link_from_nexus(
+			invalid.url,
+			invalid.link_type,
+		)
+		temporal_client.link_free(&invalid_link)
+		testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+		temporal_client.error_free(&invalid_error)
+	}
+}
+
+@(test)
+client_encodes_every_pinned_temporal_link_variant :: proc(t: ^testing.T) {
+	input, input_error := codec.encode_json("link-input")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	links := [?]temporal_client.Link{
+		{
+			kind = .Workflow_Event,
+			workflow_event = {
+				namespace = "orders",
+				workflow_id = "caller",
+				run_id = "caller-run",
+				reference_kind = .Request_Id,
+				request_id = "request-7",
+				event_type = .Workflow_Task_Completed,
+			},
+		},
+		{kind = .Batch_Job, batch_job = {job_id = "batch-1"}},
+		{
+			kind = .Activity,
+			activity = {namespace = "orders", activity_id = "charge", run_id = "activity-run"},
+		},
+		{
+			kind = .Nexus_Operation,
+			nexus_operation = {
+				namespace = "orders",
+				operation_id = "operation-1",
+				run_id = "operation-run",
+			},
+		},
+		{
+			kind = .Workflow,
+			workflow = {
+				namespace = "orders",
+				workflow_id = "target",
+				run_id = "target-run",
+				reason = "accepted update",
+			},
+		},
+	}
+	callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+		url = "http://temporal.invalid/nexus/callback",
+		links = links[:],
+	}}
+	request_bytes, request_error := temporal_client.encode_start_workflow_request(
+		"orders",
+		"link_workflow",
+		codec.payload_view(&input),
+		{
+			id = "links-1",
+			task_queue = "links",
+			request_id = "links-request-1",
+			links = links[:],
+			nexus_completion_callbacks = callbacks[:],
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, len(request.links), len(links))
+	testing.expect_value(t, len(request.completion_callbacks), 1)
+	if len(request.completion_callbacks) == 1 {
+		testing.expect_value(t, len(request.completion_callbacks[0].links), len(links))
+	}
+	if len(request.links) != len(links) do return
+
+	workflow_event, workflow_event_ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event)
+	testing.expect(t, workflow_event_ok && workflow_event.value != nil)
+	if workflow_event_ok && workflow_event.value != nil {
+		request_reference, reference_ok := workflow_event.value.reference.(proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Request_Id_Ref)
+		testing.expect(t, reference_ok && request_reference.value != nil)
+		if reference_ok && request_reference.value != nil {
+			testing.expect_value(t, request_reference.value.request_id, "request-7")
+			testing.expect(
+				t,
+				request_reference.value.event_type == .EVENT_TYPE_WORKFLOW_TASK_COMPLETED,
+			)
+		}
+	}
+	batch_job, batch_job_ok := request.links[1].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Batch_Job)
+	testing.expect(t, batch_job_ok && batch_job.value != nil)
+	if batch_job_ok && batch_job.value != nil {
+		testing.expect_value(t, batch_job.value.job_id, "batch-1")
+	}
+	activity_link, activity_ok := request.links[2].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Activity)
+	testing.expect(t, activity_ok && activity_link.value != nil)
+	if activity_ok && activity_link.value != nil {
+		testing.expect_value(t, activity_link.value.activity_id, "charge")
+	}
+	nexus_operation, nexus_operation_ok := request.links[3].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Nexus_Operation)
+	testing.expect(t, nexus_operation_ok && nexus_operation.value != nil)
+	if nexus_operation_ok && nexus_operation.value != nil {
+		testing.expect_value(t, nexus_operation.value.operation_id, "operation-1")
+	}
+	workflow_link, workflow_ok := request.links[4].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow)
+	testing.expect(t, workflow_ok && workflow_link.value != nil)
+	if workflow_ok && workflow_link.value != nil {
+		testing.expect_value(t, workflow_link.value.workflow_id, "target")
+		testing.expect_value(t, workflow_link.value.reason, "accepted update")
+	}
+
+	invalid_kind_links := [?]temporal_client.Link{{
+		kind = cast(temporal_client.Link_Kind)99,
+	}}
+	invalid_kind_bytes, invalid_kind_error := temporal_client.encode_start_workflow_request(
+		"orders",
+		"link_workflow",
+		codec.payload_view(&input),
+		{
+			id = "invalid-link-kind",
+			task_queue = "links",
+			request_id = "invalid-link-kind-request",
+			links = invalid_kind_links[:],
+		},
+	)
+	defer delete(invalid_kind_bytes)
+	defer temporal_client.error_free(&invalid_kind_error)
+	testing.expect_value(t, invalid_kind_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+
+	invalid_event_links := [?]temporal_client.Link{{
+		kind = .Workflow_Event,
+		workflow_event = {
+			namespace = "orders",
+			workflow_id = "caller",
+			run_id = "caller-run",
+			reference_kind = .Event_Id,
+			event_id = 1,
+			event_type = cast(temporal_client.Workflow_Event_Type)99,
+		},
+	}}
+	invalid_event_bytes, invalid_event_error := temporal_client.encode_start_workflow_request(
+		"orders",
+		"link_workflow",
+		codec.payload_view(&input),
+		{
+			id = "invalid-link-event",
+			task_queue = "links",
+			request_id = "invalid-link-event-request",
+			links = invalid_event_links[:],
+		},
+	)
+	defer delete(invalid_event_bytes)
+	defer temporal_client.error_free(&invalid_event_error)
+	testing.expect_value(t, invalid_event_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+}
+
+@(test)
 client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	metadata := temporal_client.Start_Metadata{}
 	init_error := temporal_client.start_metadata_init(&metadata)

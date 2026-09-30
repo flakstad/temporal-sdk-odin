@@ -349,11 +349,15 @@ immediately; `Wait_Cancellation_Requested` waits for cancellation acceptance;
 and `Wait_Cancellation_Completed` waits for the backing Workflow's terminal
 callback. The cancel handler addresses backing Workflows by operation token and
 requests cancellation through the Odin Client. The handler also translates the
-caller's Nexus `temporal://` link to `common.v1.Link.WorkflowEvent` and attaches
+caller's Nexus `temporal://` link into the generic public Link model and attaches
 it both to the callback and completer Workflow start, matching the upstream Core
-integration pattern. Terminal Nexus outcomes are absorbing: duplicate or late
-conflicting Core resolutions are acknowledged without replacing the result
-already observed by Workflow code. Other Link variants remain.
+integration pattern. The SDK encodes all five variants in the pinned common
+schema (`WorkflowEvent`, `BatchJob`, `Activity`, `NexusOperation`, and
+`Workflow`) and parses the four URL/type forms currently defined by upstream;
+`BatchJob` has no upstream Nexus URL conversion. Parsed Link strings are owned
+and released with `client.link_free`. Terminal Nexus outcomes are absorbing:
+duplicate or late conflicting Core resolutions are acknowledged without
+replacing the result already observed by Workflow code.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {

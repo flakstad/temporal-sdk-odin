@@ -260,6 +260,8 @@ Start_Workflow_Options :: struct {
 	start_delay:                time.Duration,
 	priority:                   ^Priority,
 	metadata:                   ^Start_Metadata,
+	links:                      []Link,
+	// Deprecated compatibility field. Prefer links with kind Workflow_Event.
 	workflow_event_links:       []Workflow_Event_Link,
 	nexus_completion_callbacks: []Nexus_Completion_Callback,
 	enable_eager_workflow_start: bool,
@@ -271,6 +273,8 @@ Start_Workflow_Options :: struct {
 Nexus_Completion_Callback :: struct {
 	url:     string,
 	headers: []Nexus_Callback_Header,
+	links:   []Link,
+	// Deprecated compatibility field. Prefer links with kind Workflow_Event.
 	workflow_event_links: []Workflow_Event_Link,
 }
 
@@ -279,12 +283,68 @@ Nexus_Callback_Header :: struct {
 	value: string,
 }
 
-// Workflow_Event_Type is deliberately narrow until the Client exposes a
-// general-purpose Link builder. Nexus StartOperation links currently refer to
-// the scheduling event in the caller Workflow.
 Workflow_Event_Type :: enum i32 {
 	Unspecified = 0,
+	Workflow_Execution_Started = 1,
+	Workflow_Execution_Completed = 2,
+	Workflow_Execution_Failed = 3,
+	Workflow_Execution_Timed_Out = 4,
+	Workflow_Task_Scheduled = 5,
+	Workflow_Task_Started = 6,
+	Workflow_Task_Completed = 7,
+	Workflow_Task_Timed_Out = 8,
+	Workflow_Task_Failed = 9,
+	Activity_Task_Scheduled = 10,
+	Activity_Task_Started = 11,
+	Activity_Task_Completed = 12,
+	Activity_Task_Failed = 13,
+	Activity_Task_Timed_Out = 14,
+	Activity_Task_Cancel_Requested = 15,
+	Activity_Task_Canceled = 16,
+	Timer_Started = 17,
+	Timer_Fired = 18,
+	Timer_Canceled = 19,
+	Workflow_Execution_Cancel_Requested = 20,
+	Workflow_Execution_Canceled = 21,
+	Request_Cancel_External_Workflow_Execution_Initiated = 22,
+	Request_Cancel_External_Workflow_Execution_Failed = 23,
+	External_Workflow_Execution_Cancel_Requested = 24,
+	Marker_Recorded = 25,
+	Workflow_Execution_Signaled = 26,
+	Workflow_Execution_Terminated = 27,
+	Workflow_Execution_Continued_As_New = 28,
+	Start_Child_Workflow_Execution_Initiated = 29,
+	Start_Child_Workflow_Execution_Failed = 30,
+	Child_Workflow_Execution_Started = 31,
+	Child_Workflow_Execution_Completed = 32,
+	Child_Workflow_Execution_Failed = 33,
+	Child_Workflow_Execution_Canceled = 34,
+	Child_Workflow_Execution_Timed_Out = 35,
+	Child_Workflow_Execution_Terminated = 36,
+	Signal_External_Workflow_Execution_Initiated = 37,
+	Signal_External_Workflow_Execution_Failed = 38,
+	External_Workflow_Execution_Signaled = 39,
+	Upsert_Workflow_Search_Attributes = 40,
+	Workflow_Execution_Update_Accepted = 41,
+	Workflow_Execution_Update_Rejected = 42,
+	Workflow_Execution_Update_Completed = 43,
+	Workflow_Properties_Modified_Externally = 44,
+	Activity_Properties_Modified_Externally = 45,
+	Workflow_Properties_Modified = 46,
+	Workflow_Execution_Update_Admitted = 47,
 	Nexus_Operation_Scheduled = 48,
+	Nexus_Operation_Started = 49,
+	Nexus_Operation_Completed = 50,
+	Nexus_Operation_Failed = 51,
+	Nexus_Operation_Canceled = 52,
+	Nexus_Operation_Timed_Out = 53,
+	Nexus_Operation_Cancel_Requested = 54,
+	Workflow_Execution_Options_Updated = 55,
+	Nexus_Operation_Cancel_Request_Completed = 56,
+	Nexus_Operation_Cancel_Request_Failed = 57,
+	Workflow_Execution_Paused = 58,
+	Workflow_Execution_Unpaused = 59,
+	Workflow_Execution_Time_Skipping_Transitioned = 60,
 }
 
 // Workflow_Event_Link values and their strings are borrowed during synchronous
@@ -293,8 +353,10 @@ Workflow_Event_Link :: struct {
 	namespace:           string,
 	workflow_id:         string,
 	run_id:              string,
+	reference_kind:      Workflow_Event_Reference_Kind,
 	has_event_reference: bool,
 	event_id:            i64,
+	request_id:          string,
 	event_type:          Workflow_Event_Type,
 }
 
@@ -1025,6 +1087,9 @@ start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string 
 	if options.metadata != nil && options.metadata.allocator.procedure == nil {
 		return "Workflow start metadata is not initialized"
 	}
+	for link in options.links {
+		if message := link_error(link); len(message) > 0 do return message
+	}
 	for link in options.workflow_event_links {
 		if message := workflow_event_link_error(link); len(message) > 0 do return message
 	}
@@ -1037,6 +1102,9 @@ start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string 
 				return "Nexus completion callback header keys must not be empty"
 			}
 		}
+		for link in callback.links {
+			if message := link_error(link); len(message) > 0 do return message
+		}
 		for link in callback.workflow_event_links {
 			if message := workflow_event_link_error(link); len(message) > 0 do return message
 		}
@@ -1048,40 +1116,48 @@ workflow_event_link_error :: proc(link: Workflow_Event_Link) -> string {
 	if len(link.namespace) == 0 || len(link.workflow_id) == 0 || len(link.run_id) == 0 {
 		return "Workflow event links require namespace, Workflow ID, and Run ID"
 	}
+	if i32(link.event_type) < i32(Workflow_Event_Type.Unspecified) ||
+	   i32(link.event_type) > i32(Workflow_Event_Type.Workflow_Execution_Time_Skipping_Transitioned) {
+		return "Workflow event links require a known event type"
+	}
+	reference_kind := link.reference_kind
+	if reference_kind == .None && link.has_event_reference do reference_kind = .Event_Id
+	switch reference_kind {
+	case .Event_Id:
+		if link.event_id <= 0 || link.event_type == .Unspecified {
+			return "Workflow event links require a positive event ID and event type"
+		}
+	case .Request_Id:
+		if len(link.request_id) == 0 || link.event_type == .Unspecified {
+			return "Workflow event links require a request ID and event type"
+		}
+	case .None:
+	case:
+		return "Workflow event links require a known reference kind"
+	}
+	if link.has_event_reference && link.reference_kind == .Request_Id {
+		return "Workflow event links cannot combine legacy event-reference state with a request reference"
+	}
+	if reference_kind != .Event_Id && link.event_id != 0 {
+		return "Workflow event links cannot carry an event ID without an event reference"
+	}
+	if reference_kind != .Request_Id && len(link.request_id) > 0 {
+		return "Workflow event links cannot carry a request ID without a request reference"
+	}
+	if reference_kind == .None && link.event_type != .Unspecified {
+		return "Workflow event links cannot carry an event type without a reference"
+	}
+	if reference_kind == .Event_Id && len(link.request_id) > 0 {
+		return "Workflow event links cannot combine event and request references"
+	}
+	if reference_kind == .Request_Id && link.event_id != 0 {
+		return "Workflow event links cannot combine request and event references"
+	}
 	if link.has_event_reference &&
 	   (link.event_id <= 0 || link.event_type == .Unspecified) {
 		return "Workflow event links require a positive event ID and event type"
 	}
 	return ""
-}
-
-encode_workflow_event_link :: proc(
-	link: Workflow_Event_Link,
-	workflow_events: []proto.Temporal_Api_Common_V1_Link_WorkflowEvent,
-	event_references: []proto.Temporal_Api_Common_V1_Link_WorkflowEvent_EventReference,
-	cursor: ^int,
-) -> proto.Temporal_Api_Common_V1_Link {
-	index := cursor^
-	cursor^ += 1
-	workflow_events[index] = {
-		namespace = link.namespace,
-		workflow_id = link.workflow_id,
-		run_id = link.run_id,
-	}
-	if link.has_event_reference {
-		event_references[index] = {
-			event_id = link.event_id,
-			event_type = transmute(proto.Temporal_Api_Enums_V1_EventType)link.event_type,
-		}
-		workflow_events[index].reference = proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref{
-			value = &event_references[index],
-		}
-	}
-	return {
-		variant = proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event{
-			value = &workflow_events[index],
-		},
-	}
 }
 
 free_start_proto_payloads :: proc(payloads: []proto.Temporal_Api_Common_V1_Payload) {
@@ -1144,28 +1220,19 @@ encode_start_workflow_request_payloads :: proc(
 		cron_schedule = options.cron_schedule,
 		request_eager_execution = options.enable_eager_workflow_start,
 	}
-	total_link_count := len(options.workflow_event_links)
+	total_link_count := len(options.links) + len(options.workflow_event_links)
 	for callback in options.nexus_completion_callbacks {
-		total_link_count += len(callback.workflow_event_links)
+		total_link_count += len(callback.links) + len(callback.workflow_event_links)
 	}
-	workflow_event_values := make(
-		[]proto.Temporal_Api_Common_V1_Link_WorkflowEvent,
-		total_link_count,
-	)
-	event_reference_values := make(
-		[]proto.Temporal_Api_Common_V1_Link_WorkflowEvent_EventReference,
-		total_link_count,
-	)
-	link_cursor := 0
+	link_storage := encoded_link_storage_make(total_link_count)
+	defer encoded_link_storage_free(&link_storage)
+	for link in options.links {
+		append(&request.links, encode_link(link, &link_storage))
+	}
 	for link in options.workflow_event_links {
 		append(
 			&request.links,
-			encode_workflow_event_link(
-				link,
-				workflow_event_values,
-				event_reference_values,
-				&link_cursor,
-			),
+			encode_link({kind = .Workflow_Event, workflow_event = link}, &link_storage),
 		)
 	}
 	callback_values := make(
@@ -1188,8 +1255,6 @@ encode_start_workflow_request_payloads :: proc(
 		delete(callback_values)
 		delete(request.completion_callbacks)
 		delete(request.links)
-		delete(event_reference_values)
-		delete(workflow_event_values)
 	}
 	for callback, index in options.nexus_completion_callbacks {
 		callback_values[index].url = callback.url
@@ -1203,15 +1268,13 @@ encode_start_workflow_request_payloads :: proc(
 			)
 		}
 		callback_values[index].header = callback_headers[index]
+		for link in callback.links {
+			append(&callback_links[index], encode_link(link, &link_storage))
+		}
 		for link in callback.workflow_event_links {
 			append(
 				&callback_links[index],
-				encode_workflow_event_link(
-					link,
-					workflow_event_values,
-					event_reference_values,
-					&link_cursor,
-				),
+				encode_link({kind = .Workflow_Event, workflow_event = link}, &link_storage),
 			)
 		}
 		append(

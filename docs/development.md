@@ -1061,8 +1061,8 @@ schedule-to-close timeout and verifies that Core cooperatively cancels the
 running Odin callback. It then starts an asynchronous completer Workflow with
 Temporal's callback URL/headers and requires the Workflow result to resolve the
 waiting Nexus call. The handler requires the caller Workflow-event link,
-translates its `temporal://` URL, and attaches the resulting common Link to both
-the callback and completer start. A second async operation is canceled; its
+translates its Nexus URL/type pair through the generic Link parser, and attaches
+the resulting common Link to both the callback and completer start. A second async operation is canceled; its
 registered cancel handler uses the durable operation token as the backing
 Workflow ID and calls the Odin Client cancellation API. Separate branches then
 exercise every cancellation policy: `Abandon` detaches without dispatching a
@@ -1113,9 +1113,14 @@ outlives the handler adapter. `nexus.result_async_copy(Output, token)` preserves
 a temporary token until completion encoding. `Start_Workflow_Options` accepts
 borrowed `nexus_completion_callbacks`; the Service uses those URL/header values
 to deliver the completer Workflow's eventual terminal result to the Nexus
-operation. `workflow_event_link_from_nexus_url` converts the callback-scoped raw
-Nexus link to the narrow public Workflow-event Link model; both the callback
-and ordinary Workflow start borrow those values during encoding.
+operation. `client.link_from_nexus` converts a callback-scoped raw Nexus
+URL/type pair to the generic pinned-schema Link model. It owns all decoded
+strings, so the example calls `client.link_free` after the synchronous
+Workflow-start encoding; the callback and ordinary Workflow-start options only
+borrow those values. The converter accepts upstream's WorkflowEvent,
+NexusOperation, Activity, and Workflow URL forms and the legacy WorkflowEvent
+form observed from the pinned Core/server combination. BatchJob can be
+constructed and encoded directly but has no upstream Nexus URL mapping.
 Signal-With-Start rejects completion callbacks because its pinned request
 schema has no completion-callback field.
 

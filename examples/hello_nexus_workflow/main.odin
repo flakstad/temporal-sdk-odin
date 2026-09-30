@@ -84,28 +84,34 @@ start_async_completer :: proc(
 		[]temporal_client.Nexus_Callback_Header,
 		len(operation_info.callback_headers),
 	)
+	defer delete(callback_headers)
 	for header, index in operation_info.callback_headers {
 		callback_headers[index] = {key = header.key, value = header.value}
 	}
-	workflow_event_links := make(
-		[]temporal_client.Workflow_Event_Link,
+	links := make(
+		[]temporal_client.Link,
 		len(operation_info.links),
 	)
+	defer {
+		for &link in links do temporal_client.link_free(&link)
+		delete(links)
+	}
 	for link, index in operation_info.links {
-		workflow_event_link, link_error := temporal_client.workflow_event_link_from_nexus_url(
+		temporal_link, link_error := temporal_client.link_from_nexus(
 			link.url,
+			link.type,
 		)
 		if link_error.message != nil {
-			message := fmt.aprintf("could not translate Nexus Workflow link: %s", string(link_error.message))
+			message := fmt.aprintf("could not translate Nexus link: %s", string(link_error.message))
 			temporal_client.error_free(&link_error)
 			return nexus.result_handler_error(string, message, "BAD_REQUEST", .Non_Retryable)
 		}
-		workflow_event_links[index] = workflow_event_link
+		links[index] = temporal_link
 	}
 	callbacks := [?]temporal_client.Nexus_Completion_Callback{{
 		url = operation_info.callback_url,
 		headers = callback_headers,
-		workflow_event_links = workflow_event_links,
+		links = links,
 	}}
 	workflow_id := fmt.aprintf("odin-nexus-completer-%s", operation_info.request_id)
 	defer delete(workflow_id)
@@ -119,7 +125,7 @@ start_async_completer :: proc(
 			workflow_execution_timeout = time.Minute,
 			workflow_run_timeout = time.Minute,
 			workflow_task_timeout = 10 * time.Second,
-			workflow_event_links = workflow_event_links,
+			links = links,
 			nexus_completion_callbacks = callbacks[:],
 		},
 	)
