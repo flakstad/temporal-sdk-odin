@@ -58,6 +58,7 @@ Client_Interceptor_Test_State :: struct {
 	events:                  [8]int,
 	count:                   int,
 	cancel_reason_seen:      bool,
+	reset_options_seen:      bool,
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
@@ -192,6 +193,33 @@ client_interceptor_test_cancel :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result
+}
+
+client_interceptor_test_reset :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Reset_Workflow_Input,
+	next: temporal_client.Client_Reset_Workflow_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.reason = "intercepted reset"
+		input.options.workflow_task_finish_event_id = 17
+	} else {
+		node.state.reset_options_seen = input.options.reason == "intercepted reset" &&
+		                                input.options.workflow_task_finish_event_id == 17
+	}
+	result: temporal_client.Workflow_Handle
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "reset short circuit")
+	} else {
+		result, result_error = temporal_client.client_reset_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
 }
 
 client_interceptor_test_terminate :: proc(
@@ -8017,6 +8045,124 @@ client_cancel_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_reset_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			reset_workflow = client_interceptor_test_reset,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			reset_workflow = client_interceptor_test_reset,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+	reset_handle, reset_error := temporal_client.reset_workflow(
+		&handle,
+		{workflow_task_finish_event_id = 4, reason = "caller reset"},
+	)
+	defer temporal_client.workflow_handle_free(&reset_handle)
+	defer temporal_client.error_free(&reset_error)
+	testing.expect_value(t, reset_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(reset_error.message), "reset short circuit")
+	testing.expect(t, state.reset_options_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_reset_request_preserves_target_and_reapply_exclusions :: proc(t: ^testing.T) {
+	exclusions := [?]temporal_client.Reset_Reapply_Exclude_Type{
+		.Signals,
+		.Updates,
+		.Nexus,
+	}
+	encoded, encode_error := temporal_client.encode_reset_workflow_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"run-id",
+		{
+			workflow_task_finish_event_id = 17,
+			reason = "repair deployment",
+			request_id = "reset-request-id",
+			reapply_exclude_types = exclusions[:],
+		},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "reset encoding failed: %s", string(encode_error.message))
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	request := proto.Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest(
+		encoded[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "orders")
+	testing.expect(t, request.workflow_execution != nil)
+	if request.workflow_execution != nil {
+		testing.expect_value(t, request.workflow_execution.workflow_id, "workflow-id")
+		testing.expect_value(t, request.workflow_execution.run_id, "run-id")
+	}
+	testing.expect_value(t, request.reason, "repair deployment")
+	testing.expect_value(t, request.workflow_task_finish_event_id, i64(17))
+	testing.expect_value(t, request.request_id, "reset-request-id")
+	testing.expect_value(t, request.identity, "odin-client@test")
+	testing.expect_value(t, len(request.reset_reapply_exclude_types), 3)
+	testing.expect_value(
+		t,
+		request.reset_reapply_exclude_types[0],
+		proto.Temporal_Api_Enums_V1_ResetReapplyExcludeType.RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL,
+	)
+	testing.expect_value(
+		t,
+		request.reset_reapply_exclude_types[1],
+		proto.Temporal_Api_Enums_V1_ResetReapplyExcludeType.RESET_REAPPLY_EXCLUDE_TYPE_UPDATE,
+	)
+	testing.expect_value(
+		t,
+		request.reset_reapply_exclude_types[2],
+		proto.Temporal_Api_Enums_V1_ResetReapplyExcludeType.RESET_REAPPLY_EXCLUDE_TYPE_NEXUS,
+	)
+	testing.expect_value(t, len(request.post_reset_operations), 0)
+}
+
+@(test)
+client_reset_request_rejects_invalid_event_id :: proc(t: ^testing.T) {
+	encoded, encode_error := temporal_client.encode_reset_workflow_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"",
+		{workflow_task_finish_event_id = 0},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	testing.expect(t, len(encoded) == 0)
+}
+
+@(test)
 client_terminate_interceptors_nest_and_preserve_details :: proc(t: ^testing.T) {
 	state := Client_Interceptor_Test_State{}
 	first := Client_Interceptor_Test_Node{state = &state, id = 1}
@@ -9236,6 +9382,12 @@ client_control_operations_reject_invalid_handles :: proc(t: ^testing.T) {
 	cancel_error := temporal_client.cancel_workflow(&handle)
 	defer temporal_client.error_free(&cancel_error)
 	testing.expect(t, cancel_error.kind == .Invalid_Argument)
+	_, reset_error := temporal_client.reset_workflow(
+		&handle,
+		{workflow_task_finish_event_id = 4},
+	)
+	defer temporal_client.error_free(&reset_error)
+	testing.expect(t, reset_error.kind == .Invalid_Argument)
 	terminate_error := temporal_client.terminate_workflow(&handle)
 	defer temporal_client.error_free(&terminate_error)
 	testing.expect(t, terminate_error.kind == .Invalid_Argument)

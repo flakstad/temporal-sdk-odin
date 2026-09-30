@@ -357,12 +357,28 @@ the history's `eagerExecutionAccepted` bit. No new C ABI is required, but a
 worker on a different Client connection cannot participate in eager dispatch.
 
 The same generic bridge now carries `SignalWorkflowExecution`,
-`RequestCancelWorkflowExecution`, and `TerminateWorkflowExecution`. Signals
+`RequestCancelWorkflowExecution`, `ResetWorkflowExecution`, and
+`TerminateWorkflowExecution`. Signals
 support zero or one generic/typed Payload and generate a UUIDv4 request ID for
 deduplication unless the caller supplies one. Cancellation does the same.
 Cancellation and termination forward a started handle's first execution run ID
 as a chain guard. `get_workflow_handle` performs no RPC and allows an empty run
 ID to address the current execution by Workflow ID.
+
+Reset remains a Client/Service operation rather than a Workflow command. Odin
+encodes the selected Workflow/run, positive Workflow Task boundary event ID,
+reason, request ID, client identity, and the modern repeated
+`ResetReapplyExcludeType` list. It leaves the deprecated `reset_reapply_type`
+field unset; the pinned schema documents signal reapplication as that field's
+compatibility default. `PostResetOperation` is present in the generated raw
+schema but is not yet exposed by the language-facing options. The Service
+terminates the current run, creates the replacement run, and returns its Run
+ID. Odin decodes that response in a temporary arena and clones the IDs into a
+new owned `Workflow_Handle`; the input handle is borrowed and unchanged. The
+live CLI-devserver case resets a completed repeated-argument Workflow at event
+4, runs the replacement through the ordinary Core worker path, and requires the
+same typed result from the new Run ID. No C ABI symbol was added: this is exact
+WorkflowService protobuf generation above Core's generic RPC dispatcher.
 
 `client.Client` heap-owns a stable Core runtime and connection because
 `core.Client` retains a pointer to its runtime. It also owns its namespace.

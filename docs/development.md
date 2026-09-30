@@ -847,13 +847,28 @@ defer temporal_client.workflow_handle_free(&existing)
 signal_error := temporal_client.signal_workflow_json(&existing, "approval", approval)
 cancel_error := temporal_client.cancel_workflow(&existing, "no longer needed")
 terminate_error := temporal_client.terminate_workflow(&existing, "operator decision")
+
+reset, reset_error := temporal_client.reset_workflow(
+    &existing,
+    {
+        workflow_task_finish_event_id = 4,
+        reason = "deploy replay-safe Workflow code",
+    },
+)
+defer temporal_client.workflow_handle_free(&reset)
 ```
 
 Handle creation only clones identifiers; it does not contact the Service. An
-empty run ID targets the current execution. Signal and cancellation requests
-generate UUIDv4 deduplication IDs by default. Signal and termination have
-codec-neutral Payload forms, plus typed JSON helpers. The live suite invokes
-all three operations through `examples/client_control`.
+empty run ID targets the current execution. Signal, cancellation, and reset
+requests generate UUIDv4 deduplication IDs by default. Reset requires a positive
+Workflow Task completed/timed-out/failed/started event ID and returns a separate
+owned handle for the new run without changing the source handle. Its current
+options expose signal, Update, and Nexus reapply exclusions. The deprecated
+positive reapply enum and ordered post-reset operations remain raw protobuf-only;
+an empty exclusion list preserves Service behavior, whose pinned compatibility
+default reapplies signals. Signal and termination have codec-neutral Payload
+forms, plus typed JSON helpers. The live suite invokes all four operations
+through `examples/client_control`.
 
 Queries use the same borrowed handle and Core generic-RPC path:
 
@@ -1190,6 +1205,11 @@ remain caller-owned, and repeated encoding must remain byte-identical.
 Another 500 cases do the same for zero to twelve ordered Update arguments while
 also checking Workflow/run identity, Update/request IDs, headers, and
 byte-identical request encoding.
+Another 500 generated Workflow Reset requests vary event IDs, optional Run IDs,
+and every signal/Update/Nexus reapply exclusion. They decode the exact pinned
+request type and require namespace, client identity, target, reason, request ID,
+and exclusion order to survive encoding. Focused unit tests reject a nonpositive
+event ID and verify Client interceptor nesting and option mutation.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
@@ -1283,6 +1303,12 @@ it with an empty successful completion and does not repeat the terminal command.
 The suite also cancels a Workflow with a detached, Activity-awaiting Update in
 flight. It requires no Activity-cancel command, waits for the Update client to
 receive its result, and only then accepts the Workflow's canceled close status.
+It then starts another worker for the already completed repeated-argument
+Workflow, calls `examples/client_control` with `TEMPORAL_CLIENT_ACTION=reset`
+and event ID 4, and requires the returned new Run ID to complete with the same
+typed `Odin:42:true` result. This verifies Odin request/response ownership,
+Core's generic RPC dispatcher, Server reset history construction, and ordinary
+activation/completion execution in one path.
 In a separate execution it dispatches a typed Signal to an Activity-awaiting
 handler, queries the handler's state mutation, and then completes main through
 the ordinary buffered Signal API.

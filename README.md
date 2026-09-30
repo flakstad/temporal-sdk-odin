@@ -923,6 +923,19 @@ raw_update, err := temporal_client.start_update_payloads_with_options(
 )
 defer temporal_client.update_handle_free(&raw_update)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
+
+reset_handle, err := temporal_client.reset_workflow(
+    &handle,
+    {
+        workflow_task_finish_event_id = 4,
+        reason = "deploy replay-safe Workflow code",
+        reapply_exclude_types = []temporal_client.Reset_Reapply_Exclude_Type{
+            .Updates,
+            .Nexus,
+        },
+    },
+)
+defer temporal_client.workflow_handle_free(&reset_handle)
 ```
 
 `execute_update_json` remains the one-call convenience wrapper around
@@ -957,9 +970,16 @@ Canceled, Terminated, Server, Reset Workflow, Activity, Child Workflow, Nexus
 Operation, and Nexus Handler failures; unknown/absent variants retain their
 common fields as `.Unknown`.
 
-An empty run ID targets the current execution. Signal and cancellation calls
-generate UUIDv4 request IDs unless the caller supplies one. Termination has
-plain, Payload, and typed JSON detail variants.
+An empty run ID targets the current execution. Signal, cancellation, and reset
+calls generate UUIDv4 request IDs unless the caller supplies one. A successful
+reset returns a new owned Workflow handle containing the new Run ID; it does not
+mutate the source handle. The reset point must be a Workflow Task completion,
+timeout, failure, or start event. The current surface supports the modern
+signal/Update/Nexus reapply-exclusion list. It deliberately leaves the
+deprecated positive reapply mode unset and does not yet expose post-reset
+operations. With an empty exclusion list, the pinned Temporal API documents
+signal reapplication as the compatibility default. Termination has plain,
+Payload, and typed JSON detail variants.
 
 The combined example now uses the reusable registration boundary:
 

@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:time"
 import temporal_client "../../temporal/client"
 import codec "../../temporal/codec"
@@ -100,6 +101,23 @@ cancel_interceptor :: proc(
 	return result
 }
 
+reset_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Reset_Workflow_Input,
+	next: temporal_client.Client_Reset_Workflow_Next,
+) -> (temporal_client.Workflow_Handle, temporal_client.Error) {
+	fmt.printf(
+		"Client reset interceptor entered event_id=%d reason=%q\n",
+		input.options.workflow_task_finish_event_id,
+		input.options.reason,
+	)
+	result, result_error := temporal_client.client_reset_workflow_next(next, input)
+	if result_error.message == nil {
+		fmt.println("Client reset interceptor exited after Core")
+	}
+	return result, result_error
+}
+
 terminate_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Terminate_Workflow_Input,
@@ -123,6 +141,7 @@ run :: proc() -> int {
 	name_buffer: [128]u8
 	input_buffer: [1024]u8
 	reason_buffer: [512]u8
+	event_id_buffer: [32]u8
 	action := env("TEMPORAL_CLIENT_ACTION", action_buffer[:])
 	workflow_id := env("TEMPORAL_CLIENT_WORKFLOW_ID", id_buffer[:])
 	if len(action) == 0 || len(workflow_id) == 0 {
@@ -135,6 +154,7 @@ run :: proc() -> int {
 		query_workflow = query_interceptor,
 		start_update = update_interceptor,
 		cancel_workflow = cancel_interceptor,
+		reset_workflow = reset_interceptor,
 		terminate_workflow = terminate_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -171,6 +191,33 @@ run :: proc() -> int {
 	case "cancel":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.cancel_workflow(&handle, reason)
+	case "reset":
+		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
+		event_id_value := env("TEMPORAL_CLIENT_RESET_EVENT_ID", event_id_buffer[:])
+		event_id, event_id_ok := strconv.parse_i64(event_id_value)
+		if !event_id_ok || event_id <= 0 {
+			fmt.eprintln("TEMPORAL_CLIENT_RESET_EVENT_ID must be a positive integer")
+			return 2
+		}
+		reset_handle, reset_error := temporal_client.reset_workflow(
+			&handle,
+			{
+				workflow_task_finish_event_id = event_id,
+				reason = reason,
+			},
+		)
+		if reset_error.message != nil {
+			print_error(action, &reset_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&reset_handle)
+		fmt.printf(
+			"Odin client reset workflow_id=%s new_run_id=%s event_id=%d\n",
+			workflow_id,
+			reset_handle.run_id,
+			event_id,
+		)
+		return 0
 	case "query":
 		query_name := env("TEMPORAL_CLIENT_QUERY_NAME", name_buffer[:])
 		if len(query_name) == 0 {

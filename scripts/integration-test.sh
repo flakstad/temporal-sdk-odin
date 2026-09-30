@@ -227,6 +227,50 @@ worker_pid=""
 cat "$worker_log"
 grep -q 'multiple Workflow arguments completed end-to-end through Core' "$worker_log"
 
+TEMPORAL_ODIN_SCENARIO=multiple-workflow-arguments \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Workflow Reset Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+reset_output="$(TEMPORAL_CLIENT_ACTION=reset \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$repeated_workflow_id" \
+  TEMPORAL_CLIENT_RESET_EVENT_ID=4 \
+  TEMPORAL_CLIENT_REASON="Odin SDK reset integration" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh")"
+echo "$reset_output"
+grep -q 'Client reset interceptor entered event_id=4 reason="Odin SDK reset integration"' <<<"$reset_output"
+grep -q 'Client reset interceptor exited after Core' <<<"$reset_output"
+reset_run_id="$(sed -n 's/.*new_run_id=\([^ ]*\).*/\1/p' <<<"$reset_output")"
+if [[ -z "$reset_run_id" ]]; then
+  echo "Odin reset Client did not return a new Run ID" >&2
+  exit 1
+fi
+temporal workflow result \
+  --workflow-id "$repeated_workflow_id" \
+  --run-id "$reset_run_id" \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+reset_result="$(<"$workflow_output_file")"
+echo "$reset_result"
+grep -q 'Odin:42:true' <<<"$reset_result"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'multiple Workflow arguments completed end-to-end through Core' "$worker_log"
+echo "Odin Client reset a completed Workflow and the new run completed through Core"
+
 TEMPORAL_ODIN_SCENARIO=condition \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

@@ -674,6 +674,25 @@ Query_Workflow_Options :: struct {
 	headers:          ^Headers,
 }
 
+// Reset_Reapply_Exclude_Type identifies event families that must not be copied
+// from after the reset point into the new run. An empty slice preserves the
+// Service behavior; the pinned API schema documents signal reapplication as
+// the default of its deprecated compatibility field.
+Reset_Reapply_Exclude_Type :: enum {
+	Signals,
+	Updates,
+	Nexus,
+}
+
+Reset_Workflow_Options :: struct {
+	// Must identify a WorkflowTaskCompleted, WorkflowTaskTimedOut,
+	// WorkflowTaskFailed, or WorkflowTaskStarted event in the selected run.
+	workflow_task_finish_event_id: i64,
+	reason:                        string,
+	request_id:                    string,
+	reapply_exclude_types:          []Reset_Reapply_Exclude_Type,
+}
+
 query_reject_condition_to_proto :: proc(
 	condition: Query_Reject_Condition,
 ) -> proto.Temporal_Api_Enums_V1_QueryRejectCondition {
@@ -2749,6 +2768,126 @@ cancel_workflow :: proc(
 	}
 	state := Client_Interceptor_State{client = handle.client}
 	return client_cancel_workflow_chain(&state, &input)
+}
+
+reset_reapply_exclude_type_to_proto :: proc(
+	value: Reset_Reapply_Exclude_Type,
+) -> (proto.Temporal_Api_Enums_V1_ResetReapplyExcludeType, bool) {
+	switch value {
+	case .Signals:
+		return .RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL, true
+	case .Updates:
+		return .RESET_REAPPLY_EXCLUDE_TYPE_UPDATE, true
+	case .Nexus:
+		return .RESET_REAPPLY_EXCLUDE_TYPE_NEXUS, true
+	}
+	return .RESET_REAPPLY_EXCLUDE_TYPE_UNSPECIFIED, false
+}
+
+encode_reset_workflow_request :: proc(
+	namespace, identity, workflow_id, run_id: string,
+	options: Reset_Workflow_Options,
+) -> ([dynamic]u8, Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow reset identity is incomplete")
+	}
+	if options.workflow_task_finish_event_id <= 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow reset event ID must be positive")
+	}
+	exclude_types := make(
+		[dynamic]proto.Temporal_Api_Enums_V1_ResetReapplyExcludeType,
+		0,
+		len(options.reapply_exclude_types),
+	)
+	defer delete(exclude_types)
+	for exclude_type in options.reapply_exclude_types {
+		proto_type, valid := reset_reapply_exclude_type_to_proto(exclude_type)
+		if !valid {
+			return nil, error_from_string(.Invalid_Argument, "Workflow reset reapply exclusion is invalid")
+		}
+		append(&exclude_types, proto_type)
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest{
+		namespace = namespace,
+		workflow_execution = &execution,
+		reason = options.reason,
+		workflow_task_finish_event_id = options.workflow_task_finish_event_id,
+		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
+		reset_reapply_exclude_types = exclude_types,
+		identity = identity,
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest(
+		&request,
+	), {}
+}
+
+reset_workflow_terminal :: proc(
+	input: ^Client_Reset_Workflow_Input,
+) -> (handle: Workflow_Handle, error: Error) {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	request_bytes, request_error := encode_reset_workflow_request(
+		input.handle.client.namespace,
+		input.handle.client.identity,
+		input.handle.id,
+		input.handle.run_id,
+		input.options,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		input.handle.client.connection,
+		.Workflow,
+		"ResetWorkflowExecution",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		return {}, error_from_core(&rpc_result.error)
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize reset response arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionResponse(
+		rpc_result.protobuf,
+		&response,
+	)
+	context.allocator = previous_allocator
+	if !decoded || len(response.run_id) == 0 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed reset response")
+	}
+	return get_workflow_handle(
+		input.handle.client,
+		input.handle.id,
+		response.run_id,
+		input.handle.first_execution_run_id,
+	)
+}
+
+reset_workflow :: proc(
+	handle: ^Workflow_Handle,
+	options: Reset_Workflow_Options,
+) -> (Workflow_Handle, Error) {
+	if !workflow_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	input := Client_Reset_Workflow_Input{handle = handle, options = options}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_reset_workflow_chain(&state, &input)
 }
 
 terminate_workflow_terminal :: proc(input: ^Client_Terminate_Workflow_Input) -> Error {
