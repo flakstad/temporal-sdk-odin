@@ -1,6 +1,7 @@
 package tests
 
 import allocator_runtime "base:runtime"
+import "core:c"
 import "core:testing"
 import "core:bytes"
 import "core:fmt"
@@ -6333,6 +6334,138 @@ raw_byte_ref_string :: proc(value: raw.Byte_Array_Ref) -> string {
 		return ""
 	}
 	return string(([^]u8)(value.data)[:int(value.size)])
+}
+
+@(test)
+runtime_observability_options_bind_exactly_to_the_pinned_core_abi :: proc(t: ^testing.T) {
+	logging := temporal_core.Runtime_Logging_Options{filter = "temporalio_sdk_core=debug"}
+	prometheus := temporal_core.Runtime_Prometheus_Options{
+		bind_address = "127.0.0.1:9464",
+		counters_total_suffix = true,
+		unit_suffix = true,
+		durations_as_seconds = true,
+		histogram_bucket_overrides = "workflow_task_execution_latency\n1,2.5,10",
+	}
+	tags := [?]temporal_core.Runtime_Key_Value{
+		{key = "region", value = "local"},
+		{key = "runtime", value = "odin"},
+	}
+	runtimes := [?]temporal_core.Runtime_Info{
+		{runtime_type = .Native, version = "Odin test"},
+	}
+	options := temporal_core.runtime_options_default()
+	options.logging = &logging
+	options.prometheus = &prometheus
+	options.metrics.global_tags = tags[:]
+	options.metrics.metric_prefix = "odin_"
+	options.worker_heartbeat_interval = 1500 * time.Millisecond + time.Nanosecond
+	options.runtime_info = runtimes[:]
+	options.disable_environment_info = true
+
+	bindings := temporal_core.Runtime_Option_Bindings{}
+	bindings_error := temporal_core.runtime_option_bindings_init(&bindings, options)
+	testing.expectf(t, bindings_error.message == nil, "binding failed: %s", string(bindings_error.message))
+	temporal_core.error_free(&bindings_error)
+	defer temporal_core.runtime_option_bindings_free(&bindings)
+	testing.expect(t, bindings.raw_options.telemetry == &bindings.telemetry)
+	testing.expect(t, bindings.telemetry.logging == &bindings.logging)
+	testing.expect(t, bindings.telemetry.metrics == &bindings.metrics)
+	testing.expect_value(t, raw_byte_ref_string(bindings.logging.filter), "temporalio_sdk_core=debug")
+	testing.expect(t, bindings.logging.forward_to == nil)
+	testing.expect(t, bindings.metrics.prometheus == &bindings.prometheus)
+	testing.expect(t, bindings.metrics.opentelemetry == nil)
+	testing.expect_value(t, raw_byte_ref_string(bindings.prometheus.bind_address), "127.0.0.1:9464")
+	testing.expect(t, bindings.prometheus.counters_total_suffix)
+	testing.expect(t, bindings.prometheus.unit_suffix)
+	testing.expect(t, bindings.prometheus.durations_as_seconds)
+	testing.expect_value(
+		t,
+		raw_byte_ref_string(bindings.prometheus.histogram_bucket_overrides),
+		"workflow_task_execution_latency\n1,2.5,10",
+	)
+	testing.expect(t, bindings.metrics.attach_service_name)
+	testing.expect_value(t, raw_byte_ref_string(bindings.metrics.global_tags), "region\nlocal\nruntime\nodin")
+	testing.expect_value(t, raw_byte_ref_string(bindings.metrics.metric_prefix), "odin_")
+	testing.expect_value(t, bindings.raw_options.worker_heartbeat_interval_millis, u64(1501))
+	testing.expect_value(t, bindings.raw_options.runtime_info.size, c.size_t(1))
+	testing.expect(t, bindings.raw_options.runtime_info.data == raw_data(bindings.runtime_info[:]))
+	testing.expect_value(t, bindings.runtime_info[0].runtime_type, raw.Runtime_Type.Native)
+	testing.expect_value(t, raw_byte_ref_string(bindings.runtime_info[0].version), "Odin test")
+	testing.expect(t, bindings.raw_options.disable_environment_info)
+}
+
+@(test)
+runtime_opentelemetry_options_bind_headers_and_duration :: proc(t: ^testing.T) {
+	headers := [?]temporal_core.Runtime_Key_Value{{key = "authorization", value = "Bearer test"}}
+	opentelemetry := temporal_core.Runtime_Open_Telemetry_Options{
+		url = "http://127.0.0.1:4318/v1/metrics",
+		headers = headers[:],
+		metric_periodicity = 1250 * time.Millisecond + time.Nanosecond,
+		metric_temporality = .Delta,
+		protocol = .Http,
+	}
+	options := temporal_core.runtime_options_default()
+	options.opentelemetry = &opentelemetry
+	bindings := temporal_core.Runtime_Option_Bindings{}
+	bindings_error := temporal_core.runtime_option_bindings_init(&bindings, options)
+	testing.expectf(t, bindings_error.message == nil, "binding failed: %s", string(bindings_error.message))
+	temporal_core.error_free(&bindings_error)
+	defer temporal_core.runtime_option_bindings_free(&bindings)
+	testing.expect(t, bindings.metrics.opentelemetry == &bindings.opentelemetry)
+	testing.expect(t, bindings.metrics.prometheus == nil)
+	testing.expect_value(t, raw_byte_ref_string(bindings.opentelemetry.url), "http://127.0.0.1:4318/v1/metrics")
+	testing.expect_value(t, raw_byte_ref_string(bindings.opentelemetry.headers), "authorization\nBearer test")
+	testing.expect_value(t, bindings.opentelemetry.metric_periodicity_millis, u32(1251))
+	testing.expect_value(t, bindings.opentelemetry.metric_temporality, raw.Open_Telemetry_Metric_Temporality.Delta)
+	testing.expect_value(t, bindings.opentelemetry.protocol, raw.Open_Telemetry_Protocol.Http)
+}
+
+@(test)
+runtime_observability_options_reject_ambiguous_or_malformed_values :: proc(t: ^testing.T) {
+	prometheus := temporal_core.Runtime_Prometheus_Options{bind_address = "127.0.0.1:9464"}
+	opentelemetry := temporal_core.Runtime_Open_Telemetry_Options{
+		url = "http://127.0.0.1:4317",
+		metric_temporality = .Cumulative,
+		protocol = .Grpc,
+	}
+	options := temporal_core.runtime_options_default()
+	options.prometheus = &prometheus
+	options.opentelemetry = &opentelemetry
+	error := temporal_core.runtime_options_validate(options)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	options = temporal_core.runtime_options_default()
+	options.opentelemetry = &opentelemetry
+	opentelemetry.headers = []temporal_core.Runtime_Key_Value{{key = "bad\nkey", value = "value"}}
+	bindings := temporal_core.Runtime_Option_Bindings{}
+	error = temporal_core.runtime_option_bindings_init(&bindings, options)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+	temporal_core.runtime_option_bindings_free(&bindings)
+
+	options = temporal_core.runtime_options_default()
+	prometheus.histogram_bucket_overrides = "metric-without-values"
+	options.prometheus = &prometheus
+	error = temporal_core.runtime_options_validate(options)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+}
+
+@(test)
+public_client_passes_runtime_options_to_core_before_connecting :: proc(t: ^testing.T) {
+	logging := temporal_core.Runtime_Logging_Options{}
+	runtime_options := temporal_core.runtime_options_default()
+	runtime_options.logging = &logging
+	client, error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		runtime_options = &runtime_options,
+	})
+	testing.expect_value(t, error.kind, temporal_client.Error_Kind.Connection)
+	testing.expect(t, strings.contains(string(error.message), "logging filter"))
+	temporal_client.error_free(&error)
+	temporal_client.close(&client)
 }
 
 @(test)

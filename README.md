@@ -250,6 +250,20 @@ that SDK Core throttles delivery before the Odin callback pool. Eager Activity
 reservations and the server-side task-queue rate are mapped and validated but
 remain opt-in pending equally direct behavioral tests.
 
+Core runtime observability is configurable without bypassing the public
+Client. `core.runtime_create_with_options` and
+`client.Connect_Options.runtime_options` support Core console logging filters,
+a Prometheus HTTP exporter, and OTLP metrics over gRPC or HTTP, including
+global tags, metric prefixes, histogram overrides, exporter periodicity,
+runtime heartbeat metadata, and environment privacy controls. The
+CLI-devserver suite scrapes a live Prometheus endpoint and requires the tagged
+`GetSystemInfo` request counter. Runtime option strings and typed key/value maps
+are borrowed only for synchronous construction and copied by Core. Structured
+log forwarding remains raw-only: the pinned callback has no `user_data`, may
+run on arbitrary Core threads, and lends each log record only for the callback
+duration, so a safe per-runtime Odin callback facade needs a deliberate
+process-wide dispatcher.
+
 `activity.info(ctx)`
 now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor

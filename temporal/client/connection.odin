@@ -14,6 +14,9 @@ Connect_Options :: struct {
 	target_url:             string,
 	namespace:              string,
 	identity:               string,
+	// Nil uses core.runtime_options_default(). The value is borrowed only while
+	// connect constructs the Client-owned Core runtime.
+	runtime_options:         ^temporal_core.Runtime_Options,
 	api_key:                string,
 	metadata:               []RPC_Metadata_Entry,
 	binary_metadata:        []RPC_Metadata_Entry,

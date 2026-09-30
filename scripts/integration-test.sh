@@ -6,6 +6,7 @@ server_pid=""
 worker_pid=""
 workflow_cli_pid=""
 slow_update_pid=""
+metrics_pid=""
 unknown_workflow_id=""
 signal_failure_workflow_id=""
 nondeterminism_workflow_id=""
@@ -49,6 +50,10 @@ cleanup() {
   if [[ -n "$slow_update_pid" ]]; then
     kill "$slow_update_pid" 2>/dev/null || true
     wait "$slow_update_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$metrics_pid" ]]; then
+    kill "$metrics_pid" 2>/dev/null || true
+    wait "$metrics_pid" 2>/dev/null || true
   fi
   if [[ -n "$worker_pid" ]]; then
     kill "$worker_pid" 2>/dev/null || true
@@ -114,6 +119,38 @@ fi
 "$repo_root/scripts/build-examples.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
+
+metrics_port=$((19000 + $$ % 1000))
+metrics_address="127.0.0.1:${metrics_port}"
+TEMPORAL_CORE_PROMETHEUS_BIND_ADDRESS="$metrics_address" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-core-connect.sh" >"$workflow_output_file" 2>&1 &
+metrics_pid=$!
+metrics_scraped=false
+for _ in {1..30}; do
+  if curl -fsS "http://${metrics_address}/metrics" >"$workflow_control_output_file" 2>/dev/null; then
+    metrics_scraped=true
+    break
+  fi
+  if ! kill -0 "$metrics_pid" 2>/dev/null; then
+    echo "Core Prometheus example exited before its endpoint could be scraped" >&2
+    cat "$workflow_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ "$metrics_scraped" != true ]]; then
+  echo "Core Prometheus endpoint did not become ready at $metrics_address" >&2
+  exit 1
+fi
+wait "$metrics_pid"
+metrics_pid=""
+cat "$workflow_output_file"
+grep -q 'temporal_request_total{' "$workflow_control_output_file"
+grep -q 'operation="GetSystemInfo"' "$workflow_control_output_file"
+grep -q 'service_name="temporal-core-sdk"' "$workflow_control_output_file"
+grep -q 'sdk_language="odin"' "$workflow_control_output_file"
+echo "Core Prometheus exporter exposed tagged GetSystemInfo metrics"
 
 eager_workflow_id="odin-sdk-eager-$$-$(date +%s)"
 TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \

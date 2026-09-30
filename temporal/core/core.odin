@@ -44,6 +44,100 @@ Replay_Worker :: struct {
 DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
 DEFAULT_GRACEFUL_SHUTDOWN_PERIOD :: 5 * time.Second
 
+Runtime_Key_Value :: struct {
+	key:   string,
+	value: string,
+}
+
+Runtime_Logging_Options :: struct {
+	// Uses Core's tracing filter syntax, for example "temporalio_sdk_core=debug".
+	// Logs are written by Core because forward callbacks do not carry per-runtime
+	// user data and may arrive on arbitrary runtime threads.
+	filter: string,
+}
+
+Open_Telemetry_Metric_Temporality :: raw.Open_Telemetry_Metric_Temporality
+Open_Telemetry_Protocol :: raw.Open_Telemetry_Protocol
+
+Runtime_Open_Telemetry_Options :: struct {
+	url:                        string,
+	headers:                    []Runtime_Key_Value,
+	metric_periodicity:         time.Duration,
+	metric_temporality:         Open_Telemetry_Metric_Temporality,
+	durations_as_seconds:       bool,
+	protocol:                   Open_Telemetry_Protocol,
+	// Advanced bridge escape hatch: metric/newline/comma-separated-floats.
+	histogram_bucket_overrides: string,
+}
+
+Runtime_Prometheus_Options :: struct {
+	bind_address:               string,
+	counters_total_suffix:      bool,
+	unit_suffix:                bool,
+	durations_as_seconds:       bool,
+	// Advanced bridge escape hatch: metric/newline/comma-separated-floats.
+	histogram_bucket_overrides: string,
+}
+
+Runtime_Metrics_Options :: struct {
+	attach_service_name: bool,
+	global_tags:         []Runtime_Key_Value,
+	metric_prefix:       string,
+}
+
+Runtime_Type :: raw.Runtime_Type
+
+Runtime_Info :: struct {
+	runtime_type: Runtime_Type,
+	version:      string,
+}
+
+// Runtime_Options is borrowed only during runtime_create_with_options. Exactly
+// one metrics exporter may be selected. A nil exporter disables metrics.
+Runtime_Options :: struct {
+	logging:                   ^Runtime_Logging_Options,
+	prometheus:                ^Runtime_Prometheus_Options,
+	opentelemetry:             ^Runtime_Open_Telemetry_Options,
+	metrics:                   Runtime_Metrics_Options,
+	worker_heartbeat_interval: time.Duration,
+	runtime_info:              []Runtime_Info,
+	disable_environment_info:  bool,
+}
+
+runtime_options_default :: proc() -> Runtime_Options {
+	return {
+		metrics = {attach_service_name = true},
+	}
+}
+
+runtime_prometheus_options_default :: proc(bind_address: string) -> Runtime_Prometheus_Options {
+	return {bind_address = bind_address}
+}
+
+runtime_opentelemetry_options_default :: proc(url: string) -> Runtime_Open_Telemetry_Options {
+	return {
+		url = url,
+		metric_periodicity = time.Second,
+		metric_temporality = .Cumulative,
+		protocol = .Grpc,
+	}
+}
+
+// Runtime_Option_Bindings owns every temporary buffer and address-stable raw
+// record borrowed by temporal_core_runtime_new. The bridge copies all option
+// data synchronously except a logging callback, which this layer does not set.
+Runtime_Option_Bindings :: struct {
+	raw_options:       raw.Runtime_Options,
+	telemetry:         raw.Telemetry_Options,
+	logging:           raw.Logging_Options,
+	metrics:           raw.Metrics_Options,
+	prometheus:        raw.Prometheus_Options,
+	opentelemetry:     raw.Open_Telemetry_Options,
+	runtime_info:      [dynamic]raw.Runtime_Info,
+	global_tags:       [dynamic]u8,
+	opentelemetry_headers: [dynamic]u8,
+}
+
 Poller_Behavior_Kind :: enum {
 	Default,
 	Simple_Maximum,
@@ -191,9 +285,208 @@ error_free :: proc(error: ^Error) {
 	error.status_code = 0
 }
 
+runtime_newline_map_encode :: proc(
+	entries: []Runtime_Key_Value,
+	name: string,
+) -> (encoded: [dynamic]u8, error: Error) {
+	for entry, index in entries {
+		if len(entry.key) == 0 {
+			return nil, client_option_error(fmt.tprintf("%s key must not be empty", name))
+		}
+		if strings.contains(entry.key, "\n") || strings.contains(entry.value, "\n") {
+			return nil, client_option_error(fmt.tprintf("%s keys and values must not contain newlines", name))
+		}
+		if index > 0 {
+			append(&encoded, '\n')
+		}
+		append(&encoded, ..transmute([]u8)entry.key)
+		append(&encoded, '\n')
+		append(&encoded, ..transmute([]u8)entry.value)
+	}
+	return
+}
+
+runtime_histogram_overrides_validate :: proc(value: string) -> Error {
+	if len(value) == 0 {
+		return {}
+	}
+	parts := strings.split(value, "\n")
+	defer delete(parts)
+	if len(parts) % 2 != 0 {
+		return client_option_error("histogram bucket overrides must contain metric/value pairs")
+	}
+	for index := 0; index < len(parts); index += 2 {
+		if len(parts[index]) == 0 || len(parts[index + 1]) == 0 {
+			return client_option_error("histogram bucket override metric and bucket list must not be empty")
+		}
+	}
+	return {}
+}
+
+runtime_options_validate :: proc(options: Runtime_Options) -> Error {
+	if options.prometheus != nil && options.opentelemetry != nil {
+		return client_option_error("exactly one Temporal metrics exporter may be configured")
+	}
+	if options.worker_heartbeat_interval < 0 {
+		return client_option_error("worker heartbeat interval must not be negative")
+	}
+	if options.logging != nil && len(options.logging.filter) == 0 {
+		return client_option_error("Core logging filter must not be empty")
+	}
+	if options.prometheus != nil {
+		if len(options.prometheus.bind_address) == 0 {
+			return client_option_error("Prometheus bind address must not be empty")
+		}
+		override_error := runtime_histogram_overrides_validate(
+			options.prometheus.histogram_bucket_overrides,
+		)
+		if override_error.message != nil { return override_error }
+	}
+	if options.opentelemetry != nil {
+		if len(options.opentelemetry.url) == 0 {
+			return client_option_error("OpenTelemetry URL must not be empty")
+		}
+		if options.opentelemetry.metric_periodicity < 0 {
+			return client_option_error("OpenTelemetry metric periodicity must not be negative")
+		}
+		if options.opentelemetry.metric_temporality != .Cumulative &&
+		   options.opentelemetry.metric_temporality != .Delta {
+			return client_option_error("OpenTelemetry metric temporality must be cumulative or delta")
+		}
+		if options.opentelemetry.protocol != .Grpc && options.opentelemetry.protocol != .Http {
+			return client_option_error("OpenTelemetry protocol must be gRPC or HTTP")
+		}
+		override_error := runtime_histogram_overrides_validate(
+			options.opentelemetry.histogram_bucket_overrides,
+		)
+		if override_error.message != nil { return override_error }
+	}
+	for info in options.runtime_info {
+		if info.runtime_type == .Unspecified {
+			return client_option_error("runtime info type must not be unspecified")
+		}
+	}
+	return {}
+}
+
+runtime_option_bindings_free :: proc(bindings: ^Runtime_Option_Bindings) {
+	if bindings == nil {
+		return
+	}
+	delete(bindings.runtime_info)
+	delete(bindings.global_tags)
+	delete(bindings.opentelemetry_headers)
+	bindings^ = {}
+}
+
+runtime_option_bindings_init :: proc(
+	bindings: ^Runtime_Option_Bindings,
+	options: Runtime_Options,
+) -> Error {
+	if bindings == nil {
+		return client_option_error("runtime option bindings must not be nil")
+	}
+	bindings^ = {}
+	validation_error := runtime_options_validate(options)
+	if validation_error.message != nil {
+		return validation_error
+	}
+
+	heartbeat_millis, heartbeat_error := worker_duration_millis(
+		options.worker_heartbeat_interval,
+		"worker heartbeat interval",
+	)
+	if heartbeat_error.message != nil { return heartbeat_error }
+	bindings.raw_options.worker_heartbeat_interval_millis = heartbeat_millis
+	bindings.raw_options.disable_environment_info = options.disable_environment_info
+	for info in options.runtime_info {
+		append(&bindings.runtime_info, raw.Runtime_Info{
+			runtime_type = info.runtime_type,
+			version = byte_ref(info.version),
+		})
+	}
+	if len(bindings.runtime_info) > 0 {
+		bindings.raw_options.runtime_info = {
+			data = raw_data(bindings.runtime_info[:]),
+			size = c.size_t(len(bindings.runtime_info)),
+		}
+	}
+
+	if options.logging == nil && options.prometheus == nil && options.opentelemetry == nil {
+		return {}
+	}
+	bindings.raw_options.telemetry = &bindings.telemetry
+	if options.logging != nil {
+		bindings.logging.filter = byte_ref(options.logging.filter)
+		// Nil selects Core's console logger. Forwarded callbacks remain raw-only
+		// until the SDK can provide a process-wide, thread-safe dispatcher.
+		bindings.telemetry.logging = &bindings.logging
+	}
+	if options.prometheus == nil && options.opentelemetry == nil {
+		return {}
+	}
+
+	global_tags, global_tags_error := runtime_newline_map_encode(
+		options.metrics.global_tags,
+		"metric tag",
+	)
+	if global_tags_error.message != nil { return global_tags_error }
+	bindings.global_tags = global_tags
+	bindings.metrics.attach_service_name = options.metrics.attach_service_name
+	bindings.metrics.global_tags = bytes_ref(bindings.global_tags[:])
+	bindings.metrics.metric_prefix = byte_ref(options.metrics.metric_prefix)
+	bindings.telemetry.metrics = &bindings.metrics
+	if options.prometheus != nil {
+		prometheus := options.prometheus
+		bindings.prometheus = {
+			bind_address = byte_ref(prometheus.bind_address),
+			counters_total_suffix = prometheus.counters_total_suffix,
+			unit_suffix = prometheus.unit_suffix,
+			durations_as_seconds = prometheus.durations_as_seconds,
+			histogram_bucket_overrides = byte_ref(prometheus.histogram_bucket_overrides),
+		}
+		bindings.metrics.prometheus = &bindings.prometheus
+		return {}
+	}
+
+	opentelemetry := options.opentelemetry
+	headers, headers_error := runtime_newline_map_encode(opentelemetry.headers, "OpenTelemetry header")
+	if headers_error.message != nil { return headers_error }
+	bindings.opentelemetry_headers = headers
+	periodicity_millis, periodicity_error := worker_duration_millis(
+		opentelemetry.metric_periodicity,
+		"OpenTelemetry metric periodicity",
+	)
+	if periodicity_error.message != nil { return periodicity_error }
+	if periodicity_millis > u64(max(u32)) {
+		return client_option_error("OpenTelemetry metric periodicity exceeds the Core ABI maximum")
+	}
+	bindings.opentelemetry = {
+		url = byte_ref(opentelemetry.url),
+		headers = bytes_ref(bindings.opentelemetry_headers[:]),
+		metric_periodicity_millis = u32(periodicity_millis),
+		metric_temporality = opentelemetry.metric_temporality,
+		durations_as_seconds = opentelemetry.durations_as_seconds,
+		protocol = opentelemetry.protocol,
+		histogram_bucket_overrides = byte_ref(opentelemetry.histogram_bucket_overrides),
+	}
+	bindings.metrics.opentelemetry = &bindings.opentelemetry
+	return {}
+}
+
 runtime_create :: proc() -> (runtime: Runtime, error: Error) {
-	options := raw.Runtime_Options{}
-	result := raw.runtime_new(&options)
+	return runtime_create_with_options(runtime_options_default())
+}
+
+runtime_create_with_options :: proc(options: Runtime_Options) -> (runtime: Runtime, error: Error) {
+	bindings := Runtime_Option_Bindings{}
+	bindings_error := runtime_option_bindings_init(&bindings, options)
+	if bindings_error.message != nil {
+		runtime_option_bindings_free(&bindings)
+		return {}, bindings_error
+	}
+	defer runtime_option_bindings_free(&bindings)
+	result := raw.runtime_new(&bindings.raw_options)
 	if result.fail != nil {
 		error.message = copy_core_bytes(result.fail)
 		raw.byte_array_free(result.runtime, result.fail)

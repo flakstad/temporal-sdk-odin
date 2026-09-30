@@ -15,6 +15,7 @@ Connection :: struct { _opaque: u8 }
 Worker     :: struct { _opaque: u8 }
 Worker_Replay_Pusher :: struct { _opaque: u8 }
 Cancellation_Token :: struct { _opaque: u8 }
+Forwarded_Log :: struct { _opaque: u8 }
 
 Byte_Array_Ref :: struct {
 	data: ^u8,
@@ -59,9 +60,61 @@ Runtime_Info_Array :: struct {
 	size: c.size_t,
 }
 
+Forwarded_Log_Level :: enum c.int {
+	Trace = 0,
+	Debug,
+	Info,
+	Warn,
+	Error,
+}
+
+Forwarded_Log_Callback :: #type proc "c" (level: Forwarded_Log_Level, log: ^Forwarded_Log)
+
+Logging_Options :: struct {
+	filter:     Byte_Array_Ref,
+	forward_to: Forwarded_Log_Callback,
+}
+
+Open_Telemetry_Metric_Temporality :: enum c.int {
+	Cumulative = 1,
+	Delta,
+}
+
+Open_Telemetry_Protocol :: enum c.int {
+	Grpc = 1,
+	Http,
+}
+
+Open_Telemetry_Options :: struct {
+	url:                        Byte_Array_Ref,
+	headers:                    Byte_Array_Ref,
+	metric_periodicity_millis: u32,
+	metric_temporality:         Open_Telemetry_Metric_Temporality,
+	durations_as_seconds:       bool,
+	protocol:                   Open_Telemetry_Protocol,
+	histogram_bucket_overrides: Byte_Array_Ref,
+}
+
+Prometheus_Options :: struct {
+	bind_address:               Byte_Array_Ref,
+	counters_total_suffix:      bool,
+	unit_suffix:                bool,
+	durations_as_seconds:       bool,
+	histogram_bucket_overrides: Byte_Array_Ref,
+}
+
+Metrics_Options :: struct {
+	opentelemetry:       ^Open_Telemetry_Options,
+	prometheus:          ^Prometheus_Options,
+	custom_meter:        rawptr,
+	attach_service_name: bool,
+	global_tags:         Byte_Array_Ref,
+	metric_prefix:       Byte_Array_Ref,
+}
+
 Telemetry_Options :: struct {
-	logging: rawptr,
-	metrics: rawptr,
+	logging: ^Logging_Options,
+	metrics: ^Metrics_Options,
 }
 
 Runtime_Options :: struct {
@@ -326,6 +379,24 @@ when size_of(uintptr) == 8 {
 	#assert(offset_of(Byte_Array, disable_free) == 24)
 	#assert(size_of(Runtime_Options) == 40)
 	#assert(offset_of(Runtime_Options, disable_environment_info) == 32)
+	#assert(size_of(Logging_Options) == 24)
+	#assert(offset_of(Logging_Options, forward_to) == 16)
+	#assert(size_of(Open_Telemetry_Options) == 64)
+	#assert(offset_of(Open_Telemetry_Options, metric_periodicity_millis) == 32)
+	#assert(offset_of(Open_Telemetry_Options, metric_temporality) == 36)
+	#assert(offset_of(Open_Telemetry_Options, durations_as_seconds) == 40)
+	#assert(offset_of(Open_Telemetry_Options, protocol) == 44)
+	#assert(offset_of(Open_Telemetry_Options, histogram_bucket_overrides) == 48)
+	#assert(size_of(Prometheus_Options) == 40)
+	#assert(offset_of(Prometheus_Options, counters_total_suffix) == 16)
+	#assert(offset_of(Prometheus_Options, histogram_bucket_overrides) == 24)
+	#assert(size_of(Metrics_Options) == 64)
+	#assert(offset_of(Metrics_Options, custom_meter) == 16)
+	#assert(offset_of(Metrics_Options, attach_service_name) == 24)
+	#assert(offset_of(Metrics_Options, global_tags) == 32)
+	#assert(offset_of(Metrics_Options, metric_prefix) == 48)
+	#assert(size_of(Telemetry_Options) == 16)
+	#assert(offset_of(Telemetry_Options, metrics) == 8)
 	#assert(size_of(Connection_Options) == 192)
 	#assert(offset_of(Connection_Options, tls_options) == 112)
 	#assert(offset_of(Connection_Options, grpc_compression) == 168)
@@ -368,6 +439,10 @@ foreign temporal_core {
 	runtime_new       :: proc(options: ^Runtime_Options) -> Runtime_Or_Fail ---
 	runtime_free      :: proc(runtime: ^Runtime) ---
 	byte_array_free   :: proc(runtime: ^Runtime, bytes: ^Byte_Array) ---
+	forwarded_log_target :: proc(log: ^Forwarded_Log) -> Byte_Array_Ref ---
+	forwarded_log_message :: proc(log: ^Forwarded_Log) -> Byte_Array_Ref ---
+	forwarded_log_timestamp_millis :: proc(log: ^Forwarded_Log) -> u64 ---
+	forwarded_log_fields_json :: proc(log: ^Forwarded_Log) -> Byte_Array_Ref ---
 	client_connect    :: proc(
 		runtime: ^Runtime,
 		options: ^Connection_Options,

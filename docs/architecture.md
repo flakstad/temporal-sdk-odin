@@ -496,7 +496,7 @@ ordering, and discard them on eviction.
 | Workflow time/random seeds/patch information delivery | Temporal-aware clock/random/patch APIs |
 | Initial Workflow metadata, memo, and Search Attribute delivery | Run-owned views, codecs, mutation API, and deterministic property command order |
 | Protocol-level heartbeat transport | Activity context and user-facing heartbeat/cancellation API |
-| Service metrics hooks and internal telemetry | Odin logging/tracing integration and public configuration |
+| Logging subscribers and Prometheus/OTLP metric export | Selecting Core telemetry, Odin-facing configuration, and safe callback routing |
 
 The Temporal Service owns durable history and workflow state. Neither Core nor
 the Odin process serializes and stores an Odin stack in the service. A live
@@ -774,6 +774,10 @@ Current symbol dependency:
 temporal_core_runtime_new
 temporal_core_runtime_free
 temporal_core_byte_array_free
+temporal_core_forwarded_log_target              (raw-only)
+temporal_core_forwarded_log_message             (raw-only)
+temporal_core_forwarded_log_timestamp_millis    (raw-only)
+temporal_core_forwarded_log_fields_json         (raw-only)
 temporal_core_client_connect
 temporal_core_client_free
 temporal_core_client_update_metadata
@@ -822,6 +826,44 @@ Original live-server verification environment:
 - runtime lifecycle tests green;
 - end-to-end `GetSystemInfo` green through a directly started
   `temporal server start-dev --headless` process.
+
+### Runtime telemetry boundary
+
+The pinned bridge represents telemetry entirely in the synchronous
+`TemporalCoreRuntimeOptions -> TemporalCoreTelemetryOptions` construction call.
+Logging is a filter plus an optional callback. Metrics select exactly one of
+Prometheus, OpenTelemetry, or a custom meter; shared fields contain global
+tags, metric prefix, and service-name attachment. Prometheus binds its own HTTP
+listener inside Core. OpenTelemetry builds an OTLP exporter inside Core and
+supports gRPC/HTTP, headers, temporality, periodicity, duration units, and
+histogram overrides. Odin does not implement either protocol.
+
+`Runtime_Option_Bindings` mirrors this pointer graph with address-stable raw
+records. It encodes typed tag/header pairs to the bridge's newline-delimited
+map, points every `ByteArrayRef` at caller-owned memory, calls
+`temporal_core_runtime_new`, and destroys all temporary arrays immediately
+after that call returns. This is safe because the bridge converts those values
+to owned Rust strings/maps during `Runtime::new`. The resulting Core runtime
+owns exporter tasks and listener state until `temporal_core_runtime_free`.
+The public Client accepts the same configuration while retaining sole
+ownership of the created runtime.
+
+Logging is deliberately asymmetric. A nil `forward_to` makes Core write to its
+console subscriber and is now public. A non-nil callback is expected to live
+for the runtime lifetime, receives no user-data pointer, may be invoked from
+any Core thread, and can access the opaque record only until callback return.
+The raw binding exposes the callback type and the four borrowed accessors
+(`target`, `message`, `timestamp_millis`, `fields_json`), but the idiomatic
+layer does not yet expose callbacks. A correct Odin implementation needs a
+process-wide synchronized registry and must copy every field inside the C
+callback; storing the opaque log pointer would be a use-after-free.
+
+The live acceptance test configures the Prometheus exporter on loopback,
+performs `GetSystemInfo`, scrapes `/metrics` while the runtime remains alive,
+and observes `temporal_request_total` with Core's service tag and an Odin global
+tag. This proves Core's listener, instrumentation, option ownership, and
+shutdown path together. OTLP has ABI/unit coverage but awaits a collector-backed
+integration test.
 
 The Milestone 2 path, now using schema-generated bindings, also executed
 end-to-end on the same environment:

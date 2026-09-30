@@ -358,6 +358,51 @@ and task drainage. Keep the lower bound generous: Core permits the initial
 request and the test measures Worker startup as well as polling. A run that
 forgets to populate the C rate field completes in well under that bound.
 
+### Runtime observability
+
+Use `core.runtime_options_default()` and pass the result to
+`core.runtime_create_with_options`. The same value can be attached by pointer
+to `client.Connect_Options.runtime_options`; it is borrowed only while the
+public Client constructs its owned Core runtime.
+
+```odin
+prometheus := core.Runtime_Prometheus_Options{
+    bind_address = "127.0.0.1:9464",
+    counters_total_suffix = true,
+    unit_suffix = true,
+}
+runtime_options := core.runtime_options_default()
+runtime_options.prometheus = &prometheus
+runtime_options.metrics.global_tags = []core.Runtime_Key_Value{
+    {key = "sdk_language", value = "odin"},
+}
+
+runtime, err := core.runtime_create_with_options(runtime_options)
+```
+
+Prometheus and OpenTelemetry are mutually exclusive because the Core C bridge
+accepts exactly one exporter. OTLP supports gRPC/HTTP, headers, cumulative or
+delta temporality, and a configurable export period. Durations round positive
+sub-milliseconds upward at the integer-millisecond ABI. Typed tags and headers
+are encoded as Core's `key\nvalue` map only inside an address-stable binding
+owner, and keys/values containing newlines are rejected before FFI. Histogram
+bucket overrides intentionally remain the bridge's compact
+`metric\n1,2.5,10` escape hatch for now.
+
+Setting `Runtime_Logging_Options.filter` with no forwarding callback selects
+Core's console subscriber. Although the raw package declares the forwarded-log
+callback and accessor ABI, it is not exposed as a high-level callback yet: the
+ABI supplies no per-runtime user pointer, callbacks can arrive on arbitrary
+runtime threads, and the log record is invalid immediately after return. A
+language facade must therefore copy records during the callback and coordinate
+a process-wide dispatcher. Runtime close deactivates Core's forwarder before
+the runtime is freed, but that alone does not solve callback routing.
+
+The integration suite starts `examples/core_connect` with a loopback
+Prometheus address, scrapes `/metrics` while the runtime is alive, and requires
+`temporal_request_total` for `GetSystemInfo` with both Core's `service_name` and
+the Odin global tag. This proves the exporter rather than only its C layout.
+
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.
 `activity.cancellation_details` returns the associated snapshot of Core's six

@@ -2,10 +2,34 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:time"
 import temporal_core "../../temporal/core"
 
 main :: proc() {
-	runtime, runtime_error := temporal_core.runtime_create()
+	prometheus_address_buffer: [128]u8
+	prometheus_address := os.get_env(
+		prometheus_address_buffer[:],
+		"TEMPORAL_CORE_PROMETHEUS_BIND_ADDRESS",
+	)
+	log_filter_buffer: [256]u8
+	log_filter := os.get_env(log_filter_buffer[:], "TEMPORAL_CORE_LOG_FILTER")
+	runtime_options := temporal_core.runtime_options_default()
+	prometheus_options := temporal_core.Runtime_Prometheus_Options{}
+	logging_options := temporal_core.Runtime_Logging_Options{}
+	if len(prometheus_address) > 0 {
+		prometheus_options.bind_address = prometheus_address
+		prometheus_options.counters_total_suffix = true
+		prometheus_options.unit_suffix = true
+		runtime_options.prometheus = &prometheus_options
+		runtime_options.metrics.global_tags = []temporal_core.Runtime_Key_Value{
+			{key = "sdk_language", value = "odin"},
+		}
+	}
+	if len(log_filter) > 0 {
+		logging_options.filter = log_filter
+		runtime_options.logging = &logging_options
+	}
+	runtime, runtime_error := temporal_core.runtime_create_with_options(runtime_options)
 	if runtime_error.message != nil {
 		fmt.eprintf("Core runtime initialization failed: %s\n", string(runtime_error.message))
 		temporal_core.error_free(&runtime_error)
@@ -30,4 +54,9 @@ main :: proc() {
 	defer delete(info.protobuf)
 
 	fmt.printf("Connected through Temporal SDK Core; GetSystemInfo returned %d protobuf bytes.\n", len(info.protobuf))
+	if len(prometheus_address) > 0 {
+		fmt.printf("Core Prometheus exporter is serving %s.\n", prometheus_address)
+		// The integration script scrapes while this process owns the runtime.
+		time.sleep(3 * time.Second)
+	}
 }

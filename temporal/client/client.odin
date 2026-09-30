@@ -183,7 +183,13 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 	core_options.identity = owned_identity
 
 	runtime := new(temporal_core.Runtime, heap)
-	created_runtime, core_error := temporal_core.runtime_create()
+	created_runtime: temporal_core.Runtime
+	core_error: temporal_core.Error
+	if options.runtime_options == nil {
+		created_runtime, core_error = temporal_core.runtime_create()
+	} else {
+		created_runtime, core_error = temporal_core.runtime_create_with_options(options.runtime_options^)
+	}
 	if core_error.message != nil {
 		delete(owned_identity, heap)
 		delete(owned_namespace, heap)
