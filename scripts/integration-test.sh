@@ -156,6 +156,7 @@ grep -q 'Nexus handler failure and schedule-to-close timeout retained structured
 grep -q 'Nexus selector and join composed two concurrent operations' <<<"$nexus_workflow_output"
 grep -q 'Nexus async start token reached the registered cancel handler' <<<"$nexus_workflow_output"
 grep -q 'Nexus async result completed through a Temporal Workflow callback' <<<"$nexus_workflow_output"
+grep -q 'Nexus caller Workflow event link was attached to the async completer' <<<"$nexus_workflow_output"
 grep -q 'Nexus Workflow history replayed offline through Core activations=' <<<"$nexus_workflow_output"
 temporal operator nexus endpoint delete \
   --name "$nexus_endpoint_name" \

@@ -350,6 +350,7 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	callback_path := pbt.draw(t, pbt.string_ascii(1, 48))
 	callback_header_key := pbt.draw(t, pbt.string_ascii(1, 32))
 	callback_header_value := pbt.draw(t, pbt.string_ascii(0, 64))
+	linked_event_id := i64(pbt.draw(t, pbt.int_range(1, 100_000)))
 	enable_eager_start := pbt.draw(t, pbt.boolean())
 	pbt.cover(t, type_case == 0, 5.0, "Bool Search Attribute metadata")
 	pbt.cover(t, type_case == 6, 5.0, "KeywordList Search Attribute metadata")
@@ -431,9 +432,18 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 		key = callback_header_key,
 		value = callback_header_value,
 	}}
+	workflow_event_links := [?]temporal_client.Workflow_Event_Link{{
+		namespace = "generated-namespace",
+		workflow_id = "generated-caller",
+		run_id = "generated-caller-run",
+		has_event_reference = true,
+		event_id = linked_event_id,
+		event_type = .Nexus_Operation_Scheduled,
+	}}
 	completion_callbacks := [?]temporal_client.Nexus_Completion_Callback{{
 		url = callback_url,
 		headers = callback_headers[:],
+		workflow_event_links = workflow_event_links[:],
 	}}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
 		"generated-namespace",
@@ -449,6 +459,7 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 			start_delay = time.Duration(start_delay_ms) * time.Millisecond,
 			priority = &priority,
 			metadata = &metadata,
+			workflow_event_links = workflow_event_links[:],
 			nexus_completion_callbacks = completion_callbacks[:],
 			enable_eager_workflow_start = enable_eager_start,
 		},
@@ -477,14 +488,28 @@ client_start_metadata_wire_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   len(request.header.fields) != 1 ||
 	   len(request.memo.fields) != 1 || len(request.search_attributes.indexed_fields) != 1 ||
 	   request.retry_policy == nil || request.workflow_start_delay == nil || request.priority == nil ||
-	   len(request.completion_callbacks) != 1 {
+	   len(request.completion_callbacks) != 1 || len(request.links) != 1 {
 		return pbt.fail("generated Client start metadata did not decode")
 	}
 	callback, callback_ok := request.completion_callbacks[0].variant.(proto.Temporal_Api_Common_V1_Callback_Variant_Nexus)
 	if !callback_ok || callback.value == nil || callback.value.url != callback_url ||
 	   len(callback.value.header) != 1 || callback.value.header[0].key != callback_header_key ||
-	   callback.value.header[0].value != callback_header_value {
+	   callback.value.header[0].value != callback_header_value ||
+	   len(request.completion_callbacks[0].links) != 1 {
 		return pbt.fail("generated Nexus completion callback changed across protobuf encoding")
+	}
+	workflow_event, workflow_event_ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event)
+	if !workflow_event_ok || workflow_event.value == nil ||
+	   workflow_event.value.namespace != "generated-namespace" ||
+	   workflow_event.value.workflow_id != "generated-caller" ||
+	   workflow_event.value.run_id != "generated-caller-run" {
+		return pbt.fail("generated Workflow event link identity changed")
+	}
+	event_reference, reference_ok := workflow_event.value.reference.(proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref)
+	if !reference_ok || event_reference.value == nil ||
+	   event_reference.value.event_id != linked_event_id ||
+	   event_reference.value.event_type != .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED {
+		return pbt.fail("generated Workflow event link reference changed")
 	}
 	if request.request_eager_execution != enable_eager_start ||
 	   i32(request.workflow_id_reuse_policy) != i32(reuse_case) ||

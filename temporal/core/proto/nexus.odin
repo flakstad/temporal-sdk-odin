@@ -15,6 +15,11 @@ Nexus_Header_View :: struct {
 	value: string,
 }
 
+Nexus_Link_View :: struct {
+	url:  string,
+	type: string,
+}
+
 Nexus_Task :: struct {
 	kind:             Nexus_Task_Kind,
 	task_token:       []u8,
@@ -27,6 +32,7 @@ Nexus_Task :: struct {
 	input:            Payload_View,
 	headers:          []Nexus_Header_View,
 	callback_headers: []Nexus_Header_View,
+	links:            []Nexus_Link_View,
 	scheduled_time:   Timestamp_Value,
 	request_deadline: Timestamp_Value,
 	cancel_reason:    Coresdk_Nexus_NexusTaskCancelReason,
@@ -95,6 +101,13 @@ decode_nexus_task :: proc(data: []u8) -> (task: Nexus_Task, error: Nexus_Decode_
 					callback_headers[index] = {key = entry.key, value = entry.value}
 				}
 				task.callback_headers = callback_headers
+			}
+			if len(start.links) > 0 {
+				links := make([]Nexus_Link_View, len(start.links))
+				for link, index in start.links {
+					links[index] = {url = link.url, type = link.type}
+				}
+				task.links = links
 			}
 			return task, .None
 		case Temporal_Api_Nexus_V1_Request_Variant_Cancel_Operation:

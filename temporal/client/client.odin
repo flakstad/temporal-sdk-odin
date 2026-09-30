@@ -7,6 +7,7 @@ import "core:encoding/uuid"
 import "core:math"
 import "core:mem"
 import "core:mem/virtual"
+import "core:strconv"
 import "core:strings"
 import "core:time"
 import codec "../codec"
@@ -259,6 +260,7 @@ Start_Workflow_Options :: struct {
 	start_delay:                time.Duration,
 	priority:                   ^Priority,
 	metadata:                   ^Start_Metadata,
+	workflow_event_links:       []Workflow_Event_Link,
 	nexus_completion_callbacks: []Nexus_Completion_Callback,
 	enable_eager_workflow_start: bool,
 }
@@ -269,11 +271,108 @@ Start_Workflow_Options :: struct {
 Nexus_Completion_Callback :: struct {
 	url:     string,
 	headers: []Nexus_Callback_Header,
+	workflow_event_links: []Workflow_Event_Link,
 }
 
 Nexus_Callback_Header :: struct {
 	key:   string,
 	value: string,
+}
+
+// Workflow_Event_Type is deliberately narrow until the Client exposes a
+// general-purpose Link builder. Nexus StartOperation links currently refer to
+// the scheduling event in the caller Workflow.
+Workflow_Event_Type :: enum i32 {
+	Unspecified = 0,
+	Nexus_Operation_Scheduled = 48,
+}
+
+// Workflow_Event_Link values and their strings are borrowed during synchronous
+// Workflow-start encoding.
+Workflow_Event_Link :: struct {
+	namespace:           string,
+	workflow_id:         string,
+	run_id:              string,
+	has_event_reference: bool,
+	event_id:            i64,
+	event_type:          Workflow_Event_Type,
+}
+
+// workflow_event_link_from_nexus_url translates Temporal's Nexus link URL to
+// the common WorkflowEvent link attached to a completer Workflow. Returned
+// strings borrow url and must not outlive it.
+workflow_event_link_from_nexus_url :: proc(url: string) -> (Workflow_Event_Link, Error) {
+	SCHEME :: "temporal://"
+	if !strings.has_prefix(url, SCHEME) {
+		return {}, error_from_string(.Invalid_Argument, "Nexus link must use the temporal scheme")
+	}
+	without_scheme := url[len(SCHEME):]
+	path_offset := strings.index(without_scheme, "/namespaces/")
+	if path_offset < 0 {
+		return {}, error_from_string(.Invalid_Argument, "Nexus link has no Temporal Workflow path")
+	}
+	path_and_query := without_scheme[path_offset:]
+	path := path_and_query
+	query := ""
+	if query_offset := strings.index_byte(path_and_query, '?'); query_offset >= 0 {
+		path = path_and_query[:query_offset]
+		query = path_and_query[query_offset + 1:]
+	}
+	parts, split_error := strings.split(path, "/")
+	if split_error != nil {
+		return {}, error_from_string(.Malformed_Response, "could not parse Nexus Workflow link")
+	}
+	defer delete(parts)
+	if len(parts) != 7 || parts[1] != "namespaces" || parts[3] != "workflows" ||
+	   parts[6] != "history" || len(parts[2]) == 0 || len(parts[4]) == 0 || len(parts[5]) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Nexus link has an invalid Temporal Workflow path")
+	}
+	result := Workflow_Event_Link{
+		namespace = parts[2],
+		workflow_id = parts[4],
+		run_id = parts[5],
+	}
+	if len(query) == 0 {
+		return result, {}
+	}
+	event_id: i64
+	event_type := Workflow_Event_Type.Unspecified
+	query_remaining := query
+	for {
+		part := query_remaining
+		if separator := strings.index_byte(query_remaining, '&'); separator >= 0 {
+			part = query_remaining[:separator]
+			query_remaining = query_remaining[separator + 1:]
+		} else {
+			query_remaining = ""
+		}
+		separator := strings.index_byte(part, '=')
+		if separator > 0 {
+			key := part[:separator]
+			value := part[separator + 1:]
+			if key == "eventID" {
+				parsed, ok := strconv.parse_i64(value)
+				if !ok || parsed <= 0 {
+					return {}, error_from_string(.Invalid_Argument, "Nexus link has an invalid event ID")
+				}
+				event_id = parsed
+			} else if key == "eventType" {
+				if value != "NexusOperationScheduled" &&
+				   value != "EVENT_TYPE_NEXUS_OPERATION_SCHEDULED" {
+					return {}, error_from_string(.Invalid_Argument, "Nexus link has an unsupported event type")
+				}
+				event_type = .Nexus_Operation_Scheduled
+			}
+		}
+		if len(query_remaining) == 0 do break
+	}
+	if event_id == 0 || event_type == .Unspecified {
+		return {}, error_from_string(.Invalid_Argument, "Nexus link has an incomplete event reference")
+	}
+	result.has_event_reference = true
+	result.event_id = event_id
+	result.event_type = event_type
+	return result, {}
 }
 
 // Signal_With_Start_Options borrows ordinary start options plus the one Header
@@ -926,6 +1025,9 @@ start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string 
 	if options.metadata != nil && options.metadata.allocator.procedure == nil {
 		return "Workflow start metadata is not initialized"
 	}
+	for link in options.workflow_event_links {
+		if message := workflow_event_link_error(link); len(message) > 0 do return message
+	}
 	for callback in options.nexus_completion_callbacks {
 		if len(callback.url) == 0 {
 			return "Nexus completion callback URL must not be empty"
@@ -935,8 +1037,51 @@ start_workflow_options_error :: proc(options: Start_Workflow_Options) -> string 
 				return "Nexus completion callback header keys must not be empty"
 			}
 		}
+		for link in callback.workflow_event_links {
+			if message := workflow_event_link_error(link); len(message) > 0 do return message
+		}
 	}
 	return ""
+}
+
+workflow_event_link_error :: proc(link: Workflow_Event_Link) -> string {
+	if len(link.namespace) == 0 || len(link.workflow_id) == 0 || len(link.run_id) == 0 {
+		return "Workflow event links require namespace, Workflow ID, and Run ID"
+	}
+	if link.has_event_reference &&
+	   (link.event_id <= 0 || link.event_type == .Unspecified) {
+		return "Workflow event links require a positive event ID and event type"
+	}
+	return ""
+}
+
+encode_workflow_event_link :: proc(
+	link: Workflow_Event_Link,
+	workflow_events: []proto.Temporal_Api_Common_V1_Link_WorkflowEvent,
+	event_references: []proto.Temporal_Api_Common_V1_Link_WorkflowEvent_EventReference,
+	cursor: ^int,
+) -> proto.Temporal_Api_Common_V1_Link {
+	index := cursor^
+	cursor^ += 1
+	workflow_events[index] = {
+		namespace = link.namespace,
+		workflow_id = link.workflow_id,
+		run_id = link.run_id,
+	}
+	if link.has_event_reference {
+		event_references[index] = {
+			event_id = link.event_id,
+			event_type = transmute(proto.Temporal_Api_Enums_V1_EventType)link.event_type,
+		}
+		workflow_events[index].reference = proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref{
+			value = &event_references[index],
+		}
+	}
+	return {
+		variant = proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event{
+			value = &workflow_events[index],
+		},
+	}
 }
 
 free_start_proto_payloads :: proc(payloads: []proto.Temporal_Api_Common_V1_Payload) {
@@ -999,6 +1144,30 @@ encode_start_workflow_request_payloads :: proc(
 		cron_schedule = options.cron_schedule,
 		request_eager_execution = options.enable_eager_workflow_start,
 	}
+	total_link_count := len(options.workflow_event_links)
+	for callback in options.nexus_completion_callbacks {
+		total_link_count += len(callback.workflow_event_links)
+	}
+	workflow_event_values := make(
+		[]proto.Temporal_Api_Common_V1_Link_WorkflowEvent,
+		total_link_count,
+	)
+	event_reference_values := make(
+		[]proto.Temporal_Api_Common_V1_Link_WorkflowEvent_EventReference,
+		total_link_count,
+	)
+	link_cursor := 0
+	for link in options.workflow_event_links {
+		append(
+			&request.links,
+			encode_workflow_event_link(
+				link,
+				workflow_event_values,
+				event_reference_values,
+				&link_cursor,
+			),
+		)
+	}
 	callback_values := make(
 		[]proto.Temporal_Api_Common_V1_Callback_Nexus,
 		len(options.nexus_completion_callbacks),
@@ -1007,11 +1176,20 @@ encode_start_workflow_request_payloads :: proc(
 		[][dynamic]proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry,
 		len(options.nexus_completion_callbacks),
 	)
+	callback_links := make(
+		[][dynamic]proto.Temporal_Api_Common_V1_Link,
+		len(options.nexus_completion_callbacks),
+	)
 	defer {
 		for headers in callback_headers do delete(headers)
+		for links in callback_links do delete(links)
+		delete(callback_links)
 		delete(callback_headers)
 		delete(callback_values)
 		delete(request.completion_callbacks)
+		delete(request.links)
+		delete(event_reference_values)
+		delete(workflow_event_values)
 	}
 	for callback, index in options.nexus_completion_callbacks {
 		callback_values[index].url = callback.url
@@ -1025,9 +1203,21 @@ encode_start_workflow_request_payloads :: proc(
 			)
 		}
 		callback_values[index].header = callback_headers[index]
+		for link in callback.workflow_event_links {
+			append(
+				&callback_links[index],
+				encode_workflow_event_link(
+					link,
+					workflow_event_values,
+					event_reference_values,
+					&link_cursor,
+				),
+			)
+		}
 		append(
 			&request.completion_callbacks,
 			proto.Temporal_Api_Common_V1_Callback{
+				links = callback_links[index],
 				variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus{
 					value = &callback_values[index],
 				},

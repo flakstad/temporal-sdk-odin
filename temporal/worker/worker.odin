@@ -2280,6 +2280,7 @@ Nexus_Info_Owner :: struct {
 	owned_strings:    [dynamic]string,
 	headers:          [dynamic]nexus.Header,
 	callback_headers: [dynamic]nexus.Header,
+	links:            [dynamic]nexus.Link,
 }
 
 nexus_info_owner_clone_string :: proc(
@@ -2307,6 +2308,7 @@ nexus_info_owner_destroy :: proc(owner: ^Nexus_Info_Owner) {
 	delete(owner.owned_strings)
 	delete(owner.headers)
 	delete(owner.callback_headers)
+	delete(owner.links)
 	owner^ = {}
 }
 
@@ -2323,6 +2325,7 @@ nexus_info_owner_init :: proc(
 	owner.owned_strings = make([dynamic]string, heap)
 	owner.headers = make([dynamic]nexus.Header, heap)
 	owner.callback_headers = make([dynamic]nexus.Header, heap)
+	owner.links = make([dynamic]nexus.Link, heap)
 	clone_ok: bool
 	owner.info.service, clone_ok = nexus_info_owner_clone_string(owner, task.service)
 	if !clone_ok do return error_from_string("could not allocate Nexus operation info")
@@ -2361,8 +2364,17 @@ nexus_info_owner_init :: proc(
 		}
 		append(&owner.callback_headers, nexus.Header{key = key, value = value})
 	}
+	for entry in task.links {
+		url, url_ok := nexus_info_owner_clone_string(owner, entry.url)
+		link_type, type_ok := nexus_info_owner_clone_string(owner, entry.type)
+		if !url_ok || !type_ok {
+			return error_from_string("could not allocate Nexus operation link")
+		}
+		append(&owner.links, nexus.Link{url = url, type = link_type})
+	}
 	owner.info.headers = owner.headers[:]
 	owner.info.callback_headers = owner.callback_headers[:]
+	owner.info.links = owner.links[:]
 	return {}
 }
 

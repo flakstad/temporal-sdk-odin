@@ -27,6 +27,11 @@ Header :: struct {
 	value: string,
 }
 
+Link :: struct {
+	url:  string,
+	type: string,
+}
+
 Info :: struct {
 	service:          string,
 	operation:        string,
@@ -39,6 +44,7 @@ Info :: struct {
 	task_token:       []u8,
 	headers:          []Header,
 	callback_headers: []Header,
+	links:            []Link,
 	scheduled_time:     time.Time,
 	has_scheduled_time: bool,
 	deadline:            time.Time,

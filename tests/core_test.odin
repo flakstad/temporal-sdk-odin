@@ -7713,6 +7713,14 @@ nexus_adapter_decodes_start_and_core_cancellation_tasks :: proc(t: ^testing.T) {
 		},
 	)
 	defer delete(start.callback_header)
+	append(
+		&start.links,
+		proto.Temporal_Api_Nexus_V1_Link{
+			url = "temporal://caller/namespaces/default/workflows/caller-id/caller-run/history?eventID=21&eventType=NexusOperationScheduled",
+			type = "temporal.api.common.v1.Link.WorkflowEvent",
+		},
+	)
+	defer delete(start.links)
 	scheduled_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_000, nanos = 456}
 	request := proto.Temporal_Api_Nexus_V1_Request{
 		scheduled_time = &scheduled_time,
@@ -7763,6 +7771,15 @@ nexus_adapter_decodes_start_and_core_cancellation_tasks :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(task.callback_headers), 1)
 	testing.expect_value(t, task.callback_headers[0].key, "callback-key")
 	testing.expect_value(t, task.callback_headers[0].value, "callback-value")
+	testing.expect_value(t, len(task.links), 1)
+	if len(task.links) == 1 {
+		testing.expect_value(
+			t,
+			task.links[0].url,
+			"temporal://caller/namespaces/default/workflows/caller-id/caller-run/history?eventID=21&eventType=NexusOperationScheduled",
+		)
+		testing.expect_value(t, task.links[0].type, "temporal.api.common.v1.Link.WorkflowEvent")
+	}
 	testing.expect(t, task.scheduled_time.present)
 	testing.expect(t, task.request_deadline.present)
 	testing.expect_value(t, task.scheduled_time.value, time.unix(1_700_000_000, 456))
@@ -8356,6 +8373,32 @@ client_close_event_result_owns_payload_after_decode :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_translates_nexus_workflow_event_links :: proc(t: ^testing.T) {
+	link, link_error := temporal_client.workflow_event_link_from_nexus_url(
+		"temporal://caller/namespaces/default/workflows/caller-id/caller-run/history?eventID=21&eventType=NexusOperationScheduled",
+	)
+	defer temporal_client.error_free(&link_error)
+	testing.expect(t, link_error.message == nil)
+	testing.expect_value(t, link.namespace, "default")
+	testing.expect_value(t, link.workflow_id, "caller-id")
+	testing.expect_value(t, link.run_id, "caller-run")
+	testing.expect(t, link.has_event_reference)
+	testing.expect_value(t, link.event_id, i64(21))
+	testing.expect_value(t, link.event_type, temporal_client.Workflow_Event_Type.Nexus_Operation_Scheduled)
+
+	invalid_urls := [?]string{
+		"https://caller/namespaces/default/workflows/id/run/history",
+		"temporal://caller/namespaces/default/workflows/id/run/history?eventID=0&eventType=NexusOperationScheduled",
+		"temporal://caller/namespaces/default/workflows/id/run/history?eventID=21&eventType=WorkflowExecutionStarted",
+	}
+	for invalid_url in invalid_urls {
+		_, invalid_error := temporal_client.workflow_event_link_from_nexus_url(invalid_url)
+		testing.expect(t, invalid_error.kind == .Invalid_Argument)
+		temporal_client.error_free(&invalid_error)
+	}
+}
+
+@(test)
 client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 	metadata := temporal_client.Start_Metadata{}
 	init_error := temporal_client.start_metadata_init(&metadata)
@@ -8424,6 +8467,14 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 		fairness_key = "customer-42",
 		fairness_weight = 1.5,
 	}
+	workflow_event_links := [?]temporal_client.Workflow_Event_Link{{
+		namespace = "orders-namespace",
+		workflow_id = "caller-workflow",
+		run_id = "caller-run",
+		has_event_reference = true,
+		event_id = 21,
+		event_type = .Nexus_Operation_Scheduled,
+	}}
 	callback_headers := [?]temporal_client.Nexus_Callback_Header{
 		{key = "nexus-callback-token", value = "opaque-callback-token"},
 	}
@@ -8431,6 +8482,7 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 		{
 			url = "http://temporal.invalid/nexus/callback",
 			headers = callback_headers[:],
+			workflow_event_links = workflow_event_links[:],
 		},
 	}
 	request_bytes, request_error := temporal_client.encode_start_workflow_request(
@@ -8450,6 +8502,7 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 			start_delay = 3 * time.Second,
 			priority = &priority,
 			metadata = &metadata,
+			workflow_event_links = workflow_event_links[:],
 			nexus_completion_callbacks = completion_callbacks[:],
 			enable_eager_workflow_start = true,
 		},
@@ -8582,6 +8635,26 @@ client_start_metadata_owns_and_encodes_payload_maps :: proc(t: ^testing.T) {
 			if len(callback.value.header) == 1 {
 				testing.expect_value(t, callback.value.header[0].key, "nexus-callback-token")
 				testing.expect_value(t, callback.value.header[0].value, "opaque-callback-token")
+			}
+		}
+		testing.expect_value(t, len(request.completion_callbacks[0].links), 1)
+	}
+	testing.expect_value(t, len(request.links), 1)
+	if len(request.links) == 1 {
+		workflow_event, link_ok := request.links[0].variant.(proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event)
+		testing.expect(t, link_ok && workflow_event.value != nil)
+		if link_ok && workflow_event.value != nil {
+			testing.expect_value(t, workflow_event.value.namespace, "orders-namespace")
+			testing.expect_value(t, workflow_event.value.workflow_id, "caller-workflow")
+			testing.expect_value(t, workflow_event.value.run_id, "caller-run")
+			event_reference, reference_ok := workflow_event.value.reference.(proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref)
+			testing.expect(t, reference_ok && event_reference.value != nil)
+			if reference_ok && event_reference.value != nil {
+				testing.expect_value(t, event_reference.value.event_id, i64(21))
+				testing.expect(
+					t,
+					event_reference.value.event_type == .EVENT_TYPE_NEXUS_OPERATION_SCHEDULED,
+				)
 			}
 		}
 	}

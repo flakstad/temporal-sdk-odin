@@ -71,7 +71,8 @@ start_async_completer :: proc(
 ) -> nexus.Result(string) {
 	operation_info := nexus.info(ctx)
 	if nexus_client == nil || len(operation_info.callback_url) == 0 ||
-	   len(operation_info.callback_headers) == 0 || len(operation_info.request_id) == 0 {
+	   len(operation_info.callback_headers) == 0 || len(operation_info.request_id) == 0 ||
+	   len(operation_info.links) == 0 {
 		return nexus.result_handler_error(
 			string,
 			"Temporal did not provide complete Nexus callback information",
@@ -86,9 +87,25 @@ start_async_completer :: proc(
 	for header, index in operation_info.callback_headers {
 		callback_headers[index] = {key = header.key, value = header.value}
 	}
+	workflow_event_links := make(
+		[]temporal_client.Workflow_Event_Link,
+		len(operation_info.links),
+	)
+	for link, index in operation_info.links {
+		workflow_event_link, link_error := temporal_client.workflow_event_link_from_nexus_url(
+			link.url,
+		)
+		if link_error.message != nil {
+			message := fmt.aprintf("could not translate Nexus Workflow link: %s", string(link_error.message))
+			temporal_client.error_free(&link_error)
+			return nexus.result_handler_error(string, message, "BAD_REQUEST", .Non_Retryable)
+		}
+		workflow_event_links[index] = workflow_event_link
+	}
 	callbacks := [?]temporal_client.Nexus_Completion_Callback{{
 		url = operation_info.callback_url,
 		headers = callback_headers,
+		workflow_event_links = workflow_event_links,
 	}}
 	workflow_id := fmt.aprintf("odin-nexus-completer-%s", operation_info.request_id)
 	defer delete(workflow_id)
@@ -102,6 +119,7 @@ start_async_completer :: proc(
 			workflow_execution_timeout = time.Minute,
 			workflow_run_timeout = time.Minute,
 			workflow_task_timeout = 10 * time.Second,
+			workflow_event_links = workflow_event_links,
 			nexus_completion_callbacks = callbacks[:],
 		},
 	)
@@ -550,6 +568,7 @@ run :: proc() -> int {
 	fmt.println("Nexus selector and join composed two concurrent operations")
 	fmt.println("Nexus async start token reached the registered cancel handler")
 	fmt.println("Nexus async result completed through a Temporal Workflow callback")
+	fmt.println("Nexus caller Workflow event link was attached to the async completer")
 	fmt.printf(
 		"Nexus Workflow history replayed offline through Core activations=%d\n",
 		replay_result.activations_processed,

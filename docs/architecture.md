@@ -391,8 +391,10 @@ preserved in the Odin error.
 Ordinary Workflow start additionally exposes the Service protobuf's repeated
 `completion_callbacks` field as borrowed `Nexus_Completion_Callback` values.
 Each entry maps exactly to `temporal.api.common.v1.Callback.Nexus`: URL plus
-string header map. Odin validates nonempty URLs and header keys, constructs the
-temporary protobuf graph, and discards it immediately after synchronous
+string header map and optional Workflow-event links. Ordinary start options can
+attach the same links to the new Workflow. Odin validates nonempty URLs, header
+keys, Workflow identity, and event references, constructs the temporary
+protobuf graph, and discards it immediately after synchronous
 encoding. The Service, not Core or the Odin process, invokes that URL when the
 started Workflow reaches a terminal result. `SignalWithStartWorkflowExecution`
 has no equivalent field in the pinned schema, so that API rejects completion
@@ -496,8 +498,11 @@ durable operation token, and `CancelOperation` routes an owned copy through a
 separately registered handler before emitting the exact cancel response.
 Registrations without that handler retain a non-retryable `NOT_IMPLEMENTED`
 response. Async success through a Workflow completion callback and
-`Wait_Cancellation_Requested` cancellation are live-proven. Links, metrics,
-and the remaining cancellation-policy live cases are not implemented. The
+`Wait_Cancellation_Requested` cancellation are live-proven. The handler also
+preserves Core's raw Nexus links, parses the upstream `temporal://.../history`
+form, and attaches the resulting `WorkflowEvent` link to both callback and
+completer start. Other Link variants, metrics, and the remaining
+cancellation-policy live cases are not implemented. The
 outbound interceptor and selector/join integration are implemented.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
@@ -2706,8 +2711,9 @@ Workflows are enabled.
    `NexusHandlerFailureInfo` envelope, and all callback-visible data is owned
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Callback
-   links, outbound metrics, and full cancellation-policy coverage remain.
-   Async token handoff, Workflow-backed callback completion, and
+   completion and Workflow-event linking are implemented; other Link variants,
+   outbound metrics, and full cancellation-policy coverage remain. Async token
+   handoff, Workflow-backed callback completion, caller/completer linking, and
    `Wait_Cancellation_Requested` are live-proven.
    The Workflow outbound interceptor is implemented
    and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
@@ -2733,8 +2739,7 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: add the upstream Workflow-event link to the completer start,
-live-test the three remaining cancellation policies, then property-test
+boundary: live-test the three remaining cancellation policies, then property-test
 duplicate callback/result delivery. The selector/join
 branch and async cancel-token handoff are unit-, live-, and replay-tested;
 selector ordering is also property-tested.
@@ -2742,7 +2747,7 @@ The Workflow outbound
 interceptor and handler failure/pre-start timeout classification are now
 wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
 and timeout also run through the live server. Async callback completion now
-runs through a Workflow started by the Odin handler. Activity Worker is
+runs through a linked Workflow started by the Odin handler. Activity Worker is
 no longer the next milestone: it is already implemented and extensively
 live-tested.
 

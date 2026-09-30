@@ -345,8 +345,11 @@ Workflow with the callback URL and headers supplied to the Nexus handler and
 observes its terminal JSON result complete the original async Nexus operation.
 It also proves `Wait_Cancellation_Requested`: the cancel handler addresses the
 backing Workflow by operation token, requests cancellation through the Odin
-Client, and the caller observes a canceled Nexus result. Links and live
-coverage of the other three cancellation policies remain.
+Client, and the caller observes a canceled Nexus result. The handler translates
+the caller's Nexus `temporal://` link to `common.v1.Link.WorkflowEvent` and
+attaches it both to the callback and completer Workflow start, matching the
+upstream Core integration pattern. Other Link variants and live coverage of
+the other three cancellation policies remain.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
