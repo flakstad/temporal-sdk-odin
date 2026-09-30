@@ -229,6 +229,68 @@ grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_c
 grep -q "Workflow condition resumed after a Signal and replayed on a fresh stack" "$worker_log"
 echo "Workflow condition resumed through Core and Temporal Server"
 
+TEMPORAL_ODIN_SCENARIO=workflow-cache \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Cached Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+cached_workflow_id="odin-sdk-cached-condition-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$cached_workflow_id" \
+  --type odin_condition_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"cached-order"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "replay=false .*waiting_condition=true .*completed=false" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Cached Workflow did not suspend on its predicate" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+temporal workflow signal \
+  --workflow-id "$cached_workflow_id" \
+  --name approve \
+  --input '"Cache"' \
+  --command-timeout 10s \
+  --output none
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+cached_output="$(<"$workflow_output_file")"
+echo "$cached_output"
+grep -q 'Order cached-order approved by Cache' <<<"$cached_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+if grep -q "replay=true" "$worker_log"; then
+  echo "Cached Workflow unexpectedly replayed" >&2
+  exit 1
+fi
+grep -Eq "replay=false .*signal=true signal_handlers_started=1 signal_handlers_completed=1 .*waiting_condition=false .*completed=true" "$worker_log"
+grep -Eq "replay=false .*evicted=true" "$worker_log"
+grep -q "Workflow condition resumed from its cached Odin fiber without replay" "$worker_log"
+echo "Workflow cache retained and resumed an Odin fiber through Core sticky execution"
+
 TEMPORAL_ODIN_SCENARIO=selector \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
@@ -766,6 +828,29 @@ wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
 grep -Eq "24 Activity callbacks drained with callback_peak=3 route_peak=[34] slots=3" "$worker_log"
+
+ACTIVITY_EXPECT_RATE_LIMIT=1 \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Rate-limited Odin Activity Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+ACTIVITY_LOAD=1 cargo run --quiet \
+  --manifest-path "$repo_root/native/Cargo.toml" \
+  --package activity-test-driver
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q "24 Activity callbacks rate-limited by Core to 4/s elapsed=" "$worker_log"
 
 ACTIVITY_EXPECT_SHUTDOWN=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

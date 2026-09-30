@@ -1588,12 +1588,15 @@ main :: proc() {
 			fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
 		}
 	}
-	activity_worker, create_error := worker.create(
-		&client,
-		task_queue,
-		versioning = versioning,
-		nondeterminism_policy = nondeterminism_policy,
-	)
+	worker_options := worker.options_default(task_queue)
+	worker_options.versioning = versioning
+	worker_options.nondeterminism_policy = nondeterminism_policy
+	if create_scenario == "workflow-cache" {
+		worker_options.identity_override = "temporal-sdk-odin-cached-workflow"
+		worker_options.max_cached_workflows = 10
+		worker_options.workflow_task_poller_behavior = worker.poller_simple_maximum(2)
+	}
+	activity_worker, create_error := worker.create_with_options(&client, worker_options)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
 		worker.error_free(&create_error)
@@ -1994,7 +1997,8 @@ main :: proc() {
 	expect_multiple_signal_arguments := scenario == "multiple-signal-arguments"
 	expect_multiple_query_arguments := scenario == "multiple-query-arguments"
 	expect_multiple_update_arguments := scenario == "multiple-update-arguments"
-	expect_condition := scenario == "condition"
+	expect_cached_condition := scenario == "workflow-cache"
+	expect_condition := scenario == "condition" || expect_cached_condition
 	expect_selector := scenario == "selector"
 	expect_join := scenario == "join-all"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
@@ -2026,6 +2030,13 @@ main :: proc() {
 	}
 	if !failed && run_stats.workflow_evictions < 1 {
 		fmt.eprintln("Workflow worker did not observe final cache eviction")
+		failed = true
+	}
+	if !failed && expect_cached_condition && run_stats.workflow_replay_activations != 0 {
+		fmt.eprintf(
+			"Cached Workflow unexpectedly replayed %d activations\n",
+			run_stats.workflow_replay_activations,
+		)
 		failed = true
 	}
 	if !failed {
@@ -2252,7 +2263,11 @@ main :: proc() {
 	} else if expect_signal_handler_failure {
 		fmt.println("Signal handler failure triggered Core eviction and the Worker recovered on a fresh Workflow stack")
 	} else if expect_condition {
-		fmt.println("Workflow condition resumed after a Signal and replayed on a fresh stack")
+		if expect_cached_condition {
+			fmt.println("Workflow condition resumed from its cached Odin fiber without replay")
+		} else {
+			fmt.println("Workflow condition resumed after a Signal and replayed on a fresh stack")
+		}
 	} else if expect_join {
 		fmt.println("Workflow join waited for both concurrent Activities in declaration order")
 	} else if expect_selector {

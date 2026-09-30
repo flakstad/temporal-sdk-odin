@@ -342,6 +342,22 @@ cache state, slots, both poller forms, duration rounding, rates, and sticky poll
 ratio. It runs against both the pinned PBT submodule and, during local library
 development, `PBT_ROOT=~/Projects/pbt`.
 
+The integration matrix exercises two complementary Workflow configurations.
+The ordinary condition scenario leaves caching disabled and requires a
+fresh-stack replay before its Signal can complete the Workflow. The
+`workflow-cache` scenario sets a cache of ten and a two-poller Workflow policy;
+it rejects any replay activation, requires the Signal to resume the existing
+fiber, and still requires Core's final eviction during shutdown. This is the
+minimum sticky-queue regression test for changes to Worker options, run routing,
+fiber ownership, or shutdown.
+
+`ACTIVITY_EXPECT_RATE_LIMIT=1` configures the hello Activity Worker for four
+Activities per second and runs the existing 24-Activity load driver. The Worker
+itself asserts a run time between five and thirty seconds and complete callback
+and task drainage. Keep the lower bound generous: Core permits the initial
+request and the test measures Worker startup as well as polling. A run that
+forgets to populate the C rate field completes in well under that bound.
+
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.
 `activity.cancellation_details` returns the associated snapshot of Core's six

@@ -306,6 +306,9 @@ main :: proc() {
 	concurrency_case := concurrency_value != ""
 	load_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_LOAD")
 	load_case := load_value != ""
+	rate_limit_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_RATE_LIMIT")
+	rate_limit_case := rate_limit_value != ""
+	load_case = load_case || rate_limit_case
 	shutdown_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_SHUTDOWN")
 	shutdown_case := shutdown_value != ""
 	activity_slots := load_case ? 3 : 10
@@ -315,6 +318,9 @@ main :: proc() {
 	worker_options.max_concurrent_activities = activity_slots
 	worker_options.graceful_shutdown_period = graceful_shutdown_period
 	worker_options.activity_task_poller_behavior = worker.poller_simple_maximum(2)
+	if rate_limit_case {
+		worker_options.max_worker_activities_per_second = 4
+	}
 	activity_worker, create_error := worker.create_with_options(&client, worker_options)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
@@ -393,6 +399,7 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
+	run_started := time.tick_now()
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{max_activity_tasks = max_tasks},
@@ -551,32 +558,49 @@ main :: proc() {
 			shutdown_elapsed,
 		)
 	} else if load_case {
+		run_elapsed := time.tick_since(run_started)
 		sync.mutex_lock(&load_stats_mutex)
 		active := load_activities_active
 		peak := load_activities_peak
 		completed := load_activities_completed
 		sync.mutex_unlock(&load_stats_mutex)
-		if completed != 24 || active != 0 || peak != activity_slots ||
-		   run_stats.activity_tasks_completed != 24 ||
-		   run_stats.activity_executions_peak_owned < activity_slots ||
-		   run_stats.activity_executions_peak_owned > activity_slots + 1 {
+		load_invalid := completed != 24 || active != 0 ||
+			run_stats.activity_tasks_completed != 24
+		if rate_limit_case {
+			load_invalid = load_invalid || run_elapsed < 5 * time.Second ||
+				run_elapsed > 30 * time.Second
+		} else {
+			load_invalid = load_invalid || peak != activity_slots ||
+				run_stats.activity_executions_peak_owned < activity_slots ||
+				run_stats.activity_executions_peak_owned > activity_slots + 1
+		}
+		if load_invalid {
 			fmt.eprintf(
-				"Activity load invariant failed: callbacks=%d active=%d callback_peak=%d tasks=%d route_peak=%d slots=%d\n",
+				"Activity load invariant failed: callbacks=%d active=%d callback_peak=%d tasks=%d route_peak=%d slots=%d elapsed=%v rate_limited=%v\n",
 				completed,
 				active,
 				peak,
 				run_stats.activity_tasks_completed,
 				run_stats.activity_executions_peak_owned,
 				activity_slots,
+				run_elapsed,
+				rate_limit_case,
 			)
 			os.exit(1)
 		}
-		fmt.printf(
-			"24 Activity callbacks drained with callback_peak=%d route_peak=%d slots=%d\n",
-			peak,
-			run_stats.activity_executions_peak_owned,
-			activity_slots,
-		)
+		if rate_limit_case {
+			fmt.printf(
+				"24 Activity callbacks rate-limited by Core to 4/s elapsed=%v\n",
+				run_elapsed,
+			)
+		} else {
+			fmt.printf(
+				"24 Activity callbacks drained with callback_peak=%d route_peak=%d slots=%d\n",
+				peak,
+				run_stats.activity_executions_peak_owned,
+				activity_slots,
+			)
+		}
 	} else if concurrency_case {
 		fmt.println("two Activity callbacks overlapped and worker shut down cleanly")
 	} else if retry_case {

@@ -242,6 +242,14 @@ invalid rates, poller ranges, cache/poller combinations, and negative durations
 are rejected before `worker_new`. The identity and all other referenced strings
 are owned by the Odin Worker until `worker.close`.
 
+The dev-server suite proves both cache modes: cache-disabled execution rebuilds
+the Workflow from history, while a cached sticky execution resumes the same
+suspended Odin fiber on a later Signal and evicts it cleanly at shutdown. It
+also schedules 24 Activities against a four-per-second Worker limit and checks
+that SDK Core throttles delivery before the Odin callback pool. Eager Activity
+reservations and the server-side task-queue rate are mapped and validated but
+remain opt-in pending equally direct behavioral tests.
+
 `activity.info(ctx)`
 now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor

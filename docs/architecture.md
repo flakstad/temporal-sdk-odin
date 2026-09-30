@@ -2305,6 +2305,25 @@ simple Workflow poller below two is rejected, matching Core's cache/poller
 constraint. Eager reservations stay zero by default until a dedicated mixed
 Workflow/Activity eager execution test makes enabling them a safe default.
 
+The cache path is now verified against the CLI dev server rather than only the
+C layout. A condition Workflow with `max_cached_workflows=10`, a ten-second
+sticky timeout, and `SimpleMaximum(2)` suspends after its initial activation.
+The later Signal activation resumes the same Odin fiber with `is_replaying`
+false, completes the Workflow, and then observes Core's terminal cache eviction
+during bounded Worker shutdown. The paired cache-disabled scenario still
+requires fresh-stack replay, so the suite proves both execution modes rather
+than merely accepting a sticky configuration.
+
+The per-Worker Activity rate limit is also behavior-tested. Twenty-four remote
+Activities are offered to a Worker with three execution slots and
+`max_worker_activities_per_second=4`. Core spaces the polls so the run takes at
+least five seconds (7.57 seconds in the first local run), while Odin completes
+all tasks and drains its callback routes. This demonstrates that throttling is
+performed before Activity dispatch by Core; the Odin thread pool remains a
+capacity bound, not a second rate limiter. The server-side task-queue rate and
+eager reservations still have exact ABI coverage but need dedicated behavioral
+acceptance before their defaults change.
+
 This adds no protobuf messages and no C symbols. It populates the existing
 `TemporalCoreWorkerOptions` passed to `temporal_core_worker_new`; all polling,
 rate limiting, sticky routing, heartbeat coalescing, cache management, and
