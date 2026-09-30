@@ -92,7 +92,11 @@ if ! temporal operator cluster health \
   --client-connect-timeout 1s \
   --command-timeout 1s \
   --output none >/dev/null 2>&1; then
-  temporal server start-dev --headless --log-level error >"$server_log" 2>&1 &
+  temporal server start-dev \
+    --headless \
+    --log-level error \
+    --dynamic-config-value 'system.enableActivityEagerExecution=true' \
+    >"$server_log" 2>&1 &
   server_pid=$!
 
   for _ in {1..30}; do
@@ -172,6 +176,21 @@ temporal workflow show \
   --command-timeout 10s \
   --output json >"$typed_history_file"
 grep -q '"eagerExecutionAccepted": true' "$typed_history_file"
+
+eager_activity_workflow_id="odin-sdk-eager-activity-$$-$(date +%s)"
+TEMPORAL_EAGER_ACTIVITY_WORKFLOW_ID="$eager_activity_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-eager-activity.sh" >"$workflow_output_file" 2>&1
+eager_activity_output="$(<"$workflow_output_file")"
+grep -q 'Adding 1 activity tasks received from WFT complete' <<<"$eager_activity_output" || {
+  echo "Core requested eager Activity execution, but the Service did not return the task inline." >&2
+  echo "If using an existing dev server, restart it with:" >&2
+  echo "  temporal server start-dev --dynamic-config-value 'system.enableActivityEagerExecution=true'" >&2
+  cat "$workflow_output_file" >&2
+  exit 1
+}
+grep -q "Eager Activity completed workflow_id=$eager_activity_workflow_id" <<<"$eager_activity_output"
+echo "Core received and dispatched one Activity inline with Workflow Task completion"
 
 TEMPORAL_ODIN_SCENARIO=multiple-workflow-arguments \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

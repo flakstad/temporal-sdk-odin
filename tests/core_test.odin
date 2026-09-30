@@ -6990,6 +6990,11 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	identity, identity_error := strings.clone("owned-worker-identity")
 	testing.expect(t, identity_error == nil)
 	options := worker.options_default("advanced-options-worker", "test-namespace")
+	testing.expect_value(
+		t,
+		options.max_eager_activity_reservations_per_workflow_task,
+		u32(3),
+	)
 	options.identity_override = identity
 	options.max_concurrent_activities = 19
 	options.max_cached_workflows = 8
@@ -7005,6 +7010,11 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	testing.expect_value(t, sdk_worker.core_options.max_activity_slots, 19)
 	testing.expect_value(t, sdk_worker.core_options.max_cached_workflows, u32(8))
 	testing.expect_value(t, sdk_worker.core_options.max_worker_activities_per_second, 7.5)
+	testing.expect_value(
+		t,
+		sdk_worker.core_options.max_eager_activity_reservations_per_workflow_task,
+		u32(3),
+	)
 	testing.expect_value(
 		t,
 		sdk_worker.core_options.activity_task_poller_behavior.kind,
@@ -12364,6 +12374,10 @@ workflow_fiber_recreates_stack_after_eviction :: proc(t: ^testing.T) {
 	delete(encoded)
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.scheduled_activity)
+	default_activity := inspect_scheduled_activity(processed.completion[:])
+	defer scheduled_activity_inspection_free(&default_activity)
+	testing.expect(t, default_activity.found)
+	testing.expect(t, !default_activity.disable_eager_execution)
 	testing.expect_value(t, len(runtime.instances), 1)
 	if len(runtime.instances) == 1 {
 		testing.expect_value(

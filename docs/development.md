@@ -1263,10 +1263,20 @@ the ordinary buffered Signal API.
 ## Manual run
 
 ```bash
-temporal server start-dev
+temporal server start-dev \
+  --dynamic-config-value 'system.enableActivityEagerExecution=true'
 ./scripts/run-core-connect.sh
 ./scripts/run-hello-activity.sh
 ```
+
+The dynamic value makes eager Activity delivery reproducible across server
+versions. CLI 1.5.1's bundled Server 1.29.1 declined the eager request without
+it in the first live run; current Temporal Server source defaults the setting to
+true. Either way, Core safely falls back to the normal Activity task queue when
+the Service declines. Run the focused proof with
+`./scripts/run-eager-activity.sh`. Its success line proves the Workflow and
+Activity completed, while the integration suite additionally requires Core's
+`Adding 1 activity tasks received from WFT complete` event.
 
 `./scripts/run-eager-workflow.sh` is self-contained and now also demonstrates
 the Service-to-offline-replay loop. It starts and completes a Workflow, calls

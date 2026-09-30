@@ -5250,7 +5250,6 @@ start_activity_payloads :: proc(
 		{
 			start_to_close_timeout = 20 * time.Second,
 			retry_policy = &retry_policy,
-			disable_eager_execution = true,
 		},
 	)
 }
@@ -5307,7 +5306,6 @@ start_activity_json :: proc(ctx: ^Fiber_Context, activity_type: string, input: $
 		{
 			start_to_close_timeout = 20 * time.Second,
 			retry_policy = &retry_policy,
-			disable_eager_execution = true,
 		},
 	)
 }

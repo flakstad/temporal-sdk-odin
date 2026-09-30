@@ -542,13 +542,31 @@ close event, and decodes the result Payload without Temporal CLI:
 ./scripts/run-client-start.sh
 ```
 
-The self-contained eager example creates a public Client and Worker on the same
+The self-contained eager Workflow example creates a public Client and Worker on the same
 Core connection, proves inline first-task dispatch, fetches the resulting full
 history, and replays it through an offline Core worker:
 
 ```bash
 ./scripts/run-eager-workflow.sh
 ```
+
+Eager Activity dispatch is covered separately because merely completing an
+Activity cannot distinguish inline delivery from an ordinary poll. Start the
+CLI dev server with the self-hosted feature enabled, then run the focused
+same-process proof:
+
+```bash
+temporal server start-dev \
+  --dynamic-config-value 'system.enableActivityEagerExecution=true'
+./scripts/run-eager-activity.sh
+```
+
+The example leaves Core's logging enabled so the integration suite can require
+`Adding 1 activity tasks received from WFT complete`. The explicit server flag
+keeps this reproducible across releases: CLI 1.5.1's bundled Server 1.29.1
+declined the request without it, while current Temporal Server source defaults
+the setting to true. If the Service declines, execution still succeeds through
+normal polling.
 
 The underlying replay boundary is explicit. The Client returns the exact binary
 History protobuf; the replayer borrows it for the call and returns an owned
@@ -1728,6 +1746,7 @@ examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/eager_workflow/  same-connection eager Workflow start proof
+examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker

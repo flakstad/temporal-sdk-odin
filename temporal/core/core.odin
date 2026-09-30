@@ -195,9 +195,9 @@ worker_options_default :: proc() -> Worker_Options {
 		default_heartbeat_throttle_interval = time.Second,
 		graceful_shutdown_period = DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
 		nonsticky_to_sticky_poll_ratio = 0.2,
-		// Keep eager dispatch opt-in until the Odin Activity/Workflow executor
-		// has a dedicated eager-execution integration test.
-		max_eager_activity_reservations_per_workflow_task = 0,
+		// Match Core's language-SDK default. Core still clears the request when
+		// no Activity slot is available, and the Service may decline it.
+		max_eager_activity_reservations_per_workflow_task = 3,
 	}
 }
 

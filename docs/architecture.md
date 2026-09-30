@@ -2344,8 +2344,10 @@ sub-millisecond fractions upward because the ABI stores `u64` milliseconds.
 The sticky poll ratio is restricted to `[0, 1]`. A cached Worker receives two
 fixed Workflow slots instead of the uncached default of one, and an explicit
 simple Workflow poller below two is rejected, matching Core's cache/poller
-constraint. Eager reservations stay zero by default until a dedicated mixed
-Workflow/Activity eager execution test makes enabling them a safe default.
+constraint. Eager Activity reservations now match Core's language-SDK default
+of three per Workflow Task. The ordinary `workflow.execute_activity` and
+`workflow.start_activity` helpers allow eager execution; explicit options can
+still set `disable_eager_execution=true` per command.
 
 The cache path is now verified against the CLI dev server rather than only the
 C layout. A condition Workflow with `max_cached_workflows=10`, a ten-second
@@ -2362,9 +2364,29 @@ Activities are offered to a Worker with three execution slots and
 least five seconds (7.57 seconds in the first local run), while Odin completes
 all tasks and drains its callback routes. This demonstrates that throttling is
 performed before Activity dispatch by Core; the Odin thread pool remains a
-capacity bound, not a second rate limiter. The server-side task-queue rate and
-eager reservations still have exact ABI coverage but need dedicated behavioral
-acceptance before their defaults change.
+capacity bound, not a second rate limiter. The server-side task-queue rate still
+has exact ABI coverage but needs dedicated behavioral acceptance.
+
+Eager Activity dispatch has a dedicated same-process acceptance path. The test
+uses one Core Client/Worker, ten fixed Activity slots, one Activity poller, and
+one permitted eager reservation. Core's debug event confirms that the Service
+returned an Activity task directly in `RespondWorkflowTaskCompletedResponse`
+and that Core inserted it into the Activity task stream; successful Activity
+completion alone is not accepted as proof because an ordinary poll produces the
+same language-level task. The CLI 1.5.1 dev server bundled with Server 1.29.1
+declined eager Activity execution in the first live run unless
+`system.enableActivityEagerExecution=true` was supplied. Current Temporal Server
+`main` defines that setting with a `true` default, so this is a version/dev-server
+difference rather than a general self-hosted default. The integration harness
+sets it explicitly to remain reproducible. With the flag absent in the tested
+version, Core correctly reserved a slot and requested eager execution, then
+logged that the Service returned one fewer task and released the reservation
+before normal polling handled it. This fallback is transparent to Odin code.
+
+Upstream references: [Worker performance and eager task
+behavior](https://docs.temporal.io/develop/worker-performance) and the current
+[`EnableActivityEagerExecution` server
+default](https://github.com/temporalio/temporal/blob/main/common/dynamicconfig/constants.go).
 
 This adds no protobuf messages and no C symbols. It populates the existing
 `TemporalCoreWorkerOptions` passed to `temporal_core_worker_new`; all polling,
