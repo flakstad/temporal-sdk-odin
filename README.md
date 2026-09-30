@@ -231,6 +231,10 @@ options.sticky_queue_schedule_to_start_timeout = 10 * time.Second
 options.max_worker_activities_per_second = 50
 options.workflow_task_poller_behavior = worker.poller_simple_maximum(5)
 options.activity_task_poller_behavior = worker.poller_autoscaling(1, 20, 5)
+options.resource_based_activity_tuner = worker.resource_based_activity_tuner(
+	0.8, // target memory utilization
+	0.9, // target CPU utilization
+)
 
 sdk_worker, err := worker.create_with_options(&core_client, options)
 ```
@@ -238,9 +242,15 @@ sdk_worker, err := worker.create_with_options(&core_client, options)
 Zero rate limits mean unset. Default poller behavior leaves both C pointers
 null so SDK Core can use its default and accept server-directed poller
 autoscaling. Durations are rounded upward to whole milliseconds at the C ABI;
-invalid rates, poller ranges, cache/poller combinations, and negative durations
-are rejected before `worker_new`. The identity and all other referenced strings
-are owned by the Odin Worker until `worker.close`.
+invalid rates, poller ranges, cache/poller combinations, resource targets/slot
+ranges, and negative durations are rejected before `worker_new`. A
+resource-based tuner supersedes `max_concurrent_activities` for Activity
+capacity and uses conservative default maxima of ten remote and ten local
+Activities; use `resource_based_activity_tuner_with_options` to set exact
+minimum, maximum, and ramp-throttle values. Workflow and Nexus suppliers remain
+fixed because their Odin executors do not yet implement corresponding
+concurrency. The identity and all other referenced strings are owned by the
+Odin Worker until `worker.close`.
 
 The dev-server suite proves both cache modes: cache-disabled execution rebuilds
 the Workflow from history, while a cached sticky execution resumes the same

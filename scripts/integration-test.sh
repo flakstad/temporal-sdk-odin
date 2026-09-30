@@ -735,6 +735,10 @@ run_activity_case() {
       ACTIVITY_ASYNC_MODE="${mode#async-}" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  elif [[ "$mode" == "resource-tuner" ]]; then
+    ACTIVITY_RESOURCE_TUNER=1 \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   else
     TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
@@ -825,6 +829,8 @@ run_activity_case() {
         | length == 1
       ' "$typed_history_file" >/dev/null
     fi
+  elif [[ "$mode" == "resource-tuner" ]]; then
+    grep -q "resource-based Activity tuner completed one task and shut down cleanly" "$worker_log"
   else
     grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
   fi
@@ -834,6 +840,7 @@ run_activity_case string
 run_activity_case failure
 run_activity_case typed
 run_activity_case retry
+run_activity_case resource-tuner
 run_activity_case async-token-complete
 run_activity_case async-id-complete
 run_activity_case async-token-failure

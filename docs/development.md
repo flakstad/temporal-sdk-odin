@@ -336,11 +336,33 @@ call. Null pointers select Core's default poller policy. Durations are converted
 to milliseconds with positive fractions rounded upward, zero rates map to
 Core's `None`, and nonzero rates must be finite and positive. Enabling Workflow
 caching raises the fixed Workflow slot supplier from one to two; an explicitly
-configured simple Workflow poller must likewise be at least two. Unit tests
-assert every populated C field and pointer arm. A 500-case property test varies
-cache state, slots, both poller forms, duration rounding, rates, and sticky poll
-ratio. It runs against both the pinned PBT submodule and, during local library
-development, `PBT_ROOT=~/Projects/pbt`.
+configured simple Workflow poller must likewise be at least two.
+
+Activity capacity may instead use Core's resource-based supplier:
+
+```odin
+options.resource_based_activity_tuner = worker.resource_based_activity_tuner(
+    0.8, // target memory utilization
+    0.9, // target CPU utilization
+)
+```
+
+The convenience constructor uses one-to-ten slots and a 50 ms ramp throttle
+for both remote and local Activities. The `_with_options` form exposes their
+independent slot ranges. Both suppliers must carry identical CPU/memory targets
+because the C bridge creates one shared resource controller and rejects mixed
+resource options. The Odin callback pool is sized from the enabled suppliers'
+maximums so Core never grants work without matching executor capacity. Workflow
+and Nexus remain fixed-size, and custom suppliers are not exposed yet. Prefer
+fixed slots for ordinary Workers; Temporal recommends resource-based tuning
+when resource protection or workload-specific scaling warrants it. Pairing it
+with `worker.poller_autoscaling` avoids excessive pollers at low utilization.
+
+Unit tests assert every populated C field and pointer/union arm. A 500-case
+property test varies cache state, fixed/resource slots, shared targets, both
+poller forms, duration rounding, rates, and sticky poll ratio. It runs against
+both the pinned PBT submodule and, during local library development,
+`PBT_ROOT=~/Projects/pbt`.
 
 The integration matrix exercises two complementary Workflow configurations.
 The ordinary condition scenario leaves caching disabled and requires a
@@ -357,6 +379,11 @@ itself asserts a run time between five and thirty seconds and complete callback
 and task drainage. Keep the lower bound generous: Core permits the initial
 request and the test measures Worker startup as well as polling. A run that
 forgets to populate the C rate field completes in well under that bound.
+
+`ACTIVITY_RESOURCE_TUNER=1` configures the same Worker with resource-based
+remote/Local Activity suppliers and autoscaling Activity pollers. The
+integration harness completes a real task through the CLI dev server, proving
+that Core accepts the tuner and that Odin's executor returns its completion.
 
 ### Runtime observability
 

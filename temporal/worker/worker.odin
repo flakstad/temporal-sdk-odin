@@ -195,9 +195,13 @@ Worker_Versioning_Options :: temporal_core.Worker_Versioning_Options
 Nondeterminism_Policy :: temporal_core.Nondeterminism_Policy
 Poller_Behavior_Kind :: temporal_core.Poller_Behavior_Kind
 Poller_Behavior :: temporal_core.Poller_Behavior
+Resource_Based_Slot_Options :: temporal_core.Resource_Based_Slot_Options
+Resource_Based_Activity_Tuner_Options :: temporal_core.Resource_Based_Activity_Tuner_Options
 
 poller_simple_maximum :: temporal_core.poller_simple_maximum
 poller_autoscaling :: temporal_core.poller_autoscaling
+resource_based_activity_tuner :: temporal_core.resource_based_activity_tuner
+resource_based_activity_tuner_with_options :: temporal_core.resource_based_activity_tuner_with_options
 
 Options :: struct {
 	task_queue:                                      string,
@@ -215,6 +219,7 @@ Options :: struct {
 	activity_task_poller_behavior:                    Poller_Behavior,
 	nonsticky_to_sticky_poll_ratio:                   f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
+	resource_based_activity_tuner:                    Resource_Based_Activity_Tuner_Options,
 	versioning:                                      Worker_Versioning_Options,
 	nondeterminism_policy:                           Nondeterminism_Policy,
 	workflow_stacks:                                 workflow.Stack_Options,
@@ -241,6 +246,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		nonsticky_to_sticky_poll_ratio = core_options.nonsticky_to_sticky_poll_ratio,
 		max_eager_activity_reservations_per_workflow_task =
 			core_options.max_eager_activity_reservations_per_workflow_task,
+		resource_based_activity_tuner = core_options.resource_based_activity_tuner,
 	}
 }
 
@@ -258,6 +264,7 @@ Worker :: struct {
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
+	max_concurrent_local_activities: int,
 	graceful_shutdown_period: time.Duration,
 	core_options:          temporal_core.Worker_Options,
 	versioning:             Worker_Versioning_Options,
@@ -421,6 +428,7 @@ create_with_options :: proc(
 		nonsticky_to_sticky_poll_ratio = options.nonsticky_to_sticky_poll_ratio,
 		max_eager_activity_reservations_per_workflow_task =
 			options.max_eager_activity_reservations_per_workflow_task,
+		resource_based_activity_tuner = options.resource_based_activity_tuner,
 	}
 	core_options_error := temporal_core.worker_options_validate(core_options)
 	if core_options_error.message != nil {
@@ -488,6 +496,13 @@ create_with_options :: proc(
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = options.max_concurrent_activities
+	worker.max_concurrent_local_activities = 1
+	if options.resource_based_activity_tuner.enabled {
+		worker.max_concurrent_activities =
+			options.resource_based_activity_tuner.activity_slots.maximum_slots
+		worker.max_concurrent_local_activities =
+			options.resource_based_activity_tuner.local_activity_slots.maximum_slots
+	}
 	worker.graceful_shutdown_period = options.graceful_shutdown_period
 	worker.core_options = core_options
 	worker.core_options.identity_override = owned_identity
@@ -540,6 +555,7 @@ create_replayer :: proc(
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = 1
+	worker.max_concurrent_local_activities = 1
 	worker.workflow_stacks = resolved_stacks
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
@@ -1877,10 +1893,11 @@ reap_activity_executions :: proc(
 run_activity_loop :: proc(
 	worker: ^Worker,
 	max_tasks: int,
+	executor_threads: int,
 ) -> (completed: int, cancellations: int, peak_in_flight: int, error: Error) {
 	routes := make(
 		Activity_Execution_Routes,
-		worker.max_concurrent_activities,
+		executor_threads,
 		allocator_runtime.heap_allocator(),
 	)
 	defer delete(routes)
@@ -1888,7 +1905,7 @@ run_activity_loop :: proc(
 	thread.pool_init(
 		&pool,
 		allocator_runtime.heap_allocator(),
-		worker.max_concurrent_activities,
+		executor_threads,
 	)
 	thread.pool_start(&pool)
 	pool_finished := false
@@ -2350,6 +2367,7 @@ replay_history :: proc(
 Activity_Thread_State :: struct {
 	worker:    ^Worker,
 	max_tasks: int,
+	executor_threads: int,
 	completed: int,
 	cancellations: int,
 	peak_in_flight: int,
@@ -2367,7 +2385,7 @@ activity_thread_main :: proc(state: ^Activity_Thread_State) {
 	state.completed,
 	state.cancellations,
 	state.peak_in_flight,
-	state.error = run_activity_loop(state.worker, state.max_tasks)
+	state.error = run_activity_loop(state.worker, state.max_tasks, state.executor_threads)
 	if state.error.message != nil {
 		temporal_core.worker_initiate_shutdown(&state.worker.core)
 	}
@@ -2401,6 +2419,13 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	poll_local_activities := len(worker.activity_registrations) > 0 && poll_workflows &&
 		!options.disable_activity_polling && options.enable_local_activities
 	poll_activities := poll_remote_activities || poll_local_activities
+	activity_executor_threads := 0
+	if poll_remote_activities {
+		activity_executor_threads += worker.max_concurrent_activities
+	}
+	if poll_local_activities {
+		activity_executor_threads += worker.max_concurrent_local_activities
+	}
 	if !poll_activities && !poll_workflows {
 		return {}, error_from_string("worker has no enabled registered task types")
 	}
@@ -2441,7 +2466,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		stats.activity_tasks_completed,
 		stats.activity_cancellations_received,
 		stats.activity_executions_peak_owned,
-		error = run_activity_loop(worker, options.max_activity_tasks)
+		error = run_activity_loop(worker, options.max_activity_tasks, activity_executor_threads)
 		return
 	}
 	if poll_workflows && !poll_activities {
@@ -2451,6 +2476,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	activity_state := Activity_Thread_State{
 		worker = worker,
 		max_tasks = options.max_activity_tasks,
+		executor_threads = activity_executor_threads,
 	}
 	workflow_state := Workflow_Thread_State{worker = worker, options = options}
 	workflow_thread := thread.create_and_start_with_poly_data(&workflow_state, workflow_thread_main)
@@ -2549,6 +2575,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.task_queue = ""
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
+	worker.max_concurrent_local_activities = 0
 	worker.graceful_shutdown_period = 0
 	worker.core_options = {}
 	worker.versioning = {}

@@ -155,6 +155,61 @@ Poller_Behavior :: struct {
 	initial:        int,
 }
 
+Resource_Based_Slot_Options :: struct {
+	minimum_slots: int,
+	maximum_slots: int,
+	ramp_throttle: time.Duration,
+}
+
+// Resource_Based_Activity_Tuner_Options controls the Activity and Local
+// Activity suppliers that share one Core resource controller. Workflow and
+// Nexus suppliers remain fixed until those Odin executors support the matching
+// concurrency models. Zero-value options keep the fixed-size worker defaults.
+Resource_Based_Activity_Tuner_Options :: struct {
+	enabled:              bool,
+	target_memory_usage:  f64,
+	target_cpu_usage:     f64,
+	activity_slots:       Resource_Based_Slot_Options,
+	local_activity_slots: Resource_Based_Slot_Options,
+}
+
+resource_based_activity_tuner_with_options :: proc(
+	target_memory_usage: f64,
+	target_cpu_usage: f64,
+	activity_slots: Resource_Based_Slot_Options,
+	local_activity_slots: Resource_Based_Slot_Options,
+) -> Resource_Based_Activity_Tuner_Options {
+	return {
+		enabled = true,
+		target_memory_usage = target_memory_usage,
+		target_cpu_usage = target_cpu_usage,
+		activity_slots = activity_slots,
+		local_activity_slots = local_activity_slots,
+	}
+}
+
+resource_based_activity_tuner :: proc(
+	target_memory_usage: f64,
+	target_cpu_usage: f64,
+	maximum_activity_slots := 10,
+	maximum_local_activity_slots := 10,
+) -> Resource_Based_Activity_Tuner_Options {
+	return resource_based_activity_tuner_with_options(
+		target_memory_usage,
+		target_cpu_usage,
+		{
+			minimum_slots = 1,
+			maximum_slots = maximum_activity_slots,
+			ramp_throttle = 50 * time.Millisecond,
+		},
+		{
+			minimum_slots = 1,
+			maximum_slots = maximum_local_activity_slots,
+			ramp_throttle = 50 * time.Millisecond,
+		},
+	)
+}
+
 poller_simple_maximum :: proc(maximum: int) -> Poller_Behavior {
 	return {kind = .Simple_Maximum, simple_maximum = maximum}
 }
@@ -184,6 +239,7 @@ Worker_Options :: struct {
 	activity_task_poller_behavior:                   Poller_Behavior,
 	nonsticky_to_sticky_poll_ratio:                  f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
+	resource_based_activity_tuner:                   Resource_Based_Activity_Tuner_Options,
 }
 
 worker_options_default :: proc() -> Worker_Options {
@@ -774,8 +830,57 @@ poller_behavior_validate :: proc(value: Poller_Behavior, name: string) -> Error 
 	return {}
 }
 
+resource_based_slot_options_validate :: proc(
+	options: Resource_Based_Slot_Options,
+	name: string,
+) -> Error {
+	if options.minimum_slots < 1 {
+		return client_option_error(fmt.tprintf("%s minimum slots must be at least one", name))
+	}
+	if options.maximum_slots < options.minimum_slots {
+		return client_option_error(fmt.tprintf("%s maximum slots must not be below minimum", name))
+	}
+	_, duration_error := worker_duration_millis(
+		options.ramp_throttle,
+		fmt.tprintf("%s ramp throttle", name),
+	)
+	return duration_error
+}
+
+resource_based_activity_tuner_validate :: proc(
+	options: Resource_Based_Activity_Tuner_Options,
+) -> Error {
+	if !options.enabled {
+		return {}
+	}
+	if math.is_nan(options.target_memory_usage) ||
+	   math.is_inf(options.target_memory_usage) ||
+	   options.target_memory_usage <= 0 || options.target_memory_usage > 1 {
+		return client_option_error(
+			"resource-based target memory usage must be finite and between zero (exclusive) and one",
+		)
+	}
+	if math.is_nan(options.target_cpu_usage) || math.is_inf(options.target_cpu_usage) ||
+	   options.target_cpu_usage <= 0 || options.target_cpu_usage > 1 {
+		return client_option_error(
+			"resource-based target CPU usage must be finite and between zero (exclusive) and one",
+		)
+	}
+	activity_error := resource_based_slot_options_validate(
+		options.activity_slots,
+		"resource-based Activity supplier",
+	)
+	if activity_error.message != nil {
+		return activity_error
+	}
+	return resource_based_slot_options_validate(
+		options.local_activity_slots,
+		"resource-based Local Activity supplier",
+	)
+}
+
 worker_options_validate :: proc(options: Worker_Options) -> Error {
-	if options.max_activity_slots <= 0 {
+	if !options.resource_based_activity_tuner.enabled && options.max_activity_slots <= 0 {
 		return client_option_error("max activity slots must be positive")
 	}
 	_, sticky_error := worker_duration_millis(
@@ -837,7 +942,29 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	   options.workflow_task_poller_behavior.simple_maximum < 2 {
 		return client_option_error("Workflow task simple poller must be at least two when Workflow caching is enabled")
 	}
-	return {}
+	return resource_based_activity_tuner_validate(options.resource_based_activity_tuner)
+}
+
+resource_based_slot_supplier :: proc(
+	options: Resource_Based_Slot_Options,
+	tuner_options: raw.Resource_Based_Tuner_Options,
+) -> (raw.Slot_Supplier, Error) {
+	ramp_throttle_ms, duration_error := worker_duration_millis(
+		options.ramp_throttle,
+		"resource-based slot supplier ramp throttle",
+	)
+	if duration_error.message != nil {
+		return {}, duration_error
+	}
+	return raw.Slot_Supplier{
+		tag = .Resource_Based,
+		resource_based = raw.Resource_Based_Slot_Supplier{
+			minimum_slots = uintptr(options.minimum_slots),
+			maximum_slots = uintptr(options.maximum_slots),
+			ramp_throttle_ms = ramp_throttle_ms,
+			tuner_options = tuner_options,
+		},
+	}, {}
 }
 
 poller_behavior_bind :: proc(
@@ -900,11 +1027,33 @@ worker_option_bindings_init :: proc(
 		// cannot starve the Workflow poll stream.
 		workflow_slots = 2
 	}
+	fixed_activity_slots := max(options.max_activity_slots, 1)
 	bindings.raw_options.tuner = raw.Tuner_Holder{
 		workflow_slot_supplier       = fixed_slot_supplier(workflow_slots),
-		activity_slot_supplier       = fixed_slot_supplier(uintptr(options.max_activity_slots)),
+		activity_slot_supplier       = fixed_slot_supplier(uintptr(fixed_activity_slots)),
 		local_activity_slot_supplier = fixed_slot_supplier(1),
 		nexus_task_slot_supplier     = fixed_slot_supplier(1),
+	}
+	if options.resource_based_activity_tuner.enabled {
+		tuner := options.resource_based_activity_tuner
+		raw_tuner_options := raw.Resource_Based_Tuner_Options{
+			target_memory_usage = tuner.target_memory_usage,
+			target_cpu_usage = tuner.target_cpu_usage,
+		}
+		activity_supplier, activity_supplier_error := resource_based_slot_supplier(
+			tuner.activity_slots,
+			raw_tuner_options,
+		)
+		if activity_supplier_error.message != nil {
+			return activity_supplier_error
+		}
+		local_activity_supplier, local_activity_supplier_error :=
+			resource_based_slot_supplier(tuner.local_activity_slots, raw_tuner_options)
+		if local_activity_supplier_error.message != nil {
+			return local_activity_supplier_error
+		}
+		bindings.raw_options.tuner.activity_slot_supplier = activity_supplier
+		bindings.raw_options.tuner.local_activity_slot_supplier = local_activity_supplier
 	}
 	bindings.raw_options.sticky_queue_schedule_to_start_timeout_ms = sticky_ms
 	bindings.raw_options.max_heartbeat_throttle_interval_ms = max_heartbeat_ms

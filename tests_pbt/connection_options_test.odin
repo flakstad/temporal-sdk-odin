@@ -191,6 +191,17 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	workflow_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	activity_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	slots := pbt.draw(t, pbt.int_range(1, 64))
+	resource_tuned := pbt.draw(t, pbt.boolean())
+	activity_minimum := pbt.draw(t, pbt.int_range(1, 8))
+	activity_maximum := pbt.draw(t, pbt.int_range(activity_minimum, 64))
+	local_minimum := pbt.draw(t, pbt.int_range(1, 8))
+	local_maximum := pbt.draw(t, pbt.int_range(local_minimum, 64))
+	activity_ramp_millis := pbt.draw(t, pbt.int_range(0, 1_000))
+	activity_ramp_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
+	local_ramp_millis := pbt.draw(t, pbt.int_range(0, 1_000))
+	local_ramp_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
+	target_memory_hundredths := pbt.draw(t, pbt.int_range(1, 100))
+	target_cpu_hundredths := pbt.draw(t, pbt.int_range(1, 100))
 	sticky_millis := pbt.draw(t, pbt.int_range(0, 60_000))
 	sticky_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
 	worker_rate_unset := pbt.draw(t, pbt.boolean())
@@ -207,6 +218,7 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, activity_poller_mode == 2, 20.0, "autoscaling Activity poller")
 	pbt.cover(t, sticky_fraction > 0, 40.0, "fractional duration rounds upward")
 	pbt.cover(t, worker_rate_unset, 30.0, "unset worker rate")
+	pbt.cover(t, resource_tuned, 30.0, "resource-based Activity suppliers")
 
 	options := temporal_core.worker_options_default()
 	options.identity_override = "generated-worker"
@@ -230,6 +242,25 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 		activity_poller_mode,
 		false,
 	)
+	if resource_tuned {
+		options.resource_based_activity_tuner =
+			temporal_core.resource_based_activity_tuner_with_options(
+				f64(target_memory_hundredths) / 100,
+				f64(target_cpu_hundredths) / 100,
+				{
+					minimum_slots = activity_minimum,
+					maximum_slots = activity_maximum,
+					ramp_throttle = time.Duration(activity_ramp_millis) * time.Millisecond +
+						time.Duration(activity_ramp_fraction) * time.Nanosecond,
+				},
+				{
+					minimum_slots = local_minimum,
+					maximum_slots = local_maximum,
+					ramp_throttle = time.Duration(local_ramp_millis) * time.Millisecond +
+						time.Duration(local_ramp_fraction) * time.Nanosecond,
+				},
+			)
+	}
 
 	bindings := temporal_core.Worker_Option_Bindings{}
 	bindings_error := temporal_core.worker_option_bindings_init(&bindings, options)
@@ -238,8 +269,39 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 		return pbt.fail("valid generated Worker options were rejected")
 	}
 	raw_options := &bindings.raw_options
-	if raw_options.tuner.activity_slot_supplier.fixed_size.num_slots != uintptr(slots) {
-		return pbt.fail("generated Activity slot count changed during binding")
+	if resource_tuned {
+		activity_supplier := &raw_options.tuner.activity_slot_supplier
+		local_supplier := &raw_options.tuner.local_activity_slot_supplier
+		if activity_supplier.tag != .Resource_Based || local_supplier.tag != .Resource_Based {
+			return pbt.fail("resource-based generated suppliers used the wrong C union arm")
+		}
+		expected_activity_ramp := u64(activity_ramp_millis)
+		if activity_ramp_fraction > 0 {
+			expected_activity_ramp += 1
+		}
+		expected_local_ramp := u64(local_ramp_millis)
+		if local_ramp_fraction > 0 {
+			expected_local_ramp += 1
+		}
+		if activity_supplier.resource_based.minimum_slots != uintptr(activity_minimum) ||
+		   activity_supplier.resource_based.maximum_slots != uintptr(activity_maximum) ||
+		   activity_supplier.resource_based.ramp_throttle_ms != expected_activity_ramp ||
+		   local_supplier.resource_based.minimum_slots != uintptr(local_minimum) ||
+		   local_supplier.resource_based.maximum_slots != uintptr(local_maximum) ||
+		   local_supplier.resource_based.ramp_throttle_ms != expected_local_ramp {
+			return pbt.fail("resource-based generated slot configuration changed during binding")
+		}
+		target_memory := f64(target_memory_hundredths) / 100
+		target_cpu := f64(target_cpu_hundredths) / 100
+		if activity_supplier.resource_based.tuner_options.target_memory_usage != target_memory ||
+		   activity_supplier.resource_based.tuner_options.target_cpu_usage != target_cpu ||
+		   local_supplier.resource_based.tuner_options.target_memory_usage != target_memory ||
+		   local_supplier.resource_based.tuner_options.target_cpu_usage != target_cpu {
+			return pbt.fail("resource-based generated targets changed during binding")
+		}
+	} else if raw_options.tuner.activity_slot_supplier.tag != .Fixed_Size ||
+	          raw_options.tuner.activity_slot_supplier.fixed_size.num_slots != uintptr(slots) {
+		return pbt.fail("generated fixed Activity slot count changed during binding")
 	}
 	expected_workflow_slots := uintptr(1)
 	if cache_enabled {

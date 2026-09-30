@@ -311,6 +311,8 @@ main :: proc() {
 	load_case = load_case || rate_limit_case
 	shutdown_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_SHUTDOWN")
 	shutdown_case := shutdown_value != ""
+	resource_tuner_value := os.get_env(env_buffer[:], "ACTIVITY_RESOURCE_TUNER")
+	resource_tuner_case := resource_tuner_value != ""
 	activity_slots := load_case ? 3 : 10
 	graceful_shutdown_period := shutdown_case ? 200 * time.Millisecond : temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD
 	worker_options := worker.options_default("odin-hello-activity")
@@ -318,6 +320,16 @@ main :: proc() {
 	worker_options.max_concurrent_activities = activity_slots
 	worker_options.graceful_shutdown_period = graceful_shutdown_period
 	worker_options.activity_task_poller_behavior = worker.poller_simple_maximum(2)
+	if resource_tuner_case {
+		worker_options.resource_based_activity_tuner =
+			worker.resource_based_activity_tuner_with_options(
+				0.8,
+				0.8,
+				{minimum_slots = 1, maximum_slots = 3, ramp_throttle = time.Millisecond},
+				{minimum_slots = 1, maximum_slots = 2, ramp_throttle = time.Millisecond},
+			)
+		worker_options.activity_task_poller_behavior = worker.poller_autoscaling(1, 2, 1)
+	}
 	if rate_limit_case {
 		worker_options.max_worker_activities_per_second = 4
 	}
@@ -607,6 +619,8 @@ main :: proc() {
 		fmt.println("retryable Activity failed once, then completed and worker shut down cleanly")
 	} else if async_case {
 		fmt.printf("Activity deferred completion and Odin Client applied mode=%s\n", async_mode)
+	} else if resource_tuner_case {
+		fmt.println("resource-based Activity tuner completed one task and shut down cleanly")
 	} else {
 		fmt.println("one Activity Task completed and worker shut down cleanly")
 	}

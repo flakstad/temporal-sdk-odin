@@ -2209,7 +2209,8 @@ poll thread accesses its fiber runtimes and run-ID table. This preserves
 single-threaded fiber affinity while allowing a Workflow-produced Activity to
 execute without stopping Workflow polling. Activity start tasks own
 heap-stable execution/context state until their callback thread joins. Core's
-fixed slot supplier bounds concurrency; the single poll thread continues to
+fixed or resource-based Activity slot supplier bounds concurrency; the single
+poll thread continues to
 receive prioritized cancel tasks and atomically marks the matching context.
 The live backpressure case submits 24 Activities to a three-slot Worker. The
 first three callbacks form a barrier, proving that all slots are used; the
@@ -2312,13 +2313,15 @@ hold shutdown open, which is intentional and must remain explicit in the API.
 
 `worker.create_with_options` now exposes the subset of the pinned Core worker
 builder that the Odin executor can honor without introducing another runtime:
-worker identity override, fixed Activity capacity, Workflow cache size and
-sticky timeout, heartbeat throttling, worker-local and task-queue Activity rate
-limits, graceful shutdown, Workflow/Activity poller behavior, sticky/nonsticky
-poll ratio, and eager Activity reservation count. The original `worker.create`
-is a compatibility convenience that fills the same `worker.Options` defaults.
-Nexus polling, resource/custom slot suppliers, plugins, storage drivers, and the
-experimental payload-error limit remain deliberately unexposed.
+worker identity override, fixed or resource-based Activity capacity, Workflow
+cache size and sticky timeout, heartbeat throttling, worker-local and task-queue
+Activity rate limits, graceful shutdown, Workflow/Activity poller behavior,
+sticky/nonsticky poll ratio, and eager Activity reservation count. The original
+`worker.create` is a compatibility convenience that fills the same
+`worker.Options` defaults.
+Resource-based Workflow/Nexus suppliers, custom slot suppliers, Nexus polling,
+plugins, storage drivers, and the experimental payload-error limit remain
+deliberately unexposed.
 
 The public `Poller_Behavior` is an owned tagged Odin value. Immediately before
 `temporal_core_worker_new`, `Worker_Option_Bindings` translates it to the C
@@ -2336,6 +2339,20 @@ types. The language Worker therefore clones the identity at
 identity, and nondeterminism type names, and deletes it in `worker.close`. The C
 bridge converts its borrowed `ByteArrayRef` to an owned Rust `String` during
 `worker_new`.
+
+The C bridge accepts four independent supplier union values but constructs one
+shared resource controller; consequently every resource-based arm must repeat
+the same CPU and memory targets. Odin exposes this invariant as one
+`Resource_Based_Activity_Tuner_Options` containing independent remote and Local
+Activity slot ranges. Targets must be finite in `(0, 1]`, slot minima must be
+positive, maxima cannot be below minima, and ramp durations are non-negative.
+The convenience constructor deliberately defaults both maxima to ten because
+the current Odin executor uses one OS thread per possible callback. When the
+tuner is enabled it supersedes `max_concurrent_activities`; `worker.run` sums
+the maximums of only the enabled remote/Local suppliers to size the shared
+callback pool. Workflow activation execution remains serial and Nexus is not
+implemented, so those suppliers stay fixed rather than advertising concurrency
+the language runtime cannot honor.
 
 The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
 rejects negative, NaN, and infinite values; positive values cross unchanged.
@@ -2384,7 +2401,9 @@ logged that the Service returned one fewer task and released the reservation
 before normal polling handled it. This fallback is transparent to Odin code.
 
 Upstream references: [Worker performance and eager task
-behavior](https://docs.temporal.io/develop/worker-performance) and the current
+behavior](https://docs.temporal.io/develop/worker-performance), [runtime and
+resource tuning](https://docs.temporal.io/develop/worker-performance/runtime-tuning),
+and the current
 [`EnableActivityEagerExecution` server
 default](https://github.com/temporalio/temporal/blob/main/common/dynamicconfig/constants.go).
 
@@ -2394,7 +2413,9 @@ rate limiting, sticky routing, heartbeat coalescing, cache management, and
 server negotiation remain Core responsibilities. Odin still owns callback
 capacity, registration, dispatch, Workflow fibers, and completion production.
 The ABI mapping has exact unit coverage plus a 500-case generated property over
-cache, slots, durations, rates, and both poller union arms.
+cache, fixed/resource slots, shared resource targets, durations, rates, and both
+poller union arms. A live CLI-dev-server case also creates the resource
+controller, polls one Activity through it, and returns the completion.
 
 This creates an explicit ownership boundary. The Odin worker owns cloned
 namespace/task-queue strings, registrations, Workflow runtimes, and eventually
@@ -2455,10 +2476,11 @@ Workflows are enabled.
    wire-compatible with `prost`. Unknown fields are skipped rather than
    retained. Every new root graph still needs generation, compile, unit, and
    live `prost` interoperability checks.
-3. **Worker concurrency.** The fixed-slot Activity executor, heap-stable
+3. **Worker concurrency.** The bounded Activity executor, heap-stable
    hash-indexed task-token routes, cooperative cancellation, and heartbeat
    transport pass live tests. It reuses a standard-library thread pool sized to
-   the same limit as Core's Activity slot supplier. Structured
+   the combined maxima of Core's enabled remote and Local Activity suppliers.
+   Structured
    retryable/non-retryable failures pass generated and live retry tests. A
    500-case route property exercises 1–64 opaque binary tokens, embedded zero
    bytes, duplicate rejection, and forward/reverse drain order. A live 24-task

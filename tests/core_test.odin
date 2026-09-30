@@ -6941,6 +6941,73 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 }
 
 @(test)
+resource_based_activity_tuner_binds_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
+	options := temporal_core.worker_options_default()
+	// The resource supplier supersedes the otherwise-required fixed capacity.
+	options.max_activity_slots = 0
+	options.max_cached_workflows = 8
+	options.resource_based_activity_tuner =
+		temporal_core.resource_based_activity_tuner_with_options(
+			0.72,
+			0.83,
+			{
+				minimum_slots = 2,
+				maximum_slots = 17,
+				ramp_throttle = 1250 * time.Millisecond + time.Nanosecond,
+			},
+			{
+				minimum_slots = 1,
+				maximum_slots = 9,
+				ramp_throttle = 25 * time.Millisecond + time.Nanosecond,
+			},
+		)
+
+	bindings := temporal_core.Worker_Option_Bindings{}
+	bindings_error := temporal_core.worker_option_bindings_init(&bindings, options)
+	testing.expectf(t, bindings_error.message == nil, "binding failed: %s", string(bindings_error.message))
+	temporal_core.error_free(&bindings_error)
+	tuner := &bindings.raw_options.tuner
+	testing.expect_value(t, tuner.workflow_slot_supplier.tag, raw.Slot_Supplier_Tag.Fixed_Size)
+	testing.expect_value(t, tuner.workflow_slot_supplier.fixed_size.num_slots, uintptr(2))
+	testing.expect_value(t, tuner.activity_slot_supplier.tag, raw.Slot_Supplier_Tag.Resource_Based)
+	testing.expect_value(t, tuner.activity_slot_supplier.resource_based.minimum_slots, uintptr(2))
+	testing.expect_value(t, tuner.activity_slot_supplier.resource_based.maximum_slots, uintptr(17))
+	testing.expect_value(t, tuner.activity_slot_supplier.resource_based.ramp_throttle_ms, u64(1251))
+	testing.expect_value(
+		t,
+		tuner.activity_slot_supplier.resource_based.tuner_options.target_memory_usage,
+		0.72,
+	)
+	testing.expect_value(
+		t,
+		tuner.activity_slot_supplier.resource_based.tuner_options.target_cpu_usage,
+		0.83,
+	)
+	testing.expect_value(
+		t,
+		tuner.local_activity_slot_supplier.tag,
+		raw.Slot_Supplier_Tag.Resource_Based,
+	)
+	testing.expect_value(
+		t,
+		tuner.local_activity_slot_supplier.resource_based.minimum_slots,
+		uintptr(1),
+	)
+	testing.expect_value(
+		t,
+		tuner.local_activity_slot_supplier.resource_based.maximum_slots,
+		uintptr(9),
+	)
+	testing.expect_value(
+		t,
+		tuner.local_activity_slot_supplier.resource_based.ramp_throttle_ms,
+		u64(26),
+	)
+	testing.expect_value(t, tuner.nexus_task_slot_supplier.tag, raw.Slot_Supplier_Tag.Fixed_Size)
+	testing.expect_value(t, tuner.nexus_task_slot_supplier.fixed_size.num_slots, uintptr(1))
+}
+
+@(test)
 worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) {
 	invalid_simple := temporal_core.worker_options_default()
 	invalid_simple.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(0)
@@ -6979,6 +7046,37 @@ worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) 
 	invalid_duration_error := temporal_core.worker_options_validate(invalid_duration)
 	testing.expect(t, invalid_duration_error.message != nil)
 	temporal_core.error_free(&invalid_duration_error)
+
+	invalid_target := temporal_core.worker_options_default()
+	invalid_target.resource_based_activity_tuner =
+		temporal_core.resource_based_activity_tuner(0, 0.8)
+	invalid_target_error := temporal_core.worker_options_validate(invalid_target)
+	testing.expect(t, invalid_target_error.message != nil)
+	temporal_core.error_free(&invalid_target_error)
+
+	invalid_slot_range := temporal_core.worker_options_default()
+	invalid_slot_range.resource_based_activity_tuner =
+		temporal_core.resource_based_activity_tuner_with_options(
+			0.8,
+			0.9,
+			{minimum_slots = 3, maximum_slots = 2},
+			{minimum_slots = 1, maximum_slots = 2},
+		)
+	invalid_slot_range_error := temporal_core.worker_options_validate(invalid_slot_range)
+	testing.expect(t, invalid_slot_range_error.message != nil)
+	temporal_core.error_free(&invalid_slot_range_error)
+
+	invalid_ramp := temporal_core.worker_options_default()
+	invalid_ramp.resource_based_activity_tuner =
+		temporal_core.resource_based_activity_tuner_with_options(
+			0.8,
+			0.9,
+			{minimum_slots = 1, maximum_slots = 2, ramp_throttle = -time.Nanosecond},
+			{minimum_slots = 1, maximum_slots = 2},
+		)
+	invalid_ramp_error := temporal_core.worker_options_validate(invalid_ramp)
+	testing.expect(t, invalid_ramp_error.message != nil)
+	temporal_core.error_free(&invalid_ramp_error)
 }
 
 @(test)
@@ -7000,6 +7098,12 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	options.max_cached_workflows = 8
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(3)
 	options.activity_task_poller_behavior = worker.poller_autoscaling(1, 6, 2)
+	options.resource_based_activity_tuner = worker.resource_based_activity_tuner_with_options(
+		0.75,
+		0.85,
+		{minimum_slots = 2, maximum_slots = 11, ramp_throttle = 10 * time.Millisecond},
+		{minimum_slots = 1, maximum_slots = 7, ramp_throttle = 20 * time.Millisecond},
+	)
 	options.max_worker_activities_per_second = 7.5
 
 	sdk_worker, create_error := worker.create_with_options(&client, options)
@@ -7008,6 +7112,13 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	worker.error_free(&create_error)
 	testing.expect_value(t, sdk_worker.core_options.identity_override, "owned-worker-identity")
 	testing.expect_value(t, sdk_worker.core_options.max_activity_slots, 19)
+	testing.expect_value(
+		t,
+		sdk_worker.core_options.resource_based_activity_tuner.target_memory_usage,
+		0.75,
+	)
+	testing.expect_value(t, sdk_worker.max_concurrent_activities, 11)
+	testing.expect_value(t, sdk_worker.max_concurrent_local_activities, 7)
 	testing.expect_value(t, sdk_worker.core_options.max_cached_workflows, u32(8))
 	testing.expect_value(t, sdk_worker.core_options.max_worker_activities_per_second, 7.5)
 	testing.expect_value(
