@@ -316,6 +316,14 @@ independent sizes, shared by online execution and offline replay. It does
 containment, or a stable public API. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
+The first Nexus foundation is also in place. The raw/Core packages bind the
+pinned bridge's Nexus poll and completion functions, generate the exact Nexus
+task/completion protobuf graph, map fixed slots and poller behavior, and prove
+worker validation plus poll-stream shutdown against `temporal server
+start-dev`. There is not yet a public Nexus service/operation registration API,
+task dispatcher, or Workflow-side Nexus caller, so this is transport evidence
+rather than usable Nexus support.
+
 Do not use it in production.
 
 ```odin

@@ -44,6 +44,8 @@ cargo run --quiet \
   coresdk.ActivityHeartbeat \
   coresdk.activity_task.ActivityTask \
   coresdk.ActivityTaskCompletion \
+  coresdk.nexus.NexusTask \
+  coresdk.nexus.NexusTaskCompletion \
   coresdk.workflow_activation.WorkflowActivation \
   coresdk.workflow_completion.WorkflowActivationCompletion \
   temporal.api.workflowservice.v1.StartWorkflowExecutionRequest \

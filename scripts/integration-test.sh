@@ -124,6 +124,12 @@ fi
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
+nexus_core_output="$(TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-core-connect.sh")"
+echo "$nexus_core_output"
+grep -q 'Core Nexus poll stream validated and observed clean shutdown.' <<<"$nexus_core_output"
+
 metrics_port=$((19000 + $$ % 1000))
 metrics_address="127.0.0.1:${metrics_port}"
 TEMPORAL_CORE_PROMETHEUS_BIND_ADDRESS="$metrics_address" \

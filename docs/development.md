@@ -107,10 +107,10 @@ generator reads a descriptor set produced from the exact schemas in the pinned
 ```
 
 This currently generates the transitive type graph rooted at the Core Activity
-task/completion and Workflow activation/completion messages into
-`temporal/core/proto/generated.odin`. The generated file is committed. After a
-Core pin or root-list change, regenerate it and review the diff; do not edit it
-by hand. CI/local tests use:
+task/completion, Nexus task/completion, and Workflow activation/completion
+messages into `temporal/core/proto/generated.odin`. The generated file is
+committed. After a Core pin or root-list change, regenerate it and review the
+diff; do not edit it by hand. CI/local tests use:
 
 ```bash
 ./scripts/generate-protos.sh --check
@@ -353,16 +353,19 @@ independent slot ranges. Both suppliers must carry identical CPU/memory targets
 because the C bridge creates one shared resource controller and rejects mixed
 resource options. The Odin callback pool is sized from the enabled suppliers'
 maximums so Core never grants work without matching executor capacity. Workflow
-and Nexus remain fixed-size, and custom suppliers are not exposed yet. Prefer
-fixed slots for ordinary Workers; Temporal recommends resource-based tuning
-when resource protection or workload-specific scaling warrants it. Pairing it
-with `worker.poller_autoscaling` avoids excessive pollers at low utilization.
+and Nexus remain fixed-size, and custom suppliers are not exposed yet. The
+public Worker stores validated Nexus slot and poller settings for the next
+handler slice, while only the lower Core adapter can enable/poll Nexus today.
+Prefer fixed slots for ordinary Workers; Temporal recommends resource-based
+tuning when resource protection or workload-specific scaling warrants it.
+Pairing it with `worker.poller_autoscaling` avoids excessive pollers at low
+utilization.
 
 Unit tests assert every populated C field and pointer/union arm. A 500-case
-property test varies cache state, fixed/resource slots, shared targets, both
-poller forms, duration rounding, rates, and sticky poll ratio. It runs against
-both the pinned PBT submodule and, during local library development,
-`PBT_ROOT=~/Projects/pbt`.
+property test varies cache state, fixed/resource slots, shared targets, all
+poller forms for Workflow, Activity, and Nexus, duration rounding, rates, and
+sticky poll ratio. It runs against both the pinned PBT submodule and, during
+local library development, `PBT_ROOT=~/Projects/pbt`.
 
 The integration matrix exercises two complementary Workflow configurations.
 The ordinary condition scenario leaves caching disabled and requires a
@@ -1029,6 +1032,20 @@ runtime_new -> client_connect -> GetSystemInfo RPC -> client_free -> runtime_fre
 
 The request protobuf is empty by definition. The response is intentionally kept
 opaque; receiving and freeing it proves the network and ABI path.
+
+The suite then repeats that executable with the Core-only Nexus lifecycle
+spike:
+
+```bash
+TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 ./scripts/run-core-connect.sh
+```
+
+It creates and validates a Nexus-enabled Core worker, enters the actual Nexus
+poll path, initiates shutdown, requires the poll callback's shutdown sentinel,
+and finalizes the worker. No endpoint is needed because this test proves the
+bridge symbol, Worker options, Service validation, poll stream, and memory-safe
+shutdown rather than handler dispatch. Public service/operation registration is
+not implemented yet.
 
 The same script then runs `examples/hello_activity` for several focused cases.
 A small workflow-only driver under `native/activity-test-driver` uses the

@@ -6913,6 +6913,7 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	options := temporal_core.worker_options_default()
 	options.identity_override = "odin-worker@test"
 	options.max_activity_slots = 23
+	options.max_nexus_task_slots = 7
 	options.max_cached_workflows = 17
 	options.sticky_queue_schedule_to_start_timeout = 1500 * time.Millisecond + time.Nanosecond
 	options.max_heartbeat_throttle_interval = 7 * time.Second
@@ -6922,6 +6923,7 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	options.graceful_shutdown_period = 2500 * time.Millisecond + time.Nanosecond
 	options.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(4)
 	options.activity_task_poller_behavior = temporal_core.poller_autoscaling(1, 8, 3)
+	options.nexus_task_poller_behavior = temporal_core.poller_simple_maximum(2)
 	options.nonsticky_to_sticky_poll_ratio = 0.35
 	options.max_eager_activity_reservations_per_workflow_task = 3
 
@@ -6942,6 +6944,11 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 		raw_options.tuner.activity_slot_supplier.fixed_size.num_slots,
 		uintptr(23),
 	)
+	testing.expect_value(
+		t,
+		raw_options.tuner.nexus_task_slot_supplier.fixed_size.num_slots,
+		uintptr(7),
+	)
 	testing.expect_value(t, raw_options.sticky_queue_schedule_to_start_timeout_ms, u64(1501))
 	testing.expect_value(t, raw_options.max_heartbeat_throttle_interval_ms, u64(7000))
 	testing.expect_value(t, raw_options.default_heartbeat_throttle_interval_ms, u64(1250))
@@ -6960,6 +6967,11 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	testing.expect_value(t, bindings.activity_autoscaling.minimum, uintptr(1))
 	testing.expect_value(t, bindings.activity_autoscaling.maximum, uintptr(8))
 	testing.expect_value(t, bindings.activity_autoscaling.initial, uintptr(3))
+	testing.expect(
+		t,
+		raw_options.nexus_task_poller_behavior.simple_maximum == &bindings.nexus_simple,
+	)
+	testing.expect_value(t, bindings.nexus_simple.simple_maximum, uintptr(2))
 	testing.expect_value(t, raw_options.nonsticky_to_sticky_poll_ratio, f32(0.35))
 	testing.expect_value(
 		t,
@@ -7036,6 +7048,134 @@ resource_based_activity_tuner_binds_to_the_pinned_core_c_abi :: proc(t: ^testing
 }
 
 @(test)
+nexus_task_and_completion_round_trip_the_pinned_core_contract :: proc(t: ^testing.T) {
+	input_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`{"name":"Odin"}`),
+	}
+	start := proto.Temporal_Api_Nexus_V1_StartOperationRequest{
+		service = "greeting-service",
+		operation = "say-hello",
+		request_id = "nexus-request-id",
+		callback = "http://callback.invalid/complete",
+		payload = &input_payload,
+	}
+	request := proto.Temporal_Api_Nexus_V1_Request{
+		variant = proto.Temporal_Api_Nexus_V1_Request_Variant_Start_Operation{value = &start},
+	}
+	append(
+		&request.header,
+		proto.Temporal_Api_Nexus_V1_Request_HeaderEntry{
+			key = "traceparent",
+			value = "00-test",
+		},
+	)
+	defer delete(request.header)
+	poll := proto.Temporal_Api_Workflowservice_V1_PollNexusTaskQueueResponse{
+		task_token = transmute([]u8)string("opaque-nexus-token"),
+		request = &request,
+		poller_group_id = "poller-group",
+	}
+	deadline := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 123}
+	task := proto.Coresdk_Nexus_NexusTask{
+		request_deadline = &deadline,
+		endpoint = "odin-nexus-endpoint",
+		variant = proto.Coresdk_Nexus_NexusTask_Variant_Task{value = &poll},
+	}
+	encoded_task := proto.encode_Coresdk_Nexus_NexusTask(&task)
+	defer delete(encoded_task)
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded_task := proto.Coresdk_Nexus_NexusTask{}
+	decoded := proto.decode_Coresdk_Nexus_NexusTask(encoded_task[:], &decoded_task)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	variant, task_ok := decoded_task.variant.(proto.Coresdk_Nexus_NexusTask_Variant_Task)
+	testing.expect(t, task_ok && variant.value != nil && variant.value.request != nil)
+	if task_ok && variant.value != nil && variant.value.request != nil {
+		start_variant, start_ok := variant.value.request.variant.(proto.Temporal_Api_Nexus_V1_Request_Variant_Start_Operation)
+		testing.expect(t, start_ok && start_variant.value != nil)
+		if start_ok && start_variant.value != nil {
+			testing.expect_value(t, start_variant.value.service, "greeting-service")
+			testing.expect_value(t, start_variant.value.operation, "say-hello")
+			testing.expect_value(t, start_variant.value.request_id, "nexus-request-id")
+			testing.expect(t, start_variant.value.payload != nil)
+			if start_variant.value.payload != nil {
+				testing.expect(t, bytes.equal(start_variant.value.payload.data, input_payload.data))
+			}
+		}
+		testing.expect_value(t, len(variant.value.request.header), 1)
+	}
+	testing.expect_value(t, decoded_task.endpoint, "odin-nexus-endpoint")
+	testing.expect(t, decoded_task.request_deadline != nil)
+	if decoded_task.request_deadline != nil {
+		testing.expect_value(t, decoded_task.request_deadline.seconds, i64(1_800_000_000))
+		testing.expect_value(t, decoded_task.request_deadline.nanos, i32(123))
+	}
+
+	output_payload := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`{"message":"Hello Odin"}`),
+	}
+	sync_response := proto.Temporal_Api_Nexus_V1_StartOperationResponse_Sync{
+		payload = &output_payload,
+	}
+	start_response := proto.Temporal_Api_Nexus_V1_StartOperationResponse{
+		variant = proto.Temporal_Api_Nexus_V1_StartOperationResponse_Variant_Sync_Success{
+			value = &sync_response,
+		},
+	}
+	response := proto.Temporal_Api_Nexus_V1_Response{
+		variant = proto.Temporal_Api_Nexus_V1_Response_Variant_Start_Operation{
+			value = &start_response,
+		},
+	}
+	completion := proto.Coresdk_Nexus_NexusTaskCompletion{
+		task_token = poll.task_token,
+		status = proto.Coresdk_Nexus_NexusTaskCompletion_Status_Completed{value = &response},
+	}
+	encoded_completion := proto.encode_Coresdk_Nexus_NexusTaskCompletion(&completion)
+	defer delete(encoded_completion)
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded_completion := proto.Coresdk_Nexus_NexusTaskCompletion{}
+	completion_decoded := proto.decode_Coresdk_Nexus_NexusTaskCompletion(
+		encoded_completion[:],
+		&decoded_completion,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, completion_decoded)
+	testing.expect(t, bytes.equal(decoded_completion.task_token, poll.task_token))
+	completed, completed_ok := decoded_completion.status.(proto.Coresdk_Nexus_NexusTaskCompletion_Status_Completed)
+	testing.expect(t, completed_ok && completed.value != nil)
+	if completed_ok && completed.value != nil {
+		response_variant, response_ok := completed.value.variant.(proto.Temporal_Api_Nexus_V1_Response_Variant_Start_Operation)
+		testing.expect(t, response_ok && response_variant.value != nil)
+		if response_ok && response_variant.value != nil {
+			sync_variant, sync_ok := response_variant.value.variant.(proto.Temporal_Api_Nexus_V1_StartOperationResponse_Variant_Sync_Success)
+			testing.expect(t, sync_ok && sync_variant.value != nil && sync_variant.value.payload != nil)
+			if sync_ok && sync_variant.value != nil && sync_variant.value.payload != nil {
+				testing.expect(t, bytes.equal(sync_variant.value.payload.data, output_payload.data))
+			}
+		}
+	}
+}
+
+@(test)
+nexus_core_calls_reject_uninitialized_or_disabled_workers :: proc(t: ^testing.T) {
+	core_worker := temporal_core.Worker{}
+	poll := temporal_core.worker_poll_nexus(&core_worker)
+	defer delete(poll.protobuf)
+	defer temporal_core.error_free(&poll.error)
+	testing.expect(t, poll.error.message != nil)
+
+	completion_error := temporal_core.worker_complete_nexus(&core_worker, []u8{1})
+	defer temporal_core.error_free(&completion_error)
+	testing.expect(t, completion_error.message != nil)
+}
+
+@(test)
 worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) {
 	invalid_simple := temporal_core.worker_options_default()
 	invalid_simple.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(0)
@@ -7049,6 +7189,18 @@ worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) 
 	invalid_autoscaling_error := temporal_core.worker_options_validate(invalid_autoscaling)
 	testing.expect(t, invalid_autoscaling_error.message != nil)
 	temporal_core.error_free(&invalid_autoscaling_error)
+
+	invalid_nexus_slots := temporal_core.worker_options_default()
+	invalid_nexus_slots.max_nexus_task_slots = 0
+	invalid_nexus_slots_error := temporal_core.worker_options_validate(invalid_nexus_slots)
+	testing.expect(t, invalid_nexus_slots_error.message != nil)
+	temporal_core.error_free(&invalid_nexus_slots_error)
+
+	invalid_nexus_poller := temporal_core.worker_options_default()
+	invalid_nexus_poller.nexus_task_poller_behavior = temporal_core.poller_autoscaling(2, 4, 1)
+	invalid_nexus_poller_error := temporal_core.worker_options_validate(invalid_nexus_poller)
+	testing.expect(t, invalid_nexus_poller_error.message != nil)
+	temporal_core.error_free(&invalid_nexus_poller_error)
 
 	invalid_cache_poller := temporal_core.worker_options_default()
 	invalid_cache_poller.max_cached_workflows = 1
@@ -7123,9 +7275,11 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	)
 	options.identity_override = identity
 	options.max_concurrent_activities = 19
+	options.max_concurrent_nexus_tasks = 5
 	options.max_cached_workflows = 8
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(3)
 	options.activity_task_poller_behavior = worker.poller_autoscaling(1, 6, 2)
+	options.nexus_task_poller_behavior = worker.poller_simple_maximum(2)
 	options.resource_based_activity_tuner = worker.resource_based_activity_tuner_with_options(
 		0.75,
 		0.85,
@@ -7140,6 +7294,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	worker.error_free(&create_error)
 	testing.expect_value(t, sdk_worker.core_options.identity_override, "owned-worker-identity")
 	testing.expect_value(t, sdk_worker.core_options.max_activity_slots, 19)
+	testing.expect_value(t, sdk_worker.core_options.max_nexus_task_slots, 5)
 	testing.expect_value(
 		t,
 		sdk_worker.core_options.resource_based_activity_tuner.target_memory_usage,
@@ -7158,6 +7313,11 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 		t,
 		sdk_worker.core_options.activity_task_poller_behavior.kind,
 		worker.Poller_Behavior_Kind.Autoscaling,
+	)
+	testing.expect_value(
+		t,
+		sdk_worker.core_options.nexus_task_poller_behavior.kind,
+		worker.Poller_Behavior_Kind.Simple_Maximum,
 	)
 
 	close_error := worker.close(&sdk_worker)

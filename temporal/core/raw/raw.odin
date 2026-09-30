@@ -493,6 +493,11 @@ foreign temporal_core {
 		user_data: rawptr,
 		callback: Worker_Poll_Callback,
 	) ---
+	worker_poll_nexus_task :: proc(
+		worker: ^Worker,
+		user_data: rawptr,
+		callback: Worker_Poll_Callback,
+	) ---
 	worker_complete_activity_task :: proc(
 		worker: ^Worker,
 		completion: Byte_Array_Ref,
@@ -504,6 +509,12 @@ foreign temporal_core {
 		heartbeat: Byte_Array_Ref,
 	) -> ^Byte_Array ---
 	worker_complete_workflow_activation :: proc(
+		worker: ^Worker,
+		completion: Byte_Array_Ref,
+		user_data: rawptr,
+		callback: Worker_Callback,
+	) ---
+	worker_complete_nexus_task :: proc(
 		worker: ^Worker,
 		completion: Byte_Array_Ref,
 		user_data: rawptr,

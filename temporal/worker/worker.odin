@@ -208,6 +208,7 @@ Options :: struct {
 	namespace:                                       string,
 	identity_override:                               string,
 	max_concurrent_activities:                       int,
+	max_concurrent_nexus_tasks:                      int,
 	max_cached_workflows:                            u32,
 	sticky_queue_schedule_to_start_timeout:          time.Duration,
 	max_heartbeat_throttle_interval:                  time.Duration,
@@ -217,6 +218,7 @@ Options :: struct {
 	graceful_shutdown_period:                         time.Duration,
 	workflow_task_poller_behavior:                    Poller_Behavior,
 	activity_task_poller_behavior:                    Poller_Behavior,
+	nexus_task_poller_behavior:                       Poller_Behavior,
 	nonsticky_to_sticky_poll_ratio:                   f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                    Resource_Based_Activity_Tuner_Options,
@@ -231,6 +233,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		task_queue = task_queue,
 		namespace = namespace,
 		max_concurrent_activities = core_options.max_activity_slots,
+		max_concurrent_nexus_tasks = core_options.max_nexus_task_slots,
 		max_cached_workflows = core_options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
 			core_options.sticky_queue_schedule_to_start_timeout,
@@ -243,6 +246,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		graceful_shutdown_period = core_options.graceful_shutdown_period,
 		workflow_task_poller_behavior = core_options.workflow_task_poller_behavior,
 		activity_task_poller_behavior = core_options.activity_task_poller_behavior,
+		nexus_task_poller_behavior = core_options.nexus_task_poller_behavior,
 		nonsticky_to_sticky_poll_ratio = core_options.nonsticky_to_sticky_poll_ratio,
 		max_eager_activity_reservations_per_workflow_task =
 			core_options.max_eager_activity_reservations_per_workflow_task,
@@ -265,6 +269,7 @@ Worker :: struct {
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
 	max_concurrent_local_activities: int,
+	max_concurrent_nexus_tasks: int,
 	graceful_shutdown_period: time.Duration,
 	core_options:          temporal_core.Worker_Options,
 	versioning:             Worker_Versioning_Options,
@@ -413,6 +418,7 @@ create_with_options :: proc(
 	core_options := temporal_core.Worker_Options{
 		identity_override = options.identity_override,
 		max_activity_slots = options.max_concurrent_activities,
+		max_nexus_task_slots = options.max_concurrent_nexus_tasks,
 		max_cached_workflows = options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
 			options.sticky_queue_schedule_to_start_timeout,
@@ -425,6 +431,7 @@ create_with_options :: proc(
 		graceful_shutdown_period = options.graceful_shutdown_period,
 		workflow_task_poller_behavior = options.workflow_task_poller_behavior,
 		activity_task_poller_behavior = options.activity_task_poller_behavior,
+		nexus_task_poller_behavior = options.nexus_task_poller_behavior,
 		nonsticky_to_sticky_poll_ratio = options.nonsticky_to_sticky_poll_ratio,
 		max_eager_activity_reservations_per_workflow_task =
 			options.max_eager_activity_reservations_per_workflow_task,
@@ -497,6 +504,7 @@ create_with_options :: proc(
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = options.max_concurrent_activities
 	worker.max_concurrent_local_activities = 1
+	worker.max_concurrent_nexus_tasks = options.max_concurrent_nexus_tasks
 	if options.resource_based_activity_tuner.enabled {
 		worker.max_concurrent_activities =
 			options.resource_based_activity_tuner.activity_slots.maximum_slots
@@ -556,6 +564,7 @@ create_replayer :: proc(
 	worker.lifecycle = .Configuring
 	worker.max_concurrent_activities = 1
 	worker.max_concurrent_local_activities = 1
+	worker.max_concurrent_nexus_tasks = 1
 	worker.workflow_stacks = resolved_stacks
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
@@ -2576,6 +2585,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
 	worker.max_concurrent_local_activities = 0
+	worker.max_concurrent_nexus_tasks = 0
 	worker.graceful_shutdown_period = 0
 	worker.core_options = {}
 	worker.versioning = {}

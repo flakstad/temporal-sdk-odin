@@ -408,6 +408,53 @@ protobuf call. Core sends the correct server RPC and manages server-facing
 activity mechanics; Odin owns procedure invocation, cancellation delivery,
 heartbeat API surface, payload conversion, failures, and activity concurrency.
 
+### Nexus task boundary
+
+The pinned bridge exposes Nexus as a fourth independently enabled Worker task
+type, not as a Workflow activation or an Activity task. Core polls the endpoint
+task queue and returns one serialized `coresdk.nexus.NexusTask`; the language
+SDK must decode it, dispatch the named service and operation, then return one
+serialized `coresdk.nexus.NexusTaskCompletion` with the same task token.
+
+`NexusTask` contains the original `PollNexusTaskQueueResponse` or a Core-local
+cancel request, plus Core's deadline and endpoint name. A start request carries
+the service, operation, request ID, callback URL/headers, input Payload, and
+operation headers. Its completion is one of a Nexus response, cancellation
+acknowledgement, or Temporal Failure. A synchronous successful operation
+returns exactly one Temporal Payload; an asynchronous start returns the durable
+operation token through the upstream Nexus response union.
+
+The implemented foundation deliberately stops at that boundary:
+
+- `temporal/core/raw` binds `temporal_core_worker_poll_nexus_task` and
+  `temporal_core_worker_complete_nexus_task`;
+- the repository generator roots both Core Nexus task messages and their exact
+  transitive API/Nexus protobuf graph;
+- `temporal/core` owns blocking poll/completion wrappers, validates fixed Nexus
+  slots and poller behavior, and drains the enabled stream before worker
+  finalization;
+- `examples/core_connect` validates a Nexus-enabled worker against the CLI dev
+  server, begins the real Core poll path, initiates shutdown, observes the
+  shutdown sentinel, and finalizes cleanly.
+
+This proves Odin -> C bridge -> Core -> Temporal Service lifecycle and the wire
+contract. The public language Worker does not yet enable the task type because
+it has no Nexus registry or executor. Odin must still implement service and
+operation registration, request-context ownership, sync/async result mapping,
+handler errors, cancellation routing, and concurrency before Nexus can be
+advertised as usable.
+
+Memory ownership follows the existing poll boundary. The C callback lends a
+Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
+`temporal_core_byte_array_free` immediately. Generated decoding then borrows
+strings and bytes from that copy and allocates nested collections from the
+caller's arena. A future dispatcher must clone every value that survives the
+poll/decode arena. Completion bytes are Odin-owned for the duration of the
+blocking completion call; the bridge decodes them synchronously before its
+callback returns. Core owns Service polling, protocol/state-machine behavior,
+deadlines, and transport. Odin owns handler lookup/execution, Payload codecs,
+language cancellation, handler errors, and the completion it produces.
+
 Odin now implements the fourth result variant for remote Activities. A callback
 returning `WillCompleteAsync` releases the worker task without resolving the
 server-side Activity. The callback's task token is borrowed, so the application
@@ -808,6 +855,8 @@ temporal_core_worker_validate
 temporal_core_worker_poll_activity_task
 temporal_core_worker_complete_activity_task
 temporal_core_worker_record_activity_heartbeat
+temporal_core_worker_poll_nexus_task
+temporal_core_worker_complete_nexus_task
 temporal_core_worker_poll_workflow_activation
 temporal_core_worker_complete_workflow_activation
 temporal_core_worker_request_workflow_eviction
@@ -2335,9 +2384,11 @@ Activity rate limits, graceful shutdown, Workflow/Activity poller behavior,
 sticky/nonsticky poll ratio, and eager Activity reservation count. The original
 `worker.create` is a compatibility convenience that fills the same
 `worker.Options` defaults.
-Resource-based Workflow/Nexus suppliers, custom slot suppliers, Nexus polling,
-plugins, storage drivers, and the experimental payload-error limit remain
-deliberately unexposed.
+Resource-based Workflow/Nexus suppliers, custom slot suppliers, public Nexus
+handler polling, plugins, storage drivers, and the experimental payload-error
+limit remain deliberately unexposed. The lower Core adapter does expose fixed
+Nexus slots, poller behavior, and the raw poll/completion lifecycle for the
+foundation spike.
 
 The public `Poller_Behavior` is an owned tagged Odin value. Immediately before
 `temporal_core_worker_new`, `Worker_Option_Bindings` translates it to the C
@@ -2366,9 +2417,9 @@ The convenience constructor deliberately defaults both maxima to ten because
 the current Odin executor uses one OS thread per possible callback. When the
 tuner is enabled it supersedes `max_concurrent_activities`; `worker.run` sums
 the maximums of only the enabled remote/Local suppliers to size the shared
-callback pool. Workflow activation execution remains serial and Nexus is not
-implemented, so those suppliers stay fixed rather than advertising concurrency
-the language runtime cannot honor.
+callback pool. Workflow activation execution remains serial and the public
+Nexus executor is not implemented, so those suppliers stay fixed rather than
+advertising concurrency the language runtime cannot honor.
 
 The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
 rejects negative, NaN, and infinite values; positive values cross unchanged.
@@ -2570,6 +2621,13 @@ Workflows are enabled.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
+9. **Nexus language semantics.** Core's transport and exact task/completion
+   schema are now pinned, generated, and lifecycle-tested, but they do not
+   define an Odin handler API. Sync versus async operation starts, cancellation
+   after callback handoff, header normalization, deadlines, and mapping Nexus
+   handler errors into the shared Failure model must be tested against a real
+   endpoint before that API is stabilized. Enabling the task type early would
+   make Core deliver work that the language Worker cannot yet complete.
 
 ## Workflow runtime alternatives: final decision still deferred
 
@@ -2585,6 +2643,16 @@ evidence to continue with fibers while retaining the explicit state machine as
 a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
+
+The next smallest vertical milestone is one synchronous Nexus operation:
+register one Odin service/operation handler, enable the Nexus task type only
+when that registry is nonempty, route a `StartOperation` task through the
+bounded executor, and return a synchronous Payload completion through Core.
+It should include unknown service/operation handler errors, deadline/context
+ownership, clean cancellation/shutdown, and one CLI-devserver endpoint test.
+Only after that should Workflow-side `ScheduleNexusOperation`, async operation
+tokens, and cancellation be added. Activity Worker is no longer the next
+milestone: it is already implemented and extensively live-tested.
 
 Activity concurrency, task-token routing, cooperative cancel delivery,
 heartbeat transport, typed JSON Payloads, structured user failures with a real
@@ -2703,9 +2771,10 @@ a defined Workflow-close policy, and a live cancellation/drain path. The public
 cancellation model remains experimental while API naming and accepted-Update
 policy are unresolved.
 
-The C bridge remains the recommended foundation. It now handles both Activity
-Tasks and multi-activation Workflow execution end-to-end, including replay and
-eviction. The findings add protobuf/tooling, language-runtime, and version-skew
+The C bridge remains the recommended foundation. It now handles Activity Tasks
+and multi-activation Workflow execution end-to-end, including replay and
+eviction, while the Nexus poll/completion lifecycle is proven through clean
+shutdown. The findings add protobuf/tooling, language-runtime, and version-skew
 obligations but give no reason to bypass Core or implement direct server gRPC.
 
 ### Child Workflow boundary

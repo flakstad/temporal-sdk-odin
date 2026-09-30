@@ -190,7 +190,9 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	cache_enabled := pbt.draw(t, pbt.boolean())
 	workflow_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	activity_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
+	nexus_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	slots := pbt.draw(t, pbt.int_range(1, 64))
+	nexus_slots := pbt.draw(t, pbt.int_range(1, 64))
 	resource_tuned := pbt.draw(t, pbt.boolean())
 	activity_minimum := pbt.draw(t, pbt.int_range(1, 8))
 	activity_maximum := pbt.draw(t, pbt.int_range(activity_minimum, 64))
@@ -216,6 +218,8 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, workflow_poller_mode == 1, 20.0, "simple Workflow poller")
 	pbt.cover(t, workflow_poller_mode == 2, 20.0, "autoscaling Workflow poller")
 	pbt.cover(t, activity_poller_mode == 2, 20.0, "autoscaling Activity poller")
+	pbt.cover(t, nexus_poller_mode == 1, 20.0, "simple Nexus poller")
+	pbt.cover(t, nexus_poller_mode == 2, 20.0, "autoscaling Nexus poller")
 	pbt.cover(t, sticky_fraction > 0, 40.0, "fractional duration rounds upward")
 	pbt.cover(t, worker_rate_unset, 30.0, "unset worker rate")
 	pbt.cover(t, resource_tuned, 30.0, "resource-based Activity suppliers")
@@ -223,6 +227,7 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	options := temporal_core.worker_options_default()
 	options.identity_override = "generated-worker"
 	options.max_activity_slots = slots
+	options.max_nexus_task_slots = nexus_slots
 	if cache_enabled {
 		options.max_cached_workflows = u32(pbt.draw(t, pbt.int_range(1, 500)))
 	}
@@ -240,6 +245,11 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	options.activity_task_poller_behavior = generated_poller_behavior(
 		t,
 		activity_poller_mode,
+		false,
+	)
+	options.nexus_task_poller_behavior = generated_poller_behavior(
+		t,
+		nexus_poller_mode,
 		false,
 	)
 	if resource_tuned {
@@ -310,6 +320,10 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots != expected_workflow_slots {
 		return pbt.fail("Workflow cache did not select a safe Workflow slot count")
 	}
+	if raw_options.tuner.nexus_task_slot_supplier.tag != .Fixed_Size ||
+	   raw_options.tuner.nexus_task_slot_supplier.fixed_size.num_slots != uintptr(nexus_slots) {
+		return pbt.fail("generated fixed Nexus slot count changed during binding")
+	}
 	expected_sticky_millis := u64(sticky_millis)
 	if sticky_fraction > 0 {
 		expected_sticky_millis += 1
@@ -338,6 +352,23 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 		if raw_options.workflow_task_poller_behavior.simple_maximum != nil ||
 		   raw_options.workflow_task_poller_behavior.autoscaling == nil {
 			return pbt.fail("autoscaling generated Workflow poller used the wrong C union arm")
+		}
+	}
+	switch nexus_poller_mode {
+	case 0:
+		if raw_options.nexus_task_poller_behavior.simple_maximum != nil ||
+		   raw_options.nexus_task_poller_behavior.autoscaling != nil {
+			return pbt.fail("default generated Nexus poller was not encoded as null pointers")
+		}
+	case 1:
+		if raw_options.nexus_task_poller_behavior.simple_maximum == nil ||
+		   raw_options.nexus_task_poller_behavior.autoscaling != nil {
+			return pbt.fail("simple generated Nexus poller used the wrong C union arm")
+		}
+	case 2:
+		if raw_options.nexus_task_poller_behavior.simple_maximum != nil ||
+		   raw_options.nexus_task_poller_behavior.autoscaling == nil {
+			return pbt.fail("autoscaling generated Nexus poller used the wrong C union arm")
 		}
 	}
 	return pbt.pass()

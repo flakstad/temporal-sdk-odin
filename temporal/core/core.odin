@@ -31,6 +31,7 @@ Worker :: struct {
 	workflows_enabled:         bool,
 	local_activities_enabled:  bool,
 	remote_activities_enabled: bool,
+	nexus_enabled:             bool,
 }
 
 // Replay_Worker is an offline Core worker. The pusher feeds complete serialized
@@ -228,6 +229,7 @@ poller_autoscaling :: proc(minimum, maximum, initial: int) -> Poller_Behavior {
 Worker_Options :: struct {
 	identity_override:                              string,
 	max_activity_slots:                             int,
+	max_nexus_task_slots:                           int,
 	max_cached_workflows:                           u32,
 	sticky_queue_schedule_to_start_timeout:         time.Duration,
 	max_heartbeat_throttle_interval:                 time.Duration,
@@ -237,6 +239,7 @@ Worker_Options :: struct {
 	graceful_shutdown_period:                        time.Duration,
 	workflow_task_poller_behavior:                   Poller_Behavior,
 	activity_task_poller_behavior:                   Poller_Behavior,
+	nexus_task_poller_behavior:                      Poller_Behavior,
 	nonsticky_to_sticky_poll_ratio:                  f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                   Resource_Based_Activity_Tuner_Options,
@@ -245,6 +248,7 @@ Worker_Options :: struct {
 worker_options_default :: proc() -> Worker_Options {
 	return {
 		max_activity_slots = 10,
+		max_nexus_task_slots = 1,
 		max_cached_workflows = 0,
 		sticky_queue_schedule_to_start_timeout = 10 * time.Second,
 		max_heartbeat_throttle_interval = 60 * time.Second,
@@ -265,6 +269,8 @@ Worker_Option_Bindings :: struct {
 	workflow_autoscaling: raw.Poller_Behavior_Autoscaling,
 	activity_simple:     raw.Poller_Behavior_Simple_Maximum,
 	activity_autoscaling: raw.Poller_Behavior_Autoscaling,
+	nexus_simple:        raw.Poller_Behavior_Simple_Maximum,
+	nexus_autoscaling:   raw.Poller_Behavior_Autoscaling,
 }
 
 Worker_Versioning_Mode :: enum {
@@ -883,6 +889,9 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	if !options.resource_based_activity_tuner.enabled && options.max_activity_slots <= 0 {
 		return client_option_error("max activity slots must be positive")
 	}
+	if options.max_nexus_task_slots <= 0 {
+		return client_option_error("max Nexus task slots must be positive")
+	}
 	_, sticky_error := worker_duration_millis(
 		options.sticky_queue_schedule_to_start_timeout,
 		"sticky queue schedule-to-start timeout",
@@ -936,6 +945,13 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	)
 	if activity_poller_error.message != nil {
 		return activity_poller_error
+	}
+	nexus_poller_error := poller_behavior_validate(
+		options.nexus_task_poller_behavior,
+		"Nexus task poller",
+	)
+	if nexus_poller_error.message != nil {
+		return nexus_poller_error
 	}
 	if options.max_cached_workflows > 0 &&
 	   options.workflow_task_poller_behavior.kind == .Simple_Maximum &&
@@ -1032,7 +1048,7 @@ worker_option_bindings_init :: proc(
 		workflow_slot_supplier       = fixed_slot_supplier(workflow_slots),
 		activity_slot_supplier       = fixed_slot_supplier(uintptr(fixed_activity_slots)),
 		local_activity_slot_supplier = fixed_slot_supplier(1),
-		nexus_task_slot_supplier     = fixed_slot_supplier(1),
+		nexus_task_slot_supplier     = fixed_slot_supplier(uintptr(options.max_nexus_task_slots)),
 	}
 	if options.resource_based_activity_tuner.enabled {
 		tuner := options.resource_based_activity_tuner
@@ -1072,6 +1088,11 @@ worker_option_bindings_init :: proc(
 		&bindings.activity_simple,
 		&bindings.activity_autoscaling,
 	)
+	bindings.raw_options.nexus_task_poller_behavior = poller_behavior_bind(
+		options.nexus_task_poller_behavior,
+		&bindings.nexus_simple,
+		&bindings.nexus_autoscaling,
+	)
 	bindings.raw_options.max_eager_activity_reservations_per_wf_task =
 		options.max_eager_activity_reservations_per_workflow_task
 	return {}
@@ -1085,6 +1106,7 @@ worker_create :: proc(
 	enable_workflows := false,
 	enable_local_activities := false,
 	enable_remote_activities := true,
+	enable_nexus := false,
 	versioning := Worker_Versioning_Options{},
 	nondeterminism_policy := Nondeterminism_Policy{},
 ) -> (worker: Worker, error: Error) {
@@ -1127,6 +1149,7 @@ worker_create :: proc(
 		enable_workflows = enable_workflows,
 		enable_local_activities = enable_local_activities,
 		enable_remote_activities = enable_remote_activities,
+		enable_nexus = enable_nexus,
 	}
 	options.nondeterminism_as_workflow_fail = fail_all_workflows
 	options.nondeterminism_as_workflow_fail_for_types = fail_workflow_types
@@ -1141,6 +1164,7 @@ worker_create :: proc(
 	worker.workflows_enabled = enable_workflows
 	worker.local_activities_enabled = enable_local_activities
 	worker.remote_activities_enabled = enable_remote_activities
+	worker.nexus_enabled = enable_nexus
 	return
 }
 
@@ -1349,6 +1373,29 @@ worker_poll_workflow :: proc(worker: ^Worker) -> Poll_Result {
 	return result
 }
 
+worker_poll_nexus :: proc(worker: ^Worker) -> Poll_Result {
+	result := Poll_Result{}
+	if worker == nil || worker.handle == nil || worker.runtime == nil || !worker.nexus_enabled {
+		result.error.message = bytes.clone(transmute([]u8)string("Nexus polling is not enabled"))
+		return result
+	}
+	state := Worker_Poll_State{}
+	raw.worker_poll_nexus_task(worker.handle, &state, worker_poll_callback)
+	wait_until(&state.done)
+	if state.fail != nil {
+		result.error.message = copy_core_bytes(state.fail)
+		raw.byte_array_free(worker.runtime.handle, state.fail)
+		return result
+	}
+	if state.success == nil {
+		result.shutdown = true
+		return result
+	}
+	result.protobuf = copy_core_bytes(state.success)
+	raw.byte_array_free(worker.runtime.handle, state.success)
+	return result
+}
+
 Complete_State :: struct {
 	done: sync.One_Shot_Event,
 	fail: ^raw.Byte_Array,
@@ -1394,6 +1441,21 @@ worker_complete_workflow :: proc(worker: ^Worker, completion: []u8) -> Error {
 	}
 	state := Complete_State{}
 	raw.worker_complete_workflow_activation(worker.handle, bytes_ref(completion), &state, complete_callback)
+	wait_until(&state.done)
+	if state.fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(state.fail)}
+	raw.byte_array_free(worker.runtime.handle, state.fail)
+	return error
+}
+
+worker_complete_nexus :: proc(worker: ^Worker, completion: []u8) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil || !worker.nexus_enabled {
+		return Error{message = bytes.clone(transmute([]u8)string("Nexus completion is not enabled"))}
+	}
+	state := Complete_State{}
+	raw.worker_complete_nexus_task(worker.handle, bytes_ref(completion), &state, complete_callback)
 	wait_until(&state.done)
 	if state.fail == nil {
 		return {}
@@ -1458,6 +1520,20 @@ worker_close :: proc(worker: ^Worker) -> Error {
 			error.message = bytes.clone(transmute([]u8)string("activity shutdown poll returned an unexpected task"))
 		}
 	}
+	if worker.nexus_enabled {
+		poll := worker_poll_nexus(worker)
+		if poll.protobuf != nil {
+			delete(poll.protobuf)
+		}
+		if error.message == nil {
+			error = poll.error
+		} else {
+			error_free(&poll.error)
+		}
+		if error.message == nil && !poll.shutdown {
+			error.message = bytes.clone(transmute([]u8)string("Nexus shutdown poll returned an unexpected task"))
+		}
+	}
 	finalize_error := worker_wait_call(worker, finalize_shutdown_invoke)
 	if error.message == nil {
 		error = finalize_error
@@ -1470,6 +1546,7 @@ worker_close :: proc(worker: ^Worker) -> Error {
 	worker.workflows_enabled = false
 	worker.local_activities_enabled = false
 	worker.remote_activities_enabled = false
+	worker.nexus_enabled = false
 	return error
 }
 
