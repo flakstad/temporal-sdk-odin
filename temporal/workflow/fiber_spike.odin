@@ -608,6 +608,7 @@ Timer_Result_Status :: enum {
 
 Selector_Case_Kind :: enum {
 	Activity,
+	Nexus_Operation,
 	Timer,
 	Signal,
 	Child_Workflow_Start,
@@ -620,6 +621,7 @@ Selector_Case_Kind :: enum {
 Selector_Case :: struct {
 	kind:           Selector_Case_Kind,
 	activity:       Activity_Future,
+	nexus_operation: Nexus_Operation_Future,
 	timer:          Timer_Future,
 	child_workflow: Child_Workflow_Future,
 	signal_name:    string,
@@ -8016,6 +8018,10 @@ selector_activity :: proc(future: Activity_Future) -> Selector_Case {
 	return {kind = .Activity, activity = future}
 }
 
+selector_nexus_operation :: proc(future: Nexus_Operation_Future) -> Selector_Case {
+	return {kind = .Nexus_Operation, nexus_operation = future}
+}
+
 selector_timer :: proc(future: Timer_Future) -> Selector_Case {
 	return {kind = .Timer, timer = future}
 }
@@ -8072,6 +8078,9 @@ selector_case_ready :: proc(
 	case .Activity:
 		operation, found := find_activity_operation(instance, selector_case.activity.seq)
 		return found && activity_operation_ready_for_waiter(instance, operation, token_id)
+	case .Nexus_Operation:
+		operation, found := find_nexus_operation(instance, selector_case.nexus_operation.seq)
+		return found && nexus_operation_ready_for_waiter(instance, operation, token_id)
 	case .Timer:
 		operation, found := find_timer_operation(instance, selector_case.timer.seq)
 		return found && timer_operation_ready(operation)
@@ -8131,6 +8140,14 @@ selector_cases_valid :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> boo
 			if !found {
 				return false
 			}
+		case .Nexus_Operation:
+			if selector_case.nexus_operation.seq == 0 {
+				return false
+			}
+			_, found := find_nexus_operation(instance, selector_case.nexus_operation.seq)
+			if !found {
+				return false
+			}
 		case .Timer:
 			if selector_case.timer.seq == 0 {
 				return false
@@ -8163,6 +8180,8 @@ join_cases_equal :: proc(left, right: ^Selector_Case) -> bool {
 	switch left.kind {
 	case .Activity:
 		return left.activity.seq == right.activity.seq
+	case .Nexus_Operation:
+		return left.nexus_operation.seq == right.nexus_operation.seq
 	case .Timer:
 		return left.timer.seq == right.timer.seq
 	case .Child_Workflow_Start, .Child_Workflow:

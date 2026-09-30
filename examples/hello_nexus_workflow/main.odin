@@ -91,20 +91,49 @@ hello_nexus_workflow :: proc(ctx: ^workflow.Fiber_Context, endpoint: string) -> 
 		return "Nexus timeout was not preserved"
 	}
 
-	return workflow.execute_nexus_operation_json(
+	options := workflow.Nexus_Operation_Options{
+		schedule_to_close_timeout = 20 * time.Second,
+		start_to_close_timeout = 10 * time.Second,
+		cancellation_type = .Wait_Cancellation_Completed,
+		headers = headers[:],
+	}
+	first := workflow.start_nexus_operation_json(
 		ctx,
 		endpoint,
 		NEXUS_SERVICE,
 		NEXUS_OPERATION,
 		"Odin",
-		string,
-		{
-			schedule_to_close_timeout = 20 * time.Second,
-			start_to_close_timeout = 10 * time.Second,
-			cancellation_type = .Wait_Cancellation_Completed,
-			headers = headers[:],
-		},
+		options,
 	)
+	second := workflow.start_nexus_operation_json(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		NEXUS_OPERATION,
+		"Odin",
+		options,
+	)
+	selector_cases := [?]workflow.Selector_Case{
+		workflow.selector_nexus_operation(second),
+		workflow.selector_nexus_operation(first),
+	}
+	selected := workflow.selector_select(ctx, selector_cases[:])
+	if selected.status != .Selected || selected.kind != .Nexus_Operation {
+		return "Nexus selector did not resolve an operation"
+	}
+	join_cases := [?]workflow.Selector_Case{
+		workflow.selector_nexus_operation(first),
+		workflow.selector_nexus_operation(second),
+	}
+	if workflow.join_all(ctx, join_cases[:]) != .Ready {
+		return "Nexus join did not resolve both operations"
+	}
+	first_result := workflow.await_nexus_operation(ctx, first)
+	second_result := workflow.await_nexus_operation(ctx, second)
+	if first_result != "Hello Odin" || second_result != "Hello Odin" {
+		return "Nexus selector/join returned unexpected results"
+	}
+	return first_result
 }
 
 start_when_worker_ready :: proc(user_data: rawptr) -> bool {
@@ -245,7 +274,7 @@ run :: proc() -> int {
 		return 1
 	}
 	defer temporal_client.workflow_handle_free(&state.handle)
-	if stats.workflow_executions_completed != 1 || stats.nexus_tasks_completed != 3 ||
+	if stats.workflow_executions_completed != 1 || stats.nexus_tasks_completed != 4 ||
 	   stats.nexus_cancellations_received != 1 {
 		fmt.eprintf(
 			"Unexpected Worker stats: workflows=%d Nexus=%d cancellations=%d\n",
@@ -317,6 +346,7 @@ run :: proc() -> int {
 		state.handle.id,
 	)
 	fmt.println("Nexus handler failure and schedule-to-close timeout retained structured Failure trees")
+	fmt.println("Nexus selector and join composed two concurrent operations")
 	fmt.printf(
 		"Nexus Workflow history replayed offline through Core activations=%d\n",
 		replay_result.activations_processed,

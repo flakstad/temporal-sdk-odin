@@ -3,9 +3,11 @@ package workflow_pbt_test
 import "core:bytes"
 import "core:mem/virtual"
 import "core:testing"
+import "core:time"
 import pbt "pbt:pbt"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
+import workflow "../temporal/workflow"
 
 nexus_task_and_completion_property :: proc(t: ^pbt.T) -> pbt.Result {
 	task_token := pbt.draw(t, pbt.byte_array(1, 64))
@@ -245,6 +247,286 @@ workflow_nexus_commands_preserve_generated_values :: proc(t: ^testing.T) {
 		"Workflow Nexus commands preserve generated values",
 		nexus_workflow_command_property,
 		{num_tests = 500, seed = 0x4e45_5855_535f_5746},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+nexus_selector_property_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	order: string,
+) -> string {
+	options := workflow.Nexus_Operation_Options{schedule_to_close_timeout = time.Minute}
+	first := workflow.start_nexus_operation(
+		ctx,
+		"pbt-endpoint",
+		"SelectorService",
+		"first",
+		"input",
+		options,
+	)
+	second := workflow.start_nexus_operation(
+		ctx,
+		"pbt-endpoint",
+		"SelectorService",
+		"second",
+		"input",
+		options,
+	)
+	cases := [2]workflow.Selector_Case{
+		workflow.selector_nexus_operation(first),
+		workflow.selector_nexus_operation(second),
+	}
+	if order == "reverse" {
+		cases = {
+			workflow.selector_nexus_operation(second),
+			workflow.selector_nexus_operation(first),
+		}
+	}
+	selected := workflow.selector_select(ctx, cases[:])
+	if selected.status != .Selected || selected.index != 0 ||
+	   selected.kind != .Nexus_Operation {
+		return "wrong-selection"
+	}
+	join_cases := [2]workflow.Selector_Case{
+		workflow.selector_nexus_operation(first),
+		workflow.selector_nexus_operation(second),
+	}
+	if workflow.join_all(ctx, join_cases[:]) != .Ready {
+		return "wrong-join"
+	}
+	if order == "reverse" {
+		return workflow.await_nexus_operation(ctx, second)
+	}
+	return workflow.await_nexus_operation(ctx, first)
+}
+
+append_nexus_selector_property_jobs :: proc(
+	jobs: ^[dynamic]proto.Coresdk_Workflow_Activation_WorkflowActivationJob,
+	permutation: int,
+	first_start: ^proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart,
+	first_result: ^proto.Coresdk_Workflow_Activation_ResolveNexusOperation,
+	second_start: ^proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart,
+	second_result: ^proto.Coresdk_Workflow_Activation_ResolveNexusOperation,
+) {
+	available := [4]proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation_Start{
+				value = first_start,
+			},
+		},
+		{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation{
+				value = first_result,
+			},
+		},
+		{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation_Start{
+				value = second_start,
+			},
+		},
+		{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation{
+				value = second_result,
+			},
+		},
+	}
+	orders := [6][4]int{
+		{0, 1, 2, 3},
+		{0, 2, 1, 3},
+		{0, 2, 3, 1},
+		{2, 3, 0, 1},
+		{2, 0, 3, 1},
+		{2, 0, 1, 3},
+	}
+	for index in orders[permutation] {
+		append(jobs, available[index])
+	}
+}
+
+nexus_selector_activation_order_property :: proc(t: ^pbt.T) -> pbt.Result {
+	reverse_cases := pbt.draw(t, pbt.boolean())
+	job_order := pbt.draw(t, pbt.int_range(0, 5))
+	pbt.cover(t, reverse_cases, 40.0, "reversed Nexus selector declarations")
+	for index in 0..<6 {
+		pbt.cover(t, job_order == index, 10.0, "Nexus activation job interleaving")
+	}
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"pbt_nexus_selector_workflow",
+		"test-queue",
+		nexus_selector_property_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	if init_error.message != nil {
+		return pbt.error("could not initialize Nexus selector runtime")
+	}
+
+	order := "forward"
+	if reverse_cases do order = "reverse"
+	input, input_error := codec.encode_json(order)
+	defer codec.payload_free(&input)
+	if input_error != .None {
+		return pbt.error("could not encode Nexus selector order")
+	}
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "pbt_nexus_selector_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "pbt-nexus-selector-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || initial.scheduled_nexus_operation_count != 2 ||
+	   !initial.waiting_selector {
+		return pbt.fail("generated Nexus selector Workflow did not initialize")
+	}
+	initial_completion := bytes.clone(initial.completion[:])
+	defer delete(initial_completion)
+
+	first_payload, first_payload_error := codec.encode_json("first")
+	second_payload, second_payload_error := codec.encode_json("second")
+	defer codec.payload_free(&first_payload)
+	defer codec.payload_free(&second_payload)
+	if first_payload_error != .None || second_payload_error != .None {
+		return pbt.error("could not encode Nexus selector results")
+	}
+	first_proto := proto.encode_payload(codec.payload_view(&first_payload))
+	second_proto := proto.encode_payload(codec.payload_view(&second_payload))
+	defer delete(first_proto.metadata)
+	defer delete(first_proto.external_payloads)
+	defer delete(second_proto.metadata)
+	defer delete(second_proto.external_payloads)
+	first_start := proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart_Status_Started_Sync{value = true},
+	}
+	second_start := proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart{
+		seq = 2,
+		status = proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart_Status_Started_Sync{value = true},
+	}
+	first_value := proto.Coresdk_Nexus_NexusOperationResult{
+		status = proto.Coresdk_Nexus_NexusOperationResult_Status_Completed{value = &first_proto},
+	}
+	second_value := proto.Coresdk_Nexus_NexusOperationResult{
+		status = proto.Coresdk_Nexus_NexusOperationResult_Status_Completed{value = &second_proto},
+	}
+	first_result := proto.Coresdk_Workflow_Activation_ResolveNexusOperation{seq = 1, result = &first_value}
+	second_result := proto.Coresdk_Workflow_Activation_ResolveNexusOperation{seq = 2, result = &second_value}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append_nexus_selector_property_jobs(
+		&activation.jobs,
+		job_order,
+		&first_start,
+		&first_result,
+		&second_start,
+		&second_result,
+	)
+	terminal := process_activation(&runtime, &activation)
+	defer destroy_process_result(&terminal)
+	if terminal.error.message != nil || !terminal.completed || terminal.waiting_selector {
+		return pbt.fail("generated Nexus selector activation did not complete")
+	}
+	result_payload, result_found := clone_pbt_workflow_result(terminal.completion[:])
+	defer codec.payload_free(&result_payload)
+	if !result_found {
+		return pbt.fail("Nexus selector completion had no result")
+	}
+	result: string
+	if codec.decode_json(codec.payload_view(&result_payload), &result) != .None {
+		return pbt.fail("Nexus selector completion result did not decode")
+	}
+	defer delete(result)
+	expected := "first"
+	if reverse_cases do expected = "second"
+	if result != expected {
+		return pbt.fail("Nexus selector did not choose declaration order")
+	}
+	terminal_completion := bytes.clone(terminal.completion[:])
+	defer delete(terminal_completion)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(&runtime, &activation)
+	defer destroy_process_result(&evicted)
+	if evicted.error.message != nil || !evicted.evicted {
+		return pbt.fail("generated Nexus selector Workflow did not evict")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_initial)
+	if replayed_initial.error.message != nil ||
+	   !bytes.equal(initial_completion, replayed_initial.completion[:]) {
+		return pbt.fail("Nexus selector initialization changed on replay")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append_nexus_selector_property_jobs(
+		&activation.jobs,
+		job_order,
+		&first_start,
+		&first_result,
+		&second_start,
+		&second_result,
+	)
+	replayed_terminal := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_terminal)
+	if replayed_terminal.error.message != nil ||
+	   !bytes.equal(terminal_completion, replayed_terminal.completion[:]) {
+		return pbt.fail("Nexus selector completion changed on replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_nexus_selector_is_biased_across_activation_orders :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow Nexus selector is declaration-biased across activation orders",
+		nexus_selector_activation_order_property,
+		{num_tests = 180, seed = 0x4e45_5855_535f_5345},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

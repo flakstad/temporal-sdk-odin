@@ -333,10 +333,10 @@ schedule-to-close timeout as recursive Failure trees, then observes
 The deterministic outbound interceptor can replace the endpoint, service,
 operation, input Payload, timeouts, cancellation policy, and Nexus headers
 before the terminal continuation copies them into run ownership; nested order
-and byte-identical fresh-stack replay are tested.
+and byte-identical fresh-stack replay are tested. Nexus operation Futures are
+also valid `selector_select` and allocation-free `join_all` cases.
 User-defined async operation handlers, cancel-operation handlers, Nexus
-selector branches, and live coverage of all cancellation policies are not yet
-implemented.
+and live coverage of all cancellation policies are not yet implemented.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
@@ -1635,8 +1635,9 @@ if selected.index == 0 {
 ```
 
 Ready cases are checked in slice order, independent of the order of jobs inside
-the Core activation. The selector also supports Signals and Child Workflow
-start/completion futures. It does not silently cancel losing operations;
+the Core activation. The selector also supports Nexus operation Futures,
+Signals, and Child Workflow start/completion futures. It does not silently
+cancel losing operations;
 callers retain their handles and must await or cancel them explicitly. The case
 slice and Signal names are borrowed only until `selector_select` returns, while
 the selected Signal payload/metadata views remain borrowed from the Workflow
@@ -1682,11 +1683,11 @@ if workflow.join_all(ctx, cases[:]) == .Ready {
 }
 ```
 
-`join_all` suspends until every declared Activity, Timer, Child Workflow start,
-or Child Workflow completion is ready. The ordinary typed `await_*` operations
-then return synchronously and preserve declaration order. Duplicate cases and
-Signal cases are rejected; Signal joining is deferred until the API can return
-owned per-case values without surprising allocations. Cancellation returns
+`join_all` suspends until every declared Activity, Nexus operation, Timer, Child
+Workflow start, or Child Workflow completion is ready. The ordinary typed
+`await_*` operations then return synchronously and preserve declaration order.
+Duplicate cases and Signal cases are rejected; Signal joining is deferred until
+the API can return owned per-case values without surprising allocations. Cancellation returns
 `.Canceled` if all operations have not already become ready.
 
 A 300-trace property composes both APIs around three Child Workflows. It varies

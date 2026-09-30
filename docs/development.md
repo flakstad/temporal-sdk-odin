@@ -209,6 +209,10 @@ log must show both Core-driven fresh-stack replay and the terminal
 `CancelTimer` command. The same run requires the distinct `start_timer`
 interceptor to enter and unwind around non-suspending Future creation, replace
 the Timer summary, and persist that summary in Server history.
+Offline, a separate 180-trace Nexus selector property varies declaration order
+and all valid interleavings of two Core start/result job pairs, passes both
+resolved Futures through `join_all`, and reproduces initial and terminal
+completion bytes after eviction.
 The following `TEMPORAL_ODIN_SCENARIO=join-all` case starts a fast and a
 two-second Activity with two callback slots. It requires a partial joined wait,
 Core eviction/replay, two completed Activity Tasks, and the declaration-ordered
@@ -1050,14 +1054,16 @@ shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
-Odin Worker runs the stackful caller Workflow and three registered operations.
+Odin Worker runs the stackful caller Workflow and three registered operation
+types across four Nexus tasks.
 It first observes a non-retryable handler failure, then forces a one-second
 schedule-to-close timeout and verifies that Core cooperatively cancels the
-running Odin callback, and finally requires `odin-greeting-service/hello` to
-return the JSON string `"Hello Odin"`. The example fetches the resulting server
-history and replays all branches offline through Core before the endpoint is
-deleted. This proves the real synchronous route in both directions without a
-second language SDK:
+running Odin callback. Finally it starts two concurrent
+`odin-greeting-service/hello` calls, wakes through the Nexus selector, joins
+both Futures, and requires both to return the JSON string `"Hello Odin"`. The
+example fetches the resulting server history and replays all branches offline
+through Core before the endpoint is deleted. This proves the real synchronous
+route in both directions without a second language SDK:
 
 ```text
 Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback

@@ -111,10 +111,10 @@ if selected.index == 0 {
 return "timed out"
 ```
 
-The selector supports Activity and Timer futures, named Signals, and Child
-Workflow start/completion futures. Every activation job is applied before the
-scheduler chooses the first ready case, so declaration order—not Core job
-order—is the deterministic tie-breaker. Cancellation is considered only after
+The selector supports Activity, Nexus operation, and Timer futures, named
+Signals, and Child Workflow start/completion futures. Every activation job is
+applied before the scheduler chooses the first ready case, so declaration
+order—not Core job order—is the deterministic tie-breaker. Cancellation is considered only after
 ready cases. Losing operations are left live; callers must explicitly await or
 cancel them. The case slice and its Signal names are borrowed until selection
 returns. Selected Signal values and metadata are borrowed run-arena views.
@@ -195,8 +195,8 @@ if workflow.join_all(ctx, cases[:]) == .Ready {
 }
 ```
 
-Activity, Timer, Child Workflow start, and Child Workflow completion cases are
-supported. Exact duplicate cases are invalid. Signal cases are deliberately
+Activity, Nexus operation, Timer, Child Workflow start, and Child Workflow
+completion cases are supported. Exact duplicate cases are invalid. Signal cases are deliberately
 rejected until join can return consumed Signal payloads with explicit ownership.
 Cancellation is checked after the all-ready condition, and unfinished
 operations remain owned by the Workflow when join returns `.Canceled`.

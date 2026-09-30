@@ -451,8 +451,9 @@ The implementation now crosses that boundary for synchronous operations:
   exposes Payload, typed JSON, and string `start`/`await`/`execute` forms.
 - `examples/hello_nexus_workflow` runs the caller Workflow and synchronous
   handlers in one Odin Worker. It live-proves success, a non-retryable handler
-  failure, and schedule-to-close timeout/cancellation, then fetches the server
-  history and passes all three branches through Core's offline replayer.
+  failure, schedule-to-close timeout/cancellation, and two concurrent successful
+  calls composed with selector/join, then fetches the server history and passes
+  every branch through Core's offline replayer.
 
 This proves the complete synchronous route from a Temporal Workflow through
 Service, Core, the C ABI, and an Odin operation callback and back. Unknown
@@ -475,8 +476,9 @@ and translating server events into the two activation-job forms.
 The remaining boundary is intentionally explicit. `CancelOperation` receives a
 non-retryable `NOT_IMPLEMENTED` handler failure because this first slice exposes
 no durable async operation token or user cancel handler. Async starts, callback
-completion, links, outbound interceptor/metric hooks, selector integration, and
-stronger cancellation/deadline live cases are not implemented. The caller does
+completion, links, metrics, and stronger cancellation/deadline live cases are
+not implemented. The outbound interceptor and selector/join integration are
+now implemented. The caller does
 accept Core's async start-token activation shape internally, but no Odin handler
 can produce such a token yet and that path is not claimed as live-proven.
 
@@ -1648,10 +1650,10 @@ completion through Core.
 The Workflow selector is another language-runtime-only boundary. The pinned
 Rust SDK documents its `select!` as deterministic and biased, polling branches
 in declaration order through `futures_util::select_biased!`. Odin mirrors that
-contract with `Selector_Case` values for Activity, Timer, Signal, Child
-Workflow start, and Child Workflow completion futures. Core still supplies the
-durable resolutions; it does not select among language futures and no C ABI or
-protobuf addition is involved.
+contract with `Selector_Case` values for Activity, Nexus operation, Timer,
+Signal, Child Workflow start, and Child Workflow completion futures. Core still
+supplies the durable resolutions; it does not select among language futures and
+no C ABI or protobuf addition is involved.
 
 All jobs in one activation are applied before the stable Workflow scheduler is
 drained. Consequently, when several cases become ready in the same activation,
@@ -1664,7 +1666,13 @@ call only; selected Signal payload and metadata views borrow the run arena.
 Eviction drops the suspended selector with the fiber, and replay reconstructs
 it from the same command sequence.
 
-The unit suite covers Activity/Activity ordering and a Signal/Timer tie. A
+The unit suite covers Activity/Activity and Nexus/Nexus ordering plus a
+Signal/Timer tie. The Nexus case resolves both operations in one activation,
+chooses by declaration order rather than sequence/job order, and reproduces the
+two schedule commands byte-for-byte after eviction. A dedicated 180-trace
+Nexus property varies forward/reverse declaration order and every valid
+interleaving of the two start/result job pairs, exercises `join_all`, and
+requires byte-identical initial and terminal replay completions. The existing
 180-trace property crosses all six case permutations with all six Core-job
 permutations and requires byte-identical fresh-stack replay. The CLI dev-server
 case starts a real Activity and Timer, observes `waiting_selector=true`, lets
@@ -1683,8 +1691,8 @@ waits for every case instead of choosing one. Upstream Rust has both a
 heterogeneous `join!` macro and a homogeneous generic `join_all`; Odin has
 neither variadic macros nor one generic Future result type. The current API is
 therefore a heterogeneous, allocation-free readiness barrier. After `.Ready`,
-the existing typed Activity, Timer, or Child Workflow `await_*` call reads each
-result synchronously in application-selected order.
+the existing typed Activity, Nexus operation, Timer, or Child Workflow
+`await_*` call reads each result synchronously in application-selected order.
 
 Exact duplicate cases are rejected because Odin handles are copyable whereas
 Rust futures are normally moved. Signal cases are also rejected for now:
@@ -2675,7 +2683,7 @@ Workflows are enabled.
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Async operation
    handlers, user cancel handlers, callback completion, links, outbound
-   metrics, selector branches, and explicit operation cancellation after
+   metrics and explicit operation cancellation after
    callback handoff remain. The Workflow outbound interceptor is implemented
    and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
    cooperative timeout cancellation of a running synchronous Odin handler are
@@ -2700,8 +2708,9 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: live-test all four cancellation policies; add the selector branch;
-and property-test activation order/duplicate delivery. The Workflow outbound
+boundary: live-test all four cancellation policies, then property-test duplicate
+delivery. The selector/join branch is unit-, property-, live-, and replay-tested.
+The Workflow outbound
 interceptor and handler failure/pre-start timeout classification are now
 wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
 and timeout also run through the live server. After that,
@@ -2746,7 +2755,10 @@ through command metadata and replay. Timer duration, summary, and explicit
 cancellation-token options are implemented. A 300-trace Child composition
 property now covers start/completion selectors, start/completion joins,
 explicit cancellation, partial readiness, and four byte-identical replay
-completions. None of these scheduler features requires a new C ABI symbol.
+completions. Nexus operation Futures now participate in the same selector/join
+readiness model, with a separate 180-trace biased-order/job-interleaving and
+fresh-stack replay property.
+None of these scheduler features requires a new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for
