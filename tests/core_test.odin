@@ -6748,6 +6748,143 @@ worker_graceful_shutdown_period_rounds_for_c_abi_and_is_owned_by_worker :: proc(
 }
 
 @(test)
+worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
+	options := temporal_core.worker_options_default()
+	options.identity_override = "odin-worker@test"
+	options.max_activity_slots = 23
+	options.max_cached_workflows = 17
+	options.sticky_queue_schedule_to_start_timeout = 1500 * time.Millisecond + time.Nanosecond
+	options.max_heartbeat_throttle_interval = 7 * time.Second
+	options.default_heartbeat_throttle_interval = 1250 * time.Millisecond
+	options.max_worker_activities_per_second = 4.5
+	options.max_task_queue_activities_per_second = 9.25
+	options.graceful_shutdown_period = 2500 * time.Millisecond + time.Nanosecond
+	options.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(4)
+	options.activity_task_poller_behavior = temporal_core.poller_autoscaling(1, 8, 3)
+	options.nonsticky_to_sticky_poll_ratio = 0.35
+	options.max_eager_activity_reservations_per_workflow_task = 3
+
+	bindings := temporal_core.Worker_Option_Bindings{}
+	bindings_error := temporal_core.worker_option_bindings_init(&bindings, options)
+	testing.expectf(t, bindings_error.message == nil, "binding failed: %s", string(bindings_error.message))
+	temporal_core.error_free(&bindings_error)
+	raw_options := &bindings.raw_options
+	testing.expect_value(t, raw_byte_ref_string(raw_options.identity_override), "odin-worker@test")
+	testing.expect_value(t, raw_options.max_cached_workflows, u32(17))
+	testing.expect_value(
+		t,
+		raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots,
+		uintptr(2),
+	)
+	testing.expect_value(
+		t,
+		raw_options.tuner.activity_slot_supplier.fixed_size.num_slots,
+		uintptr(23),
+	)
+	testing.expect_value(t, raw_options.sticky_queue_schedule_to_start_timeout_ms, u64(1501))
+	testing.expect_value(t, raw_options.max_heartbeat_throttle_interval_ms, u64(7000))
+	testing.expect_value(t, raw_options.default_heartbeat_throttle_interval_ms, u64(1250))
+	testing.expect_value(t, raw_options.max_activities_per_second, 4.5)
+	testing.expect_value(t, raw_options.max_task_queue_activities_per_second, 9.25)
+	testing.expect_value(t, raw_options.graceful_shutdown_period_ms, u64(2501))
+	testing.expect(
+		t,
+		raw_options.workflow_task_poller_behavior.simple_maximum == &bindings.workflow_simple,
+	)
+	testing.expect_value(t, bindings.workflow_simple.simple_maximum, uintptr(4))
+	testing.expect(
+		t,
+		raw_options.activity_task_poller_behavior.autoscaling == &bindings.activity_autoscaling,
+	)
+	testing.expect_value(t, bindings.activity_autoscaling.minimum, uintptr(1))
+	testing.expect_value(t, bindings.activity_autoscaling.maximum, uintptr(8))
+	testing.expect_value(t, bindings.activity_autoscaling.initial, uintptr(3))
+	testing.expect_value(t, raw_options.nonsticky_to_sticky_poll_ratio, f32(0.35))
+	testing.expect_value(
+		t,
+		raw_options.max_eager_activity_reservations_per_wf_task,
+		u32(3),
+	)
+}
+
+@(test)
+worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) {
+	invalid_simple := temporal_core.worker_options_default()
+	invalid_simple.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(0)
+	invalid_simple_error := temporal_core.worker_options_validate(invalid_simple)
+	testing.expect(t, invalid_simple_error.message != nil)
+	temporal_core.error_free(&invalid_simple_error)
+
+	invalid_autoscaling := temporal_core.worker_options_default()
+	invalid_autoscaling.activity_task_poller_behavior =
+		temporal_core.poller_autoscaling(2, 5, 1)
+	invalid_autoscaling_error := temporal_core.worker_options_validate(invalid_autoscaling)
+	testing.expect(t, invalid_autoscaling_error.message != nil)
+	temporal_core.error_free(&invalid_autoscaling_error)
+
+	invalid_cache_poller := temporal_core.worker_options_default()
+	invalid_cache_poller.max_cached_workflows = 1
+	invalid_cache_poller.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(1)
+	invalid_cache_poller_error := temporal_core.worker_options_validate(invalid_cache_poller)
+	testing.expect(t, invalid_cache_poller_error.message != nil)
+	temporal_core.error_free(&invalid_cache_poller_error)
+
+	invalid_rate := temporal_core.worker_options_default()
+	invalid_rate.max_worker_activities_per_second = -1
+	invalid_rate_error := temporal_core.worker_options_validate(invalid_rate)
+	testing.expect(t, invalid_rate_error.message != nil)
+	temporal_core.error_free(&invalid_rate_error)
+
+	invalid_ratio := temporal_core.worker_options_default()
+	invalid_ratio.nonsticky_to_sticky_poll_ratio = 1.01
+	invalid_ratio_error := temporal_core.worker_options_validate(invalid_ratio)
+	testing.expect(t, invalid_ratio_error.message != nil)
+	temporal_core.error_free(&invalid_ratio_error)
+
+	invalid_duration := temporal_core.worker_options_default()
+	invalid_duration.max_heartbeat_throttle_interval = -time.Nanosecond
+	invalid_duration_error := temporal_core.worker_options_validate(invalid_duration)
+	testing.expect(t, invalid_duration_error.message != nil)
+	temporal_core.error_free(&invalid_duration_error)
+}
+
+@(test)
+language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	identity, identity_error := strings.clone("owned-worker-identity")
+	testing.expect(t, identity_error == nil)
+	options := worker.options_default("advanced-options-worker", "test-namespace")
+	options.identity_override = identity
+	options.max_concurrent_activities = 19
+	options.max_cached_workflows = 8
+	options.workflow_task_poller_behavior = worker.poller_simple_maximum(3)
+	options.activity_task_poller_behavior = worker.poller_autoscaling(1, 6, 2)
+	options.max_worker_activities_per_second = 7.5
+
+	sdk_worker, create_error := worker.create_with_options(&client, options)
+	delete(identity)
+	testing.expectf(t, create_error.message == nil, "worker.create_with_options failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	testing.expect_value(t, sdk_worker.core_options.identity_override, "owned-worker-identity")
+	testing.expect_value(t, sdk_worker.core_options.max_activity_slots, 19)
+	testing.expect_value(t, sdk_worker.core_options.max_cached_workflows, u32(8))
+	testing.expect_value(t, sdk_worker.core_options.max_worker_activities_per_second, 7.5)
+	testing.expect_value(
+		t,
+		sdk_worker.core_options.activity_task_poller_behavior.kind,
+		worker.Poller_Behavior_Kind.Autoscaling,
+	)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+	testing.expect(t, sdk_worker.core_options.identity_override == "")
+}
+
+@(test)
 language_worker_rejects_run_without_materializing_empty_core_worker :: proc(t: ^testing.T) {
 	raw_runtime := raw.Runtime{}
 	runtime := temporal_core.Runtime{handle = &raw_runtime}

@@ -2266,6 +2266,53 @@ flag after 200 ms, returns cooperatively, and verifies Core flushes its terminal
 completion before finalization. An uncooperative callback can therefore still
 hold shutdown open, which is intentional and must remain explicit in the API.
 
+### Worker configuration boundary
+
+`worker.create_with_options` now exposes the subset of the pinned Core worker
+builder that the Odin executor can honor without introducing another runtime:
+worker identity override, fixed Activity capacity, Workflow cache size and
+sticky timeout, heartbeat throttling, worker-local and task-queue Activity rate
+limits, graceful shutdown, Workflow/Activity poller behavior, sticky/nonsticky
+poll ratio, and eager Activity reservation count. The original `worker.create`
+is a compatibility convenience that fills the same `worker.Options` defaults.
+Nexus polling, resource/custom slot suppliers, plugins, storage drivers, and the
+experimental payload-error limit remain deliberately unexposed.
+
+The public `Poller_Behavior` is an owned tagged Odin value. Immediately before
+`temporal_core_worker_new`, `Worker_Option_Bindings` translates it to the C
+bridge's two-pointer representation and owns the pointed-to simple/autoscaling
+records on the calling stack. Both null means `None`, allowing Core's default
+`SimpleMaximum(5)` behavior and server-directed autoscaling enrollment; exactly
+one non-null pointer selects the corresponding policy. The bridge calls
+`to_core()` and copies all values synchronously, so neither pointer escapes
+`worker_new`. Odin validates minimum/maximum/initial ordering before the FFI.
+
+`identity_override` differs from those temporary numeric records because Worker
+construction is intentionally delayed until registrations determine the task
+types. The language Worker therefore clones the identity at
+`create_with_options`, retains it alongside namespace, task queue, versioning
+identity, and nondeterminism type names, and deletes it in `worker.close`. The C
+bridge converts its borrowed `ByteArrayRef` to an owned Rust `String` during
+`worker_new`.
+
+The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
+rejects negative, NaN, and infinite values; positive values cross unchanged.
+Durations use non-negative Odin `time.Duration` values and round positive
+sub-millisecond fractions upward because the ABI stores `u64` milliseconds.
+The sticky poll ratio is restricted to `[0, 1]`. A cached Worker receives two
+fixed Workflow slots instead of the uncached default of one, and an explicit
+simple Workflow poller below two is rejected, matching Core's cache/poller
+constraint. Eager reservations stay zero by default until a dedicated mixed
+Workflow/Activity eager execution test makes enabling them a safe default.
+
+This adds no protobuf messages and no C symbols. It populates the existing
+`TemporalCoreWorkerOptions` passed to `temporal_core_worker_new`; all polling,
+rate limiting, sticky routing, heartbeat coalescing, cache management, and
+server negotiation remain Core responsibilities. Odin still owns callback
+capacity, registration, dispatch, Workflow fibers, and completion production.
+The ABI mapping has exact unit coverage plus a 500-case generated property over
+cache, slots, durations, rates, and both poller union arms.
+
 This creates an explicit ownership boundary. The Odin worker owns cloned
 namespace/task-queue strings, registrations, Workflow runtimes, and eventually
 the Core worker handle. It only borrows the client pointer; the client and Core

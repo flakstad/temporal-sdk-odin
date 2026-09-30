@@ -217,7 +217,32 @@ sends outstanding Activities a `.Worker_Shutdown` cancellation; the live
 suite proves the reason/detail flags, cooperative return, completion flush, and
 clean finalization.
 This period delays cancellation—it is not a force-kill timeout, so an Activity
-that ignores cancellation can still keep shutdown open. `activity.info(ctx)`
+that ignores cancellation can still keep shutdown open.
+
+Advanced Core worker controls use an explicit defaulted options value, while
+the shorter `worker.create` call remains available:
+
+```odin
+options := worker.options_default("orders")
+options.identity_override = "orders-worker-1"
+options.max_concurrent_activities = 32
+options.max_cached_workflows = 1_000
+options.sticky_queue_schedule_to_start_timeout = 10 * time.Second
+options.max_worker_activities_per_second = 50
+options.workflow_task_poller_behavior = worker.poller_simple_maximum(5)
+options.activity_task_poller_behavior = worker.poller_autoscaling(1, 20, 5)
+
+sdk_worker, err := worker.create_with_options(&core_client, options)
+```
+
+Zero rate limits mean unset. Default poller behavior leaves both C pointers
+null so SDK Core can use its default and accept server-directed poller
+autoscaling. Durations are rounded upward to whole milliseconds at the C ABI;
+invalid rates, poller ranges, cache/poller combinations, and negative durations
+are rejected before `worker_new`. The identity and all other referenced strings
+are owned by the Odin Worker until `worker.close`.
+
+`activity.info(ctx)`
 now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor
 headers, and previous heartbeat details as callback-scoped borrowed values; a retry integration test

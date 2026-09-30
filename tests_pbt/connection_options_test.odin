@@ -166,3 +166,128 @@ worker_shutdown_durations_preserve_generated_c_abi_contract :: proc(t: ^testing.
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+generated_poller_behavior :: proc(t: ^pbt.T, mode: int, cached: bool) -> temporal_core.Poller_Behavior {
+	switch mode {
+	case 0:
+		return {}
+	case 1:
+		minimum := 1
+		if cached {
+			minimum = 2
+		}
+		return temporal_core.poller_simple_maximum(pbt.draw(t, pbt.int_range(minimum, 32)))
+	case 2:
+		minimum := pbt.draw(t, pbt.int_range(1, 8))
+		maximum := pbt.draw(t, pbt.int_range(minimum, 32))
+		initial := pbt.draw(t, pbt.int_range(minimum, maximum))
+		return temporal_core.poller_autoscaling(minimum, maximum, initial)
+	}
+	return {}
+}
+
+worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
+	cache_enabled := pbt.draw(t, pbt.boolean())
+	workflow_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
+	activity_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
+	slots := pbt.draw(t, pbt.int_range(1, 64))
+	sticky_millis := pbt.draw(t, pbt.int_range(0, 60_000))
+	sticky_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
+	worker_rate_unset := pbt.draw(t, pbt.boolean())
+	worker_rate_tenths := 0
+	if !worker_rate_unset {
+		worker_rate_tenths = pbt.draw(t, pbt.int_range(1, 1_000))
+	}
+	task_queue_rate_tenths := pbt.draw(t, pbt.int_range(0, 1_000))
+	ratio_hundredths := pbt.draw(t, pbt.int_range(0, 100))
+	pbt.cover(t, cache_enabled, 30.0, "Workflow cache enabled")
+	pbt.cover(t, workflow_poller_mode == 0, 20.0, "Core-default Workflow poller")
+	pbt.cover(t, workflow_poller_mode == 1, 20.0, "simple Workflow poller")
+	pbt.cover(t, workflow_poller_mode == 2, 20.0, "autoscaling Workflow poller")
+	pbt.cover(t, activity_poller_mode == 2, 20.0, "autoscaling Activity poller")
+	pbt.cover(t, sticky_fraction > 0, 40.0, "fractional duration rounds upward")
+	pbt.cover(t, worker_rate_unset, 30.0, "unset worker rate")
+
+	options := temporal_core.worker_options_default()
+	options.identity_override = "generated-worker"
+	options.max_activity_slots = slots
+	if cache_enabled {
+		options.max_cached_workflows = u32(pbt.draw(t, pbt.int_range(1, 500)))
+	}
+	options.sticky_queue_schedule_to_start_timeout =
+		time.Duration(sticky_millis) * time.Millisecond +
+		time.Duration(sticky_fraction) * time.Nanosecond
+	options.max_worker_activities_per_second = f64(worker_rate_tenths) / 10
+	options.max_task_queue_activities_per_second = f64(task_queue_rate_tenths) / 10
+	options.nonsticky_to_sticky_poll_ratio = f32(ratio_hundredths) / 100
+	options.workflow_task_poller_behavior = generated_poller_behavior(
+		t,
+		workflow_poller_mode,
+		cache_enabled,
+	)
+	options.activity_task_poller_behavior = generated_poller_behavior(
+		t,
+		activity_poller_mode,
+		false,
+	)
+
+	bindings := temporal_core.Worker_Option_Bindings{}
+	bindings_error := temporal_core.worker_option_bindings_init(&bindings, options)
+	defer temporal_core.error_free(&bindings_error)
+	if bindings_error.message != nil {
+		return pbt.fail("valid generated Worker options were rejected")
+	}
+	raw_options := &bindings.raw_options
+	if raw_options.tuner.activity_slot_supplier.fixed_size.num_slots != uintptr(slots) {
+		return pbt.fail("generated Activity slot count changed during binding")
+	}
+	expected_workflow_slots := uintptr(1)
+	if cache_enabled {
+		expected_workflow_slots = 2
+	}
+	if raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots != expected_workflow_slots {
+		return pbt.fail("Workflow cache did not select a safe Workflow slot count")
+	}
+	expected_sticky_millis := u64(sticky_millis)
+	if sticky_fraction > 0 {
+		expected_sticky_millis += 1
+	}
+	if raw_options.sticky_queue_schedule_to_start_timeout_ms != expected_sticky_millis {
+		return pbt.fail("generated sticky timeout changed at the C ABI boundary")
+	}
+	if raw_options.max_activities_per_second != options.max_worker_activities_per_second ||
+	   raw_options.max_task_queue_activities_per_second !=
+	     options.max_task_queue_activities_per_second ||
+	   raw_options.nonsticky_to_sticky_poll_ratio != options.nonsticky_to_sticky_poll_ratio {
+		return pbt.fail("generated Worker rates changed during binding")
+	}
+	switch workflow_poller_mode {
+	case 0:
+		if raw_options.workflow_task_poller_behavior.simple_maximum != nil ||
+		   raw_options.workflow_task_poller_behavior.autoscaling != nil {
+			return pbt.fail("default generated Workflow poller was not encoded as null pointers")
+		}
+	case 1:
+		if raw_options.workflow_task_poller_behavior.simple_maximum == nil ||
+		   raw_options.workflow_task_poller_behavior.autoscaling != nil {
+			return pbt.fail("simple generated Workflow poller used the wrong C union arm")
+		}
+	case 2:
+		if raw_options.workflow_task_poller_behavior.simple_maximum != nil ||
+		   raw_options.workflow_task_poller_behavior.autoscaling == nil {
+			return pbt.fail("autoscaling generated Workflow poller used the wrong C union arm")
+		}
+	}
+	return pbt.pass()
+}
+
+@(test)
+worker_options_preserve_generated_core_configuration :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Worker options preserve Core configuration",
+		worker_options_binding_property,
+		{num_tests = 500, seed = 0x574f_524b_4f50_5453},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

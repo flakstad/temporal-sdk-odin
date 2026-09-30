@@ -193,6 +193,56 @@ Worker_Versioning_Mode :: temporal_core.Worker_Versioning_Mode
 Worker_Versioning_Behavior :: temporal_core.Worker_Versioning_Behavior
 Worker_Versioning_Options :: temporal_core.Worker_Versioning_Options
 Nondeterminism_Policy :: temporal_core.Nondeterminism_Policy
+Poller_Behavior_Kind :: temporal_core.Poller_Behavior_Kind
+Poller_Behavior :: temporal_core.Poller_Behavior
+
+poller_simple_maximum :: temporal_core.poller_simple_maximum
+poller_autoscaling :: temporal_core.poller_autoscaling
+
+Options :: struct {
+	task_queue:                                      string,
+	namespace:                                       string,
+	identity_override:                               string,
+	max_concurrent_activities:                       int,
+	max_cached_workflows:                            u32,
+	sticky_queue_schedule_to_start_timeout:          time.Duration,
+	max_heartbeat_throttle_interval:                  time.Duration,
+	default_heartbeat_throttle_interval:              time.Duration,
+	max_worker_activities_per_second:                 f64,
+	max_task_queue_activities_per_second:             f64,
+	graceful_shutdown_period:                         time.Duration,
+	workflow_task_poller_behavior:                    Poller_Behavior,
+	activity_task_poller_behavior:                    Poller_Behavior,
+	nonsticky_to_sticky_poll_ratio:                   f32,
+	max_eager_activity_reservations_per_workflow_task: u32,
+	versioning:                                      Worker_Versioning_Options,
+	nondeterminism_policy:                           Nondeterminism_Policy,
+	workflow_stacks:                                 workflow.Stack_Options,
+}
+
+options_default :: proc(task_queue: string, namespace := "default") -> Options {
+	core_options := temporal_core.worker_options_default()
+	return {
+		task_queue = task_queue,
+		namespace = namespace,
+		max_concurrent_activities = core_options.max_activity_slots,
+		max_cached_workflows = core_options.max_cached_workflows,
+		sticky_queue_schedule_to_start_timeout =
+			core_options.sticky_queue_schedule_to_start_timeout,
+		max_heartbeat_throttle_interval = core_options.max_heartbeat_throttle_interval,
+		default_heartbeat_throttle_interval =
+			core_options.default_heartbeat_throttle_interval,
+		max_worker_activities_per_second = core_options.max_worker_activities_per_second,
+		max_task_queue_activities_per_second =
+			core_options.max_task_queue_activities_per_second,
+		graceful_shutdown_period = core_options.graceful_shutdown_period,
+		workflow_task_poller_behavior = core_options.workflow_task_poller_behavior,
+		activity_task_poller_behavior = core_options.activity_task_poller_behavior,
+		nonsticky_to_sticky_poll_ratio = core_options.nonsticky_to_sticky_poll_ratio,
+		max_eager_activity_reservations_per_workflow_task =
+			core_options.max_eager_activity_reservations_per_workflow_task,
+	}
+}
 
 Worker :: struct {
 	core:                   temporal_core.Worker,
@@ -209,6 +259,7 @@ Worker :: struct {
 	lifecycle:              Lifecycle,
 	max_concurrent_activities: int,
 	graceful_shutdown_period: time.Duration,
+	core_options:          temporal_core.Worker_Options,
 	versioning:             Worker_Versioning_Options,
 	nondeterminism_policy:  Nondeterminism_Policy,
 	workflow_stacks:        workflow.Stack_Options,
@@ -330,68 +381,104 @@ create :: proc(
 	workflow_stacks := workflow.Stack_Options{},
 	graceful_shutdown_period := temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
 ) -> (worker: Worker, error: Error) {
+	options := options_default(task_queue, namespace)
+	options.max_concurrent_activities = max_concurrent_activities
+	options.versioning = versioning
+	options.nondeterminism_policy = nondeterminism_policy
+	options.workflow_stacks = workflow_stacks
+	options.graceful_shutdown_period = graceful_shutdown_period
+	return create_with_options(client, options)
+}
+
+create_with_options :: proc(
+	client: ^temporal_core.Client,
+	options: Options,
+) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		return {}, error_from_string("client is not initialized")
 	}
-	if len(task_queue) == 0 {
+	if len(options.task_queue) == 0 {
 		return {}, error_from_string("task queue must not be empty")
 	}
-	if len(namespace) == 0 {
+	if len(options.namespace) == 0 {
 		return {}, error_from_string("namespace must not be empty")
 	}
-	if max_concurrent_activities <= 0 {
-		return {}, error_from_string("max concurrent activities must be positive")
+	core_options := temporal_core.Worker_Options{
+		identity_override = options.identity_override,
+		max_activity_slots = options.max_concurrent_activities,
+		max_cached_workflows = options.max_cached_workflows,
+		sticky_queue_schedule_to_start_timeout =
+			options.sticky_queue_schedule_to_start_timeout,
+		max_heartbeat_throttle_interval = options.max_heartbeat_throttle_interval,
+		default_heartbeat_throttle_interval =
+			options.default_heartbeat_throttle_interval,
+		max_worker_activities_per_second = options.max_worker_activities_per_second,
+		max_task_queue_activities_per_second =
+			options.max_task_queue_activities_per_second,
+		graceful_shutdown_period = options.graceful_shutdown_period,
+		workflow_task_poller_behavior = options.workflow_task_poller_behavior,
+		activity_task_poller_behavior = options.activity_task_poller_behavior,
+		nonsticky_to_sticky_poll_ratio = options.nonsticky_to_sticky_poll_ratio,
+		max_eager_activity_reservations_per_workflow_task =
+			options.max_eager_activity_reservations_per_workflow_task,
 	}
-	_, shutdown_period_error := temporal_core.worker_graceful_shutdown_period_millis(
-		graceful_shutdown_period,
-	)
-	if shutdown_period_error.message != nil {
-		return {}, error_from_core(&shutdown_period_error)
+	core_options_error := temporal_core.worker_options_validate(core_options)
+	if core_options_error.message != nil {
+		return {}, error_from_core(&core_options_error)
 	}
-	versioning_error := temporal_core.worker_versioning_options_validate(versioning)
+	versioning_error := temporal_core.worker_versioning_options_validate(options.versioning)
 	if versioning_error.message != nil {
 		return {}, error_from_core(&versioning_error)
 	}
 	nondeterminism_error := temporal_core.nondeterminism_policy_validate(
-		nondeterminism_policy,
+		options.nondeterminism_policy,
 	)
 	if nondeterminism_error.message != nil {
 		return {}, error_from_core(&nondeterminism_error)
 	}
-	resolved_stacks, stack_error := workflow.stack_options_resolve(workflow_stacks)
+	resolved_stacks, stack_error := workflow.stack_options_resolve(options.workflow_stacks)
 	if stack_error.message != nil {
 		return {}, error_from_workflow(&stack_error)
 	}
-	owned_task_queue, allocation_error := strings.clone(task_queue)
+	owned_task_queue, allocation_error := strings.clone(options.task_queue)
 	if allocation_error != nil {
 		return {}, error_from_string("could not allocate worker task queue")
 	}
-	owned_namespace, namespace_allocation_error := strings.clone(namespace)
+	owned_namespace, namespace_allocation_error := strings.clone(options.namespace)
 	if namespace_allocation_error != nil {
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate worker namespace")
 	}
-	owned_build_id, build_id_allocation_error := strings.clone(versioning.build_id)
+	owned_identity, identity_allocation_error := strings.clone(options.identity_override)
+	if identity_allocation_error != nil {
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_string("could not allocate worker identity override")
+	}
+	owned_build_id, build_id_allocation_error := strings.clone(options.versioning.build_id)
 	if build_id_allocation_error != nil {
+		delete(owned_identity)
 		delete(owned_namespace)
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate worker Build ID")
 	}
 	owned_deployment_name, deployment_name_allocation_error := strings.clone(
-		versioning.deployment_name,
+		options.versioning.deployment_name,
 	)
 	if deployment_name_allocation_error != nil {
 		delete(owned_build_id)
+		delete(owned_identity)
 		delete(owned_namespace)
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate worker deployment name")
 	}
 	owned_failure_types, failure_types_ok := owned_string_slice_clone(
-		nondeterminism_policy.fail_workflow_types,
+		options.nondeterminism_policy.fail_workflow_types,
 	)
 	if !failure_types_ok {
 		delete(owned_deployment_name)
 		delete(owned_build_id)
+		delete(owned_identity)
 		delete(owned_namespace)
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate nondeterminism failure Workflow types")
@@ -400,12 +487,14 @@ create :: proc(
 	worker.namespace = owned_namespace
 	worker.task_queue = owned_task_queue
 	worker.lifecycle = .Configuring
-	worker.max_concurrent_activities = max_concurrent_activities
-	worker.graceful_shutdown_period = graceful_shutdown_period
-	worker.versioning = versioning
+	worker.max_concurrent_activities = options.max_concurrent_activities
+	worker.graceful_shutdown_period = options.graceful_shutdown_period
+	worker.core_options = core_options
+	worker.core_options.identity_override = owned_identity
+	worker.versioning = options.versioning
 	worker.versioning.build_id = owned_build_id
 	worker.versioning.deployment_name = owned_deployment_name
-	worker.nondeterminism_policy = nondeterminism_policy
+	worker.nondeterminism_policy = options.nondeterminism_policy
 	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
 	worker.workflow_stacks = resolved_stacks
 	worker.activity_registrations = make([dynamic]Activity_Registration)
@@ -2322,12 +2411,11 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	core_worker, create_error := temporal_core.worker_create(
 		worker.client,
 		worker.task_queue,
+		worker.core_options,
 		worker.namespace,
 		enable_workflows = poll_workflows,
 		enable_local_activities = poll_local_activities,
 		enable_remote_activities = poll_remote_activities,
-		max_activity_slots = worker.max_concurrent_activities,
-		graceful_shutdown_period = worker.graceful_shutdown_period,
 		versioning = worker.versioning,
 		nondeterminism_policy = worker.nondeterminism_policy,
 	)
@@ -2444,6 +2532,7 @@ close :: proc(worker: ^Worker) -> Error {
 	delete(worker.rejected_workflow_runs)
 	delete(worker.namespace)
 	delete(worker.task_queue)
+	delete(worker.core_options.identity_override)
 	delete(worker.versioning.build_id)
 	delete(worker.versioning.deployment_name)
 	owned_string_slice_free(worker.nondeterminism_policy.fail_workflow_types)
@@ -2461,6 +2550,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.lifecycle = .Closed
 	worker.max_concurrent_activities = 0
 	worker.graceful_shutdown_period = 0
+	worker.core_options = {}
 	worker.versioning = {}
 	worker.nondeterminism_policy = {}
 	worker.workflow_stacks = {}

@@ -310,12 +310,12 @@ main :: proc() {
 	shutdown_case := shutdown_value != ""
 	activity_slots := load_case ? 3 : 10
 	graceful_shutdown_period := shutdown_case ? 200 * time.Millisecond : temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD
-	activity_worker, create_error := worker.create(
-		&client,
-		"odin-hello-activity",
-		max_concurrent_activities = activity_slots,
-		graceful_shutdown_period = graceful_shutdown_period,
-	)
+	worker_options := worker.options_default("odin-hello-activity")
+	worker_options.identity_override = "temporal-sdk-odin-hello-activity"
+	worker_options.max_concurrent_activities = activity_slots
+	worker_options.graceful_shutdown_period = graceful_shutdown_period
+	worker_options.activity_task_poller_behavior = worker.poller_simple_maximum(2)
+	activity_worker, create_error := worker.create_with_options(&client, worker_options)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
 		worker.error_free(&create_error)

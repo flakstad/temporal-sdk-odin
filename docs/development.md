@@ -322,6 +322,26 @@ cancellation completion reaches the server before `run` and `close` finish.
 Core does not terminate callback code after another timeout: an Activity that
 ignores cooperative cancellation can keep Worker shutdown waiting indefinitely.
 
+For the complete supported Core configuration surface, construct
+`worker.options_default(task_queue)` and call `worker.create_with_options`.
+Do not start from `worker.Options{}` unless every field is intentionally filled:
+the helper preserves the SDK's explicit heartbeat, poll-ratio, slot, shutdown,
+and eager-reservation defaults. The language Worker clones `identity_override`
+because Core construction remains delayed until `run`; all numeric values are
+stored by value.
+
+The Core adapter uses `Worker_Option_Bindings` to keep the raw simple/autoscaling
+poller records address-stable for the synchronous `temporal_core_worker_new`
+call. Null pointers select Core's default poller policy. Durations are converted
+to milliseconds with positive fractions rounded upward, zero rates map to
+Core's `None`, and nonzero rates must be finite and positive. Enabling Workflow
+caching raises the fixed Workflow slot supplier from one to two; an explicitly
+configured simple Workflow poller must likewise be at least two. Unit tests
+assert every populated C field and pointer arm. A 500-case property test varies
+cache state, slots, both poller forms, duration rounding, rates, and sticky poll
+ratio. It runs against both the pinned PBT submodule and, during local library
+development, `PBT_ROOT=~/Projects/pbt`.
+
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.
 `activity.cancellation_details` returns the associated snapshot of Core's six

@@ -3,6 +3,8 @@ package core
 
 import "core:c"
 import "core:bytes"
+import "core:fmt"
+import "core:math"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -41,6 +43,79 @@ Replay_Worker :: struct {
 
 DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
 DEFAULT_GRACEFUL_SHUTDOWN_PERIOD :: 5 * time.Second
+
+Poller_Behavior_Kind :: enum {
+	Default,
+	Simple_Maximum,
+	Autoscaling,
+}
+
+// Poller_Behavior is the owned Odin representation. Default leaves the C
+// pointers null, allowing Core to choose its default and participate in
+// server-directed poller autoscaling when available.
+Poller_Behavior :: struct {
+	kind:           Poller_Behavior_Kind,
+	simple_maximum: int,
+	minimum:        int,
+	maximum:        int,
+	initial:        int,
+}
+
+poller_simple_maximum :: proc(maximum: int) -> Poller_Behavior {
+	return {kind = .Simple_Maximum, simple_maximum = maximum}
+}
+
+poller_autoscaling :: proc(minimum, maximum, initial: int) -> Poller_Behavior {
+	return {
+		kind = .Autoscaling,
+		minimum = minimum,
+		maximum = maximum,
+		initial = initial,
+	}
+}
+
+// Worker_Options contains the Core-owned worker controls the Odin runtime can
+// currently honor. Strings are borrowed only for worker_create.
+Worker_Options :: struct {
+	identity_override:                              string,
+	max_activity_slots:                             int,
+	max_cached_workflows:                           u32,
+	sticky_queue_schedule_to_start_timeout:         time.Duration,
+	max_heartbeat_throttle_interval:                 time.Duration,
+	default_heartbeat_throttle_interval:             time.Duration,
+	max_worker_activities_per_second:                f64,
+	max_task_queue_activities_per_second:            f64,
+	graceful_shutdown_period:                        time.Duration,
+	workflow_task_poller_behavior:                   Poller_Behavior,
+	activity_task_poller_behavior:                   Poller_Behavior,
+	nonsticky_to_sticky_poll_ratio:                  f32,
+	max_eager_activity_reservations_per_workflow_task: u32,
+}
+
+worker_options_default :: proc() -> Worker_Options {
+	return {
+		max_activity_slots = 10,
+		max_cached_workflows = 0,
+		sticky_queue_schedule_to_start_timeout = 10 * time.Second,
+		max_heartbeat_throttle_interval = 60 * time.Second,
+		default_heartbeat_throttle_interval = time.Second,
+		graceful_shutdown_period = DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
+		nonsticky_to_sticky_poll_ratio = 0.2,
+		// Keep eager dispatch opt-in until the Odin Activity/Workflow executor
+		// has a dedicated eager-execution integration test.
+		max_eager_activity_reservations_per_workflow_task = 0,
+	}
+}
+
+// Worker_Option_Bindings owns the address-stable structs referenced by the raw
+// C options. Core copies them synchronously during worker_new.
+Worker_Option_Bindings :: struct {
+	raw_options:         raw.Worker_Options,
+	workflow_simple:     raw.Poller_Behavior_Simple_Maximum,
+	workflow_autoscaling: raw.Poller_Behavior_Autoscaling,
+	activity_simple:     raw.Poller_Behavior_Simple_Maximum,
+	activity_autoscaling: raw.Poller_Behavior_Autoscaling,
+}
 
 Worker_Versioning_Mode :: enum {
 	Unversioned,
@@ -369,17 +444,207 @@ worker_graceful_shutdown_period_millis :: proc(
 	return
 }
 
+worker_duration_millis :: proc(
+	value: time.Duration,
+	name: string,
+) -> (millis: u64, error: Error) {
+	if value < 0 {
+		message := fmt.tprintf("%s must not be negative", name)
+		return 0, client_option_error(message)
+	}
+	millis = u64(value / time.Millisecond)
+	if value % time.Millisecond != 0 {
+		millis += 1
+	}
+	return
+}
+
+poller_behavior_validate :: proc(value: Poller_Behavior, name: string) -> Error {
+	switch value.kind {
+	case .Default:
+		return {}
+	case .Simple_Maximum:
+		if value.simple_maximum < 1 {
+			return client_option_error(fmt.tprintf("%s simple maximum must be at least one", name))
+		}
+	case .Autoscaling:
+		if value.minimum < 1 {
+			return client_option_error(fmt.tprintf("%s autoscaling minimum must be at least one", name))
+		}
+		if value.maximum < value.minimum {
+			return client_option_error(fmt.tprintf("%s autoscaling maximum must not be below minimum", name))
+		}
+		if value.initial < value.minimum || value.initial > value.maximum {
+			return client_option_error(fmt.tprintf("%s autoscaling initial must be between minimum and maximum", name))
+		}
+	}
+	return {}
+}
+
+worker_options_validate :: proc(options: Worker_Options) -> Error {
+	if options.max_activity_slots <= 0 {
+		return client_option_error("max activity slots must be positive")
+	}
+	_, sticky_error := worker_duration_millis(
+		options.sticky_queue_schedule_to_start_timeout,
+		"sticky queue schedule-to-start timeout",
+	)
+	if sticky_error.message != nil {
+		return sticky_error
+	}
+	_, max_heartbeat_error := worker_duration_millis(
+		options.max_heartbeat_throttle_interval,
+		"maximum heartbeat throttle interval",
+	)
+	if max_heartbeat_error.message != nil {
+		return max_heartbeat_error
+	}
+	_, default_heartbeat_error := worker_duration_millis(
+		options.default_heartbeat_throttle_interval,
+		"default heartbeat throttle interval",
+	)
+	if default_heartbeat_error.message != nil {
+		return default_heartbeat_error
+	}
+	_, shutdown_error := worker_graceful_shutdown_period_millis(
+		options.graceful_shutdown_period,
+	)
+	if shutdown_error.message != nil {
+		return shutdown_error
+	}
+	worker_rate := options.max_worker_activities_per_second
+	if math.is_nan(worker_rate) || math.is_inf(worker_rate) || worker_rate < 0 ||
+	   (worker_rate != 0 && worker_rate < math.F64_MIN) {
+		return client_option_error("maximum worker Activities per second must be finite and non-negative")
+	}
+	task_queue_rate := options.max_task_queue_activities_per_second
+	if math.is_nan(task_queue_rate) || math.is_inf(task_queue_rate) || task_queue_rate < 0 {
+		return client_option_error("maximum task-queue Activities per second must be finite and non-negative")
+	}
+	ratio := options.nonsticky_to_sticky_poll_ratio
+	if math.is_nan(ratio) || math.is_inf(ratio) || ratio < 0 || ratio > 1 {
+		return client_option_error("nonsticky-to-sticky poll ratio must be finite and between zero and one")
+	}
+	workflow_poller_error := poller_behavior_validate(
+		options.workflow_task_poller_behavior,
+		"Workflow task poller",
+	)
+	if workflow_poller_error.message != nil {
+		return workflow_poller_error
+	}
+	activity_poller_error := poller_behavior_validate(
+		options.activity_task_poller_behavior,
+		"Activity task poller",
+	)
+	if activity_poller_error.message != nil {
+		return activity_poller_error
+	}
+	if options.max_cached_workflows > 0 &&
+	   options.workflow_task_poller_behavior.kind == .Simple_Maximum &&
+	   options.workflow_task_poller_behavior.simple_maximum < 2 {
+		return client_option_error("Workflow task simple poller must be at least two when Workflow caching is enabled")
+	}
+	return {}
+}
+
+poller_behavior_bind :: proc(
+	value: Poller_Behavior,
+	simple: ^raw.Poller_Behavior_Simple_Maximum,
+	autoscaling: ^raw.Poller_Behavior_Autoscaling,
+) -> raw.Poller_Behavior {
+	switch value.kind {
+	case .Default:
+		return {}
+	case .Simple_Maximum:
+		simple.simple_maximum = uintptr(value.simple_maximum)
+		return {simple_maximum = simple}
+	case .Autoscaling:
+		autoscaling.minimum = uintptr(value.minimum)
+		autoscaling.maximum = uintptr(value.maximum)
+		autoscaling.initial = uintptr(value.initial)
+		return {autoscaling = autoscaling}
+	}
+	return {}
+}
+
+worker_option_bindings_init :: proc(
+	bindings: ^Worker_Option_Bindings,
+	options: Worker_Options,
+) -> Error {
+	if bindings == nil {
+		return client_option_error("worker option bindings must not be nil")
+	}
+	bindings^ = {}
+	validation_error := worker_options_validate(options)
+	if validation_error.message != nil {
+		return validation_error
+	}
+	sticky_ms, sticky_error := worker_duration_millis(
+		options.sticky_queue_schedule_to_start_timeout,
+		"sticky queue schedule-to-start timeout",
+	)
+	if sticky_error.message != nil { return sticky_error }
+	max_heartbeat_ms, max_heartbeat_error := worker_duration_millis(
+		options.max_heartbeat_throttle_interval,
+		"maximum heartbeat throttle interval",
+	)
+	if max_heartbeat_error.message != nil { return max_heartbeat_error }
+	default_heartbeat_ms, default_heartbeat_error := worker_duration_millis(
+		options.default_heartbeat_throttle_interval,
+		"default heartbeat throttle interval",
+	)
+	if default_heartbeat_error.message != nil { return default_heartbeat_error }
+	shutdown_ms, shutdown_error := worker_graceful_shutdown_period_millis(
+		options.graceful_shutdown_period,
+	)
+	if shutdown_error.message != nil { return shutdown_error }
+
+	bindings.raw_options.identity_override = byte_ref(options.identity_override)
+	bindings.raw_options.max_cached_workflows = options.max_cached_workflows
+	workflow_slots := uintptr(1)
+	if options.max_cached_workflows > 0 {
+		// Cached workers need at least two Workflow slots so a cache eviction
+		// cannot starve the Workflow poll stream.
+		workflow_slots = 2
+	}
+	bindings.raw_options.tuner = raw.Tuner_Holder{
+		workflow_slot_supplier       = fixed_slot_supplier(workflow_slots),
+		activity_slot_supplier       = fixed_slot_supplier(uintptr(options.max_activity_slots)),
+		local_activity_slot_supplier = fixed_slot_supplier(1),
+		nexus_task_slot_supplier     = fixed_slot_supplier(1),
+	}
+	bindings.raw_options.sticky_queue_schedule_to_start_timeout_ms = sticky_ms
+	bindings.raw_options.max_heartbeat_throttle_interval_ms = max_heartbeat_ms
+	bindings.raw_options.default_heartbeat_throttle_interval_ms = default_heartbeat_ms
+	bindings.raw_options.max_activities_per_second = options.max_worker_activities_per_second
+	bindings.raw_options.max_task_queue_activities_per_second = options.max_task_queue_activities_per_second
+	bindings.raw_options.graceful_shutdown_period_ms = shutdown_ms
+	bindings.raw_options.workflow_task_poller_behavior = poller_behavior_bind(
+		options.workflow_task_poller_behavior,
+		&bindings.workflow_simple,
+		&bindings.workflow_autoscaling,
+	)
+	bindings.raw_options.nonsticky_to_sticky_poll_ratio = options.nonsticky_to_sticky_poll_ratio
+	bindings.raw_options.activity_task_poller_behavior = poller_behavior_bind(
+		options.activity_task_poller_behavior,
+		&bindings.activity_simple,
+		&bindings.activity_autoscaling,
+	)
+	bindings.raw_options.max_eager_activity_reservations_per_wf_task =
+		options.max_eager_activity_reservations_per_workflow_task
+	return {}
+}
+
 worker_create :: proc(
 	client: ^Client,
 	task_queue: string,
+	worker_options: Worker_Options,
 	namespace := "default",
 	enable_workflows := false,
 	enable_local_activities := false,
 	enable_remote_activities := true,
-	max_activity_slots := 10,
 	versioning := Worker_Versioning_Options{},
 	nondeterminism_policy := Nondeterminism_Policy{},
-	graceful_shutdown_period := DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
 ) -> (worker: Worker, error: Error) {
 	if client == nil || client.handle == nil || client.runtime == nil {
 		error.message = bytes.clone(transmute([]u8)string("client is not initialized"))
@@ -389,15 +654,10 @@ worker_create :: proc(
 		error.message = bytes.clone(transmute([]u8)string("task queue must not be empty"))
 		return
 	}
-	if max_activity_slots <= 0 {
-		error.message = bytes.clone(transmute([]u8)string("max activity slots must be positive"))
-		return
-	}
-	graceful_shutdown_period_ms, shutdown_period_error := worker_graceful_shutdown_period_millis(
-		graceful_shutdown_period,
-	)
-	if shutdown_period_error.message != nil {
-		return {}, shutdown_period_error
+	bindings := Worker_Option_Bindings{}
+	bindings_error := worker_option_bindings_init(&bindings, worker_options)
+	if bindings_error.message != nil {
+		return {}, bindings_error
 	}
 	versioning_error := worker_versioning_options_validate(versioning)
 	if versioning_error.message != nil {
@@ -417,29 +677,18 @@ worker_create :: proc(
 		workflow_type_refs,
 	)
 
-	options := raw.Worker_Options{
-		namespace = byte_ref(namespace),
-		task_queue = byte_ref(task_queue),
-		versioning_strategy = worker_versioning_strategy_raw(versioning),
-		tuner = raw.Tuner_Holder{
-			workflow_slot_supplier       = fixed_slot_supplier(1),
-			activity_slot_supplier       = fixed_slot_supplier(uintptr(max_activity_slots)),
-			local_activity_slot_supplier = fixed_slot_supplier(1),
-			nexus_task_slot_supplier     = fixed_slot_supplier(1),
-		},
-		task_types = raw.Worker_Task_Types{
-			enable_workflows = enable_workflows,
-			enable_local_activities = enable_local_activities,
-			enable_remote_activities = enable_remote_activities,
-		},
-		max_heartbeat_throttle_interval_ms     = 60_000,
-		default_heartbeat_throttle_interval_ms = 1_000,
-		graceful_shutdown_period_ms            = graceful_shutdown_period_ms,
-		nonsticky_to_sticky_poll_ratio         = 0.2,
-		nondeterminism_as_workflow_fail         = fail_all_workflows,
-		nondeterminism_as_workflow_fail_for_types = fail_workflow_types,
+	options := &bindings.raw_options
+	options.namespace = byte_ref(namespace)
+	options.task_queue = byte_ref(task_queue)
+	options.versioning_strategy = worker_versioning_strategy_raw(versioning)
+	options.task_types = raw.Worker_Task_Types{
+		enable_workflows = enable_workflows,
+		enable_local_activities = enable_local_activities,
+		enable_remote_activities = enable_remote_activities,
 	}
-	result := raw.worker_new(client.handle, &options)
+	options.nondeterminism_as_workflow_fail = fail_all_workflows
+	options.nondeterminism_as_workflow_fail_for_types = fail_workflow_types
+	result := raw.worker_new(client.handle, options)
 	if result.fail != nil {
 		error.message = copy_core_bytes(result.fail)
 		raw.byte_array_free(client.runtime.handle, result.fail)
