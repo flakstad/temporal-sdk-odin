@@ -1819,6 +1819,7 @@ registered before a Workflow are copied when its runtime is created;
 interceptors registered afterward are copied into every existing runtime.
 Registration after `worker.run` starts is rejected. The current typed hooks are
 `start_activity`, `start_local_activity`, `start_child_workflow`,
+`start_nexus_operation`,
 `signal_child_workflow`, `signal_external_workflow`,
 `cancel_external_workflow`, `continue_as_new`, `start_timer`, `sleep`, and
 `cancel_child_workflow`. Each has a semantic input, its natural result type,
@@ -1844,6 +1845,14 @@ identity and reason remain mutable semantic input. The record itself is copied;
 working map is reclaimed with the terminal run arena because the call cannot
 return to execute a defer.
 
+Nexus uses its protocol-specific UTF-8 header slice rather than the generic
+Payload Header builder. The `start_nexus_operation` input exposes endpoint,
+service, operation, one Payload view, and the complete options record. All are
+call-scoped and mutable. Its terminal continuation clones the Payload, strings,
+timeouts, cancellation policy, and headers into run-arena ownership before
+returning the `Nexus_Operation_Future`; interceptor-owned replacement slices
+therefore need remain valid only until `next` returns.
+
 These callbacks run on the Workflow fiber and execute again during history
 replay. They must be deterministic: use no network/filesystem access, wall
 clock, process randomness, or external mutable state that affects the result.
@@ -1854,7 +1863,8 @@ The unit suite verifies nested entry/unwind order, caller-header isolation,
 command headers, timer-duration and cancellation-reason replacement, delayed
 sleep-interceptor unwind until timer resolution, immediate timer-start unwind,
 summary metadata, and explicit-token cancellation,
-Continue-As-New header merging, and byte-identical completions after
+Continue-As-New header merging, Nexus semantic/header replacement and nested
+unwind, and byte-identical completions after
 fresh-stack replay. A 500-case PBT property varies seven operations, chain
 depth, and short-circuit position on the outbound side; the shared property now
 varies thirteen operations after including all five inbound hooks.

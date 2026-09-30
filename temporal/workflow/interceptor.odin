@@ -54,10 +54,36 @@ Outbound_Start_Local_Activity_Interceptor_Proc :: #type proc(
 	next: Outbound_Start_Local_Activity_Next,
 ) -> Activity_Future
 
+Outbound_Start_Nexus_Operation_Input :: struct {
+	ctx:       ^Fiber_Context,
+	endpoint:  string,
+	service:   string,
+	operation: string,
+	input:     codec.Payload_View,
+	options:   Nexus_Operation_Options,
+}
+
+Outbound_Start_Nexus_Operation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Outbound_Start_Nexus_Operation_Input,
+) -> Nexus_Operation_Future
+
+Outbound_Start_Nexus_Operation_Next :: struct {
+	data:   rawptr,
+	invoke: Outbound_Start_Nexus_Operation_Next_Proc,
+}
+
+Outbound_Start_Nexus_Operation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Outbound_Start_Nexus_Operation_Input,
+	next: Outbound_Start_Nexus_Operation_Next,
+) -> Nexus_Operation_Future
+
 Outbound_Interceptor :: struct {
 	user_data:                rawptr,
 	start_activity:           Outbound_Start_Activity_Interceptor_Proc,
 	start_local_activity:     Outbound_Start_Local_Activity_Interceptor_Proc,
+	start_nexus_operation:    Outbound_Start_Nexus_Operation_Interceptor_Proc,
 	start_child_workflow:     Outbound_Start_Child_Workflow_Interceptor_Proc,
 	signal_child_workflow:    Outbound_Signal_Child_Workflow_Interceptor_Proc,
 	signal_external_workflow: Outbound_Signal_External_Workflow_Interceptor_Proc,
@@ -71,6 +97,7 @@ Outbound_Interceptor :: struct {
 outbound_interceptor_has_operation :: proc(interceptor: Outbound_Interceptor) -> bool {
 	return interceptor.start_activity != nil ||
 	       interceptor.start_local_activity != nil ||
+	       interceptor.start_nexus_operation != nil ||
 	       interceptor.start_child_workflow != nil ||
 	       interceptor.signal_child_workflow != nil ||
 	       interceptor.signal_external_workflow != nil ||
@@ -110,6 +137,22 @@ outbound_start_local_activity_next :: proc(
 	if next.invoke == nil || input == nil || input.ctx == nil {
 		if input != nil {
 			workflow_interceptor_failure(input.ctx, "invalid Workflow Local Activity interceptor continuation")
+		}
+		return {}
+	}
+	return next.invoke(next.data, input)
+}
+
+outbound_start_nexus_operation_next :: proc(
+	next: Outbound_Start_Nexus_Operation_Next,
+	input: ^Outbound_Start_Nexus_Operation_Input,
+) -> Nexus_Operation_Future {
+	if next.invoke == nil || input == nil || input.ctx == nil {
+		if input != nil {
+			workflow_interceptor_failure(
+				input.ctx,
+				"invalid Workflow Nexus operation interceptor continuation",
+			)
 		}
 		return {}
 	}
@@ -191,6 +234,52 @@ outbound_start_local_activity_chain :: proc(
 		return {}
 	}
 	return start_local_activity_owned(input.ctx, input.activity_type, owned_inputs, options)
+}
+
+outbound_start_nexus_operation_chain :: proc(
+	data: rawptr,
+	input: ^Outbound_Start_Nexus_Operation_Input,
+) -> Nexus_Operation_Future {
+	state := cast(^Outbound_Interceptor_State)data
+	if state == nil || state.instance == nil || state.instance.runtime == nil || input == nil {
+		if input != nil {
+			workflow_interceptor_failure(
+				input.ctx,
+				"invalid Workflow Nexus operation interceptor state",
+			)
+		}
+		return {}
+	}
+	interceptors := state.instance.runtime.outbound_interceptors[:]
+	for index := state.index; index < len(interceptors); index += 1 {
+		entry := &interceptors[index]
+		if entry.start_nexus_operation == nil do continue
+		next_state := Outbound_Interceptor_State{instance = state.instance, index = index + 1}
+		return entry.start_nexus_operation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = outbound_start_nexus_operation_chain},
+		)
+	}
+	owned_input, clone_error := codec.payload_clone(
+		input.input,
+		state.instance.odin_context.allocator,
+	)
+	if clone_error != .None {
+		workflow_interceptor_failure(
+			input.ctx,
+			"could not preserve intercepted Nexus operation input Payload",
+		)
+		return {}
+	}
+	return start_nexus_operation_owned(
+		input.ctx,
+		input.endpoint,
+		input.service,
+		input.operation,
+		owned_input,
+		input.options,
+	)
 }
 
 outbound_headers_init :: proc(

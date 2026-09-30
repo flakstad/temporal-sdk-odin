@@ -1866,6 +1866,16 @@ preserves its non-returning `-> !` contract through every continuation. The
 caller-owned builder is never mutated, and call-scoped inputs/continuations
 cannot safely be retained.
 
+Nexus operation start is now part of the same ordered outbound chain, but its
+headers are Nexus protocol strings rather than Temporal Payload Headers. Its
+semantic input exposes endpoint, service, operation, one Payload view, the
+three timeouts, cancellation policy, and header slice. The terminal continuation
+clones every retained value into the Workflow run arena before returning the
+non-suspending `Nexus_Operation_Future`. Thus an interceptor can use a temporary
+replacement Payload/header slice during `next`, while neither it nor the
+continuation may escape the call. Offline eviction/replay tests require nested
+entry/unwind order and byte-identical `ScheduleNexusOperation` command bytes.
+
 Sleep interception deliberately wraps the entire stackful wait: code after
 `next` resumes only when the timer fires or cancellation unwinds the wait.
 Timer creation has a second, non-suspending `start_timer` chain. Its terminal
@@ -2665,8 +2675,9 @@ Workflows are enabled.
    beyond the poll arena. Workflow operation state, results, recursive failures,
    and optional operation tokens are owned by the run arena. Async operation
    handlers, user cancel handlers, callback completion, links, outbound
-   interceptors, selector branches, and explicit operation cancellation after
-   callback handoff remain. Schedule-to-close deadline enforcement and Core's
+   metrics, selector branches, and explicit operation cancellation after
+   callback handoff remain. The Workflow outbound interceptor is implemented
+   and fresh-stack replay-tested. Schedule-to-close deadline enforcement and Core's
    cooperative timeout cancellation of a running synchronous Odin handler are
    live-proven. A bounded run
    stops polling after its requested task count, so cancellation of that final
@@ -2689,10 +2700,11 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The next smallest vertical milestone is hardening the new Workflow-to-Nexus
-boundary: live-test all four cancellation policies; add the Workflow
-outbound-interceptor hook and selector branch; and property-test activation
-order/duplicate delivery. Handler failure and pre-start timeout classification
-are now wire-, unit-, live-, and replay-tested. After that,
+boundary: live-test all four cancellation policies; add the selector branch;
+and property-test activation order/duplicate delivery. The Workflow outbound
+interceptor and handler failure/pre-start timeout classification are now
+wire-/unit-tested as applicable and fresh-stack replay-tested; handler failure
+and timeout also run through the live server. After that,
 implement durable async Odin operation tokens, callback completion, and
 user-defined cancel handlers as a separate vertical slice. Activity Worker is
 no longer the next milestone: it is already implemented and extensively

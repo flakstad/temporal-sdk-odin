@@ -157,6 +157,26 @@ when its terminal continuation creates the timer. Code after timer `next`
 runs immediately after Future creation; code after sleep `next` runs only when
 the wait resolves.
 
+Nexus operation start has the same non-suspending Future boundary. Its outbound
+interceptor may deterministically replace endpoint, service, operation, input
+Payload view, timeouts, cancellation policy, or Nexus protocol headers before
+calling `next`:
+
+```odin
+nexus_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Outbound_Start_Nexus_Operation_Input,
+	next: workflow.Outbound_Start_Nexus_Operation_Next,
+) -> workflow.Nexus_Operation_Future {
+	input.options.schedule_to_close_timeout = 30 * time.Second
+	return workflow.outbound_start_nexus_operation_next(next, input)
+}
+```
+
+The input Payload, header slice, and continuation are borrowed only for this
+call. The terminal continuation clones all retained data into the Workflow run
+arena, and the chain executes again during replay.
+
 `join_all` waits for every already-started durable operation in a borrowed case
 slice. It allocates no result collection: after `.Ready`, the existing typed
 await operations retrieve their values synchronously in caller-controlled

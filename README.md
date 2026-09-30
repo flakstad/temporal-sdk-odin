@@ -294,7 +294,8 @@ reject asynchronous completion because they have no server-side pending task.
 Workers can also register deterministic
 Workflow outbound interceptors for remote and Local Activity scheduling, Child
 Workflow start/Signal, external Workflow Signal/cancellation, and
-Continue-As-New, durable sleep, and explicit Child Workflow cancellation.
+Continue-As-New, durable sleep, explicit Child Workflow cancellation, and
+Nexus operation start.
 These run inside the Workflow fiber on normal execution and replay, receive
 isolated per-call headers where the command supports them, and emit through the
 existing Core command path. Workflow inbound interceptors now wrap the complete
@@ -329,8 +330,13 @@ creates a real CLI-devserver endpoint, runs both caller Workflow and operation
 handlers in Odin, preserves a non-retryable handler failure and a
 schedule-to-close timeout as recursive Failure trees, then observes
 `Hello Odin`, fetches the server history, and replays it through Core.
+The deterministic outbound interceptor can replace the endpoint, service,
+operation, input Payload, timeouts, cancellation policy, and Nexus headers
+before the terminal continuation copies them into run ownership; nested order
+and byte-identical fresh-stack replay are tested.
 User-defined async operation handlers, cancel-operation handlers, Nexus
-outbound interceptors, and selector branches are not yet implemented.
+selector branches, and live coverage of all cancellation policies are not yet
+implemented.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {

@@ -306,6 +306,15 @@ client_interceptor_test_count_workflows :: proc(
 
 @(test)
 workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t: ^testing.T) {
+	interceptor_state := Workflow_Nexus_Interceptor_Test_State{}
+	first_interceptor := Workflow_Nexus_Interceptor_Test_Node{
+		state = &interceptor_state,
+		id = 1,
+	}
+	second_interceptor := Workflow_Nexus_Interceptor_Test_Node{
+		state = &interceptor_state,
+		id = 2,
+	}
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
 		&runtime,
@@ -316,6 +325,24 @@ workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t:
 	testing.expect(t, init_error.message == nil)
 	workflow.error_free(&init_error)
 	defer workflow.fiber_runtime_close(&runtime)
+	first_interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{
+			user_data = &first_interceptor,
+			start_nexus_operation = workflow_nexus_test_interceptor,
+		},
+	)
+	second_interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+		&runtime,
+		{
+			user_data = &second_interceptor,
+			start_nexus_operation = workflow_nexus_test_interceptor,
+		},
+	)
+	testing.expect(t, first_interceptor_error.message == nil)
+	testing.expect(t, second_interceptor_error.message == nil)
+	workflow.error_free(&first_interceptor_error)
+	workflow.error_free(&second_interceptor_error)
 
 	input, input_error := codec.encode_json("Odin")
 	testing.expect(t, input_error == .None)
@@ -353,14 +380,14 @@ workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t:
 	testing.expect(t, inspection.decoded)
 	testing.expect_value(t, inspection.command_count, 1)
 	testing.expect_value(t, inspection.scheduled_nexus_operation_seq, u32(1))
-	testing.expect_value(t, string(inspection.nexus_endpoint), "odin-test-endpoint")
-	testing.expect_value(t, string(inspection.nexus_service), "GreetingService")
-	testing.expect_value(t, string(inspection.nexus_operation), "hello")
-	testing.expect_value(t, string(inspection.nexus_input), `"Odin"`)
-	testing.expect_value(t, inspection.nexus_header_count, 2)
-	testing.expect_value(t, string(inspection.nexus_header_key), "x-odin-test")
-	testing.expect_value(t, string(inspection.nexus_header_value), "workflow")
-	testing.expect_value(t, inspection.nexus_schedule_to_close_timeout, 2*time.Minute)
+	testing.expect_value(t, string(inspection.nexus_endpoint), "intercepted-endpoint")
+	testing.expect_value(t, string(inspection.nexus_service), "InterceptedGreetingService")
+	testing.expect_value(t, string(inspection.nexus_operation), "intercepted-hello")
+	testing.expect_value(t, string(inspection.nexus_input), `"Intercepted Odin"`)
+	testing.expect_value(t, inspection.nexus_header_count, 1)
+	testing.expect_value(t, string(inspection.nexus_header_key), "x-odin-interceptor")
+	testing.expect_value(t, string(inspection.nexus_header_value), "active")
+	testing.expect_value(t, inspection.nexus_schedule_to_close_timeout, 3*time.Minute)
 	testing.expect_value(t, inspection.nexus_schedule_to_start_timeout, 15*time.Second)
 	testing.expect_value(t, inspection.nexus_start_to_close_timeout, 45*time.Second)
 	testing.expect_value(
@@ -374,6 +401,13 @@ workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t:
 	delete(inspection.nexus_input)
 	delete(inspection.nexus_header_key)
 	delete(inspection.nexus_header_value)
+	testing.expect_value(t, interceptor_state.terminal_calls, 1)
+	testing.expect(t, interceptor_state.second_saw_first_mutations)
+	testing.expect_value(t, interceptor_state.event_count, 4)
+	expected_initial_events := [?]int{1, 2, -2, -1}
+	for expected, index in expected_initial_events {
+		testing.expect_value(t, interceptor_state.events[index], expected)
+	}
 	delete(initial.completion)
 	workflow.error_free(&initial.error)
 
@@ -408,6 +442,11 @@ workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t:
 	testing.expect(t, replayed.error.message == nil)
 	testing.expect(t, replayed.scheduled_nexus_operation)
 	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	testing.expect_value(t, interceptor_state.terminal_calls, 2)
+	testing.expect_value(t, interceptor_state.event_count, 8)
+	for expected, index in expected_initial_events {
+		testing.expect_value(t, interceptor_state.events[index + 4], expected)
+	}
 	delete(initial_bytes)
 	delete(replayed.completion)
 	workflow.error_free(&replayed.error)
@@ -4872,6 +4911,61 @@ nexus_caller_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) 
 			headers = headers[:],
 		},
 	)
+}
+
+Workflow_Nexus_Interceptor_Test_State :: struct {
+	events:                     [8]int,
+	event_count:                int,
+	terminal_calls:             int,
+	second_saw_first_mutations: bool,
+}
+
+Workflow_Nexus_Interceptor_Test_Node :: struct {
+	state: ^Workflow_Nexus_Interceptor_Test_State,
+	id:    int,
+}
+
+workflow_nexus_test_interceptor :: proc(
+	user_data: rawptr,
+	input: ^workflow.Outbound_Start_Nexus_Operation_Input,
+	next: workflow.Outbound_Start_Nexus_Operation_Next,
+) -> workflow.Nexus_Operation_Future {
+	node := cast(^Workflow_Nexus_Interceptor_Test_Node)user_data
+	state := node.state
+	state.events[state.event_count] = node.id
+	state.event_count += 1
+	if node.id == 1 {
+		input.endpoint = "intercepted-endpoint"
+		input.service = "InterceptedGreetingService"
+		input.operation = "intercepted-hello"
+		input.options.schedule_to_close_timeout = 3 * time.Minute
+		headers := [?]workflow.Nexus_Header{{
+			key = "x-odin-interceptor",
+			value = "active",
+		}}
+		input.options.headers = headers[:]
+		metadata := [?]codec.Metadata_Entry{{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		}}
+		input.input = {
+			metadata = metadata[:],
+			data = transmute([]u8)string(`"Intercepted Odin"`),
+		}
+	} else {
+		state.second_saw_first_mutations = input.endpoint == "intercepted-endpoint" &&
+		                                  input.service == "InterceptedGreetingService" &&
+		                                  input.operation == "intercepted-hello" &&
+		                                  input.options.schedule_to_close_timeout == 3*time.Minute &&
+		                                  len(input.options.headers) == 1 &&
+		                                  input.options.headers[0].key == "x-odin-interceptor" &&
+		                                  string(input.input.data) == `"Intercepted Odin"`
+		state.terminal_calls += 1
+	}
+	result := workflow.outbound_start_nexus_operation_next(next, input)
+	state.events[state.event_count] = -node.id
+	state.event_count += 1
+	return result
 }
 
 child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {

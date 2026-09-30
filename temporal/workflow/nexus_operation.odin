@@ -251,19 +251,22 @@ start_nexus_operation_payload :: proc(
 	input: codec.Payload_View,
 	options := Nexus_Operation_Options{schedule_to_close_timeout = 20 * time.Second},
 ) -> Nexus_Operation_Future {
-	if ctx == nil || ctx.instance == nil {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready {
+		if ctx != nil && ctx.instance != nil {
+			ctx.instance.phase = .Failed
+		}
 		return {}
 	}
-	owned_input, clone_error := codec.payload_clone(input, ctx.instance.odin_context.allocator)
-	if clone_error != .None {
-		mark_nexus_operation_failure(
-			ctx,
-			"could not preserve Nexus operation input",
-			"OdinWorkflowPayloadConversionError",
-		)
-		return {}
+	interceptor_input := Outbound_Start_Nexus_Operation_Input{
+		ctx = ctx,
+		endpoint = endpoint,
+		service = service,
+		operation = operation,
+		input = input,
+		options = options,
 	}
-	return start_nexus_operation_owned(ctx, endpoint, service, operation, owned_input, options)
+	state := Outbound_Interceptor_State{instance = ctx.instance}
+	return outbound_start_nexus_operation_chain(&state, &interceptor_input)
 }
 
 start_nexus_operation_json :: proc(
@@ -284,7 +287,15 @@ start_nexus_operation_json :: proc(
 		)
 		return {}
 	}
-	return start_nexus_operation_owned(ctx, endpoint, service, operation, payload, options)
+	defer codec.payload_free(&payload)
+	return start_nexus_operation_payload(
+		ctx,
+		endpoint,
+		service,
+		operation,
+		codec.payload_view(&payload),
+		options,
+	)
 }
 
 start_nexus_operation :: proc(
