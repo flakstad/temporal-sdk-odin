@@ -140,6 +140,41 @@ async_wait :: proc(ctx: ^nexus.Context, name: string) -> nexus.Result(string) {
 	return start_async_completer(ctx, name, ASYNC_WAIT_WORKFLOW_TYPE)
 }
 
+async_probe :: proc(ctx: ^nexus.Context, _: string) -> nexus.Result(string) {
+	operation_info := nexus.info(ctx)
+	if len(operation_info.request_id) == 0 || len(operation_info.operation) == 0 {
+		return nexus.result_handler_error(
+			string,
+			"Temporal did not provide a Nexus probe request ID",
+			"INTERNAL",
+			.Non_Retryable,
+		)
+	}
+	operation_token := fmt.aprintf(
+		"odin-nexus-probe-%s-%s",
+		operation_info.operation,
+		operation_info.request_id,
+	)
+	defer delete(operation_token)
+	return nexus.result_async_copy(string, operation_token)
+}
+
+cancel_async_probe :: proc(
+	ctx: ^nexus.Context,
+	operation_token: string,
+) -> nexus.Cancel_Result {
+	operation_info := nexus.info(ctx)
+	if operation_info.operation != "async-try-cancel" || len(operation_token) == 0 ||
+	   operation_info.operation_token != operation_token {
+		return nexus.cancel_handler_error(
+			"unexpected Nexus cancellation-policy probe token",
+			"BAD_REQUEST",
+			.Non_Retryable,
+		)
+	}
+	return nexus.cancel_complete()
+}
+
 cancel_async_wait :: proc(
 	ctx: ^nexus.Context,
 	operation_token: string,
@@ -245,6 +280,69 @@ hello_nexus_workflow :: proc(ctx: ^workflow.Fiber_Context, endpoint: string) -> 
 	if async_result.status != .Canceled {
 		return "Nexus async operation did not acknowledge cancellation"
 	}
+
+	wait_completed_future := workflow.start_nexus_operation_json(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		"async-wait-completed",
+		"Odin",
+		{
+			schedule_to_close_timeout = 20 * time.Second,
+			cancellation_type = .Wait_Cancellation_Completed,
+		},
+	)
+	workflow.sleep(ctx, 100 * time.Millisecond)
+	if !workflow.cancel_nexus_operation(ctx, wait_completed_future) {
+		return "Nexus wait-completed cancellation was not requested"
+	}
+	wait_completed_result := workflow.await_nexus_operation_result(ctx, wait_completed_future)
+	if wait_completed_result.status != .Canceled {
+		return "Nexus wait-completed operation did not reach terminal cancellation"
+	}
+
+	try_cancel_future := workflow.start_nexus_operation_json(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		"async-try-cancel",
+		"Odin",
+		{
+			schedule_to_close_timeout = 20 * time.Second,
+			cancellation_type = .Try_Cancel,
+		},
+	)
+	workflow.sleep(ctx, 100 * time.Millisecond)
+	if !workflow.cancel_nexus_operation(ctx, try_cancel_future) {
+		return "Nexus try-cancel operation was not canceled"
+	}
+	try_cancel_result := workflow.await_nexus_operation_result(ctx, try_cancel_future)
+	if try_cancel_result.status != .Canceled {
+		return "Nexus try-cancel caller did not resume immediately"
+	}
+
+	abandon_future := workflow.start_nexus_operation_json(
+		ctx,
+		endpoint,
+		NEXUS_SERVICE,
+		"async-abandon",
+		"Odin",
+		{
+			schedule_to_close_timeout = 20 * time.Second,
+			cancellation_type = .Abandon,
+		},
+	)
+	workflow.sleep(ctx, 100 * time.Millisecond)
+	if !workflow.cancel_nexus_operation(ctx, abandon_future) {
+		return "Nexus abandon operation was not detached"
+	}
+	abandon_result := workflow.await_nexus_operation_result(ctx, abandon_future)
+	if abandon_result.status != .Canceled {
+		return "Nexus abandon caller did not resume immediately"
+	}
+	// Give the Service time to dispatch TryCancel. Abandon must remain silent;
+	// the final Worker counters distinguish those two policies.
+	workflow.sleep(ctx, 2 * time.Second)
 
 	options := workflow.Nexus_Operation_Options{
 		schedule_to_close_timeout = 20 * time.Second,
@@ -431,6 +529,48 @@ run :: proc() -> int {
 		worker.error_free(&async_registration_error)
 		return 1
 	}
+	wait_completed_registration_error := worker.register_json_nexus_operation_result(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"async-wait-completed",
+		async_wait,
+	)
+	if wait_completed_registration_error.message != nil {
+		fmt.eprintf(
+			"Nexus wait-completed registration failed: %s\n",
+			string(wait_completed_registration_error.message),
+		)
+		worker.error_free(&wait_completed_registration_error)
+		return 1
+	}
+	try_cancel_registration_error := worker.register_json_nexus_operation_result(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"async-try-cancel",
+		async_probe,
+	)
+	if try_cancel_registration_error.message != nil {
+		fmt.eprintf(
+			"Nexus try-cancel registration failed: %s\n",
+			string(try_cancel_registration_error.message),
+		)
+		worker.error_free(&try_cancel_registration_error)
+		return 1
+	}
+	abandon_registration_error := worker.register_json_nexus_operation_result(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"async-abandon",
+		async_probe,
+	)
+	if abandon_registration_error.message != nil {
+		fmt.eprintf(
+			"Nexus abandon registration failed: %s\n",
+			string(abandon_registration_error.message),
+		)
+		worker.error_free(&abandon_registration_error)
+		return 1
+	}
 	async_complete_registration_error := worker.register_json_nexus_operation_result(
 		&sdk_worker,
 		NEXUS_SERVICE,
@@ -459,6 +599,34 @@ run :: proc() -> int {
 		worker.error_free(&cancel_registration_error)
 		return 1
 	}
+	wait_completed_cancel_error := worker.register_nexus_cancel_handler(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"async-wait-completed",
+		cancel_async_wait,
+	)
+	if wait_completed_cancel_error.message != nil {
+		fmt.eprintf(
+			"Nexus wait-completed cancel registration failed: %s\n",
+			string(wait_completed_cancel_error.message),
+		)
+		worker.error_free(&wait_completed_cancel_error)
+		return 1
+	}
+	try_cancel_handler_error := worker.register_nexus_cancel_handler(
+		&sdk_worker,
+		NEXUS_SERVICE,
+		"async-try-cancel",
+		cancel_async_probe,
+	)
+	if try_cancel_handler_error.message != nil {
+		fmt.eprintf(
+			"Nexus try-cancel handler registration failed: %s\n",
+			string(try_cancel_handler_error.message),
+		)
+		worker.error_free(&try_cancel_handler_error)
+		return 1
+	}
 
 	id_buffer: [256]u8
 	workflow_id := os.get_env(id_buffer[:], "TEMPORAL_NEXUS_WORKFLOW_ID")
@@ -478,7 +646,7 @@ run :: proc() -> int {
 	stats, run_error := worker.run(
 		&sdk_worker,
 		{
-			max_workflow_executions = 3,
+			max_workflow_executions = 4,
 			on_ready = start_when_worker_ready,
 			on_ready_data = &state,
 		},
@@ -493,13 +661,15 @@ run :: proc() -> int {
 		return 1
 	}
 	defer temporal_client.workflow_handle_free(&state.handle)
-	if stats.workflow_executions_completed != 3 || stats.nexus_tasks_completed != 7 ||
-	   stats.nexus_cancellations_received != 1 {
+	if stats.workflow_executions_completed != 4 || stats.nexus_tasks_completed != 12 ||
+	   stats.nexus_cancellations_received != 1 ||
+	   stats.nexus_cancel_operations_received != 3 {
 		fmt.eprintf(
-			"Unexpected Worker stats: workflows=%d Nexus=%d cancellations=%d\n",
+			"Unexpected Worker stats: workflows=%d Nexus=%d task_cancellations=%d cancel_operations=%d\n",
 			stats.workflow_executions_completed,
 			stats.nexus_tasks_completed,
 			stats.nexus_cancellations_received,
+			stats.nexus_cancel_operations_received,
 		)
 		return 1
 	}
@@ -567,6 +737,7 @@ run :: proc() -> int {
 	fmt.println("Nexus handler failure and schedule-to-close timeout retained structured Failure trees")
 	fmt.println("Nexus selector and join composed two concurrent operations")
 	fmt.println("Nexus async start token reached the registered cancel handler")
+	fmt.println("All four Nexus cancellation policies completed their distinct live paths")
 	fmt.println("Nexus async result completed through a Temporal Workflow callback")
 	fmt.println("Nexus caller Workflow event link was attached to the async completer")
 	fmt.printf(

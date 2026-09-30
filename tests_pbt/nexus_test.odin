@@ -252,6 +252,83 @@ workflow_nexus_commands_preserve_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+nexus_cancellation_policy_property :: proc(t: ^pbt.T) -> pbt.Result {
+	policy_index := pbt.draw(t, pbt.int_range(0, 3))
+	policy := workflow.Nexus_Operation_Cancellation_Type(policy_index)
+	pbt.cover(t, policy == .Wait_Cancellation_Completed, 20.0, "wait cancellation completed")
+	pbt.cover(t, policy == .Abandon, 20.0, "abandon")
+	pbt.cover(t, policy == .Try_Cancel, 20.0, "try cancel")
+	pbt.cover(t, policy == .Wait_Cancellation_Requested, 20.0, "wait cancellation requested")
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return pbt.error("could not initialize Nexus cancellation policy arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	instance := workflow.Fiber_Instance{phase = .Ready}
+	instance.nexus_operations = make([dynamic]workflow.Fiber_Nexus_Operation)
+	append(
+		&instance.nexus_operations,
+		workflow.Fiber_Nexus_Operation{
+			seq = 1,
+			options = {cancellation_type = policy},
+			start_state = .Succeeded,
+			state = .Commanded,
+		},
+	)
+	ctx := workflow.Fiber_Context{instance = &instance}
+	if !workflow.cancel_nexus_operation(&ctx, {seq = 1}) {
+		return pbt.fail("generated Nexus policy rejected cancellation")
+	}
+
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	processed := workflow.Process_Result{}
+	workflow.append_fiber_nexus_operation_cancellations(&processed, &commands, &instance)
+	operation := &instance.nexus_operations[0]
+	if policy == .Abandon {
+		if len(commands) != 0 || operation.state != .Canceled ||
+		   operation.cancellation_command_emitted ||
+		   !workflow.nexus_operation_ready_for_waiter(&instance, operation, 0) {
+			return pbt.fail("Abandon emitted cancellation or remained suspended")
+		}
+	} else {
+		if len(commands) != 1 || !operation.cancellation_command_emitted ||
+		   !processed.requested_nexus_operation_cancellation {
+			return pbt.fail("canceling Nexus policy did not emit exactly one command")
+		}
+		if policy == .Try_Cancel {
+			if operation.state != .Canceled ||
+			   !workflow.nexus_operation_ready_for_waiter(&instance, operation, 0) {
+				return pbt.fail("TryCancel did not resume immediately")
+			}
+		} else if operation.state != .Cancel_Requested ||
+		          workflow.nexus_operation_ready_for_waiter(&instance, operation, 0) {
+			return pbt.fail("waiting Nexus policy resumed before Core resolution")
+		}
+	}
+	command_count := len(commands)
+	workflow.append_fiber_nexus_operation_cancellations(&processed, &commands, &instance)
+	if len(commands) != command_count {
+		return pbt.fail("Nexus cancellation command was emitted more than once")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_nexus_cancellation_policies_preserve_distinct_transitions :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow Nexus cancellation policies preserve distinct transitions",
+		nexus_cancellation_policy_property,
+		{num_tests = 240, seed = 0x4e45_5855_535f_4341},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 nexus_selector_property_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	order: string,

@@ -1054,8 +1054,8 @@ shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
 `odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
-Odin Worker runs the stackful caller Workflow, two completer Workflows, and five
-registered operation types across seven Nexus tasks.
+Odin Worker runs the stackful caller Workflow, three completer Workflows, and
+eight registered operation types across twelve Nexus tasks.
 It first observes a non-retryable handler failure, then forces a one-second
 schedule-to-close timeout and verifies that Core cooperatively cancels the
 running Odin callback. It then starts an asynchronous completer Workflow with
@@ -1064,7 +1064,12 @@ waiting Nexus call. The handler requires the caller Workflow-event link,
 translates its `temporal://` URL, and attaches the resulting common Link to both
 the callback and completer start. A second async operation is canceled; its
 registered cancel handler uses the durable operation token as the backing
-Workflow ID and calls the Odin Client cancellation API. Finally it starts two concurrent
+Workflow ID and calls the Odin Client cancellation API. Separate branches then
+exercise every cancellation policy: `Abandon` detaches without dispatching a
+protocol cancellation, `Try_Cancel` dispatches it while resuming the caller
+immediately, `Wait_Cancellation_Requested` waits for Service acceptance, and
+`Wait_Cancellation_Completed` waits for the backing Workflow's terminal
+callback. Finally it starts two concurrent
 `odin-greeting-service/hello` calls, wakes through the Nexus selector, joins
 both Futures, and requires both to return the JSON string `"Hello Odin"`. The
 example fetches the resulting server history and replays all branches offline
@@ -1089,12 +1094,19 @@ NEXUS_ENDPOINT=odin-nexus-local \
   ./scripts/run-hello-nexus-workflow.sh
 ```
 
-The example starts one Workflow, handles the operation matrix, validates the result,
+The example starts one caller Workflow plus three backing/completer Workflows,
+handles the operation matrix, validates the result,
 replays the fetched history, and exits. `scripts/integration-test.sh` is the
 canonical repeatable harness. Endpoint names permit letters, digits, and
 hyphens, but not underscores. Core cancel tasks are routed cooperatively.
 Protocol `CancelOperation` requests invoke an explicitly registered handler;
 registrations without one return a non-retryable `NOT_IMPLEMENTED` response.
+Worker statistics distinguish these paths:
+`nexus_cancellations_received` counts Core-local `CancelTask` notifications for
+an in-flight handler, while `nexus_cancel_operations_received` counts protocol
+`CancelOperation` tasks. The live matrix requires exactly one local timeout
+cancellation and three protocol cancel operations; the latter count also proves
+that `Abandon` did not dispatch a fourth request.
 `nexus.result_async(Output, token)` populates both the modern operation token
 and deprecated operation ID for compatibility when token storage already
 outlives the handler adapter. `nexus.result_async_copy(Output, token)` preserves

@@ -185,7 +185,10 @@ Run_Stats :: struct {
 	// configured Core slot count.
 	activity_executions_peak_owned:        int,
 	nexus_tasks_completed:                  int,
+	// Core-local CancelTask notifications for an already running handler.
 	nexus_cancellations_received:           int,
+	// Protocol CancelOperation tasks dispatched to registered cancel handlers.
+	nexus_cancel_operations_received:       int,
 	nexus_executions_peak_owned:            int,
 	workflow_activations_completed:       int,
 	workflow_activation_failures:         int,
@@ -2680,7 +2683,13 @@ reap_nexus_executions :: proc(
 run_nexus_loop :: proc(
 	worker: ^Worker,
 	max_tasks, executor_threads: int,
-) -> (completed: int, cancellations: int, peak_in_flight: int, error: Error) {
+) -> (
+	completed: int,
+	cancellations: int,
+	cancel_operations: int,
+	peak_in_flight: int,
+	error: Error,
+) {
 	routes := make(Nexus_Execution_Routes, executor_threads, allocator_runtime.heap_allocator())
 	defer delete(routes)
 	pool := thread.Pool{}
@@ -2700,11 +2709,11 @@ run_nexus_loop :: proc(
 		reaped, reap_error := reap_nexus_executions(&routes, &pool)
 		completed += reaped
 		if reap_error.message != nil {
-			return completed, cancellations, peak_in_flight, reap_error
+			return completed, cancellations, cancel_operations, peak_in_flight, reap_error
 		}
 		poll := temporal_core.worker_poll_nexus(&worker.core)
 		if poll.error.message != nil {
-			return completed, cancellations, peak_in_flight, error_from_core(&poll.error)
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
 			break
@@ -2713,7 +2722,7 @@ run_nexus_loop :: proc(
 		decode_arena: virtual.Arena
 		if virtual.arena_init_growing(&decode_arena) != nil {
 			delete(poll.protobuf)
-			return completed, cancellations, peak_in_flight, error_from_string("could not initialize Nexus protobuf decode arena")
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_string("could not initialize Nexus protobuf decode arena")
 		}
 		previous_allocator := context.allocator
 		context.allocator = virtual.arena_allocator(&decode_arena)
@@ -2722,7 +2731,7 @@ run_nexus_loop :: proc(
 		if decode_error != .None {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, peak_in_flight, error_from_string("Core returned a malformed NexusTask protobuf")
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_string("Core returned a malformed NexusTask protobuf")
 		}
 		if task.kind == .Cancel_Task {
 			execution, found := nexus_execution_route_find(routes, task.task_token)
@@ -2741,24 +2750,27 @@ run_nexus_loop :: proc(
 		if task.kind != .Start_Operation && task.kind != .Cancel_Operation {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, peak_in_flight, error_from_string("Core returned an unsupported Nexus task")
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_string("Core returned an unsupported Nexus task")
+		}
+		if task.kind == .Cancel_Operation {
+			cancel_operations += 1
 		}
 		if _, duplicate := nexus_execution_route_find(routes, task.task_token); duplicate {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, peak_in_flight, error_from_string("Core returned a duplicate Nexus task token")
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_string("Core returned a duplicate Nexus task token")
 		}
 		execution, execute_error := nexus_execution_start(worker, &pool, &task)
 		virtual.arena_destroy(&decode_arena)
 		delete(poll.protobuf)
 		if execute_error.message != nil {
-			return completed, cancellations, peak_in_flight, execute_error
+			return completed, cancellations, cancel_operations, peak_in_flight, execute_error
 		}
 		started += 1
 		if execution == nil {
 			completed += 1
 		} else if !nexus_execution_route_add(&routes, execution) {
-			return completed, cancellations, peak_in_flight, error_from_string("could not route Nexus execution task token")
+			return completed, cancellations, cancel_operations, peak_in_flight, error_from_string("could not route Nexus execution task token")
 		} else {
 			peak_in_flight = max(peak_in_flight, len(routes))
 		}
@@ -2767,7 +2779,7 @@ run_nexus_loop :: proc(
 	pool_finished = true
 	reaped, reap_error := reap_nexus_executions(&routes, &pool)
 	completed += reaped
-	return completed, cancellations, peak_in_flight, reap_error
+	return completed, cancellations, cancel_operations, peak_in_flight, reap_error
 }
 
 record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
@@ -3163,6 +3175,7 @@ Nexus_Thread_State :: struct {
 	executor_threads: int,
 	completed:      int,
 	cancellations:  int,
+	cancel_operations: int,
 	peak_in_flight: int,
 	error:          Error,
 }
@@ -3187,6 +3200,7 @@ workflow_thread_main :: proc(state: ^Workflow_Thread_State) {
 nexus_thread_main :: proc(state: ^Nexus_Thread_State) {
 	state.completed,
 	state.cancellations,
+	state.cancel_operations,
 	state.peak_in_flight,
 	state.error = run_nexus_loop(state.worker, state.max_tasks, state.executor_threads)
 	if state.error.message != nil {
@@ -3274,6 +3288,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if poll_nexus && !poll_activities && !poll_workflows {
 		stats.nexus_tasks_completed,
 		stats.nexus_cancellations_received,
+		stats.nexus_cancel_operations_received,
 		stats.nexus_executions_peak_owned,
 		error = run_nexus_loop(worker, options.max_nexus_tasks, worker.max_concurrent_nexus_tasks)
 		return
@@ -3349,6 +3364,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	stats.activity_executions_peak_owned = activity_state.peak_in_flight
 	stats.nexus_tasks_completed = nexus_state.completed
 	stats.nexus_cancellations_received = nexus_state.cancellations
+	stats.nexus_cancel_operations_received = nexus_state.cancel_operations
 	stats.nexus_executions_peak_owned = nexus_state.peak_in_flight
 	if workflow_state.error.message != nil {
 		error = workflow_state.error
