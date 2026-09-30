@@ -1043,6 +1043,51 @@ Activity_Execution :: struct {
 	error:         Error,
 }
 
+// Activity executions are routed by the exact opaque Core task-token bytes.
+// Keys borrow each execution's owned task_token and must be removed before the
+// execution is destroyed.
+Activity_Execution_Routes :: map[string]^Activity_Execution
+
+activity_execution_route_find :: proc(
+	routes: Activity_Execution_Routes,
+	task_token: []u8,
+) -> (^Activity_Execution, bool) {
+	execution, found := routes[string(task_token)]
+	return execution, found
+}
+
+activity_execution_route_add :: proc(
+	routes: ^Activity_Execution_Routes,
+	execution: ^Activity_Execution,
+) -> bool {
+	if routes == nil || execution == nil || len(execution.task_token) == 0 {
+		return false
+	}
+	key := string(execution.task_token)
+	_, found := routes^[key]
+	if found {
+		return false
+	}
+	routes^[key] = execution
+	return true
+}
+
+activity_execution_route_remove :: proc(
+	routes: ^Activity_Execution_Routes,
+	execution: ^Activity_Execution,
+) -> bool {
+	if routes == nil || execution == nil || len(execution.task_token) == 0 {
+		return false
+	}
+	key := string(execution.task_token)
+	routed, found := routes^[key]
+	if !found || routed != execution {
+		return false
+	}
+	delete_key(routes, key)
+	return true
+}
+
 Activity_Info_Owner :: struct {
 	info:                    activity.Info,
 	owned_strings:           [dynamic]string,
@@ -1696,20 +1741,8 @@ process_workflow_activation :: proc(
 	return
 }
 
-find_activity_execution :: proc(
-	executions: []^Activity_Execution,
-	task_token: []u8,
-) -> (^Activity_Execution, bool) {
-	for execution in executions {
-		if bytes.equal(execution.task_token, task_token) {
-			return execution, true
-		}
-	}
-	return nil, false
-}
-
 reap_activity_executions :: proc(
-	executions: ^[dynamic]^Activity_Execution,
+	routes: ^Activity_Execution_Routes,
 	pool: ^thread.Pool,
 ) -> (completed: int, error: Error) {
 	for {
@@ -1718,14 +1751,7 @@ reap_activity_executions :: proc(
 			break
 		}
 		execution := cast(^Activity_Execution)task.data
-		index := -1
-		for candidate, candidate_index in executions^ {
-			if candidate == execution {
-				index = candidate_index
-				break
-			}
-		}
-		if index < 0 {
+		if !activity_execution_route_remove(routes, execution) {
 			activity_execution_destroy(execution)
 			if error.message == nil {
 				error = error_from_string("Activity executor returned an unknown task")
@@ -1741,7 +1767,6 @@ reap_activity_executions :: proc(
 			completed += 1
 		}
 		activity_execution_destroy(execution)
-		unordered_remove(executions, index)
 	}
 	return
 }
@@ -1750,8 +1775,12 @@ run_activity_loop :: proc(
 	worker: ^Worker,
 	max_tasks: int,
 ) -> (completed: int, cancellations: int, error: Error) {
-	executions := make([dynamic]^Activity_Execution)
-	defer delete(executions)
+	routes := make(
+		Activity_Execution_Routes,
+		worker.max_concurrent_activities,
+		allocator_runtime.heap_allocator(),
+	)
+	defer delete(routes)
 	pool := thread.Pool{}
 	thread.pool_init(
 		&pool,
@@ -1763,14 +1792,14 @@ run_activity_loop :: proc(
 	defer {
 		if !pool_finished {
 			thread.pool_finish(&pool)
-			_, cleanup_error := reap_activity_executions(&executions, &pool)
+			_, cleanup_error := reap_activity_executions(&routes, &pool)
 			error_free(&cleanup_error)
 		}
 		thread.pool_destroy(&pool)
 	}
 	started := 0
 	for max_tasks <= 0 || started < max_tasks {
-		reaped, reap_error := reap_activity_executions(&executions, &pool)
+		reaped, reap_error := reap_activity_executions(&routes, &pool)
 		completed += reaped
 		if reap_error.message != nil {
 			return completed, cancellations, reap_error
@@ -1799,7 +1828,7 @@ run_activity_loop :: proc(
 			return completed, cancellations, error_from_string("Core returned a malformed ActivityTask protobuf")
 		}
 		if task.kind == .Cancel {
-			execution, found := find_activity_execution(executions[:], task.task_token)
+			execution, found := activity_execution_route_find(routes, task.task_token)
 			if found {
 				activity.context_request_cancellation(
 					&execution.ctx,
@@ -1812,6 +1841,16 @@ run_activity_loop :: proc(
 			delete(poll.protobuf)
 			continue
 		}
+		if len(task.task_token) == 0 {
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			return completed, cancellations, error_from_string("Core returned an Activity start without a task token")
+		}
+		if _, duplicate := activity_execution_route_find(routes, task.task_token); duplicate {
+			virtual.arena_destroy(&decode_arena)
+			delete(poll.protobuf)
+			return completed, cancellations, error_from_string("Core returned a duplicate Activity task token")
+		}
 
 		execution, execute_error := activity_execution_start(worker, &pool, &task)
 		virtual.arena_destroy(&decode_arena)
@@ -1822,13 +1861,13 @@ run_activity_loop :: proc(
 		started += 1
 		if execution == nil {
 			completed += 1
-		} else {
-			append(&executions, execution)
+		} else if !activity_execution_route_add(&routes, execution) {
+			return completed, cancellations, error_from_string("could not route Activity execution task token")
 		}
 	}
 	thread.pool_finish(&pool)
 	pool_finished = true
-	reaped, reap_error := reap_activity_executions(&executions, &pool)
+	reaped, reap_error := reap_activity_executions(&routes, &pool)
 	completed += reaped
 	return completed, cancellations, reap_error
 }

@@ -4906,7 +4906,8 @@ activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
 
 	tokens: [10][2]u8
 	executions: [10]worker.Activity_Execution
-	routes: [10]^worker.Activity_Execution
+	routes := make(worker.Activity_Execution_Routes, count)
+	defer delete(routes)
 	captures: [10]Activity_Heartbeat_Capture
 	for index in 0 ..< count {
 		tokens[index] = {u8(index), u8(index + 0xa5)}
@@ -4918,7 +4919,9 @@ activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
 			&captures[index],
 			capture_activity_heartbeat,
 		)
-		routes[index] = &executions[index]
+		if !worker.activity_execution_route_add(&routes, &executions[index]) {
+			return pbt.error("could not add generated Activity execution route")
+		}
 	}
 
 	for _ in 0 ..< heartbeats_before {
@@ -4926,7 +4929,7 @@ activity_token_routing_preserves_cancellation :: proc(t: ^pbt.T) -> pbt.Result {
 			return pbt.fail("heartbeat failed before generated cancellation")
 		}
 	}
-	found, ok := worker.find_activity_execution(routes[:count], tokens[target][:])
+	found, ok := worker.activity_execution_route_find(routes, tokens[target][:])
 	if !ok || found != &executions[target] {
 		return pbt.fail("task token routed to the wrong Activity execution")
 	}

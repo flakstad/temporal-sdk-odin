@@ -293,8 +293,12 @@ never migrates between threads. The Activity poll thread instead creates one
 heap-stable execution record per start task and submits it to a reusable Odin
 standard-library thread pool. The pool and Core's fixed-size Activity slot
 supplier both use `max_concurrent_activities` (10 by default), while the poll
-thread remains free to deliver task-token-matched cancel tasks. On exit, the
-pool finishes queued/running callbacks before its execution records are freed.
+thread remains free to deliver task-token-matched cancel tasks. Active
+executions are hash-indexed by exact opaque binary task token; the key borrows
+the execution-owned token and is deleted before that execution is freed. A
+500-case property stresses 1–64 routes, embedded NUL bytes, duplicate tokens,
+lookup locality, and forward/reverse drain order. On exit, the pool finishes
+queued/running callbacks before its execution records are freed.
 `worker.request_shutdown` is safe to call from a coordinating thread;
 `worker.close` must only be called after `run` returns.
 

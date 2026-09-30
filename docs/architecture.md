@@ -2169,7 +2169,11 @@ execute without stopping Workflow polling. Activity start tasks own
 heap-stable execution/context state until their callback thread joins. Core's
 fixed slot supplier bounds concurrency; the single poll thread continues to
 receive prioritized cancel tasks and atomically marks the matching context.
-Core explicitly permits Activity completions to be called concurrently.
+The poll thread indexes each execution by the exact opaque binary task token;
+the map key borrows the execution-owned token and is removed before execution
+destruction. This makes cancellation routing average constant-time and rejects
+duplicate start tokens instead of overwriting a live route. Core explicitly
+permits Activity completions to be called concurrently.
 
 Cancellation cannot forcibly unwind arbitrary Odin code. User code must return
 after observing `activity.is_cancellation_requested`; the worker then emits an
@@ -2301,13 +2305,14 @@ Workflows are enabled.
    retained. Every new root graph still needs generation, compile, unit, and
    live `prost` interoperability checks.
 3. **Worker concurrency.** The fixed-slot Activity executor, heap-stable
-   task-token routes, cooperative cancellation, and heartbeat transport pass
-   live tests. It now reuses a standard-library thread pool sized to the same
-   limit as Core's Activity slot supplier. Structured retryable/non-retryable
-   failures now pass generated and live retry tests. It still uses a linear
-   in-flight lookup and lacks load/backpressure, process-level panic
-   containment and
-   shutdown-timeout stress tests.
+   hash-indexed task-token routes, cooperative cancellation, and heartbeat
+   transport pass live tests. It reuses a standard-library thread pool sized to
+   the same limit as Core's Activity slot supplier. Structured
+   retryable/non-retryable failures pass generated and live retry tests. A
+   500-case route property exercises 1–64 opaque binary tokens, embedded zero
+   bytes, duplicate rejection, and forward/reverse drain order. The remaining
+   risks are sustained-load/backpressure validation, process-level panic
+   containment, and shutdown-timeout stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and

@@ -19,6 +19,35 @@ import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
 
+@(test)
+activity_execution_routes_preserve_opaque_binary_task_tokens :: proc(t: ^testing.T) {
+	routes := make(worker.Activity_Execution_Routes)
+	defer delete(routes)
+	first_token := [?]u8{0x00, 0xff, 0x41, 0x00, 0x7f}
+	second_token := [?]u8{0x00, 0xff, 0x41, 0x00, 0x80}
+	duplicate_token := [?]u8{0x00, 0xff, 0x41, 0x00, 0x7f}
+	first := worker.Activity_Execution{task_token = first_token[:]}
+	second := worker.Activity_Execution{task_token = second_token[:]}
+	duplicate := worker.Activity_Execution{task_token = duplicate_token[:]}
+
+	testing.expect(t, worker.activity_execution_route_add(&routes, &first))
+	testing.expect(t, worker.activity_execution_route_add(&routes, &second))
+	testing.expect(t, !worker.activity_execution_route_add(&routes, &duplicate))
+	testing.expect_value(t, len(routes), 2)
+
+	found, first_found := worker.activity_execution_route_find(routes, duplicate_token[:])
+	testing.expect(t, first_found && found == &first)
+	testing.expect(t, !worker.activity_execution_route_remove(&routes, &duplicate))
+	testing.expect(t, worker.activity_execution_route_remove(&routes, &first))
+	_, removed_found := worker.activity_execution_route_find(routes, first_token[:])
+	testing.expect(t, !removed_found)
+	testing.expect(t, worker.activity_execution_route_remove(&routes, &second))
+	testing.expect_value(t, len(routes), 0)
+	testing.expect(t, !worker.activity_execution_route_add(&routes, nil))
+	empty := worker.Activity_Execution{}
+	testing.expect(t, !worker.activity_execution_route_add(&routes, &empty))
+}
+
 Heartbeat_Capture :: struct {
 	calls:   int,
 	details: string,

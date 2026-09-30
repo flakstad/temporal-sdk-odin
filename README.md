@@ -198,7 +198,10 @@ correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
-cancellation. The context preserves Core's cancellation reason and all six
+cancellation. Opaque binary task tokens are indexed in an execution-owned hash
+route, giving average constant-time cancellation delivery as concurrency grows;
+duplicate tokens are rejected as a Core protocol invariant. The context
+preserves Core's cancellation reason and all six
 detail flags (`not_found`, `cancelled`, `paused`, `timed_out`,
 `worker_shutdown`, and `reset`). Typed callbacks may return a canceled result
 with a user Payload; a Workflow using `Wait_Cancellation_Completed` can request
