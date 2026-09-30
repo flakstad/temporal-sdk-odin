@@ -89,7 +89,7 @@ workflow_sleep_interceptor :: proc(
 	input: ^workflow.Outbound_Sleep_Input,
 	next: workflow.Outbound_Sleep_Next,
 ) {
-	fmt.printf("Workflow sleep interceptor entered duration=%v\n", input.duration)
+	fmt.printf("Workflow sleep interceptor entered duration=%v\n", input.options.duration)
 	workflow.outbound_sleep_next(next, input)
 	fmt.println("Workflow sleep interceptor exited")
 }

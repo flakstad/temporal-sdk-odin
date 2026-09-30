@@ -1,11 +1,10 @@
 package workflow
 
-import "core:time"
 import codec "../codec"
 
 Outbound_Start_Timer_Input :: struct {
-	ctx:      ^Fiber_Context,
-	duration: time.Duration,
+	ctx:     ^Fiber_Context,
+	options: Timer_Options,
 }
 
 Outbound_Start_Timer_Next_Proc :: #type proc(
@@ -25,8 +24,8 @@ Outbound_Start_Timer_Interceptor_Proc :: #type proc(
 ) -> Timer_Future
 
 Outbound_Sleep_Input :: struct {
-	ctx:      ^Fiber_Context,
-	duration: time.Duration,
+	ctx:     ^Fiber_Context,
+	options: Timer_Options,
 }
 
 Outbound_Sleep_Next_Proc :: #type proc(
@@ -299,7 +298,7 @@ outbound_start_timer_chain :: proc(
 			{data = &next_state, invoke = outbound_start_timer_chain},
 		)
 	}
-	return start_timer_unintercepted(input.ctx, input.duration)
+	return start_timer_unintercepted(input.ctx, input.options)
 }
 
 outbound_sleep_chain :: proc(
@@ -322,7 +321,7 @@ outbound_sleep_chain :: proc(
 		)
 		return
 	}
-	sleep_terminal(input.ctx, input.duration)
+	sleep_terminal(input.ctx, input.options)
 }
 
 outbound_cancel_child_workflow_chain :: proc(

@@ -256,6 +256,12 @@ temporal workflow execute \
 selector_output="$(<"$workflow_output_file")"
 echo "$selector_output"
 grep -q 'Hello selector' <<<"$selector_output"
+temporal workflow show \
+  --workflow-id "$selector_workflow_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+grep -q 'userMetadata' "$typed_history_file"
+grep -Eq 'Selector timeout intercepted by Odin|IlNlbGVjdG9yIHRpbWVvdXQgaW50ZXJjZXB0ZWQgYnkgT2RpbiI=' "$typed_history_file"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

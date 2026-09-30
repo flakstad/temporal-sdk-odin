@@ -433,6 +433,15 @@ Signal_Options :: struct {
 	headers: ^Headers,
 }
 
+// Timer_Options borrows summary only for the start call. A zero-value
+// cancellation token inherits the token selected by the current Workflow
+// fiber. Empty summary means no UI-facing Timer summary.
+Timer_Options :: struct {
+	duration:           time.Duration,
+	cancellation_token: Cancellation_Token,
+	summary:            string,
+}
+
 // Activity_Options borrows its strings, slices, and retry_policy only for the
 // start/execute call. The Workflow runtime copies them into the run arena before
 // it can suspend. A zero duration means "not specified".
@@ -1049,9 +1058,11 @@ Fiber_Property_Command :: struct {
 }
 
 Fiber_Timer_Operation :: struct {
-	seq:      u32,
-	duration: time.Duration,
-	state:    Fiber_Operation_State,
+	seq:         u32,
+	duration:    time.Duration,
+	summary:     codec.Payload,
+	has_summary: bool,
+	state:       Fiber_Operation_State,
 	detached_from_root_cancellation: bool,
 	cancellation_token_id: u32,
 }
@@ -8244,39 +8255,75 @@ selector_select :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Selector
 	return {status = .Canceled, index = -1}
 }
 
-start_timer_unintercepted :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
+start_timer_unintercepted :: proc(ctx: ^Fiber_Context, options: Timer_Options) -> Timer_Future {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || options.duration <= 0 {
 		timer_fail(ctx, "invalid Workflow timer start")
 		return {}
 	}
 	instance := ctx.instance
-	if current_cancellation_applies(instance) {
-		return {}
+	token_id := current_cancellation_token_id(instance)
+	if options.cancellation_token.id != 0 {
+		if options.cancellation_token.instance != instance {
+			timer_fail(ctx, "Workflow timer cancellation token belongs to another run")
+			return {}
+		}
+		_, token_found := find_cancellation_node(instance, options.cancellation_token.id)
+		if !token_found {
+			timer_fail(ctx, "Workflow timer cancellation token was not found")
+			return {}
+		}
+		token_id = options.cancellation_token.id
+	}
+	summary := codec.Payload{}
+	has_summary := len(options.summary) > 0
+	if has_summary {
+		encode_error: codec.Error
+		summary, encode_error = codec.encode_json(
+			options.summary,
+			instance.odin_context.allocator,
+		)
+		if encode_error != .None {
+			timer_fail(ctx, "could not preserve Workflow timer summary")
+			return {}
+		}
 	}
 	instance.next_timer_seq += 1
+	state := Fiber_Operation_State.Scheduled
+	if cancellation_token_is_requested_id(instance, token_id) {
+		state = .Canceled
+	}
 	operation := Fiber_Timer_Operation{
 		seq = instance.next_timer_seq,
-		duration = duration,
-		state = .Scheduled,
+		duration = options.duration,
+		summary = summary,
+		has_summary = has_summary,
+		state = state,
 		detached_from_root_cancellation = !cancellation_token_linked_to_root(
 			instance,
-			current_cancellation_token_id(instance),
+			token_id,
 		),
-		cancellation_token_id = current_cancellation_token_id(instance),
+		cancellation_token_id = token_id,
 	}
 	append(&instance.timers, operation)
 	return {seq = operation.seq}
 }
 
-// start_timer creates a durable timer Future without suspending. Its outbound
-// interceptor may inspect or replace Future creation but does not await it.
-start_timer :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
+// start_timer_with_options creates a durable timer Future without suspending.
+// Its options remain mutable throughout the synchronous outbound interceptor
+// chain and are copied into Workflow-run ownership by the terminal continuation.
+start_timer_with_options :: proc(ctx: ^Fiber_Context, options: Timer_Options) -> Timer_Future {
 	if ctx == nil || ctx.instance == nil {
 		return {}
 	}
-	input := Outbound_Start_Timer_Input{ctx = ctx, duration = duration}
+	input := Outbound_Start_Timer_Input{ctx = ctx, options = options}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	return outbound_start_timer_chain(&state, &input)
+}
+
+// start_timer creates a durable timer Future without suspending. Its outbound
+// interceptor may inspect or replace Future creation but does not await it.
+start_timer :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
+	return start_timer_with_options(ctx, {duration = duration})
 }
 
 cancel_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> bool {
@@ -8331,30 +8378,30 @@ await_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> Timer_Result_S
 
 // sleep schedules a durable Temporal timer and suspends the Workflow fiber.
 // It never reads wall-clock time in the language runtime.
-sleep_terminal :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
+sleep_terminal :: proc(ctx: ^Fiber_Context, options: Timer_Options) {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || options.duration <= 0 {
 		if ctx != nil && ctx.instance != nil {
 			ctx.instance.phase = .Failed
 		}
 		return
 	}
-	instance := ctx.instance
-	if current_cancellation_applies(instance) {
-		return
-	}
 	// Sleep remains a suspending operation, while Timer creation traverses its
 	// own non-suspending interceptor chain.
-	future := start_timer(ctx, duration)
+	future := start_timer_with_options(ctx, options)
 	_ = await_timer(ctx, future)
 }
 
-sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+sleep_with_options :: proc(ctx: ^Fiber_Context, options: Timer_Options) {
 	if ctx == nil || ctx.instance == nil {
 		return
 	}
-	input := Outbound_Sleep_Input{ctx = ctx, duration = duration}
+	input := Outbound_Sleep_Input{ctx = ctx, options = options}
 	state := Outbound_Interceptor_State{instance = ctx.instance}
 	outbound_sleep_chain(&state, &input)
+}
+
+sleep :: proc(ctx: ^Fiber_Context, duration: time.Duration) {
+	sleep_with_options(ctx, {duration = duration})
 }
 
 condition_fail :: proc(ctx: ^Fiber_Context, message: string) {
@@ -8941,13 +8988,21 @@ append_fiber_timer_command :: proc(
 		seq = operation.seq,
 		start_to_fire_timeout = timeout,
 	}
+	command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+		variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer{
+			value = start_timer,
+		},
+	}
+	if operation.has_summary {
+		summary := new(proto.Temporal_Api_Common_V1_Payload)
+		summary^ = proto.encode_payload(codec.payload_view(&operation.summary))
+		user_metadata := new(proto.Temporal_Api_Sdk_V1_UserMetadata)
+		user_metadata.summary = summary
+		command.user_metadata = user_metadata
+	}
 	append(
 		commands,
-		proto.Coresdk_Workflow_Commands_WorkflowCommand{
-			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer{
-				value = start_timer,
-			},
-		},
+		command,
 	)
 	operation.state = .Commanded
 	result.started_timer = true

@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:bytes"
+import "core:mem/virtual"
 import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
@@ -14,7 +15,10 @@ selector_property_workflow :: proc(
 ) -> string {
 	first := workflow.start_activity(ctx, "first", "input")
 	second := workflow.start_activity(ctx, "second", "input")
-	timer := workflow.start_timer(ctx, time.Hour)
+	timer := workflow.start_timer_with_options(
+		ctx,
+		{duration = time.Hour, summary = order},
+	)
 	cases: [3]workflow.Selector_Case
 	switch order {
 	case "0":
@@ -47,6 +51,56 @@ selector_property_workflow :: proc(
 		}
 		return "timer"
 	}
+}
+
+selector_timer_summary_matches :: proc(
+	data: []u8,
+	expected: codec.Payload_View,
+) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil {
+			return false
+		}
+		for command in status.value.commands {
+			#partial switch variant in command.variant {
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer:
+				if variant.value == nil || command.user_metadata == nil ||
+				   command.user_metadata.summary == nil {
+					return false
+				}
+				summary := command.user_metadata.summary
+				if !bytes.equal(summary.data, expected.data) ||
+				   len(summary.metadata) != len(expected.metadata) {
+					return false
+				}
+				for entry, index in summary.metadata {
+					if entry.key != expected.metadata[index].key ||
+					   !bytes.equal(entry.value, expected.metadata[index].value) {
+						return false
+					}
+				}
+				return true
+			}
+		}
+	}
+	return false
 }
 
 append_selector_property_jobs :: proc(
@@ -134,6 +188,9 @@ selector_order_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if initial.error.message != nil || initial.scheduled_activity_count != 2 ||
 	   !initial.started_timer || !initial.waiting_selector {
 		return pbt.fail("generated selector Workflow did not initialize")
+	}
+	if !selector_timer_summary_matches(initial.completion[:], codec.payload_view(&input)) {
+		return pbt.fail("generated selector Timer summary did not reach command metadata")
 	}
 	initial_completion := bytes.clone(initial.completion[:])
 	defer delete(initial_completion)

@@ -2854,7 +2854,7 @@ workflow_sleep_test_interceptor :: proc(
 ) {
 	state := cast(^Workflow_Sleep_Test_State)user_data
 	state.entered += 1
-	input.duration *= 2
+	input.options.duration *= 2
 	workflow.outbound_sleep_next(next, input)
 	state.exited += 1
 }
@@ -2866,8 +2866,9 @@ workflow_timer_test_interceptor :: proc(
 ) -> workflow.Timer_Future {
 	state := cast(^Workflow_Sleep_Test_State)user_data
 	state.timer_entered += 1
-	state.timer_input_duration = input.duration
-	input.duration += 3 * time.Millisecond
+	state.timer_input_duration = input.options.duration
+	input.options.duration += 3 * time.Millisecond
+	input.options.summary = "intercepted sleep timer"
 	future := workflow.outbound_start_timer_next(next, input)
 	state.timer_future_seq = future.seq
 	state.timer_exited += 1
@@ -3150,7 +3151,10 @@ fiber_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> strin
 
 fiber_chain_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	first := workflow.execute_activity(ctx, "hello", name)
-	workflow.sleep(ctx, time.Millisecond)
+	workflow.sleep_with_options(
+		ctx,
+		{duration = time.Millisecond, summary = "Original sleep summary"},
+	)
 	return workflow.execute_activity(ctx, "hello", first)
 }
 
@@ -4585,6 +4589,30 @@ fiber_signal_timeout_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: s
 	return result.value
 }
 
+fiber_timer_options_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	token := workflow.cancellation_detached(ctx)
+	timer := workflow.start_timer_with_options(
+		ctx,
+		{
+			duration = 45 * time.Second,
+			cancellation_token = token,
+			summary = "Explicit token timer",
+		},
+	)
+	_ = workflow.await_signal(ctx, "cancel-explicit-timer")
+	requested := workflow.cancellation_request(token, "timer option cancellation")
+	if !requested {
+		return "timer token cancellation failed"
+	}
+	if workflow.await_timer(ctx, timer) != .Canceled {
+		return "timer did not observe explicit token cancellation"
+	}
+	return "timer-options-ok"
+}
+
 fiber_signal_timeout_activity_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
@@ -5332,6 +5360,7 @@ Workflow_Completion_Inspection :: struct {
 	canceled_timer_seq:     u32,
 	started_timer_seq:      u32,
 	started_timer_duration: time.Duration,
+	started_timer_summary:  []u8,
 	canceled_activity_seq:  u32,
 	canceled_activity_count: int,
 	canceled_activity_seqs: [4]u32,
@@ -5377,6 +5406,12 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 					inspection.started_timer_duration = proto_duration_value(
 						variant.value.start_to_fire_timeout,
 					)
+					if command.user_metadata != nil &&
+					   command.user_metadata.summary != nil {
+						inspection.started_timer_summary = bytes.clone(
+							command.user_metadata.summary.data,
+						)
+					}
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
 				if variant.value != nil {
@@ -12191,6 +12226,12 @@ workflow_fiber_sequences_activity_timer_activity :: proc(t: ^testing.T) {
 	testing.expect_value(t, inbound_state.event_count, 2)
 	timer_inspection := inspect_workflow_completion(processed.completion[:])
 	testing.expect_value(t, timer_inspection.started_timer_duration, 5 * time.Millisecond)
+	testing.expect_value(
+		t,
+		string(timer_inspection.started_timer_summary),
+		`"intercepted sleep timer"`,
+	)
+	delete(timer_inspection.started_timer_summary)
 
 	// Rebuild the suspended Workflow on a fresh stack and require the composed
 	// sleep/start-timer interceptor chains to emit identical command bytes.
@@ -17902,6 +17943,105 @@ workflow_fiber_signal_timeout_timer_wins :: proc(t: ^testing.T) {
 	testing.expect_value(t, inspection.command_count, 1)
 	testing.expect(t, inspection.completed)
 	testing.expect_value(t, string(inspection.completion_result), `"Timed out"`)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_timer_options_encode_summary_and_select_cancellation_token :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_timer_options_workflow",
+		"test-queue",
+		fiber_timer_options_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_timer_options_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-timer-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		processed.error.message == nil,
+		"Timer options initialization failed: %s",
+		string(processed.error.message),
+	)
+	testing.expect(t, processed.started_timer && processed.waiting_signal)
+	inspection := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect_value(t, inspection.started_timer_seq, u32(1))
+	testing.expect_value(t, inspection.started_timer_duration, 45 * time.Second)
+	testing.expect_value(
+		t,
+		string(inspection.started_timer_summary),
+		`"Explicit token timer"`,
+	)
+	delete(inspection.started_timer_summary)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	signal_input, signal_input_error := codec.encode_json("cancel")
+	testing.expect(t, signal_input_error == .None)
+	defer codec.payload_free(&signal_input)
+	signal_input_proto := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(signal_input_proto.metadata)
+	defer delete(signal_input_proto.external_payloads)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "cancel-explicit-timer",
+	}
+	defer delete(signal.input)
+	append(&signal.input, signal_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		processed.error.message == nil,
+		"explicit Timer token cancellation failed: %s",
+		string(processed.error.message),
+	)
+	testing.expect(t, processed.received_signal)
+	testing.expect(t, processed.canceled_timer)
+	testing.expect(t, processed.completed)
+	terminal := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, terminal.decoded && terminal.completed)
+	testing.expect_value(t, terminal.canceled_timer_seq, u32(1))
+	testing.expect_value(t, string(terminal.completion_result), `"timer-options-ok"`)
+	delete(terminal.completion_result)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
 }

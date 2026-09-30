@@ -120,9 +120,22 @@ cancel them. The case slice and its Signal names are borrowed until selection
 returns. Selected Signal values and metadata are borrowed run-arena views.
 
 Direct `start_timer` traverses the outbound `start_timer` interceptor without
-suspending. The input exposes the duration and the continuation returns the
-created `Timer_Future`, so an interceptor can deterministically replace the
-duration or Future:
+suspending. Use `start_timer_with_options` to select a specific Workflow
+cancellation token or attach a UI-facing summary:
+
+```odin
+timer := workflow.start_timer_with_options(ctx, {
+	duration = 30 * time.Second,
+	cancellation_token = timeout_token,
+	summary = "Wait for approval",
+})
+```
+
+A zero token inherits the current fiber token. Empty summary means absent; a
+non-empty value is copied into Workflow-run ownership and serialized as
+`json/plain` command `UserMetadata.summary`. The interceptor input exposes the
+complete mutable options record and its continuation returns the created
+`Timer_Future`, so it can deterministically replace options or the Future:
 
 ```odin
 timer_interceptor :: proc(
@@ -130,11 +143,14 @@ timer_interceptor :: proc(
 	input: ^workflow.Outbound_Start_Timer_Input,
 	next: workflow.Outbound_Start_Timer_Next,
 ) -> workflow.Timer_Future {
-	input.duration *= 2
+	input.options.duration *= 2
+	input.options.summary = "intercepted timer"
 	return workflow.outbound_start_timer_next(next, input)
 }
 ```
 
+`sleep_with_options(ctx, options)` exposes the same record for sequential code;
+plain `sleep(ctx, duration)` remains the compact convenience.
 `sleep` has a separate stackful interceptor because it models the complete
 suspending call. It traverses the sleep chain first and the timer-start chain
 when its terminal continuation creates the timer. Code after timer `next`

@@ -123,7 +123,7 @@ workflow_interceptor_property_sleep :: proc(
 	node := cast(^Workflow_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id
 	node.state.event_count += 1
-	input.duration += time.Duration(node.id)
+	input.options.duration += time.Duration(node.id)
 	if !node.short_circuit {
 		workflow.outbound_sleep_next(next, input)
 	}
@@ -139,7 +139,7 @@ workflow_interceptor_property_timer :: proc(
 	node := cast(^Workflow_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id
 	node.state.event_count += 1
-	input.duration += time.Duration(node.id)
+	input.options.duration += time.Duration(node.id)
 	result := workflow.Timer_Future{}
 	if !node.short_circuit {
 		result = workflow.outbound_start_timer_next(next, input)
@@ -371,7 +371,10 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		}
 		_ = workflow.outbound_cancel_external_workflow_chain(&chain, &input)
 	case 5:
-		input := workflow.Outbound_Sleep_Input{ctx = &ctx, duration = time.Second}
+		input := workflow.Outbound_Sleep_Input{
+			ctx = &ctx,
+			options = {duration = time.Second},
+		}
 		workflow.outbound_sleep_chain(&chain, &input)
 	case 6:
 		input := workflow.Outbound_Cancel_Child_Workflow_Input{
@@ -436,7 +439,10 @@ workflow_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		}
 		_ = workflow.inbound_handle_update_handler_chain(&inbound_chain, &input)
 	case 12:
-		input := workflow.Outbound_Start_Timer_Input{ctx = &ctx, duration = time.Second}
+		input := workflow.Outbound_Start_Timer_Input{
+			ctx = &ctx,
+			options = {duration = time.Second},
+		}
 		_ = workflow.outbound_start_timer_chain(&chain, &input)
 	}
 	reached := short_index + 1

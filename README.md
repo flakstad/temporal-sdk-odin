@@ -1486,8 +1486,24 @@ run. The CLI-devserver suite live-proves an Activity/Timer race, fresh-stack
 replay, and explicit timer cancellation.
 
 `start_timer` traverses the distinct outbound `start_timer` interceptor and
-returns its `Timer_Future` without suspending. An interceptor may replace the
-duration before calling `workflow.outbound_start_timer_next`. `sleep` first
+returns its `Timer_Future` without suspending. `start_timer_with_options`
+additionally accepts an explicit Workflow cancellation token and a UI-facing
+summary:
+
+```odin
+timeout := workflow.cancellation_child(workflow.cancellation_root(ctx))
+timer := workflow.start_timer_with_options(ctx, {
+    duration = 30 * time.Second,
+    cancellation_token = timeout,
+    summary = "Wait for payment",
+})
+```
+
+A zero token inherits the token selected by the current Workflow fiber. The
+summary is copied into run ownership and encoded as Temporal command
+`UserMetadata`. An interceptor may replace any option before calling
+`workflow.outbound_start_timer_next`. `sleep_with_options` exposes the same
+options for the sequential, suspending form. `sleep` first
 traverses the stackful `sleep` chain and then the timer-start chain: code after
 a timer-start continuation runs as soon as the Future is created, while code
 after a sleep continuation runs only after the timer fires or is canceled.

@@ -418,10 +418,11 @@ workflow_timer_interceptor :: proc(
 	input: ^workflow.Outbound_Start_Timer_Input,
 	next: workflow.Outbound_Start_Timer_Next,
 ) -> workflow.Timer_Future {
-	is_probe := input.duration == 30 * time.Second
+	is_probe := input.options.duration == 30 * time.Second
 	if is_probe {
 		fmt.println("Workflow Timer interceptor entered before command")
-		input.duration = 31 * time.Second
+		input.options.duration = 31 * time.Second
+		input.options.summary = "Selector timeout intercepted by Odin"
 	}
 	future := workflow.outbound_start_timer_next(next, input)
 	if is_probe {
@@ -843,7 +844,13 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	}
 	if name == "selector" {
 		activity_future := workflow.start_activity(ctx, "hello", name)
-		timer_future := workflow.start_timer(ctx, 30 * time.Second)
+		timer_future := workflow.start_timer_with_options(
+			ctx,
+			{
+				duration = 30 * time.Second,
+				summary = "Selector timeout",
+			},
+		)
 		cases := [?]workflow.Selector_Case{
 			workflow.selector_activity(activity_future),
 			workflow.selector_timer(timer_future),

@@ -1731,11 +1731,17 @@ returns `CancellableWorkflowOutboundFuture<TimerResult>`, while
 `WorkflowContext::timer` calls that chain before preparing the Future. Odin's
 source evidence is in
 `crates/workflow/src/workflow_interceptors.rs` and
-`crates/workflow/src/workflow_context.rs`. Odin's current public timer surface
-exposes duration plus the selected cancellation scope, so the
-interceptor input presently exposes the mutable duration; Core-internal token
-selection remains derived from the active Odin cancellation scope. Timer
-summary/event-group fields can be added when the public Odin timer options grow.
+`crates/workflow/src/workflow_context.rs`. Odin now mirrors the stable options
+that cross this language boundary: duration, an optional explicit Workflow
+cancellation token, and summary. A zero token inherits the token selected by
+the current main/Signal/Update fiber. The terminal continuation validates that
+an explicit token belongs to the same run, copies summary as `json/plain` into
+the run arena, and places it in `WorkflowCommand.user_metadata.summary`. The
+whole mutable `Timer_Options` record traverses each interceptor. Core's
+experimental Event Group markers remain intentionally out of the public API.
+`start_timer_with_options` returns the non-suspending Future;
+`sleep_with_options` composes the stackful sleep and timer-start chains around
+the same record.
 
 This differs from .NET's stackful outbound `DelayAsync` boundary, which is the
 closest analogue for Odin `sleep`. Explicit Child cancellation is a separate
@@ -2406,9 +2412,11 @@ The declaration-biased Workflow selector, allocation-free `join_all`, public
 Timer future, and distinct non-suspending timer-start interceptor are now
 implemented and live-proven. Two independent
 180-trace properties cover selector case/job order and join job/split order with
-fresh-stack replay. The next smallest runtime slice is generative Child
-start/completion and cancellation coverage for selector/join, followed by the
-remaining public Timer options. Neither requires a new C ABI symbol.
+fresh-stack replay; the selector property also carries generated Timer summaries
+through command metadata and replay. Timer duration, summary, and explicit
+cancellation-token options are implemented. The next smallest runtime slice is
+generative Child start/completion and cancellation coverage for selector/join.
+It requires no new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for

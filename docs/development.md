@@ -201,7 +201,8 @@ and one durable Timer, waits with `waiting_selector=true`, selects the Activity,
 explicitly cancels the losing Timer, and returns `Hello selector`. The worker
 log must show both Core-driven fresh-stack replay and the terminal
 `CancelTimer` command. The same run requires the distinct `start_timer`
-interceptor to enter and unwind around non-suspending Future creation.
+interceptor to enter and unwind around non-suspending Future creation, replace
+the Timer summary, and persist that summary in Server history.
 The following `TEMPORAL_ODIN_SCENARIO=join-all` case starts a fast and a
 two-second Activity with two callback slots. It requires a partial joined wait,
 Core eviction/replay, two completed Activity Tasks, and the declaration-ordered
@@ -1593,7 +1594,11 @@ and an explicit `next` continuation. Continue-As-New and its continuation are
 so code after `next` runs only after timer resolution or cancellation. In
 contrast, `start_timer` returns its `Timer_Future` and unwinds immediately.
 The terminal sleep continuation calls through the timer-start chain after all
-sleep interceptors have applied their duration changes.
+sleep interceptors have applied their duration changes. The mutable Timer input
+contains `Timer_Options`: duration, optional explicit cancellation token, and
+summary. Empty token inherits the current fiber token; non-empty summary is
+encoded as command `UserMetadata.summary`. `start_timer_with_options` returns a
+Future; `sleep_with_options` applies the same record to the suspending form.
 
 The SDK clones the caller's command headers into a Workflow-run-arena working
 map before invoking the chain. Every interceptor sees the same mutable working
@@ -1614,6 +1619,7 @@ Logging is possible but will normally appear again on replay.
 The unit suite verifies nested entry/unwind order, caller-header isolation,
 command headers, timer-duration and cancellation-reason replacement, delayed
 sleep-interceptor unwind until timer resolution, immediate timer-start unwind,
+summary metadata, and explicit-token cancellation,
 Continue-As-New header merging, and byte-identical completions after
 fresh-stack replay. A 500-case PBT property varies seven operations, chain
 depth, and short-circuit position on the outbound side; the shared property now
@@ -1621,7 +1627,9 @@ varies thirteen operations after including all five inbound hooks.
 CLI-devserver scenarios read interceptor-injected
 headers from real Activity, Child Workflow, Signal, and next-run Workflow
 contexts after they cross SDK Core. The selector scenario proves the
-timer-start hook around real Core command creation and cancellation. The Child
+timer-start hook and interceptor-replaced summary in real Server history around
+Core command creation and cancellation. Its 180-trace PBT property also varies
+summary values and requires byte-identical replay. The Child
 Workflow scenario also proves
 sleep suspension/unwind and explicit Child cancellation hooks around real Core
 commands.
