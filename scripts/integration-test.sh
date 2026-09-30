@@ -264,6 +264,42 @@ grep -Eq "resolved=1 .*canceled_timer=true .*waiting_selector=false .*completed=
 grep -q "Workflow selector chose the ready Activity and canceled its losing timer" "$worker_log"
 echo "Workflow selector raced an Activity and timer through Core and Temporal Server"
 
+TEMPORAL_ODIN_SCENARIO=join-all \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Join Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+join_workflow_id="odin-sdk-join-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$join_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"join-all"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file"
+join_output="$(<"$workflow_output_file")"
+echo "$join_output"
+grep -Fq 'Hello join-fast \u0026 Hello Temporal-slow' <<<"$join_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=false .*scheduled=2 .*waiting_join=true .*completed=false" "$worker_log"
+grep -Eq "replay=true .*scheduled=2 .*waiting_join=true .*completed=false" "$worker_log"
+grep -Eq "resolved=2 .*waiting_join=false .*completed=true" "$worker_log"
+grep -q "Workflow join waited for both concurrent Activities in declaration order" "$worker_log"
+echo "Workflow join waited for concurrent Activities through Core and Temporal Server"
+
 TEMPORAL_ODIN_SCENARIO=multiple-signal-arguments \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

@@ -1528,6 +1528,31 @@ case starts a real Activity and Timer, observes `waiting_selector=true`, lets
 the Activity win, emits `CancelTimer`, and completes through Core and Temporal
 Server after Core has also forced a replay on a fresh Odin stack.
 
+Odin's first `join_all` boundary reuses the same durable case descriptors but
+waits for every case instead of choosing one. Upstream Rust has both a
+heterogeneous `join!` macro and a homogeneous generic `join_all`; Odin has
+neither variadic macros nor one generic Future result type. The current API is
+therefore a heterogeneous, allocation-free readiness barrier. After `.Ready`,
+the existing typed Activity, Timer, or Child Workflow `await_*` call reads each
+result synchronously in application-selected order.
+
+Exact duplicate cases are rejected because Odin handles are copyable whereas
+Rust futures are normally moved. Signal cases are also rejected for now:
+consuming several buffered Signals needs an explicit owned result collection,
+and silently allocating one would conflict with the SDK's ownership goals. The
+case slice is borrowed across suspension. If the selected cancellation token is
+requested before every operation is ready, join returns `.Canceled` and leaves
+the operation handles under caller ownership. As with selector, this scheduler
+state never crosses the C ABI and adds no protobuf type or Core symbol.
+
+A focused unit trace resolves the second Activity first, verifies the join
+remains suspended, then resolves the first Activity and Timer in reverse job
+order before checking three byte-identical replay completions. A 180-trace PBT
+suite varies all six Core job orders and both one/two-result activation splits.
+The live dev-server case runs a fast and a two-second Activity concurrently,
+observes a partial `waiting_join=true` activation, and completes in declaration
+order after Core eviction and replay.
+
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
 failed operation sequence. Its terminal `UpdateResponse.Rejected` restores the
@@ -2358,13 +2383,12 @@ Signal-handler buffer/order/replay cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The declaration-biased Workflow selector and public Timer future are now
-implemented and live-proven. A 180-trace property crosses six case orders with
-six Core job orders and fresh-stack replay. The next smallest concurrency slice
-is deterministic `join`/`join_all` over the same Future handles, plus a distinct
-non-suspending timer-start interceptor; neither requires a new C ABI symbol.
-Child start/completion selector branches and cancellation should receive the
-same generative coverage before the selector API is considered stable.
+The declaration-biased Workflow selector, allocation-free `join_all`, and
+public Timer future are now implemented and live-proven. Two independent
+180-trace properties cover selector case/job order and join job/split order with
+fresh-stack replay. The next smallest runtime slice is a distinct
+non-suspending timer-start interceptor, plus generative Child start/completion
+and cancellation coverage for selector/join. None requires a new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for

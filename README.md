@@ -1489,6 +1489,29 @@ replay, and explicit timer cancellation.
 interceptor represents the suspending operation. A future timer-start
 interceptor must preserve non-suspending Future creation semantics.
 
+Already-started durable operations can also be joined without hidden result
+allocations:
+
+```odin
+first := workflow.start_activity(ctx, "charge", first_order)
+second := workflow.start_activity(ctx, "charge", second_order)
+cases := [?]workflow.Selector_Case{
+    workflow.selector_activity(first),
+    workflow.selector_activity(second),
+}
+if workflow.join_all(ctx, cases[:]) == .Ready {
+    first_result := workflow.await_activity(ctx, first)
+    second_result := workflow.await_activity(ctx, second)
+}
+```
+
+`join_all` suspends until every declared Activity, Timer, Child Workflow start,
+or Child Workflow completion is ready. The ordinary typed `await_*` operations
+then return synchronously and preserve declaration order. Duplicate cases and
+Signal cases are rejected; Signal joining is deferred until the API can return
+owned per-case values without surprising allocations. Cancellation returns
+`.Canceled` if all operations have not already become ready.
+
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child
 deadline adds its own timer, while a later one adds no redundant command.

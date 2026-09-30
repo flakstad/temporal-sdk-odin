@@ -188,6 +188,11 @@ Activities and one Timer with all six Core activation-job orders. Across 180
 generated traces the first declared ready case must win, and initialize plus
 terminal completions must be byte-identical after eviction and fresh-stack
 replay.
+The Workflow-join property generates all six resolution orders for two
+Activities and one Timer, split after either one or two early jobs. Every early
+activation must retain `waiting_join=true`; only the final operation may resume
+the Workflow. Result order and all three completions must survive fresh-stack
+replay byte-for-byte across 180 traces.
 The CLI-devserver suite also starts `odin_condition_workflow`, waits until the
 Worker reports `waiting_condition=true`, sends an `approve` Signal through the
 Temporal CLI, and requires the predicate-resumed result plus clean eviction.
@@ -196,6 +201,10 @@ and one durable Timer, waits with `waiting_selector=true`, selects the Activity,
 explicitly cancels the losing Timer, and returns `Hello selector`. The worker
 log must show both Core-driven fresh-stack replay and the terminal
 `CancelTimer` command.
+The following `TEMPORAL_ODIN_SCENARIO=join-all` case starts a fast and a
+two-second Activity with two callback slots. It requires a partial joined wait,
+Core eviction/replay, two completed Activity Tasks, and the declaration-ordered
+result `Hello join-fast & Hello Temporal-slow`.
 The activation-metadata unit test varies history size, Continue-As-New and
 target-version flags, deployment/build identity, full replay, and query-only
 replay. It queries `__temporal_workflow_metadata`, evicts the run, and requires

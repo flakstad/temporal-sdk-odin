@@ -260,3 +260,291 @@ workflow_selector_is_biased_across_generated_job_orders :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+join_property_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	first := workflow.start_activity(ctx, "first", "input")
+	second := workflow.start_activity(ctx, "second", "input")
+	timer := workflow.start_timer(ctx, time.Hour)
+	cases := [?]workflow.Selector_Case{
+		workflow.selector_activity(first),
+		workflow.selector_activity(second),
+		workflow.selector_timer(timer),
+	}
+	if workflow.join_all(ctx, cases[:]) != .Ready {
+		return "canceled"
+	}
+	first_result := workflow.await_activity(ctx, first)
+	second_result := workflow.await_activity(ctx, second)
+	if workflow.await_timer(ctx, timer) != .Fired {
+		return "timer-not-fired"
+	}
+	if first_result == "first" && second_result == "second" {
+		return "ordered"
+	}
+	return "misordered"
+}
+
+append_join_property_jobs :: proc(
+	jobs: ^[dynamic]proto.Coresdk_Workflow_Activation_WorkflowActivationJob,
+	permutation, begin, end: int,
+	first: ^proto.Coresdk_Workflow_Activation_ResolveActivity,
+	second: ^proto.Coresdk_Workflow_Activation_ResolveActivity,
+	timer: ^proto.Coresdk_Workflow_Activation_FireTimer,
+) {
+	orders := [6][3]int{
+		{0, 1, 2},
+		{0, 2, 1},
+		{1, 0, 2},
+		{1, 2, 0},
+		{2, 0, 1},
+		{2, 1, 0},
+	}
+	for position in begin..<end {
+		switch orders[permutation][position] {
+		case 0:
+			append(
+				jobs,
+				proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+					variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{value = first},
+				},
+			)
+		case 1:
+			append(
+				jobs,
+				proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+					variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{value = second},
+				},
+			)
+		case 2:
+			append(
+				jobs,
+				proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+					variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{value = timer},
+				},
+			)
+		}
+	}
+}
+
+join_order_property :: proc(t: ^pbt.T) -> pbt.Result {
+	job_order := pbt.draw(t, pbt.int_range(0, 5))
+	split := pbt.draw(t, pbt.int_range(1, 2))
+	job_labels := [?]string{
+		"a-b-t join jobs",
+		"a-t-b join jobs",
+		"b-a-t join jobs",
+		"b-t-a join jobs",
+		"t-a-b join jobs",
+		"t-b-a join jobs",
+	}
+	for label, index in job_labels {
+		pbt.cover(t, job_order == index, 10.0, label)
+	}
+	pbt.cover(t, split == 1, 40.0, "one early join result")
+	pbt.cover(t, split == 2, 40.0, "two early join results")
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"pbt_join_workflow",
+		"test-queue",
+		join_property_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	if init_error.message != nil {
+		return pbt.error("could not initialize join runtime")
+	}
+
+	input, input_error := codec.encode_json("input")
+	defer codec.payload_free(&input)
+	if input_error != .None {
+		return pbt.error("could not encode join input")
+	}
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "pbt_join_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "pbt-join-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || initial.scheduled_activity_count != 2 ||
+	   !initial.started_timer || !initial.waiting_join {
+		return pbt.fail("generated join Workflow did not initialize")
+	}
+	initial_completion := bytes.clone(initial.completion[:])
+	defer delete(initial_completion)
+
+	first_payload, first_payload_error := codec.encode_json("first")
+	second_payload, second_payload_error := codec.encode_json("second")
+	defer codec.payload_free(&first_payload)
+	defer codec.payload_free(&second_payload)
+	if first_payload_error != .None || second_payload_error != .None {
+		return pbt.error("could not encode join Activity results")
+	}
+	first_proto := proto.encode_payload(codec.payload_view(&first_payload))
+	second_proto := proto.encode_payload(codec.payload_view(&second_payload))
+	defer delete(first_proto.metadata)
+	defer delete(first_proto.external_payloads)
+	defer delete(second_proto.metadata)
+	defer delete(second_proto.external_payloads)
+	first_success := proto.Coresdk_Activity_Result_Success{result = &first_proto}
+	second_success := proto.Coresdk_Activity_Result_Success{result = &second_proto}
+	first_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &first_success},
+	}
+	second_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{value = &second_success},
+	}
+	resolve_first := proto.Coresdk_Workflow_Activation_ResolveActivity{seq = 1, result = &first_resolution}
+	resolve_second := proto.Coresdk_Workflow_Activation_ResolveActivity{seq = 2, result = &second_resolution}
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append_join_property_jobs(
+		&activation.jobs,
+		job_order,
+		0,
+		split,
+		&resolve_first,
+		&resolve_second,
+		&fire_timer,
+	)
+	partial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&partial)
+	if partial.error.message != nil || partial.completed || !partial.waiting_join {
+		return pbt.fail("generated partial join resumed too early")
+	}
+	partial_completion := bytes.clone(partial.completion[:])
+	defer delete(partial_completion)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append_join_property_jobs(
+		&activation.jobs,
+		job_order,
+		split,
+		3,
+		&resolve_first,
+		&resolve_second,
+		&fire_timer,
+	)
+	terminal := process_activation(&runtime, &activation)
+	defer destroy_process_result(&terminal)
+	if terminal.error.message != nil || !terminal.completed || terminal.waiting_join {
+		return pbt.fail("generated complete join did not resume")
+	}
+	result_payload, found := clone_pbt_workflow_result(terminal.completion[:])
+	defer codec.payload_free(&result_payload)
+	if !found {
+		return pbt.fail("join completion had no result")
+	}
+	result: string
+	if codec.decode_json(codec.payload_view(&result_payload), &result) != .None {
+		return pbt.fail("join completion result did not decode")
+	}
+	defer delete(result)
+	if result != "ordered" {
+		return pbt.fail("join results did not preserve declaration order")
+	}
+	terminal_completion := bytes.clone(terminal.completion[:])
+	defer delete(terminal_completion)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{value = &eviction},
+		},
+	)
+	evicted := process_activation(&runtime, &activation)
+	defer destroy_process_result(&evicted)
+	if evicted.error.message != nil || !evicted.evicted {
+		return pbt.fail("generated join Workflow did not evict")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{value = &initialize},
+		},
+	)
+	replayed_initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_initial)
+	if replayed_initial.error.message != nil ||
+	   !bytes.equal(initial_completion, replayed_initial.completion[:]) {
+		return pbt.fail("join initialization changed on replay")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 8
+	append_join_property_jobs(
+		&activation.jobs,
+		job_order,
+		0,
+		split,
+		&resolve_first,
+		&resolve_second,
+		&fire_timer,
+	)
+	replayed_partial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_partial)
+	if replayed_partial.error.message != nil ||
+	   !bytes.equal(partial_completion, replayed_partial.completion[:]) {
+		return pbt.fail("partial join changed on replay")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 14
+	append_join_property_jobs(
+		&activation.jobs,
+		job_order,
+		split,
+		3,
+		&resolve_first,
+		&resolve_second,
+		&fire_timer,
+	)
+	replayed_terminal := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_terminal)
+	if replayed_terminal.error.message != nil ||
+	   !bytes.equal(terminal_completion, replayed_terminal.completion[:]) {
+		return pbt.fail("terminal join changed on replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_join_all_waits_across_generated_resolution_orders :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow join waits across generated Core resolution orders",
+		join_order_property,
+		{num_tests = 180, seed = 0x4a4f_494e_5f41_4c4c},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

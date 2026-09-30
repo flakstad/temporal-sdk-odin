@@ -807,6 +807,20 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "join-all" {
+		first := workflow.start_activity(ctx, "hello", "join-fast")
+		second := workflow.start_activity(ctx, "hello", "Temporal-slow")
+		cases := [?]workflow.Selector_Case{
+			workflow.selector_activity(first),
+			workflow.selector_activity(second),
+		}
+		if workflow.join_all(ctx, cases[:]) != .Ready {
+			return "Activity join canceled"
+		}
+		first_result := workflow.await_activity(ctx, first)
+		second_result := workflow.await_activity(ctx, second)
+		return fmt.aprintf("%s & %s", first_result, second_result)
+	}
 	if name == "selector" {
 		activity_future := workflow.start_activity(ctx, "hello", name)
 		timer_future := workflow.start_timer(ctx, 30 * time.Second)
@@ -1453,7 +1467,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		error_message = string(processed.error.message)
 	}
 	fmt.printf(
-		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d memo_upserts=%d search_upserts=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_condition=%v waiting_selector=%v waiting_handlers=%v completed=%v evicted=%v\n",
+		"activation history=%d replay=%v activation_failed=%v error=%q scheduled=%d local_scheduled=%d last_activity=%d resolved=%d failed=%v signal=%v signal_handlers_started=%d signal_handlers_completed=%d unfinished_signals=%d signal_warnings=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d unfinished_updates=%d update_warnings=%d patches=%d deprecated_patches=%d memo_upserts=%d search_upserts=%d cancel=%v canceled_workflow=%v started_timer=%v canceled_timer=%v canceled_activity=%v waiting_activity=%d waiting_timer=%d waiting_signal=%v waiting_condition=%v waiting_join=%v waiting_selector=%v waiting_handlers=%v completed=%v evicted=%v\n",
 		processed.history_length,
 		processed.is_replaying,
 		processed.activation_failed,
@@ -1488,6 +1502,7 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		processed.waiting_timer_seq,
 		processed.waiting_signal,
 		processed.waiting_condition,
+		processed.waiting_join,
 		processed.waiting_selector,
 		processed.waiting_handlers,
 		processed.completed,
@@ -1951,12 +1966,13 @@ main :: proc() {
 	expect_multiple_update_arguments := scenario == "multiple-update-arguments"
 	expect_condition := scenario == "condition"
 	expect_selector := scenario == "selector"
+	expect_join := scenario == "join-all"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition ? 0 : (expect_update ? 4 : ((expect_signal_handler || expect_local_activity_retry) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition ? 0 : (expect_update ? 4 : ((expect_signal_handler || expect_local_activity_retry || expect_join) ? 2 : 1)),
 			max_workflow_executions = expect_schedule_backfill ? 3 : 1,
 			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
@@ -2057,6 +2073,14 @@ main :: proc() {
 			if run_stats.activity_tasks_completed != 2 || run_stats.workflow_signals_received != 0 ||
 			   run_stats.timers_canceled != 0 {
 				fmt.eprintln("Retrying Local Activity Workflow path produced unexpected worker stats")
+				failed = true
+			}
+		} else if expect_join {
+			if run_stats.activity_tasks_completed != 2 ||
+			   run_stats.workflow_signals_received != 0 ||
+			   run_stats.timers_canceled != 0 ||
+			   run_stats.workflow_replay_activations < 1 {
+				fmt.eprintln("Workflow join stats did not match")
 				failed = true
 			}
 		} else if expect_selector {
@@ -2199,6 +2223,8 @@ main :: proc() {
 		fmt.println("Signal handler failure triggered Core eviction and the Worker recovered on a fresh Workflow stack")
 	} else if expect_condition {
 		fmt.println("Workflow condition resumed after a Signal and replayed on a fresh stack")
+	} else if expect_join {
+		fmt.println("Workflow join waited for both concurrent Activities in declaration order")
 	} else if expect_selector {
 		fmt.println("Workflow selector chose the ready Activity and canceled its losing timer")
 	} else {

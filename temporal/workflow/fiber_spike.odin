@@ -20,6 +20,8 @@ Condition_Predicate :: proc(data: rawptr) -> bool
 Fiber_Context :: struct {
 	instance:       ^Fiber_Instance,
 	update_context: ^Update_Context,
+	waiting_join_cases: []Selector_Case,
+	waiting_join_cancellation_token_id: u32,
 	waiting_selector_cases: []Selector_Case,
 	waiting_selector_cancellation_token_id: u32,
 	waiting_condition_data: rawptr,
@@ -540,6 +542,7 @@ Fiber_Phase :: enum {
 	Ready,
 	Waiting_Condition,
 	Waiting_Mutex,
+	Waiting_Join,
 	Waiting_Selector,
 	Waiting_Activity,
 	Waiting_Child_Workflow_Start,
@@ -614,6 +617,11 @@ Selector_Case :: struct {
 
 Selector_Status :: enum {
 	Selected,
+	Canceled,
+}
+
+Join_Status :: enum {
+	Ready,
 	Canceled,
 }
 
@@ -7952,13 +7960,25 @@ selector_child_workflow :: proc(future: Child_Workflow_Future) -> Selector_Case 
 	return {kind = .Child_Workflow, child_workflow = future}
 }
 
-selector_fail :: proc(ctx: ^Fiber_Context, message: string) {
+workflow_wait_fail :: proc(ctx: ^Fiber_Context, message, failure_type: string) {
 	if ctx == nil || ctx.instance == nil {
 		return
 	}
 	ctx.instance.failure_message = message
-	ctx.instance.failure_type = "OdinWorkflowSelectorError"
+	ctx.instance.failure_type = failure_type
 	ctx.instance.phase = .Failed
+}
+
+selector_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	workflow_wait_fail(ctx, message, "OdinWorkflowSelectorError")
+}
+
+join_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	workflow_wait_fail(ctx, message, "OdinWorkflowJoinError")
+}
+
+timer_fail :: proc(ctx: ^Fiber_Context, message: string) {
+	workflow_wait_fail(ctx, message, "OdinWorkflowTimerError")
 }
 
 timer_operation_ready :: proc(operation: ^Fiber_Timer_Operation) -> bool {
@@ -8064,6 +8084,109 @@ selector_cases_valid :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> boo
 	return true
 }
 
+join_cases_equal :: proc(left, right: ^Selector_Case) -> bool {
+	if left == nil || right == nil || left.kind != right.kind {
+		return false
+	}
+	switch left.kind {
+	case .Activity:
+		return left.activity.seq == right.activity.seq
+	case .Timer:
+		return left.timer.seq == right.timer.seq
+	case .Child_Workflow_Start, .Child_Workflow:
+		return left.child_workflow.seq == right.child_workflow.seq
+	case .Signal:
+		return left.signal_name == right.signal_name
+	}
+	return false
+}
+
+join_cases_valid :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> bool {
+	if !selector_cases_valid(ctx, cases) {
+		return false
+	}
+	for &join_case, index in cases {
+		// Signal consumption needs an owned per-case result and is deliberately
+		// deferred. Durable operation handles have stable result APIs already.
+		if join_case.kind == .Signal {
+			return false
+		}
+		for previous_index in 0..<index {
+			if join_cases_equal(&join_case, &cases[previous_index]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+join_all_ready :: proc(ctx: ^Fiber_Context, cases: []Selector_Case, token_id: u32) -> bool {
+	if len(cases) == 0 {
+		return false
+	}
+	for &join_case in cases {
+		if !selector_case_ready(ctx, &join_case, token_id) {
+			return false
+		}
+	}
+	return true
+}
+
+join_should_resume :: proc(ctx: ^Fiber_Context) -> bool {
+	if ctx == nil || ctx.instance == nil || len(ctx.waiting_join_cases) == 0 {
+		return false
+	}
+	return join_all_ready(
+		ctx,
+		ctx.waiting_join_cases,
+		ctx.waiting_join_cancellation_token_id,
+	) || cancellation_token_is_requested_id(
+		ctx.instance,
+		ctx.waiting_join_cancellation_token_id,
+	)
+}
+
+// join_all waits until every durable case is ready. Cases are checked in slice
+// order and their existing await APIs can then retrieve results synchronously.
+// Failed or canceled operations are not hidden or implicitly discarded.
+// Signal cases are intentionally unsupported until their consumed result can
+// be returned without hidden allocation.
+join_all :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Join_Status {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(ctx.waiting_join_cases) != 0 || !join_cases_valid(ctx, cases) {
+		join_fail(ctx, "invalid Workflow join")
+		return .Canceled
+	}
+	instance := ctx.instance
+	token_id := current_cancellation_token_id(instance)
+	if join_all_ready(ctx, cases, token_id) {
+		return .Ready
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
+		return .Canceled
+	}
+
+	ctx.waiting_join_cases = cases
+	ctx.waiting_join_cancellation_token_id = token_id
+	defer {
+		ctx.waiting_join_cases = nil
+		ctx.waiting_join_cancellation_token_id = 0
+	}
+	instance.phase = .Waiting_Join
+	if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+		join_fail(ctx, "could not resume Workflow join")
+		return .Canceled
+	}
+	if join_all_ready(ctx, cases, token_id) {
+		return .Ready
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
+		return .Canceled
+	}
+	join_fail(ctx, "Workflow join resumed before every case was ready")
+	return .Canceled
+}
+
 selector_result :: proc(ctx: ^Fiber_Context, cases: []Selector_Case, index: int) -> Selector_Result {
 	selector_case := &cases[index]
 	result := Selector_Result{status = .Selected, index = index, kind = selector_case.kind}
@@ -8123,7 +8246,7 @@ selector_select :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Selector
 
 start_timer_unintercepted :: proc(ctx: ^Fiber_Context, duration: time.Duration) -> Timer_Future {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || duration <= 0 {
-		selector_fail(ctx, "invalid Workflow timer start")
+		timer_fail(ctx, "invalid Workflow timer start")
 		return {}
 	}
 	instance := ctx.instance
@@ -8174,25 +8297,25 @@ cancel_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> bool {
 
 await_timer :: proc(ctx: ^Fiber_Context, future: Timer_Future) -> Timer_Result_Status {
 	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready || future.seq == 0 {
-		selector_fail(ctx, "invalid Workflow timer await")
+		timer_fail(ctx, "invalid Workflow timer await")
 		return .Canceled
 	}
 	instance := ctx.instance
 	operation, found := find_timer_operation(instance, future.seq)
 	if !found {
-		selector_fail(ctx, "Workflow timer operation was not found")
+		timer_fail(ctx, "Workflow timer operation was not found")
 		return .Canceled
 	}
 	if !timer_operation_ready(operation) {
 		instance.waiting_timer_seq = future.seq
 		instance.phase = .Waiting_Timer
 		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
-			selector_fail(ctx, "could not resume Workflow timer await")
+			timer_fail(ctx, "could not resume Workflow timer await")
 			return .Canceled
 		}
 		operation, found = find_timer_operation(instance, future.seq)
 		if !found || !timer_operation_ready(operation) {
-			selector_fail(ctx, "Workflow timer resumed without a resolution")
+			timer_fail(ctx, "Workflow timer resumed without a resolution")
 			return .Canceled
 		}
 	}
@@ -9501,6 +9624,8 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
+	case .Waiting_Join:
+		return join_should_resume(&routine.ctx)
 	case .Waiting_Selector:
 		return selector_should_resume(&routine.ctx)
 	case .Waiting_Activity:
@@ -9865,6 +9990,8 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		return condition_should_resume(&routine.ctx)
 	case .Waiting_Mutex:
 		return routine.ctx.mutex_granted || cancellation_applies
+	case .Waiting_Join:
+		return join_should_resume(&routine.ctx)
 	case .Waiting_Selector:
 		return selector_should_resume(&routine.ctx)
 	case .Waiting_Activity:
@@ -9940,6 +10067,8 @@ resume_main_workflow_if_ready :: proc(
 	case .Waiting_Mutex:
 		should_resume = instance.workflow_context.mutex_granted ||
 		                current_cancellation_applies(instance)
+	case .Waiting_Join:
+		should_resume = join_should_resume(&instance.workflow_context)
 	case .Waiting_Selector:
 		should_resume = selector_should_resume(&instance.workflow_context)
 	case .Waiting_Activity:
@@ -10415,6 +10544,8 @@ append_fiber_pending_commands :: proc(
 	case .Waiting_Condition:
 		result.waiting_condition = true
 	case .Waiting_Mutex:
+	case .Waiting_Join:
+		result.waiting_join = true
 	case .Waiting_Selector:
 		result.waiting_selector = true
 	case .Waiting_Activity:

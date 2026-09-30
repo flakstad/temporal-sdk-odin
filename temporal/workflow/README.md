@@ -124,6 +124,30 @@ because that interceptor models a complete suspending sleep call rather than
 Future creation. This gap is explicit while the timer-start interceptor shape
 is designed.
 
+`join_all` waits for every already-started durable operation in a borrowed case
+slice. It allocates no result collection: after `.Ready`, the existing typed
+await operations retrieve their values synchronously in caller-controlled
+order.
+
+```odin
+first := workflow.start_activity(ctx, "charge", first_order)
+second := workflow.start_activity(ctx, "charge", second_order)
+cases := [?]workflow.Selector_Case{
+	workflow.selector_activity(first),
+	workflow.selector_activity(second),
+}
+if workflow.join_all(ctx, cases[:]) == .Ready {
+	first_result := workflow.await_activity(ctx, first)
+	second_result := workflow.await_activity(ctx, second)
+}
+```
+
+Activity, Timer, Child Workflow start, and Child Workflow completion cases are
+supported. Exact duplicate cases are invalid. Signal cases are deliberately
+rejected until join can return consumed Signal payloads with explicit ownership.
+Cancellation is checked after the all-ready condition, and unfinished
+operations remain owned by the Workflow when join returns `.Canceled`.
+
 `workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
 stack sizes independently when the Worker is created. Zero selects the 128 KiB
 default; explicit sizes are validated between 32 KiB and 16 MiB. Replay Workers
