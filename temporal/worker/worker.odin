@@ -149,6 +149,11 @@ Run_Options :: struct {
 Run_Stats :: struct {
 	activity_tasks_completed:             int,
 	activity_cancellations_received:      int,
+	// Highest number of started Activity executions simultaneously owned by
+	// this language Worker. A completed callback remains owned until its pool
+	// result is reaped, so completion handoff may briefly add one above the
+	// configured Core slot count.
+	activity_executions_peak_owned:        int,
 	workflow_activations_completed:       int,
 	workflow_activation_failures:         int,
 	workflow_executions_completed:        int,
@@ -1774,7 +1779,7 @@ reap_activity_executions :: proc(
 run_activity_loop :: proc(
 	worker: ^Worker,
 	max_tasks: int,
-) -> (completed: int, cancellations: int, error: Error) {
+) -> (completed: int, cancellations: int, peak_in_flight: int, error: Error) {
 	routes := make(
 		Activity_Execution_Routes,
 		worker.max_concurrent_activities,
@@ -1802,11 +1807,11 @@ run_activity_loop :: proc(
 		reaped, reap_error := reap_activity_executions(&routes, &pool)
 		completed += reaped
 		if reap_error.message != nil {
-			return completed, cancellations, reap_error
+			return completed, cancellations, peak_in_flight, reap_error
 		}
 		poll := temporal_core.worker_poll_activity(&worker.core)
 		if poll.error.message != nil {
-			return completed, cancellations, error_from_core(&poll.error)
+			return completed, cancellations, peak_in_flight, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
 			break
@@ -1816,7 +1821,7 @@ run_activity_loop :: proc(
 		arena_error := virtual.arena_init_growing(&decode_arena)
 		if arena_error != nil {
 			delete(poll.protobuf)
-			return completed, cancellations, error_from_string("could not initialize protobuf decode arena")
+			return completed, cancellations, peak_in_flight, error_from_string("could not initialize protobuf decode arena")
 		}
 		previous_allocator := context.allocator
 		context.allocator = virtual.arena_allocator(&decode_arena)
@@ -1825,7 +1830,7 @@ run_activity_loop :: proc(
 		if decode_error != .None {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, error_from_string("Core returned a malformed ActivityTask protobuf")
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned a malformed ActivityTask protobuf")
 		}
 		if task.kind == .Cancel {
 			execution, found := activity_execution_route_find(routes, task.task_token)
@@ -1844,32 +1849,34 @@ run_activity_loop :: proc(
 		if len(task.task_token) == 0 {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, error_from_string("Core returned an Activity start without a task token")
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned an Activity start without a task token")
 		}
 		if _, duplicate := activity_execution_route_find(routes, task.task_token); duplicate {
 			virtual.arena_destroy(&decode_arena)
 			delete(poll.protobuf)
-			return completed, cancellations, error_from_string("Core returned a duplicate Activity task token")
+			return completed, cancellations, peak_in_flight, error_from_string("Core returned a duplicate Activity task token")
 		}
 
 		execution, execute_error := activity_execution_start(worker, &pool, &task)
 		virtual.arena_destroy(&decode_arena)
 		delete(poll.protobuf)
 		if execute_error.message != nil {
-			return completed, cancellations, execute_error
+			return completed, cancellations, peak_in_flight, execute_error
 		}
 		started += 1
 		if execution == nil {
 			completed += 1
 		} else if !activity_execution_route_add(&routes, execution) {
-			return completed, cancellations, error_from_string("could not route Activity execution task token")
+			return completed, cancellations, peak_in_flight, error_from_string("could not route Activity execution task token")
+		} else {
+			peak_in_flight = max(peak_in_flight, len(routes))
 		}
 	}
 	thread.pool_finish(&pool)
 	pool_finished = true
 	reaped, reap_error := reap_activity_executions(&routes, &pool)
 	completed += reaped
-	return completed, cancellations, reap_error
+	return completed, cancellations, peak_in_flight, reap_error
 }
 
 record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_Result) {
@@ -2247,6 +2254,7 @@ Activity_Thread_State :: struct {
 	max_tasks: int,
 	completed: int,
 	cancellations: int,
+	peak_in_flight: int,
 	error:     Error,
 }
 
@@ -2258,7 +2266,10 @@ Workflow_Thread_State :: struct {
 }
 
 activity_thread_main :: proc(state: ^Activity_Thread_State) {
-	state.completed, state.cancellations, state.error = run_activity_loop(state.worker, state.max_tasks)
+	state.completed,
+	state.cancellations,
+	state.peak_in_flight,
+	state.error = run_activity_loop(state.worker, state.max_tasks)
 	if state.error.message != nil {
 		temporal_core.worker_initiate_shutdown(&state.worker.core)
 	}
@@ -2331,6 +2342,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if poll_activities && !poll_workflows {
 		stats.activity_tasks_completed,
 		stats.activity_cancellations_received,
+		stats.activity_executions_peak_owned,
 		error = run_activity_loop(worker, options.max_activity_tasks)
 		return
 	}
@@ -2368,6 +2380,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	stats = workflow_state.stats
 	stats.activity_tasks_completed = activity_state.completed
 	stats.activity_cancellations_received = activity_state.cancellations
+	stats.activity_executions_peak_owned = activity_state.peak_in_flight
 	if workflow_state.error.message != nil {
 		error = workflow_state.error
 		error_free(&activity_state.error)

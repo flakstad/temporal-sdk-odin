@@ -299,6 +299,14 @@ the execution-owned token and is deleted before that execution is freed. A
 500-case property stresses 1–64 routes, embedded NUL bytes, duplicate tokens,
 lookup locality, and forward/reverse drain order. On exit, the pool finishes
 queued/running callbacks before its execution records are freed.
+The dev-server suite also schedules 24 Activities at once against a Worker with
+three slots. It requires an exact callback peak of three, all 24 completions,
+an empty callback set at shutdown, and a bounded task-token route peak of three
+or four. Four is valid because Core releases a slot when completion is accepted
+before the poll loop reaps that callback's finished pool task. The observed
+route high-water mark is returned as
+`Run_Stats.activity_executions_peak_owned`; it is an Odin ownership metric, not
+a second Core slot count.
 `worker.request_shutdown` is safe to call from a coordinating thread;
 `worker.close` must only be called after `run` returns.
 

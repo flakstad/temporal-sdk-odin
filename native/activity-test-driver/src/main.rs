@@ -130,6 +130,31 @@ impl ConcurrentActivityDriverWorkflow {
     }
 }
 
+const ACTIVITY_LOAD_TASKS: usize = 24;
+
+#[workflow]
+#[derive(Default)]
+struct ActivityLoadDriverWorkflow;
+
+#[workflow_methods]
+impl ActivityLoadDriverWorkflow {
+    #[run(name = "odin_activity_load_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let activities = (0..ACTIVITY_LOAD_TASKS).map(|index| {
+            ctx.execute_activity(
+                HelloActivity,
+                format!("load-{index:02}"),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+        });
+        let results = temporalio_sdk::workflows::join_all(activities).await;
+        for result in results {
+            result?;
+        }
+        Ok(format!("completed {ACTIVITY_LOAD_TASKS} load Activities"))
+    }
+}
+
 #[workflow]
 #[derive(Default)]
 struct TypedActivityDriverWorkflow;
@@ -211,10 +236,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = std::env::var("ACTIVITY_INPUT").unwrap_or_else(|_| "Odin".to_string());
     let expect_failure = std::env::var_os("ACTIVITY_EXPECT_FAILURE").is_some();
     let concurrent = std::env::var_os("ACTIVITY_CONCURRENT").is_some();
+    let load = std::env::var_os("ACTIVITY_LOAD").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
-    let expected = if concurrent {
+    let expected = if load {
+        format!("completed {ACTIVITY_LOAD_TASKS} load Activities")
+    } else if concurrent {
         "Hello concurrent-a & Hello concurrent-b".to_string()
     } else {
         format!("Hello {input}")
@@ -228,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<ActivityDriverWorkflow>()?
         .register_workflow::<FailureDriverWorkflow>()?
         .register_workflow::<ConcurrentActivityDriverWorkflow>()?
+        .register_workflow::<ActivityLoadDriverWorkflow>()?
         .register_workflow::<TypedActivityDriverWorkflow>()?
         .register_workflow::<RetryActivityDriverWorkflow>()?
         .register_workflow::<AsyncActivityDriverWorkflow>()?
@@ -368,6 +397,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .start_workflow(
                     FailureDriverWorkflow::run,
                     input,
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await?
+        } else if load {
+            let handle = client
+                .start_workflow(
+                    ActivityLoadDriverWorkflow::run,
+                    (),
                     WorkflowStartOptions::new(queue, workflow_id).build(),
                 )
                 .await?;

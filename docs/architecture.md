@@ -2169,6 +2169,15 @@ execute without stopping Workflow polling. Activity start tasks own
 heap-stable execution/context state until their callback thread joins. Core's
 fixed slot supplier bounds concurrency; the single poll thread continues to
 receive prioritized cancel tasks and atomically marks the matching context.
+The live backpressure case submits 24 Activities to a three-slot Worker. The
+first three callbacks form a barrier, proving that all slots are used; the
+callback high-water mark must remain exactly three while every task completes.
+The language Worker also reports its execution-ownership high-water mark in
+`Run_Stats.activity_executions_peak_owned`. That route count may transiently be
+four: Core can accept one completion and dispatch replacement work before the
+Odin poll loop reaps the completed pool task. This is a completion-handoff
+window, not a fourth executing callback, and remains bounded under the full
+fan-out.
 The poll thread indexes each execution by the exact opaque binary task token;
 the map key borrows the execution-owned token and is removed before execution
 destruction. This makes cancellation routing average constant-time and rejects
@@ -2310,9 +2319,11 @@ Workflows are enabled.
    the same limit as Core's Activity slot supplier. Structured
    retryable/non-retryable failures pass generated and live retry tests. A
    500-case route property exercises 1–64 opaque binary tokens, embedded zero
-   bytes, duplicate rejection, and forward/reverse drain order. The remaining
-   risks are sustained-load/backpressure validation, process-level panic
-   containment, and shutdown-timeout stress tests.
+   bytes, duplicate rejection, and forward/reverse drain order. A live 24-task
+   fan-out saturates three Core slots, verifies a hard callback peak of three,
+   bounds the completion-handoff route set to four, and drains cleanly. The
+   remaining risks are process-level panic containment and shutdown-timeout
+   stress tests.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and

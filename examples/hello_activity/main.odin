@@ -16,6 +16,10 @@ import worker "../../temporal/worker"
 
 concurrent_activities: int
 concurrent_overlap_observed: bool
+load_stats_mutex: sync.Mutex
+load_activities_active: int
+load_activities_peak: int
+load_activities_completed: int
 async_task_token: []u8
 async_workflow_id: string
 async_workflow_run_id: string
@@ -79,6 +83,32 @@ async_identity_free :: proc() {
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
 	_ = ctx
+	if strings.has_prefix(name, "load-") {
+		sync.mutex_lock(&load_stats_mutex)
+		load_activities_active += 1
+		load_activities_peak = max(load_activities_peak, load_activities_active)
+		sync.mutex_unlock(&load_stats_mutex)
+		defer {
+			sync.mutex_lock(&load_stats_mutex)
+			load_activities_active -= 1
+			load_activities_completed += 1
+			sync.mutex_unlock(&load_stats_mutex)
+		}
+
+		// Keep the first batch live until all three configured slots have
+		// entered Odin. Subsequent batches pause briefly so Core has sustained
+		// pressure instead of a one-shot overlap.
+		for _ in 0 ..< 500 {
+			sync.mutex_lock(&load_stats_mutex)
+			ready := load_activities_peak >= 3
+			sync.mutex_unlock(&load_stats_mutex)
+			if ready {
+				break
+			}
+			time.sleep(10 * time.Millisecond)
+		}
+		time.sleep(40 * time.Millisecond)
+	}
 	if strings.has_prefix(name, "concurrent-") {
 		sync.atomic_add(&concurrent_activities, 1)
 		defer sync.atomic_sub(&concurrent_activities, 1)
@@ -231,7 +261,17 @@ main :: proc() {
 	}
 	defer temporal_core.client_close(&client)
 
-	activity_worker, create_error := worker.create(&client, "odin-hello-activity")
+	env_buffer: [64]u8
+	concurrency_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_CONCURRENT")
+	concurrency_case := concurrency_value != ""
+	load_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_LOAD")
+	load_case := load_value != ""
+	activity_slots := load_case ? 3 : 10
+	activity_worker, create_error := worker.create(
+		&client,
+		"odin-hello-activity",
+		max_concurrent_activities = activity_slots,
+	)
 	if create_error.message != nil {
 		fmt.eprintf("Worker creation failed: %s\n", string(create_error.message))
 		worker.error_free(&create_error)
@@ -280,9 +320,6 @@ main :: proc() {
 	}
 
 	fmt.println("Odin Activity Worker is polling task queue odin-hello-activity")
-	env_buffer: [64]u8
-	concurrency_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_CONCURRENT")
-	concurrency_case := concurrency_value != ""
 	retry_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_RETRY")
 	retry_case := retry_value != ""
 	async_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_ASYNC")
@@ -292,10 +329,12 @@ main :: proc() {
 		async_mode = "token-complete"
 	}
 	max_tasks := 1
-	if concurrency_case || retry_case {
+	if load_case {
+		max_tasks = 24
+	} else if concurrency_case || retry_case {
 		max_tasks = 2
 	}
-	_, run_error := worker.run(
+	run_stats, run_error := worker.run(
 		&activity_worker,
 		{max_activity_tasks = max_tasks},
 	)
@@ -420,7 +459,34 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
-	if concurrency_case {
+	if load_case {
+		sync.mutex_lock(&load_stats_mutex)
+		active := load_activities_active
+		peak := load_activities_peak
+		completed := load_activities_completed
+		sync.mutex_unlock(&load_stats_mutex)
+		if completed != 24 || active != 0 || peak != activity_slots ||
+		   run_stats.activity_tasks_completed != 24 ||
+		   run_stats.activity_executions_peak_owned < activity_slots ||
+		   run_stats.activity_executions_peak_owned > activity_slots + 1 {
+			fmt.eprintf(
+				"Activity load invariant failed: callbacks=%d active=%d callback_peak=%d tasks=%d route_peak=%d slots=%d\n",
+				completed,
+				active,
+				peak,
+				run_stats.activity_tasks_completed,
+				run_stats.activity_executions_peak_owned,
+				activity_slots,
+			)
+			os.exit(1)
+		}
+		fmt.printf(
+			"24 Activity callbacks drained with callback_peak=%d route_peak=%d slots=%d\n",
+			peak,
+			run_stats.activity_executions_peak_owned,
+			activity_slots,
+		)
+	} else if concurrency_case {
 		fmt.println("two Activity callbacks overlapped and worker shut down cleanly")
 	} else if retry_case {
 		fmt.println("retryable Activity failed once, then completed and worker shut down cleanly")

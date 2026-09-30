@@ -198,7 +198,12 @@ correct fiber runtime, and polls both Core task streams concurrently. Its
 bounded reusable Activity thread pool runs callbacks concurrently, exposes
 cooperative cancellation and typed heartbeat payloads through
 `activity.Context`, and has live tests for overlap and heartbeat-driven
-cancellation. Opaque binary task tokens are indexed in an execution-owned hash
+cancellation. A sustained-load case fans 24 Activities into three Core slots,
+asserts a hard callback peak of three, and drains every execution before
+shutdown. `worker.Run_Stats.activity_executions_peak_owned` reports the largest
+task-token route set; it may briefly be one above the slot count while a
+completed callback crosses the Core-to-pool handoff. Opaque binary task tokens
+are indexed in an execution-owned hash
 route, giving average constant-time cancellation delivery as concurrency grows;
 duplicate tokens are rejected as a Core protocol invariant. The context
 preserves Core's cancellation reason and all six
