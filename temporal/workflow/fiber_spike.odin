@@ -554,6 +554,7 @@ Fiber_Phase :: enum {
 	Waiting_Join,
 	Waiting_Selector,
 	Waiting_Activity,
+	Waiting_Nexus_Operation,
 	Waiting_Child_Workflow_Start,
 	Waiting_Child_Workflow,
 	Waiting_External_Signal,
@@ -1156,6 +1157,7 @@ Fiber_Signal_Routine :: struct {
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
+	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
@@ -1164,6 +1166,7 @@ Fiber_Signal_Routine :: struct {
 	detached_scope_depth: int,
 	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
+	unhandled_nexus_operation_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
@@ -1187,6 +1190,7 @@ Fiber_Update_Routine :: struct {
 	ctx:                  Fiber_Context,
 	result:               Payload_Result,
 	waiting_activity_seq: u32,
+	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
@@ -1195,6 +1199,7 @@ Fiber_Update_Routine :: struct {
 	detached_scope_depth: int,
 	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
+	unhandled_nexus_operation_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
@@ -1227,6 +1232,7 @@ Fiber_Instance :: struct {
 	invoke:          Workflow_Invoke_Proc,
 	workflow_context: Fiber_Context,
 	activities:       [dynamic]Fiber_Activity_Operation,
+	nexus_operations: [dynamic]Fiber_Nexus_Operation,
 	child_workflows:  [dynamic]Fiber_Child_Workflow_Operation,
 	external_signals: [dynamic]Fiber_External_Signal_Operation,
 	external_cancels: [dynamic]Fiber_External_Cancel_Operation,
@@ -1241,6 +1247,7 @@ Fiber_Instance :: struct {
 	update_handlers:  [dynamic]Fiber_Update_Handler,
 	update_routines:  [dynamic]^Fiber_Update_Routine,
 	waiting_activity_seq: u32,
+	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
@@ -1257,10 +1264,12 @@ Fiber_Instance :: struct {
 	terminal_failure_message:   string,
 	terminal_failure_type:      string,
 	unhandled_activity_seq: u32,
+	unhandled_nexus_operation_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:       string,
 	failure_type:          string,
 	next_activity_seq: u32,
+	next_nexus_operation_seq: u32,
 	next_child_workflow_seq: u32,
 	next_external_signal_seq: u32,
 	next_external_cancel_seq: u32,
@@ -1576,6 +1585,7 @@ fiber_result_error :: proc(operation: string, result: fiber_raw.Result) -> Error
 
 Fiber_Execution_State :: struct {
 	waiting_activity_seq: u32,
+	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
@@ -1584,6 +1594,7 @@ Fiber_Execution_State :: struct {
 	detached_scope_depth: int,
 	current_cancellation_token_id: u32,
 	unhandled_activity_seq: u32,
+	unhandled_nexus_operation_seq: u32,
 	unhandled_child_workflow_seq: u32,
 	failure_message:        string,
 	failure_type:           string,
@@ -1594,6 +1605,7 @@ Fiber_Execution_State :: struct {
 capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = instance.waiting_activity_seq,
+		waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = instance.waiting_child_workflow_seq,
 		waiting_external_signal_seq = instance.waiting_external_signal_seq,
 		waiting_external_cancel_seq = instance.waiting_external_cancel_seq,
@@ -1602,6 +1614,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 		detached_scope_depth = instance.detached_scope_depth,
 		current_cancellation_token_id = instance.current_cancellation_token_id,
 		unhandled_activity_seq = instance.unhandled_activity_seq,
+		unhandled_nexus_operation_seq = instance.unhandled_nexus_operation_seq,
 		unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq,
 		failure_message = instance.failure_message,
 		failure_type = instance.failure_type,
@@ -1612,6 +1625,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 
 apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Execution_State) {
 	instance.waiting_activity_seq = state.waiting_activity_seq
+	instance.waiting_nexus_operation_seq = state.waiting_nexus_operation_seq
 	instance.waiting_child_workflow_seq = state.waiting_child_workflow_seq
 	instance.waiting_external_signal_seq = state.waiting_external_signal_seq
 	instance.waiting_external_cancel_seq = state.waiting_external_cancel_seq
@@ -1620,6 +1634,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 	instance.detached_scope_depth = state.detached_scope_depth
 	instance.current_cancellation_token_id = state.current_cancellation_token_id
 	instance.unhandled_activity_seq = state.unhandled_activity_seq
+	instance.unhandled_nexus_operation_seq = state.unhandled_nexus_operation_seq
 	instance.unhandled_child_workflow_seq = state.unhandled_child_workflow_seq
 	instance.failure_message = state.failure_message
 	instance.failure_type = state.failure_type
@@ -1630,6 +1645,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = routine.waiting_activity_seq,
+		waiting_nexus_operation_seq = routine.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
 		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
@@ -1638,6 +1654,7 @@ signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execut
 		detached_scope_depth = routine.detached_scope_depth,
 		current_cancellation_token_id = routine.current_cancellation_token_id,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
+		unhandled_nexus_operation_seq = routine.unhandled_nexus_operation_seq,
 		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
 		failure_type = routine.failure_type,
@@ -1651,6 +1668,7 @@ capture_signal_routine_execution :: proc(
 	instance: ^Fiber_Instance,
 ) {
 	routine.waiting_activity_seq = instance.waiting_activity_seq
+	routine.waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
 	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
@@ -1659,6 +1677,7 @@ capture_signal_routine_execution :: proc(
 	routine.detached_scope_depth = instance.detached_scope_depth
 	routine.current_cancellation_token_id = instance.current_cancellation_token_id
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
+	routine.unhandled_nexus_operation_seq = instance.unhandled_nexus_operation_seq
 	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
 	routine.failure_type = instance.failure_type
@@ -1709,6 +1728,13 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 				failure_type = "OdinWorkflowSignalActivityFailure"
 			}
 		}
+		if instance.unhandled_nexus_operation_seq != 0 {
+			operation, found := find_nexus_operation(instance, instance.unhandled_nexus_operation_seq)
+			if found {
+				message = operation.failure_message
+				failure_type = "OdinWorkflowSignalNexusOperationFailure"
+			}
+		}
 		if instance.unhandled_child_workflow_seq != 0 {
 			operation, found := find_child_workflow_operation(instance, instance.unhandled_child_workflow_seq)
 			if found {
@@ -1742,6 +1768,7 @@ signal_routine_entry :: proc "c" (user_data: rawptr) {
 update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execution_State {
 	return {
 		waiting_activity_seq = routine.waiting_activity_seq,
+		waiting_nexus_operation_seq = routine.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
 		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
@@ -1750,6 +1777,7 @@ update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execut
 		detached_scope_depth = routine.detached_scope_depth,
 		current_cancellation_token_id = routine.current_cancellation_token_id,
 		unhandled_activity_seq = routine.unhandled_activity_seq,
+		unhandled_nexus_operation_seq = routine.unhandled_nexus_operation_seq,
 		unhandled_child_workflow_seq = routine.unhandled_child_workflow_seq,
 		failure_message = routine.failure_message,
 		failure_type = routine.failure_type,
@@ -1763,6 +1791,7 @@ capture_update_routine_execution :: proc(
 	instance: ^Fiber_Instance,
 ) {
 	routine.waiting_activity_seq = instance.waiting_activity_seq
+	routine.waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
 	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
@@ -1771,6 +1800,7 @@ capture_update_routine_execution :: proc(
 	routine.detached_scope_depth = instance.detached_scope_depth
 	routine.current_cancellation_token_id = instance.current_cancellation_token_id
 	routine.unhandled_activity_seq = instance.unhandled_activity_seq
+	routine.unhandled_nexus_operation_seq = instance.unhandled_nexus_operation_seq
 	routine.unhandled_child_workflow_seq = instance.unhandled_child_workflow_seq
 	routine.failure_message = instance.failure_message
 	routine.failure_type = instance.failure_type
@@ -1819,6 +1849,13 @@ update_routine_entry :: proc "c" (user_data: rawptr) {
 			if found {
 				message = operation.failure_message
 				failure_type = "OdinWorkflowUpdateActivityFailure"
+			}
+		}
+		if instance.unhandled_nexus_operation_seq != 0 {
+			operation, found := find_nexus_operation(instance, instance.unhandled_nexus_operation_seq)
+			if found {
+				message = operation.failure_message
+				failure_type = "OdinWorkflowUpdateNexusOperationFailure"
 			}
 		}
 		if instance.unhandled_child_workflow_seq != 0 {
@@ -1895,6 +1932,10 @@ fiber_instance_destroy :: proc(instance: ^Fiber_Instance) -> Error {
 			codec.payload_free(&input)
 		}
 		delete(operation.inputs)
+		codec.payload_free(&operation.result)
+	}
+	for &operation in instance.nexus_operations {
+		codec.payload_free(&operation.input)
 		codec.payload_free(&operation.result)
 	}
 	for &operation in instance.child_workflows {
@@ -2260,6 +2301,7 @@ add_fiber_instance :: proc(
 	instance.property_commands = make([dynamic]Fiber_Property_Command)
 	instance.last_completion_results = make([dynamic]codec.Payload)
 	instance.activities = make([dynamic]Fiber_Activity_Operation)
+	instance.nexus_operations = make([dynamic]Fiber_Nexus_Operation)
 	instance.child_workflows = make([dynamic]Fiber_Child_Workflow_Operation)
 	instance.external_signals = make([dynamic]Fiber_External_Signal_Operation)
 	instance.external_cancels = make([dynamic]Fiber_External_Cancel_Operation)
@@ -4028,6 +4070,27 @@ apply_cancellation_to_operations :: proc(instance: ^Fiber_Instance) {
 				operation.state = .Cancel_Requested
 			}
 		case .Resolved, .Failed, .Cancel_Requested, .Canceled:
+		}
+	}
+	for index in 0..<len(instance.nexus_operations) {
+		operation := &instance.nexus_operations[index]
+		if !cancellation_token_is_requested_id(instance, operation.cancellation_token_id) {
+			continue
+		}
+		reason := cancellation_token_reason_id(instance, operation.cancellation_token_id)
+		operation.failure_message = reason
+		switch operation.state {
+		case .Scheduled:
+			operation.state = .Canceled
+			operation.start_state = .Failed
+		case .Commanded:
+			switch operation.options.cancellation_type {
+			case .Abandon:
+				operation.state = .Canceled
+			case .Try_Cancel, .Wait_Cancellation_Completed, .Wait_Cancellation_Requested:
+				operation.state = .Cancel_Requested
+			}
+		case .Resolved, .Failed, .Cancel_Requested, .Canceled, .Timed_Out:
 		}
 	}
 	for index in 0..<len(instance.timers) {
@@ -9262,11 +9325,13 @@ append_fiber_child_workflow_cancellations :: proc(
 Workflow_Command_State :: struct {
 	phase:             Fiber_Phase,
 	next_activity_seq: u32,
+	next_nexus_operation_seq: u32,
 	next_timer_seq:    u32,
 	next_child_workflow_seq: u32,
 	next_external_signal_seq: u32,
 	next_external_cancel_seq: u32,
 	activity_count:    int,
+	nexus_operation_count: int,
 	timer_count:       int,
 	child_workflow_count: int,
 	external_signal_count: int,
@@ -9282,11 +9347,13 @@ workflow_command_state :: proc(instance: ^Fiber_Instance) -> Workflow_Command_St
 	return {
 		phase = instance.phase,
 		next_activity_seq = instance.next_activity_seq,
+		next_nexus_operation_seq = instance.next_nexus_operation_seq,
 		next_timer_seq = instance.next_timer_seq,
 		next_child_workflow_seq = instance.next_child_workflow_seq,
 		next_external_signal_seq = instance.next_external_signal_seq,
 		next_external_cancel_seq = instance.next_external_cancel_seq,
 		activity_count = len(instance.activities),
+		nexus_operation_count = len(instance.nexus_operations),
 		timer_count = len(instance.timers),
 		child_workflow_count = len(instance.child_workflows),
 		external_signal_count = len(instance.external_signals),
@@ -9305,11 +9372,13 @@ workflow_command_state_changed :: proc(
 ) -> bool {
 	return instance.phase != before.phase ||
 		instance.next_activity_seq != before.next_activity_seq ||
+		instance.next_nexus_operation_seq != before.next_nexus_operation_seq ||
 		instance.next_timer_seq != before.next_timer_seq ||
 		instance.next_child_workflow_seq != before.next_child_workflow_seq ||
 		instance.next_external_signal_seq != before.next_external_signal_seq ||
 		instance.next_external_cancel_seq != before.next_external_cancel_seq ||
 		len(instance.activities) != before.activity_count ||
+		len(instance.nexus_operations) != before.nexus_operation_count ||
 		len(instance.timers) != before.timer_count ||
 		len(instance.child_workflows) != before.child_workflow_count ||
 		len(instance.external_signals) != before.external_signal_count ||
@@ -9327,6 +9396,7 @@ restore_workflow_command_state :: proc(
 ) {
 	instance.phase = before.phase
 	instance.next_activity_seq = before.next_activity_seq
+	instance.next_nexus_operation_seq = before.next_nexus_operation_seq
 	instance.next_timer_seq = before.next_timer_seq
 	instance.next_child_workflow_seq = before.next_child_workflow_seq
 	instance.next_external_signal_seq = before.next_external_signal_seq
@@ -9334,6 +9404,9 @@ restore_workflow_command_state :: proc(
 	instance.random_state = before.random_state
 	for len(instance.activities) > before.activity_count {
 		ordered_remove(&instance.activities, len(instance.activities) - 1)
+	}
+	for len(instance.nexus_operations) > before.nexus_operation_count {
+		ordered_remove(&instance.nexus_operations, len(instance.nexus_operations) - 1)
 	}
 	for len(instance.timers) > before.timer_count {
 		ordered_remove(&instance.timers, len(instance.timers) - 1)
@@ -9692,6 +9765,13 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 			operation,
 			routine.current_cancellation_token_id,
 		)
+	case .Waiting_Nexus_Operation:
+		operation, found := find_nexus_operation(instance, routine.waiting_nexus_operation_seq)
+		return found && nexus_operation_ready_for_waiter(
+			instance,
+			operation,
+			routine.current_cancellation_token_id,
+		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.start_state != .Pending
@@ -9731,6 +9811,7 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> (resumed: boo
 		resumed = true
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
+		routine.waiting_nexus_operation_seq = 0
 		routine.waiting_child_workflow_seq = 0
 		routine.waiting_external_signal_seq = 0
 		routine.waiting_external_cancel_seq = 0
@@ -9993,6 +10074,14 @@ append_finished_update_routine_response :: proc(
 		if found {
 			failure_proto = operation.failure_proto
 		}
+	} else if kind == .Rejected && routine.unhandled_nexus_operation_seq != 0 {
+		operation, found := find_nexus_operation(
+			routine.instance,
+			routine.unhandled_nexus_operation_seq,
+		)
+		if found {
+			failure_proto = operation.failure_proto
+		}
 	} else if kind == .Rejected && routine.unhandled_child_workflow_seq != 0 {
 		operation, found := find_child_workflow_operation(
 			routine.instance,
@@ -10058,6 +10147,13 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 			operation,
 			routine.current_cancellation_token_id,
 		)
+	case .Waiting_Nexus_Operation:
+		operation, found := find_nexus_operation(instance, routine.waiting_nexus_operation_seq)
+		return found && nexus_operation_ready_for_waiter(
+			instance,
+			operation,
+			routine.current_cancellation_token_id,
+		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.start_state != .Pending
@@ -10097,6 +10193,7 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> (resumed: boo
 		resumed = true
 		routine.phase = .Ready
 		routine.waiting_activity_seq = 0
+		routine.waiting_nexus_operation_seq = 0
 		routine.waiting_child_workflow_seq = 0
 		routine.waiting_external_signal_seq = 0
 		routine.waiting_external_cancel_seq = 0
@@ -10131,6 +10228,13 @@ resume_main_workflow_if_ready :: proc(
 	case .Waiting_Activity:
 		operation, found := find_activity_operation(instance, instance.waiting_activity_seq)
 		should_resume = found && activity_operation_ready_for_waiter(
+			instance,
+			operation,
+			current_cancellation_token_id(instance),
+		)
+	case .Waiting_Nexus_Operation:
+		operation, found := find_nexus_operation(instance, instance.waiting_nexus_operation_seq)
+		should_resume = found && nexus_operation_ready_for_waiter(
 			instance,
 			operation,
 			current_cancellation_token_id(instance),
@@ -10170,6 +10274,7 @@ resume_main_workflow_if_ready :: proc(
 	}
 	instance.phase = .Ready
 	instance.waiting_activity_seq = 0
+	instance.waiting_nexus_operation_seq = 0
 	instance.waiting_child_workflow_seq = 0
 	instance.waiting_external_signal_seq = 0
 	instance.waiting_external_cancel_seq = 0
@@ -10473,6 +10578,12 @@ append_shared_operation_commands :: proc(
 			append_fiber_schedule_command(result, commands, operation, task_queue)
 		}
 	}
+	for index in 0..<len(instance.nexus_operations) {
+		operation := &instance.nexus_operations[index]
+		if operation.state == .Scheduled {
+			append_fiber_schedule_nexus_operation_command(result, commands, operation)
+		}
+	}
 	for index in 0..<len(instance.timers) {
 		operation := &instance.timers[index]
 		if operation.state == .Scheduled {
@@ -10498,6 +10609,7 @@ append_shared_operation_commands :: proc(
 		}
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
+	append_fiber_nexus_operation_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
 	append_fiber_child_workflow_cancellations(result, commands, instance)
 	append_fiber_external_signal_cancellations(result, commands, instance)
@@ -10607,6 +10719,8 @@ append_fiber_pending_commands :: proc(
 		result.waiting_selector = true
 	case .Waiting_Activity:
 		result.waiting_activity_seq = instance.waiting_activity_seq
+	case .Waiting_Nexus_Operation:
+		result.waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq
 	case .Waiting_Child_Workflow_Start:
 		result.waiting_child_workflow_start_seq = instance.waiting_child_workflow_seq
 	case .Waiting_Child_Workflow:
@@ -10829,6 +10943,15 @@ append_fiber_failure_command :: proc(
 		if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
 			return error_from_string("could not restore unhandled Activity failure")
 		}
+	} else if instance.unhandled_nexus_operation_seq != 0 {
+		operation, found := find_nexus_operation(instance, instance.unhandled_nexus_operation_seq)
+		if !found || (operation.state != .Failed && operation.state != .Timed_Out) ||
+		   len(operation.failure_proto) == 0 {
+			return error_from_string("Workflow fiber failed without a preserved Nexus operation failure")
+		}
+		if !proto.decode_Temporal_Api_Failure_V1_Failure(operation.failure_proto, failure) {
+			return error_from_string("could not restore unhandled Nexus operation failure")
+		}
 	} else if instance.unhandled_child_workflow_seq != 0 {
 		operation, found := find_child_workflow_operation(
 			instance,
@@ -10886,6 +11009,7 @@ append_fiber_cancellation_commands :: proc(
 		return error_from_string("fiber spike emitted cancellation after another command")
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
+	append_fiber_nexus_operation_cancellations(result, commands, instance)
 	append_fiber_timer_cancellations(result, commands, instance)
 	append_fiber_child_workflow_cancellations(result, commands, instance)
 	append_fiber_external_signal_cancellations(result, commands, instance)
@@ -11335,6 +11459,34 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			}
 			if !resolution_handled {
 				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
+				return
+			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation_Start:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "Nexus operation start resolution has no Workflow fiber")
+				return
+			}
+			context.allocator = instance.odin_context.allocator
+			resolution_error := apply_nexus_operation_start_resolution(instance, variant.value, &result)
+			context.allocator = previous_allocator
+			if len(resolution_error) > 0 {
+				process_error(&result, activation.run_id, resolution_error)
+				return
+			}
+
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation:
+			handled = true
+			if variant.value == nil || !instance_found {
+				process_error(&result, activation.run_id, "Nexus operation resolution has no Workflow fiber")
+				return
+			}
+			context.allocator = instance.odin_context.allocator
+			resolution_error := apply_nexus_operation_resolution(instance, variant.value, &result)
+			context.allocator = previous_allocator
+			if len(resolution_error) > 0 {
+				process_error(&result, activation.run_id, resolution_error)
 				return
 			}
 

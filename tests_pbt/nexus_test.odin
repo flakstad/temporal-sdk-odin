@@ -150,3 +150,102 @@ nexus_tasks_and_completions_preserve_generated_values :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+nexus_workflow_command_property :: proc(t: ^pbt.T) -> pbt.Result {
+	seq := u32(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	endpoint := pbt.draw(t, pbt.string_ascii(1, 64))
+	service := pbt.draw(t, pbt.string_ascii(1, 64))
+	operation := pbt.draw(t, pbt.string_ascii(1, 64))
+	payload_data := pbt.draw(t, pbt.byte_array(0, 512))
+	header_key := pbt.draw(t, pbt.string_ascii(1, 48))
+	header_value := pbt.draw(t, pbt.string_ascii(0, 128))
+	cancellation_index := pbt.draw(t, pbt.int_range(0, 3))
+	cancellation_type := proto.Coresdk_Nexus_NexusOperationCancellationType(cancellation_index)
+	close_seconds := i64(pbt.draw(t, pbt.int_range(1, 86_400)))
+	start_seconds := i64(pbt.draw(t, pbt.int_range(0, 3_600)))
+	run_seconds := i64(pbt.draw(t, pbt.int_range(0, 3_600)))
+	pbt.cover(t, len(payload_data) == 0, 0.1, "empty Workflow Nexus input")
+	pbt.cover(t, len(payload_data) >= 400, 15.0, "large Workflow Nexus input")
+	pbt.cover(t, cancellation_index == 0, 20.0, "wait cancellation completed")
+	pbt.cover(t, cancellation_index == 3, 20.0, "wait cancellation requested")
+
+	payload := proto.Temporal_Api_Common_V1_Payload{data = payload_data}
+	close_timeout := proto.Google_Protobuf_Duration{seconds = close_seconds}
+	start_timeout := proto.Google_Protobuf_Duration{seconds = start_seconds}
+	run_timeout := proto.Google_Protobuf_Duration{seconds = run_seconds}
+	schedule := proto.Coresdk_Workflow_Commands_ScheduleNexusOperation{
+		seq = seq,
+		endpoint = endpoint,
+		service = service,
+		operation = operation,
+		input = &payload,
+		schedule_to_close_timeout = &close_timeout,
+		schedule_to_start_timeout = &start_timeout,
+		start_to_close_timeout = &run_timeout,
+		cancellation_type = cancellation_type,
+	}
+	append(
+		&schedule.nexus_header,
+		proto.Coresdk_Workflow_Commands_ScheduleNexusOperation_NexusHeaderEntry{
+			key = header_key,
+			value = header_value,
+		},
+	)
+	defer delete(schedule.nexus_header)
+	command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+		variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Nexus_Operation{
+			value = &schedule,
+		},
+	}
+	encoded := proto.encode_Coresdk_Workflow_Commands_WorkflowCommand(&command)
+	defer delete(encoded)
+
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return pbt.error("could not initialize Workflow Nexus command decode arena")
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded := proto.Coresdk_Workflow_Commands_WorkflowCommand{}
+	decoded_ok := proto.decode_Coresdk_Workflow_Commands_WorkflowCommand(encoded[:], &decoded)
+	context.allocator = previous_allocator
+	if !decoded_ok {
+		return pbt.fail("generated Workflow Nexus command did not decode")
+	}
+	variant, variant_ok := decoded.variant.(proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Nexus_Operation)
+	if !variant_ok || variant.value == nil {
+		return pbt.fail("generated Workflow Nexus command lost its variant")
+	}
+	actual := variant.value
+	if actual.seq != seq || actual.endpoint != endpoint || actual.service != service ||
+	   actual.operation != operation || actual.input == nil ||
+	   !bytes.equal(actual.input.data, payload_data) ||
+	   actual.cancellation_type != cancellation_type {
+		return pbt.fail("generated Workflow Nexus command changed routing or payload fields")
+	}
+	if len(actual.nexus_header) != 1 || actual.nexus_header[0].key != header_key ||
+	   actual.nexus_header[0].value != header_value {
+		return pbt.fail("generated Workflow Nexus command changed header fields")
+	}
+	if actual.schedule_to_close_timeout == nil ||
+	   actual.schedule_to_close_timeout.seconds != close_seconds ||
+	   actual.schedule_to_start_timeout == nil ||
+	   actual.schedule_to_start_timeout.seconds != start_seconds ||
+	   actual.start_to_close_timeout == nil ||
+	   actual.start_to_close_timeout.seconds != run_seconds {
+		return pbt.fail("generated Workflow Nexus command changed timeout fields")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_nexus_commands_preserve_generated_values :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow Nexus commands preserve generated values",
+		nexus_workflow_command_property,
+		{num_tests = 500, seed = 0x4e45_5855_535f_5746},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

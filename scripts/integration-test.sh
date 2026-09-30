@@ -141,37 +141,18 @@ nexus_endpoint_name="odin-nexus-${RANDOM}-$(date +%s)"
 temporal operator nexus endpoint create \
   --name "$nexus_endpoint_name" \
   --target-namespace default \
-  --target-task-queue odin-hello-nexus \
-  --description 'Temporal SDK for Odin synchronous Nexus integration' \
+  --target-task-queue odin-hello-nexus-workflow \
+  --description 'Temporal SDK for Odin Workflow-to-Nexus integration' \
   --command-timeout 10s \
   --output none
-TEMPORAL_ODIN_SKIP_BUILD=1 \
-  "$repo_root/scripts/run-hello-nexus.sh" >"$worker_log" 2>&1 &
-worker_pid=$!
-for _ in {1..30}; do
-  if grep -q 'Odin Nexus Worker is polling' "$worker_log" 2>/dev/null; then
-    break
-  fi
-  if ! kill -0 "$worker_pid" 2>/dev/null; then
-    echo "Odin Nexus Worker exited before polling; see $worker_log" >&2
-    cat "$worker_log" >&2
-    exit 1
-  fi
-  sleep 1
-done
-if ! grep -q 'Odin Nexus Worker is polling' "$worker_log" 2>/dev/null; then
-  echo "Odin Nexus Worker did not become ready; see $worker_log" >&2
-  exit 1
-fi
 NEXUS_ENDPOINT="$nexus_endpoint_name" \
-  TEMPORAL_TASK_QUEUE="odin-nexus-caller-${RANDOM}-$(date +%s)" \
-  cargo run --quiet \
-    --manifest-path "$repo_root/native/Cargo.toml" \
-    --package activity-test-driver
-wait "$worker_pid"
-worker_pid=""
-cat "$worker_log"
-grep -q 'one synchronous Nexus operation completed and worker shut down cleanly' "$worker_log"
+  TEMPORAL_NEXUS_WORKFLOW_ID="odin-nexus-workflow-${RANDOM}-$(date +%s)" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-nexus-workflow.sh" >"$workflow_output_file"
+nexus_workflow_output="$(<"$workflow_output_file")"
+echo "$nexus_workflow_output"
+grep -q 'Odin Workflow called Odin Nexus operation through Temporal: Hello Odin' <<<"$nexus_workflow_output"
+grep -q 'Nexus Workflow history replayed offline through Core activations=' <<<"$nexus_workflow_output"
 temporal operator nexus endpoint delete \
   --name "$nexus_endpoint_name" \
   --command-timeout 10s \

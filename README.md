@@ -316,15 +316,20 @@ independent sizes, shared by online execution and offline replay. It does
 containment, or a stable public API. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
-Synchronous Nexus operation handling is now a live-proven vertical slice. The
+Synchronous Nexus operation handling and Workflow-side calling are now a
+live-proven vertical slice. The
 raw/Core packages bind the pinned bridge's separate Nexus poll and completion
 functions, while `temporal/nexus` and the public Worker own operation context,
 service/operation registration, typed JSON adapters, bounded concurrent
 dispatch, cooperative Core cancellation, and exact handler-failure mapping.
-The integration suite creates a real CLI-devserver Nexus endpoint, invokes the
-Odin handler from a Temporal Workflow, and observes its result. Async operation
-tokens, user-defined cancel-operation handlers, and an Odin Workflow-side Nexus
-caller are not implemented yet.
+The stackful Workflow runtime now emits `ScheduleNexusOperation`, consumes the
+separate start/result activation jobs, preserves recursive failures, and offers
+Payload, JSON, and string `start`/`await`/`execute` APIs. The integration suite
+creates a real CLI-devserver endpoint, runs both caller Workflow and operation
+handler in Odin, observes `Hello Odin`, fetches the server history, and replays
+it through Core. User-defined async operation handlers, cancel-operation
+handlers, Nexus outbound interceptors, and selector branches are not yet
+implemented.
 
 ```odin
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
@@ -338,6 +343,18 @@ _ = worker.register_nexus_operation(
     hello,
 )
 _, _ = worker.run(&sdk_worker)
+```
+
+```odin
+result := workflow.execute_nexus_operation_json(
+    ctx,
+    endpoint,
+    "odin-greeting-service",
+    "hello",
+    "Odin",
+    string,
+    {schedule_to_close_timeout = 20 * time.Second},
+)
 ```
 
 Do not use it in production.
@@ -1806,6 +1823,7 @@ examples/replay_history/  offline binary-history compatibility corpus runner
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker
+examples/hello_nexus_workflow/ all-Odin Workflow-to-Nexus and replay proof
 examples/hello_workflow/  sequential suspension/replay/eviction proof
 examples/child_workflow/  child and external Workflow operation proofs
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests

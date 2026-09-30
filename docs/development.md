@@ -1049,10 +1049,12 @@ bridge symbol, Worker options, Service validation, poll stream, and memory-safe
 shutdown independently of handler dispatch.
 
 The suite next creates a uniquely named Nexus endpoint targeting
-`odin-hello-nexus`, starts `examples/hello_nexus`, and invokes
-`odin-greeting-service/hello` from a small Workflow in the Rust integration
-driver. The result must be the JSON string `"Hello Odin"`; the endpoint is then
-deleted. This proves the real synchronous route in both directions:
+`odin-hello-nexus-workflow` and starts `examples/hello_nexus_workflow`. The same
+Odin Worker runs the stackful caller Workflow and the registered
+`odin-greeting-service/hello` handler. The result must be the JSON string
+`"Hello Odin"`; the example then fetches its server history and replays it
+offline through Core before the endpoint is deleted. This proves the real
+synchronous route in both directions without a second language SDK:
 
 ```text
 Workflow -> Temporal endpoint -> Core Nexus poll -> Odin callback
@@ -1065,18 +1067,19 @@ To exercise the worker manually after building the examples:
 temporal operator nexus endpoint create \
   --name odin-nexus-local \
   --target-namespace default \
-  --target-task-queue odin-hello-nexus
+  --target-task-queue odin-hello-nexus-workflow
 
-TEMPORAL_ODIN_SKIP_BUILD=1 ./scripts/run-hello-nexus.sh
+NEXUS_ENDPOINT=odin-nexus-local \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/run-hello-nexus-workflow.sh
 ```
 
-The example intentionally handles one operation and exits. Invoke it from a
-Workflow while it is polling; `scripts/integration-test.sh` is the canonical
-repeatable harness. Endpoint names permit letters, digits, and hyphens, but not
-underscores. The current public slice supports synchronous starts only. Core
-cancel tasks are routed cooperatively, while protocol `CancelOperation`
-requests return `NOT_IMPLEMENTED` until durable async operation tokens and
-cancel handlers exist.
+The example starts one Workflow, handles one operation, validates the result,
+replays the fetched history, and exits. `scripts/integration-test.sh` is the
+canonical repeatable harness. Endpoint names permit letters, digits, and
+hyphens, but not underscores. Core cancel tasks are routed cooperatively, while
+protocol `CancelOperation` requests return `NOT_IMPLEMENTED` until durable
+async operation tokens and cancel handlers exist.
 
 The same script then runs `examples/hello_activity` for several focused cases.
 A small workflow-only driver under `native/activity-test-driver` uses the
@@ -1258,6 +1261,12 @@ and every signal/Update/Nexus reapply exclusion. They decode the exact pinned
 request type and require namespace, client identity, target, reason, request ID,
 and exclusion order to survive encoding. Focused unit tests reject a nonpositive
 event ID and verify Client interceptor nesting and option mutation.
+Another 500 cases generate Workflow-side Nexus schedule commands across opaque
+Payload bytes, endpoint/service/operation strings, string headers, all four
+cancellation policies, and independent schedule-to-close, schedule-to-start,
+and start-to-close timeouts. The focused runtime test additionally forces cache
+eviction and requires byte-identical replay before applying both the synchronous
+start and completed-result jobs in one activation.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,

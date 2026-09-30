@@ -305,6 +305,165 @@ client_interceptor_test_count_workflows :: proc(
 }
 
 @(test)
+workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"nexus_caller_test_workflow",
+		"nexus-caller-task-queue",
+		nexus_caller_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "nexus_caller_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "nexus-caller-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, initial.error.message == nil, "Nexus operation schedule failed: %s", string(initial.error.message))
+	testing.expect(t, initial.scheduled_nexus_operation)
+	testing.expect_value(t, initial.scheduled_nexus_operation_count, 1)
+	testing.expect_value(t, initial.nexus_operation_seq, u32(1))
+	testing.expect_value(t, initial.waiting_nexus_operation_seq, u32(1))
+	initial_bytes := bytes.clone(initial.completion[:])
+	inspection := inspect_workflow_completion(initial.completion[:])
+	testing.expect(t, inspection.decoded)
+	testing.expect_value(t, inspection.command_count, 1)
+	testing.expect_value(t, inspection.scheduled_nexus_operation_seq, u32(1))
+	testing.expect_value(t, string(inspection.nexus_endpoint), "odin-test-endpoint")
+	testing.expect_value(t, string(inspection.nexus_service), "GreetingService")
+	testing.expect_value(t, string(inspection.nexus_operation), "hello")
+	testing.expect_value(t, string(inspection.nexus_input), `"Odin"`)
+	testing.expect_value(t, inspection.nexus_header_count, 2)
+	testing.expect_value(t, string(inspection.nexus_header_key), "x-odin-test")
+	testing.expect_value(t, string(inspection.nexus_header_value), "workflow")
+	testing.expect_value(t, inspection.nexus_schedule_to_close_timeout, 2*time.Minute)
+	testing.expect_value(t, inspection.nexus_schedule_to_start_timeout, 15*time.Second)
+	testing.expect_value(t, inspection.nexus_start_to_close_timeout, 45*time.Second)
+	testing.expect_value(
+		t,
+		inspection.nexus_cancellation_type,
+		proto.Coresdk_Nexus_NexusOperationCancellationType.WAIT_CANCELLATION_REQUESTED,
+	)
+	delete(inspection.nexus_endpoint)
+	delete(inspection.nexus_service)
+	delete(inspection.nexus_operation)
+	delete(inspection.nexus_input)
+	delete(inspection.nexus_header_key)
+	delete(inspection.nexus_header_value)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed.error.message == nil)
+	testing.expect(t, replayed.scheduled_nexus_operation)
+	testing.expect(t, bytes.equal(initial_bytes, replayed.completion[:]))
+	delete(initial_bytes)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	output, output_error := codec.encode_json("Hello Odin")
+	testing.expect(t, output_error == .None)
+	defer codec.payload_free(&output)
+	proto_output := proto.encode_payload(codec.payload_view(&output))
+	defer delete(proto_output.metadata)
+	defer delete(proto_output.external_payloads)
+	resolve_start := proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart{
+		seq = 1,
+		status = proto.Coresdk_Workflow_Activation_ResolveNexusOperationStart_Status_Started_Sync{
+			value = true,
+		},
+	}
+	nexus_result := proto.Coresdk_Nexus_NexusOperationResult{
+		status = proto.Coresdk_Nexus_NexusOperationResult_Status_Completed{
+			value = &proto_output,
+		},
+	}
+	resolve_result := proto.Coresdk_Workflow_Activation_ResolveNexusOperation{
+		seq = 1,
+		result = &nexus_result,
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	activation.history_length = 8
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation_Start{
+				value = &resolve_start,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Nexus_Operation{
+				value = &resolve_result,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "Nexus operation completion failed: %s", string(completed.error.message))
+	testing.expect_value(t, completed.resolved_nexus_operation_start_seq, u32(1))
+	testing.expect_value(t, completed.resolved_nexus_operation_seq, u32(1))
+	testing.expect(t, completed.completed)
+	completed_inspection := inspect_workflow_completion(completed.completion[:])
+	testing.expect(t, completed_inspection.decoded && completed_inspection.completed)
+	testing.expect_value(t, string(completed_inspection.completion_result), `"Hello Odin"`)
+	delete(completed_inspection.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
 child_workflow_start_completion_and_fresh_stack_replay :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -4693,6 +4852,28 @@ registry_second_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: strin
 	return "second"
 }
 
+nexus_caller_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
+	headers := [?]workflow.Nexus_Header{
+		{key = "x-odin-test", value = "workflow"},
+		{key = "x-request-id", value = "nexus-1"},
+	}
+	return workflow.execute_nexus_operation_json(
+		ctx,
+		"odin-test-endpoint",
+		"GreetingService",
+		"hello",
+		input,
+		string,
+		{
+			schedule_to_close_timeout = 2 * time.Minute,
+			schedule_to_start_timeout = 15 * time.Second,
+			start_to_close_timeout = 45 * time.Second,
+			cancellation_type = .Wait_Cancellation_Requested,
+			headers = headers[:],
+		},
+	)
+}
+
 child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) -> string {
 	name, name_error := codec.encode_json(input)
 	if name_error != .None {
@@ -5364,6 +5545,19 @@ Workflow_Completion_Inspection :: struct {
 	failure_cause:    proto.Temporal_Api_Enums_V1_WorkflowTaskFailedCause,
 	command_count:    int,
 	scheduled_activity_seq: u32,
+	scheduled_nexus_operation_seq: u32,
+	nexus_endpoint: []u8,
+	nexus_service: []u8,
+	nexus_operation: []u8,
+	nexus_input: []u8,
+	nexus_header_count: int,
+	nexus_header_key: []u8,
+	nexus_header_value: []u8,
+	nexus_schedule_to_close_timeout: time.Duration,
+	nexus_schedule_to_start_timeout: time.Duration,
+	nexus_start_to_close_timeout: time.Duration,
+	nexus_cancellation_type: proto.Coresdk_Nexus_NexusOperationCancellationType,
+	canceled_nexus_operation_seq: u32,
 	started_child_workflow_seq: u32,
 	child_workflow_id: []u8,
 	child_workflow_type: []u8,
@@ -5475,6 +5669,39 @@ inspect_workflow_completion :: proc(data: []u8) -> (inspection: Workflow_Complet
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
 				if variant.value != nil {
 					inspection.scheduled_activity_seq = variant.value.seq
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Nexus_Operation:
+				if variant.value != nil {
+					inspection.scheduled_nexus_operation_seq = variant.value.seq
+					inspection.nexus_endpoint = bytes.clone(transmute([]u8)variant.value.endpoint)
+					inspection.nexus_service = bytes.clone(transmute([]u8)variant.value.service)
+					inspection.nexus_operation = bytes.clone(transmute([]u8)variant.value.operation)
+					if variant.value.input != nil {
+						inspection.nexus_input = bytes.clone(variant.value.input.data)
+					}
+					inspection.nexus_header_count = len(variant.value.nexus_header)
+					if len(variant.value.nexus_header) > 0 {
+						inspection.nexus_header_key = bytes.clone(
+							transmute([]u8)variant.value.nexus_header[0].key,
+						)
+						inspection.nexus_header_value = bytes.clone(
+							transmute([]u8)variant.value.nexus_header[0].value,
+						)
+					}
+					inspection.nexus_schedule_to_close_timeout = proto_duration_value(
+						variant.value.schedule_to_close_timeout,
+					)
+					inspection.nexus_schedule_to_start_timeout = proto_duration_value(
+						variant.value.schedule_to_start_timeout,
+					)
+					inspection.nexus_start_to_close_timeout = proto_duration_value(
+						variant.value.start_to_close_timeout,
+					)
+					inspection.nexus_cancellation_type = variant.value.cancellation_type
+				}
+			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_Nexus_Operation:
+				if variant.value != nil {
+					inspection.canceled_nexus_operation_seq = variant.value.seq
 				}
 			case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Child_Workflow_Execution:
 				if variant.value != nil {
@@ -12887,6 +13114,47 @@ workflow_activity_wait_cancellation_preserves_user_details :: proc(t: ^testing.T
 	testing.expect(t, decode_error == .None)
 	testing.expect_value(t, decoded_detail.dependency, "payments")
 	testing.expect_value(t, decoded_detail.attempt, u32(9))
+}
+
+@(test)
+workflow_nexus_cancellation_emits_once_and_honors_wait_policy :: proc(t: ^testing.T) {
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	defer {context.allocator = previous_allocator}
+
+	instance := workflow.Fiber_Instance{phase = .Ready}
+	instance.nexus_operations = make([dynamic]workflow.Fiber_Nexus_Operation)
+	append(
+		&instance.nexus_operations,
+		workflow.Fiber_Nexus_Operation{
+			seq = 7,
+			options = {cancellation_type = .Wait_Cancellation_Completed},
+			start_state = .Succeeded,
+			state = .Commanded,
+		},
+	)
+	ctx := workflow.Fiber_Context{instance = &instance}
+	testing.expect(t, workflow.cancel_nexus_operation(&ctx, {seq = 7}))
+	testing.expect(t, instance.nexus_operations[0].state == .Cancel_Requested)
+	commands := make([dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand)
+	processed := workflow.Process_Result{}
+	workflow.append_fiber_nexus_operation_cancellations(&processed, &commands, &instance)
+	testing.expect_value(t, len(commands), 1)
+	testing.expect(t, processed.requested_nexus_operation_cancellation)
+	testing.expect_value(t, processed.canceled_nexus_operation_seq, u32(7))
+	testing.expect(t, instance.nexus_operations[0].cancellation_command_emitted)
+	testing.expect(t, instance.nexus_operations[0].state == .Cancel_Requested)
+	request_found := false
+	#partial switch variant in commands[0].variant {
+	case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Request_Cancel_Nexus_Operation:
+		request_found = variant.value != nil && variant.value.seq == 7
+	}
+	testing.expect(t, request_found)
+	workflow.append_fiber_nexus_operation_cancellations(&processed, &commands, &instance)
+	testing.expect_value(t, len(commands), 1)
 }
 
 @(test)

@@ -444,7 +444,14 @@ The implementation now crosses that boundary for synchronous operations:
   server, begins the real Core poll path, initiates shutdown, observes the
   shutdown sentinel, and finalizes cleanly.
 - `examples/hello_nexus` is called through a real CLI-devserver endpoint by a
-  small Rust test Workflow and returns a typed JSON string through Core.
+  Workflow caller and returns a typed JSON string through Core.
+- `temporal/workflow/nexus_operation.odin` owns a replay-stable operation table,
+  emits `ScheduleNexusOperation`/`RequestCancelNexusOperation`, consumes Core's
+  distinct `ResolveNexusOperationStart` and `ResolveNexusOperation` jobs, and
+  exposes Payload, typed JSON, and string `start`/`await`/`execute` forms.
+- `examples/hello_nexus_workflow` runs the caller Workflow and synchronous
+  handler in one Odin Worker, fetches its server history, and passes that
+  history through Core's offline replayer.
 
 This proves the complete synchronous route from a Temporal Workflow through
 Service, Core, the C ABI, and an Odin operation callback and back. Unknown
@@ -454,11 +461,23 @@ pinned Core explicitly requires; the deprecated Nexus `HandlerError` message is
 not used. A Core-local cancel task atomically marks the matching callback
 context, and a cooperative callback is acknowledged with `AckCancel`.
 
+Workflow-side ownership follows the other stackful operations. Endpoint,
+service, operation, string headers, input Payload, result Payload, async
+operation token, encoded recursive Failure, and cancellation metadata live in
+the Workflow-run arena. Futures contain only a stable sequence number because
+the dynamic operation table may move. On eviction, result/input Payload buffers
+are released before the arena; replay reconstructs the table by re-executing
+the Workflow and reproduces the exact command bytes. Core remains responsible
+for endpoint routing, Nexus state machines, history interpretation, timeouts,
+and translating server events into the two activation-job forms.
+
 The remaining boundary is intentionally explicit. `CancelOperation` receives a
 non-retryable `NOT_IMPLEMENTED` handler failure because this first slice exposes
 no durable async operation token or user cancel handler. Async starts, callback
-completion, links, Workflow-side scheduling in Odin, interceptor/metric hooks,
-and stronger cancellation/deadline live cases are not implemented.
+completion, links, outbound interceptor/metric hooks, selector integration, and
+stronger cancellation/deadline live cases are not implemented. The caller does
+accept Core's async start-token activation shape internally, but no Odin handler
+can produce such a token yet and that path is not claimed as live-proven.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
 Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
@@ -2638,12 +2657,15 @@ Workflows are enabled.
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
 9. **Nexus language semantics.** Core's transport, exact task/completion schema,
-   and one public synchronous Odin handler path are pinned, generated, and
-   live-tested against a real endpoint. Handler errors have the exact
+   one public synchronous Odin handler path, and the stackful Workflow caller
+   are pinned, generated, replay-tested, and live-tested against a real
+   endpoint. Handler errors have the exact
    `NexusHandlerFailureInfo` envelope, and all callback-visible data is owned
-   beyond the poll arena. Async operation starts/tokens, user cancel handlers,
-   callback completion, links, Workflow-side scheduling in Odin, deadline
-   enforcement, and cancellation after callback handoff remain. A bounded run
+   beyond the poll arena. Workflow operation state, results, recursive failures,
+   and optional operation tokens are owned by the run arena. Async operation
+   handlers, user cancel handlers, callback completion, links, outbound
+   interceptors, selector branches, deadline enforcement, and cancellation
+   after callback handoff remain. A bounded run
    stops polling after its requested task count, so cancellation of that final
    in-flight task is only meaningful for unbounded production runs; tests must
    not confuse the bounded example control with production cancellation.
@@ -2663,16 +2685,14 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The next smallest vertical milestone is an Odin Workflow-side synchronous Nexus
-caller. It should encode `ScheduleNexusOperation`, track the scheduled, started,
-and completed activation jobs through eviction and replay, expose generic
-Payload and typed JSON APIs, and replace the Rust integration driver with an
-all-Odin Service -> Core -> Worker path. In parallel, add live
-unknown-operation, handler-error, deadline, and cooperative-cancellation cases
-before stabilizing the handler API. Async operation tokens and callback
-completion should follow only after the synchronous replay contract is
-byte-identical. Activity Worker is no longer the next milestone: it is already
-implemented and extensively live-tested.
+The next smallest vertical milestone is hardening the new Workflow-to-Nexus
+boundary: live-test start failure, operation failure, timeout, and all four
+cancellation policies; add the Workflow outbound-interceptor hook and selector
+branch; and property-test activation order/duplicate delivery. After that,
+implement durable async Odin operation tokens, callback completion, and
+user-defined cancel handlers as a separate vertical slice. Activity Worker is
+no longer the next milestone: it is already implemented and extensively
+live-tested.
 
 Activity concurrency, task-token routing, cooperative cancel delivery,
 heartbeat transport, typed JSON Payloads, structured user failures with a real
