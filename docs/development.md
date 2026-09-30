@@ -193,6 +193,12 @@ Activities and one Timer, split after either one or two early jobs. Every early
 activation must retain `waiting_join=true`; only the final operation may resume
 the Workflow. Result order and all three completions must survive fresh-stack
 replay byte-for-byte across 180 traces.
+A 300-trace Child composition property then combines both primitives. Three
+children resolve start jobs in every generated order; a start selector and
+start join run before one generated child is explicitly canceled. Completion
+selection receives two jobs in either order, completion join must remain blocked
+until the third child resolves, and initialize/start/partial/terminal completion
+bytes must all survive eviction and fresh-stack replay.
 The CLI-devserver suite also starts `odin_condition_workflow`, waits until the
 Worker reports `waiting_condition=true`, sends an `approve` Signal through the
 Temporal CLI, and requires the predicate-resumed result plus clean eviction.

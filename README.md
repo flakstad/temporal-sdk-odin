@@ -1531,6 +1531,12 @@ Signal cases are rejected; Signal joining is deferred until the API can return
 owned per-case values without surprising allocations. Cancellation returns
 `.Canceled` if all operations have not already become ready.
 
+A 300-trace property composes both APIs around three Child Workflows. It varies
+start and completion declaration order, Core job order, and the explicitly
+canceled child; every intermediate completion must remain byte-identical after
+eviction and fresh-stack replay. This exercises Child start/completion futures
+as scheduler inputs rather than only testing their direct `await_*` paths.
+
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child
 deadline adds its own timer, while a later one adds no redundant command.

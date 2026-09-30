@@ -1528,6 +1528,13 @@ case starts a real Activity and Timer, observes `waiting_selector=true`, lets
 the Activity win, emits `CancelTimer`, and completes through Core and Temporal
 Server after Core has also forced a replay on a fresh Odin stack.
 
+A second 300-trace composition property starts three Child Workflows, selects
+between two start futures, joins all three start futures, explicitly cancels one
+of the children, selects between two completion futures, and finally joins all
+three completions across a partial activation boundary. It varies declaration
+and Core-job order plus all cancellation targets, then reproduces all four
+activation completions byte-for-byte on fresh-stack replay.
+
 Odin's first `join_all` boundary reuses the same durable case descriptors but
 waits for every case instead of choosing one. Upstream Rust has both a
 heterogeneous `join!` macro and a homogeneous generic `join_all`; Odin has
@@ -2414,9 +2421,10 @@ implemented and live-proven. Two independent
 180-trace properties cover selector case/job order and join job/split order with
 fresh-stack replay; the selector property also carries generated Timer summaries
 through command metadata and replay. Timer duration, summary, and explicit
-cancellation-token options are implemented. The next smallest runtime slice is
-generative Child start/completion and cancellation coverage for selector/join.
-It requires no new C ABI symbol.
+cancellation-token options are implemented. A 300-trace Child composition
+property now covers start/completion selectors, start/completion joins,
+explicit cancellation, partial readiness, and four byte-identical replay
+completions. None of these scheduler features requires a new C ABI symbol.
 
 The Child Workflow start/result/failure/signal/cancellation slice is now
 implemented. The Workflow-local Future acts as the public child handle for

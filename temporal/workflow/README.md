@@ -180,6 +180,9 @@ supported. Exact duplicate cases are invalid. Signal cases are deliberately
 rejected until join can return consumed Signal payloads with explicit ownership.
 Cancellation is checked after the all-ready condition, and unfinished
 operations remain owned by the Workflow when join returns `.Canceled`.
+Selector/join composition over Child start and completion futures, including an
+explicitly canceled child and partial readiness, is covered by a 300-trace
+fresh-stack replay property.
 
 `workflow.Stack_Options` controls Workflow, Signal-handler, and Update-handler
 stack sizes independently when the Worker is created. Zero selects the 128 KiB
