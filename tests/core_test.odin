@@ -21,6 +21,7 @@ import temporal_failure "../temporal/failure"
 import nexus "../temporal/nexus"
 import protobuf "../temporal/protobuf"
 import supervisor "../temporal/supervisor"
+import temporal_sdk "../temporal"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
@@ -27925,6 +27926,42 @@ client_connection_options_validate_security_and_metadata_contracts :: proc(t: ^t
 	testing.expect(t, public_error.message != nil)
 	temporal_client.error_free(&public_error)
 	temporal_client.close(&invalid_client)
+}
+
+@(test)
+top_level_sdk_facade_preserves_namespace_and_explicit_ownership :: proc(t: ^testing.T) {
+	client := temporal_sdk.Client{namespace = "orders"}
+	options := temporal_sdk.worker_options_default(&client, "orders-queue")
+	testing.expect_value(t, options.task_queue, "orders-queue")
+	testing.expect_value(t, options.namespace, "orders")
+	testing.expect(t, options.max_concurrent_activities > 0)
+
+	default_options := temporal_sdk.worker_options_default(nil, "default-queue")
+	testing.expect_value(t, default_options.namespace, "default")
+
+	invalid_client := temporal_sdk.Client{}
+	_, create_error := temporal_sdk.worker_create(&invalid_client, "orders-queue")
+	testing.expect(t, create_error.message != nil)
+	temporal_sdk.worker_error_free(&create_error)
+	temporal_sdk.client_close(&invalid_client)
+	testing.expect(t, invalid_client.runtime == nil)
+	testing.expect(t, invalid_client.connection == nil)
+
+	empty_worker := temporal_sdk.Worker{}
+	activity_error := temporal_sdk.worker_register_json_activity(
+		&empty_worker,
+		"hello",
+		proc(_: ^activity.Context, input: string) -> string { return input },
+	)
+	testing.expect(t, activity_error.message != nil)
+	temporal_sdk.worker_error_free(&activity_error)
+	workflow_error := temporal_sdk.worker_register_json_workflow(
+		&empty_worker,
+		"hello-workflow",
+		proc(_: ^workflow.Fiber_Context, input: string) -> string { return input },
+	)
+	testing.expect(t, workflow_error.message != nil)
+	temporal_sdk.worker_error_free(&workflow_error)
 }
 
 offline_replay_history_fixture :: proc(workflow_type_name: string) -> [dynamic]u8 {

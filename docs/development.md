@@ -109,6 +109,27 @@ macOS and the standard compiler toolchain on Linux.
 The first native build is substantial because it compiles Core and its Rust
 dependency graph. Incremental builds are fast.
 
+## Top-level lifecycle facade
+
+`temporal/temporal.odin` exposes a deliberately small convenience surface for
+Client connection, Worker creation, registration, running, shutdown, and
+cleanup. `worker_create` inherits the connected Client's namespace;
+`worker_create_with_options` does the same only when `options.namespace` is
+empty. Both paths still copy Worker configuration into Worker ownership.
+
+The facade aliases the underlying concrete Client/Worker types and their
+distinct error types. It does not wrap handles in another allocation or merge
+error ownership. Advanced Client operations and deterministic Workflow
+primitives remain under `temporal/client` and `temporal/workflow`.
+
+Build the compile-checked facade example with all other examples, or run its
+one-task Activity Worker against the CLI dev server:
+
+```bash
+./scripts/build-examples.sh
+./native/target/release/temporal-odin-sdk-hello-activity
+```
+
 ## Native packages and platform CI
 
 Create the package for the current host with:

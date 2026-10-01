@@ -7,7 +7,9 @@ Current status: Milestones 0–2 plus bounded explicit-state-machine and stackfu
 fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
-Odin Client over Core's generic WorkflowService RPC bridge. The Client also
+Odin Client over Core's generic WorkflowService RPC bridge. A thin top-level
+`temporal` facade now exposes ordinary Client/Worker lifecycle and registration
+without changing the concrete module types or hiding cleanup. The Client also
 sends typed signals, requests cancellation, pauses/unpauses or terminates executions, and updates
 versioning/priority/time-skipping execution options with explicit field masks. It now
 starts, polls, describes, requests cancellation of, terminates, and deletes
@@ -812,6 +814,38 @@ Build all Odin examples in one pass with:
 ```bash
 ./scripts/build-examples.sh
 ```
+
+The small top-level package covers ordinary Client/Worker lifecycle while
+feature-specific APIs remain in their explicit packages:
+
+```odin
+import activity "temporal/activity"
+import temporal "temporal"
+
+hello :: proc(_: ^activity.Context, name: string) -> string {
+    return "Hello " + name
+}
+
+client, client_error := temporal.connect()
+assert(client_error.message == nil)
+defer temporal.client_close(&client)
+
+sdk_worker, worker_error := temporal.worker_create(&client, "hello")
+assert(worker_error.message == nil)
+defer {
+    close_error := temporal.worker_close(&sdk_worker)
+    temporal.worker_error_free(&close_error)
+}
+
+register_error := temporal.worker_register_activity(&sdk_worker, "hello", hello)
+assert(register_error.message == nil)
+_, run_error := temporal.worker_run(&sdk_worker)
+assert(run_error.message == nil)
+```
+
+The facade keeps Client and Worker errors distinct and does not hide cleanup.
+See `examples/sdk_hello_activity` for checked error handling and a bounded live
+run against the Temporal CLI dev server.
 
 Build a host-specific native runtime archive and verify that the packaged Core
 ABI can initialize and shut down:
@@ -2319,6 +2353,7 @@ temporal/workflow/        explicit-state and stackful-fiber experiments
 temporal/workflow/isolate versioned activation/completion process framing
 temporal/client/          owned Client and Workflow handle/control APIs
 temporal/failure/         owned recursive Temporal Failure model
+examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
