@@ -110,6 +110,7 @@ Client_Interceptor_Test_State :: struct {
 	activity_mutation_kind:  temporal_client.Standalone_Activity_Mutation_Kind,
 	activity_control_seen:   bool,
 	activity_control_kind:   temporal_client.Standalone_Activity_Control_Kind,
+	activity_options_seen:   bool,
 	activity_list_seen:      bool,
 	activity_count_seen:     bool,
 }
@@ -757,6 +758,32 @@ client_interceptor_test_standalone_activity_control :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result
+}
+
+client_interceptor_test_update_standalone_activity_options :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Update_Standalone_Activity_Options_Input,
+	next: temporal_client.Client_Update_Standalone_Activity_Options_Next,
+) -> (temporal_client.Standalone_Activity_Options, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.update.task_queue = "intercepted-queue"
+	} else {
+		node.state.activity_options_seen = input.update.task_queue == "intercepted-queue" &&
+		                                   input.allocator.procedure != nil
+	}
+	result: temporal_client.Standalone_Activity_Options
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result.task_queue = "intercepted-result"
+	} else {
+		result, result_error = temporal_client.client_update_standalone_activity_options_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
 }
 
 client_interceptor_test_list_standalone_activities :: proc(
@@ -10964,7 +10991,7 @@ client_server_feature_model_separates_sdk_surface_and_server_evidence :: proc(t:
 		.Standalone_Activity,
 		capabilities,
 	)
-	testing.expect(t, !standalone_activity.sdk_implemented)
+	testing.expect(t, standalone_activity.sdk_implemented)
 	testing.expect_value(t, standalone_activity.support, temporal_client.Server_Feature_Support.Unknown)
 	testing.expect_value(t, temporal_client.server_feature_name(.Standalone_Activity), "standalone-activity")
 }
@@ -11233,6 +11260,7 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 			describe_standalone_activity = client_interceptor_test_describe_standalone_activity,
 			standalone_activity_mutation = client_interceptor_test_standalone_activity_mutation,
 			standalone_activity_control = client_interceptor_test_standalone_activity_control,
+			update_standalone_activity_options = client_interceptor_test_update_standalone_activity_options,
 			list_standalone_activities = client_interceptor_test_list_standalone_activities,
 			count_standalone_activities = client_interceptor_test_count_standalone_activities,
 		})
@@ -11306,6 +11334,18 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 		testing.expect_value(t, state.activity_control_kind, kind)
 		for event, index in expected do testing.expect_value(t, state.events[index], event)
 	}
+
+	state.count = 0
+	updated, update_error := temporal_client.update_standalone_activity_options(
+		&handle,
+		{update_mask = []string{temporal_client.Standalone_Activity_Option_Path_Task_Queue_Name}, task_queue = "caller-queue"},
+	)
+	testing.expect(t, update_error.message == nil)
+	testing.expect_value(t, updated.task_queue, "intercepted-result")
+	temporal_client.standalone_activity_options_free(&updated)
+	temporal_client.error_free(&update_error)
+	testing.expect(t, state.activity_options_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
 	state.count = 0
 	page, list_error := temporal_client.list_standalone_activities(
@@ -26055,6 +26095,207 @@ standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^te
 	delete(invalid_bytes)
 	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
 	temporal_client.error_free(&invalid_error)
+
+}
+
+@(test)
+standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
+	paths := [?]string{
+		temporal_client.Standalone_Activity_Option_Path_Task_Queue_Name,
+		temporal_client.Standalone_Activity_Option_Path_Start_To_Close_Timeout,
+		temporal_client.Standalone_Activity_Option_Path_Retry_Policy,
+		temporal_client.Standalone_Activity_Option_Path_Priority,
+	}
+	retry := temporal_client.Retry_Policy{
+		initial_interval = time.Second,
+		backoff_coefficient = 2,
+		maximum_interval = 10 * time.Second,
+		maximum_attempts = 5,
+		non_retryable_error_types = []string{"BadOrder"},
+	}
+	priority := temporal_client.Priority{
+		priority_key = 4,
+		fairness_key = "customer-42",
+		fairness_weight = 1.5,
+	}
+	request_bytes, request_error := temporal_client.encode_update_standalone_activity_options_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		{
+			update_mask = paths[:],
+			task_queue = "priority-payments",
+			start_to_close_timeout = 45 * time.Second,
+			retry_policy = &retry,
+			priority = &priority,
+			request_id = "options-request",
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest(request_bytes[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.resource_id, "activity:activity-42")
+	testing.expect_value(t, request.request_id, "options-request")
+	testing.expect(t, request.update_mask != nil && len(request.update_mask.paths) == 4)
+	if request.update_mask != nil {
+		testing.expect_value(t, request.update_mask.paths[0], "task_queue.name")
+	}
+	testing.expect(t, request.activity_options != nil)
+	if request.activity_options != nil {
+		testing.expect(t, request.activity_options.task_queue != nil)
+		if request.activity_options.task_queue != nil {
+			testing.expect_value(t, request.activity_options.task_queue.name, "priority-payments")
+		}
+		testing.expect(t, request.activity_options.start_to_close_timeout != nil)
+		testing.expect(t, request.activity_options.retry_policy != nil)
+		testing.expect(t, request.activity_options.priority != nil)
+	}
+	virtual.arena_destroy(&decode_arena)
+
+	task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "priority-payments"}
+	start_to_close := proto.Google_Protobuf_Duration{seconds = 45}
+	retry_initial := proto.Google_Protobuf_Duration{seconds = 1}
+	retry_proto := proto.Temporal_Api_Common_V1_RetryPolicy{
+		initial_interval = &retry_initial,
+		backoff_coefficient = 2,
+		maximum_attempts = 5,
+	}
+	append(&retry_proto.non_retryable_error_types, "BadOrder")
+	defer delete(retry_proto.non_retryable_error_types)
+	priority_proto := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 4,
+		fairness_key = "customer-42",
+		fairness_weight = 1.5,
+	}
+	options_proto := proto.Temporal_Api_Activity_V1_ActivityOptions{
+		task_queue = &task_queue,
+		start_to_close_timeout = &start_to_close,
+		retry_policy = &retry_proto,
+		priority = &priority_proto,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsResponse{
+		activity_options = &options_proto,
+	}
+	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsResponse(&response)
+	owned, response_error := temporal_client.decode_update_standalone_activity_options_response(response_bytes[:])
+	owned_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&owned_arena) == nil)
+	arena_owned, arena_error := temporal_client.decode_update_standalone_activity_options_response(
+		response_bytes[:],
+		virtual.arena_allocator(&owned_arena),
+	)
+	testing.expect(t, arena_error.message == nil)
+	testing.expect_value(t, arena_owned.priority.fairness_key, "customer-42")
+	temporal_client.standalone_activity_options_free(&arena_owned)
+	temporal_client.error_free(&arena_error)
+	virtual.arena_destroy(&owned_arena)
+	delete(response_bytes)
+	defer temporal_client.standalone_activity_options_free(&owned)
+	defer temporal_client.error_free(&response_error)
+	testing.expect(t, response_error.message == nil)
+	testing.expect_value(t, owned.task_queue, "priority-payments")
+	testing.expect(t, owned.start_to_close_timeout.present)
+	testing.expect_value(t, owned.start_to_close_timeout.value, 45 * time.Second)
+	testing.expect(t, owned.has_retry_policy)
+	testing.expect_value(t, len(owned.retry_policy.non_retryable_error_types), 1)
+	testing.expect(t, owned.priority.present)
+	testing.expect_value(t, owned.priority.fairness_key, "customer-42")
+
+	duplicate_paths := [?]string{"priority", "priority"}
+	invalid_bytes, invalid_error := temporal_client.encode_update_standalone_activity_options_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		{update_mask = duplicate_paths[:], priority = &priority},
+	)
+	delete(invalid_bytes)
+	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&invalid_error)
+
+	leaf_paths := [?]string{
+		temporal_client.Standalone_Activity_Option_Path_Retry_Maximum_Attempts,
+		temporal_client.Standalone_Activity_Option_Path_Priority_Fairness_Weight,
+	}
+	leaf_bytes, leaf_error := temporal_client.encode_update_standalone_activity_options_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		{
+			update_mask = leaf_paths[:],
+			retry_policy = &retry,
+			priority = &priority,
+			request_id = "leaf-request",
+		},
+	)
+	defer delete(leaf_bytes)
+	defer temporal_client.error_free(&leaf_error)
+	testing.expect(t, leaf_error.message == nil)
+	leaf_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&leaf_arena) == nil)
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&leaf_arena)
+	leaf_request := proto.Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest{}
+	leaf_decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest(leaf_bytes[:], &leaf_request)
+	context.allocator = previous_allocator
+	testing.expect(t, leaf_decoded)
+	testing.expect(t, leaf_request.activity_options != nil)
+	if leaf_request.activity_options != nil {
+		testing.expect(t, leaf_request.activity_options.retry_policy != nil)
+		testing.expect(t, leaf_request.activity_options.priority != nil)
+		if leaf_request.activity_options.retry_policy != nil {
+			testing.expect_value(t, leaf_request.activity_options.retry_policy.maximum_attempts, i32(5))
+		}
+		if leaf_request.activity_options.priority != nil {
+			testing.expect_value(t, leaf_request.activity_options.priority.fairness_weight, f32(1.5))
+		}
+	}
+	virtual.arena_destroy(&leaf_arena)
+
+	restore_bytes, restore_error := temporal_client.encode_update_standalone_activity_options_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		{restore_original = true, request_id = "restore-request"},
+	)
+	defer delete(restore_bytes)
+	defer temporal_client.error_free(&restore_error)
+	testing.expect(t, restore_error.message == nil)
+	restore_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&restore_arena) == nil)
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&restore_arena)
+	restore_request := proto.Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest{}
+	restore_decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsRequest(restore_bytes[:], &restore_request)
+	context.allocator = previous_allocator
+	testing.expect(t, restore_decoded)
+	testing.expect(t, restore_request.restore_original)
+	testing.expect(t, restore_request.update_mask == nil)
+	testing.expect(t, restore_request.activity_options == nil)
+	virtual.arena_destroy(&restore_arena)
+
+	legacy_task_queue_path := [?]string{"task_queue"}
+	legacy_bytes, legacy_error := temporal_client.encode_update_standalone_activity_options_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		{update_mask = legacy_task_queue_path[:], task_queue = "queue"},
+	)
+	delete(legacy_bytes)
+	testing.expect_value(t, legacy_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&legacy_error)
 }
 
 @(test)

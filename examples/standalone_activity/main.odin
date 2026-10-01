@@ -102,6 +102,43 @@ main :: proc() {
 	}
 	temporal_client.standalone_activity_description_free(&description)
 	if mode == "control" {
+		updated_task_queue := fmt.aprintf("%s-updated", task_queue)
+		defer delete(updated_task_queue)
+		update_paths := [?]string{
+			temporal_client.Standalone_Activity_Option_Path_Task_Queue_Name,
+			temporal_client.Standalone_Activity_Option_Path_Start_To_Close_Timeout,
+			temporal_client.Standalone_Activity_Option_Path_Priority,
+		}
+		updated_priority := temporal_client.Priority{priority_key = 7, fairness_key = "odin-control"}
+		updated_options, update_error := temporal_client.update_standalone_activity_options(
+			&handle,
+			{
+				update_mask = update_paths[:],
+				task_queue = updated_task_queue,
+				start_to_close_timeout = 20 * time.Second,
+				priority = &updated_priority,
+			},
+		)
+		if update_error.message != nil do fail("Standalone Activity options update failed", &update_error)
+		if updated_options.task_queue != updated_task_queue ||
+		   !updated_options.start_to_close_timeout.present ||
+		   updated_options.start_to_close_timeout.value != 20 * time.Second ||
+		   !updated_options.priority.present || updated_options.priority.priority_key != 7 {
+			temporal_client.standalone_activity_options_free(&updated_options)
+			fail("Standalone Activity options update returned unexpected values")
+		}
+		temporal_client.standalone_activity_options_free(&updated_options)
+		updated_description, updated_describe_error := temporal_client.describe_standalone_activity(&handle)
+		if updated_describe_error.message != nil {
+			fail("Updated standalone Activity Describe failed", &updated_describe_error)
+		}
+		if updated_description.task_queue != updated_task_queue ||
+		   !updated_description.start_to_close_timeout.present ||
+		   updated_description.start_to_close_timeout.value != 20 * time.Second {
+			temporal_client.standalone_activity_description_free(&updated_description)
+			fail("Describe did not observe updated standalone Activity options")
+		}
+		temporal_client.standalone_activity_description_free(&updated_description)
 		pause_error := temporal_client.pause_standalone_activity(
 			&handle,
 			{reason = "Odin control integration pause"},
@@ -137,7 +174,7 @@ main :: proc() {
 		delete_error := temporal_client.delete_standalone_activity(&handle)
 		if delete_error.message != nil do fail("Standalone Activity control deletion failed", &delete_error)
 		fmt.printf(
-			"Standalone Activity %s/%s was paused, reset, unpaused, terminated, and deleted through the Odin Client.\n",
+			"Standalone Activity %s/%s was updated, paused, reset, unpaused, terminated, and deleted through the Odin Client.\n",
 			handle.id,
 			handle.run_id,
 		)

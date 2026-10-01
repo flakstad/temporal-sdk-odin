@@ -620,6 +620,28 @@ Client_Standalone_Activity_Control_Interceptor_Proc :: #type proc(
 	next: Client_Standalone_Activity_Control_Next,
 ) -> Error
 
+Client_Update_Standalone_Activity_Options_Input :: struct {
+	handle:    ^Standalone_Activity_Handle,
+	update:    Standalone_Activity_Options_Update,
+	allocator: mem.Allocator,
+}
+
+Client_Update_Standalone_Activity_Options_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Update_Standalone_Activity_Options_Input,
+) -> (Standalone_Activity_Options, Error)
+
+Client_Update_Standalone_Activity_Options_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Update_Standalone_Activity_Options_Next_Proc,
+}
+
+Client_Update_Standalone_Activity_Options_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Update_Standalone_Activity_Options_Input,
+	next: Client_Update_Standalone_Activity_Options_Next,
+) -> (Standalone_Activity_Options, Error)
+
 Client_List_Standalone_Activities_Input :: struct {
 	client:    ^Client,
 	options:   List_Standalone_Activities_Options,
@@ -780,6 +802,7 @@ Client_Interceptor :: struct {
 	describe_standalone_activity: Client_Describe_Standalone_Activity_Interceptor_Proc,
 	standalone_activity_mutation: Client_Standalone_Activity_Mutation_Interceptor_Proc,
 	standalone_activity_control:  Client_Standalone_Activity_Control_Interceptor_Proc,
+	update_standalone_activity_options: Client_Update_Standalone_Activity_Options_Interceptor_Proc,
 	list_standalone_activities:   Client_List_Standalone_Activities_Interceptor_Proc,
 	count_standalone_activities:  Client_Count_Standalone_Activities_Interceptor_Proc,
 	describe_schedule:  Client_Describe_Schedule_Interceptor_Proc,
@@ -1048,6 +1071,16 @@ client_standalone_activity_control_next :: proc(
 ) -> Error {
 	if next.invoke == nil || input == nil {
 		return error_from_string(.Invalid_Argument, "invalid standalone Activity control interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_update_standalone_activity_options_next :: proc(
+	next: Client_Update_Standalone_Activity_Options_Next,
+	input: ^Client_Update_Standalone_Activity_Options_Input,
+) -> (Standalone_Activity_Options, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity options interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -1710,6 +1743,27 @@ client_standalone_activity_control_chain :: proc(
 		)
 	}
 	return standalone_activity_control_terminal(input)
+}
+
+client_update_standalone_activity_options_chain :: proc(
+	data: rawptr,
+	input: ^Client_Update_Standalone_Activity_Options_Input,
+) -> (Standalone_Activity_Options, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity options interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.update_standalone_activity_options == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.update_standalone_activity_options(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_update_standalone_activity_options_chain},
+		)
+	}
+	return update_standalone_activity_options_terminal(input)
 }
 
 client_list_standalone_activities_chain :: proc(

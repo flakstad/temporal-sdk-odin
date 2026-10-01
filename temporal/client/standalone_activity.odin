@@ -190,7 +190,7 @@ standalone_activity_description_free :: proc(description: ^Standalone_Activity_D
 	}
 	for value in strings_to_delete do delete(value^, allocator)
 	for error_type in description.retry_policy.non_retryable_error_types do delete(error_type, allocator)
-	delete(description.retry_policy.non_retryable_error_types)
+	delete(description.retry_policy.non_retryable_error_types, allocator)
 	for &payload in description.heartbeat_details do codec.payload_free(&payload)
 	for &entry in description.headers {
 		delete(entry.key, allocator)
@@ -781,7 +781,7 @@ standalone_activity_clone_retry_policy :: proc(
 		owned, cloned := description_clone_string(value, allocator)
 		if !cloned {
 			for existing in policy.non_retryable_error_types[:index] do delete(existing, allocator)
-			delete(policy.non_retryable_error_types)
+			delete(policy.non_retryable_error_types, allocator)
 			return {}, true, false
 		}
 		policy.non_retryable_error_types[index] = owned

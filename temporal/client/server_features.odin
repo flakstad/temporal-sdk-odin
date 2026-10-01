@@ -82,15 +82,13 @@ server_feature_evidence_name :: proc(evidence: Server_Feature_Evidence) -> strin
 }
 
 // server_feature_sdk_implemented describes the public Odin surface, not
-// server support. The initial standalone Activity lifecycle, metadata,
-// Visibility, interceptors, and Pause/Unpause/Reset exist, but the
-// execution-option update RPC remains, so it is still false.
+// server support. The complete pinned standalone Activity lifecycle is now
+// represented, including metadata, Visibility, operator controls, options,
+// and interceptors.
 server_feature_sdk_implemented :: proc(feature: Server_Feature) -> bool {
 	switch feature {
-	case .Schedules, .Schedule_Count, .Nexus, .Standalone_Nexus, .Workflow_Pause:
+	case .Schedules, .Schedule_Count, .Nexus, .Standalone_Nexus, .Workflow_Pause, .Standalone_Activity:
 		return true
-	case .Standalone_Activity:
-		return false
 	}
 	return false
 }
@@ -146,9 +144,9 @@ server_feature_from_rpc_error :: proc(
 // because authentication, namespace, and transport failures do not establish
 // whether the feature is supported.
 //
-// Workflow Pause would require a mutation, and the full standalone Activity
-// lifecycle is not yet present in the SDK. Both therefore return Unknown with
-// no evidence and no network call.
+// Workflow Pause and standalone Activity support would require mutations to
+// prove on Services without an authoritative capability bit. Both therefore
+// return Unknown with no evidence and no network call.
 probe_server_feature :: proc(
 	client: ^Client,
 	feature: Server_Feature,

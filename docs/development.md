@@ -1371,12 +1371,19 @@ Describe's long-poll token, list/count queries, and input Payload views are
 borrowed only for the synchronous call. Start supports Header Payloads, Search
 Attributes, static summary/details, Links, completion callbacks, and
 `Use_Existing` attachment options. Start, Poll, Describe, the three mutations,
-List, and Count all participate in the typed Client interceptor chain. Pause,
+List, Count, and options update all participate in the typed Client interceptor
+chain. Pause,
 Unpause, and Reset share a typed control interceptor and are live-proven by a
 workerless scheduled execution that remains paused across Reset, resumes, and
-is then terminated and deleted. The remaining standalone Activity control
-slice is `UpdateActivityExecutionOptions`; all four newer request/response
-pairs are now generated protobuf roots.
+is then terminated and deleted. Before those controls, the same execution is
+moved to a new task queue and receives a new Start-To-Close timeout and
+Priority through `UpdateActivityExecutionOptions`; both the owned RPC response
+and a subsequent Describe must observe the update. Update masks use exact
+protobuf paths such as `task_queue.name`, with exported Odin constants for all
+Server-supported paths. The response owns its copied strings and nested Retry
+Policy/Priority values and must be released with
+`standalone_activity_options_free`. This completes the four newer standalone
+Activity request/response pairs in the pinned API.
 
 The suite then repeats that executable with the Core-only Nexus lifecycle
 spike:
@@ -2418,7 +2425,7 @@ feature=schedule-count sdk=true support=unsupported evidence=safe-rpc-probe stat
 feature=nexus sdk=true support=supported evidence=get-system-info status=0
 feature=standalone-nexus sdk=true support=unsupported evidence=safe-rpc-probe status=12
 feature=workflow-pause sdk=true support=unknown evidence=none status=0
-feature=standalone-activity sdk=false support=unknown evidence=none status=0
+feature=standalone-activity sdk=true support=unknown evidence=none status=0
 ```
 
 The count probes are read-only. Do not turn a failed authentication, namespace,

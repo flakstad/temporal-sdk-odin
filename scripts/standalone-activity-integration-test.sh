@@ -85,6 +85,6 @@ STANDALONE_ACTIVITY_MODE=control \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-standalone-activity.sh" >"$client_log" 2>&1
 cat "$client_log"
-grep -q 'was paused, reset, unpaused, terminated, and deleted through the Odin Client' "$client_log"
+grep -q 'was updated, paused, reset, unpaused, terminated, and deleted through the Odin Client' "$client_log"
 
-echo "Standalone Activity lifecycle, visibility, pause/unpause/reset integration passed."
+echo "Standalone Activity lifecycle, visibility, options, pause/unpause/reset integration passed."
