@@ -7,40 +7,47 @@ import temporal_client "../../temporal/client"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
 import workflow_isolate "../../temporal/workflow/isolate"
-
-WORKFLOW_TYPE :: "odin_isolated_workflow_spike"
-DEFAULT_TASK_QUEUE :: "odin-isolated-workflow-core"
-
-// Core requires a registered Workflow type before polling. Online activations
-// are deliberately routed to the external manager, so this procedure must
-// never execute in the parent process.
-parent_registration_only :: proc(_: ^workflow.Fiber_Context, _: string) -> string {
-	return "parent Workflow dispatcher was unexpectedly invoked"
-}
+import workflow_app "../workflow_isolate_app"
 
 Start_State :: struct {
-	client:      ^temporal_client.Client,
-	workflow_id: string,
-	task_queue:  string,
-	handle:      temporal_client.Workflow_Handle,
-	error:       temporal_client.Error,
+	client:       ^temporal_client.Client,
+	greeting_id:  string,
+	farewell_id:  string,
+	task_queue:   string,
+	greeting:     temporal_client.Workflow_Handle,
+	farewell:     temporal_client.Workflow_Handle,
+	greeting_error: temporal_client.Error,
+	farewell_error: temporal_client.Error,
 }
 
 start_when_ready :: proc(user_data: rawptr) -> bool {
 	state := cast(^Start_State)user_data
-	state.handle, state.error = temporal_client.start_workflow_json(
+	common_options := temporal_client.Start_Workflow_Options{
+		task_queue = state.task_queue,
+		workflow_execution_timeout = time.Minute,
+		workflow_run_timeout = time.Minute,
+		workflow_task_timeout = 10 * time.Second,
+	}
+	greeting_options := common_options
+	greeting_options.id = state.greeting_id
+	state.greeting, state.greeting_error = temporal_client.start_workflow_json(
 		state.client,
-		WORKFLOW_TYPE,
+		workflow_app.GREETING_WORKFLOW_TYPE,
 		"Odin",
-		{
-			id = state.workflow_id,
-			task_queue = state.task_queue,
-			workflow_execution_timeout = time.Minute,
-			workflow_run_timeout = time.Minute,
-			workflow_task_timeout = 10 * time.Second,
-		},
+		greeting_options,
 	)
-	return state.error.message == nil
+	if state.greeting_error.message != nil {
+		return false
+	}
+	farewell_options := common_options
+	farewell_options.id = state.farewell_id
+	state.farewell, state.farewell_error = temporal_client.start_workflow_json(
+		state.client,
+		workflow_app.FAREWELL_WORKFLOW_TYPE,
+		"Odin",
+		farewell_options,
+	)
+	return state.farewell_error.message == nil
 }
 
 run :: proc() -> int {
@@ -53,16 +60,18 @@ run :: proc() -> int {
 	task_queue_buffer: [256]u8
 	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
 	if len(task_queue) == 0 {
-		task_queue = DEFAULT_TASK_QUEUE
+		task_queue = workflow_app.DEFAULT_TASK_QUEUE
 	}
 	id_buffer: [256]u8
-	workflow_id := os.get_env(id_buffer[:], "TEMPORAL_ODIN_WORKFLOW_ID")
-	owned_workflow_id := ""
-	if len(workflow_id) == 0 {
-		owned_workflow_id = fmt.aprintf("odin-isolate-%d", time.now()._nsec)
-		defer delete(owned_workflow_id)
-		workflow_id = owned_workflow_id
+	greeting_id := os.get_env(id_buffer[:], "TEMPORAL_ODIN_WORKFLOW_ID")
+	owned_greeting_id := ""
+	if len(greeting_id) == 0 {
+		owned_greeting_id = fmt.aprintf("odin-isolate-%d", time.now()._nsec)
+		defer delete(owned_greeting_id)
+		greeting_id = owned_greeting_id
 	}
+	farewell_id := fmt.aprintf("%s-farewell", greeting_id)
+	defer delete(farewell_id)
 
 	client, connect_error := temporal_client.connect()
 	if connect_error.message != nil {
@@ -72,9 +81,23 @@ run :: proc() -> int {
 	}
 	defer temporal_client.close(&client)
 
+	registry := workflow.Registry{}
+	registry_init_error := workflow.registry_init(&registry)
+	if registry_init_error.message != nil {
+		workflow.error_free(&registry_init_error)
+		return 1
+	}
+	defer workflow.registry_close(&registry)
+	registry_error := workflow_app.register(&registry)
+	if registry_error.message != nil {
+		fmt.eprintf("Workflow registry creation failed: %s\n", string(registry_error.message))
+		workflow.error_free(&registry_error)
+		return 1
+	}
+
 	worker_options := worker.options_default(task_queue)
 	worker_options.max_cached_workflows = 0
-	worker_options.workflow_task_poller_behavior = worker.poller_simple_maximum(1)
+	worker_options.workflow_task_poller_behavior = worker.poller_simple_maximum(2)
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
 		worker_options,
@@ -88,9 +111,9 @@ run :: proc() -> int {
 		close_error := worker.close(&sdk_worker)
 		worker.error_free(&close_error)
 	}
-	register_error := worker.register_workflow(&sdk_worker, WORKFLOW_TYPE, parent_registration_only)
+	register_error := worker.register_external_workflow_registry(&sdk_worker, &registry)
 	if register_error.message != nil {
-		fmt.eprintf("Workflow registration failed: %s\n", string(register_error.message))
+		fmt.eprintf("External Workflow registry failed: %s\n", string(register_error.message))
 		worker.error_free(&register_error)
 		return 1
 	}
@@ -129,7 +152,7 @@ run :: proc() -> int {
 	manager_error := workflow_isolate.manager_init(&executor_manager, {
 		command = child[:],
 		first_command = first_child[:],
-		maximum_executors = 1,
+		maximum_executors = 2,
 		activation_timeout = activation_timeout,
 	})
 	if manager_error.message != nil {
@@ -141,62 +164,95 @@ run :: proc() -> int {
 
 	start := Start_State{
 		client = &client,
-		workflow_id = workflow_id,
+		greeting_id = greeting_id,
+		farewell_id = farewell_id,
 		task_queue = task_queue,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
-		max_workflow_executions = 1,
+		max_workflow_executions = 2,
 		workflow_activation_processor = workflow_isolate.manager_process_activation,
 		workflow_activation_processor_data = &executor_manager,
 		on_ready = start_when_ready,
 		on_ready_data = &start,
 	})
-	if start.error.message != nil {
-		fmt.eprintf("Workflow start failed: %s\n", string(start.error.message))
-		temporal_client.error_free(&start.error)
+	if start.greeting_error.message != nil || start.farewell_error.message != nil {
+		if start.greeting_error.message != nil {
+			fmt.eprintf("Greeting Workflow start failed: %s\n", string(start.greeting_error.message))
+		}
+		if start.farewell_error.message != nil {
+			fmt.eprintf("Farewell Workflow start failed: %s\n", string(start.farewell_error.message))
+		}
+		temporal_client.error_free(&start.greeting_error)
+		temporal_client.error_free(&start.farewell_error)
 		worker.error_free(&run_error)
 		return 1
 	}
-	defer temporal_client.workflow_handle_free(&start.handle)
+	defer temporal_client.workflow_handle_free(&start.greeting)
+	defer temporal_client.workflow_handle_free(&start.farewell)
 	if run_error.message != nil {
 		fmt.eprintf("Worker run failed: %s\n", string(run_error.message))
 		worker.error_free(&run_error)
 		return 1
 	}
 
-	result: string
-	result_error := temporal_client.get_result_json(&start.handle, &result)
-	defer delete(result)
-	if result_error.message != nil {
-		fmt.eprintf("Workflow result failed: %s\n", string(result_error.message))
-		temporal_client.error_free(&result_error)
+	greeting_result: string
+	greeting_result_error := temporal_client.get_result_json(
+		&start.greeting,
+		&greeting_result,
+	)
+	defer delete(greeting_result)
+	if greeting_result_error.message != nil {
+		fmt.eprintf("Greeting Workflow result failed: %s\n", string(greeting_result_error.message))
+		temporal_client.error_free(&greeting_result_error)
+		return 1
+	}
+	farewell_result: workflow_app.Farewell_Result
+	farewell_result_error := temporal_client.get_result_json(
+		&start.farewell,
+		&farewell_result,
+	)
+	defer delete(farewell_result.message)
+	if farewell_result_error.message != nil {
+		fmt.eprintf("Farewell Workflow result failed: %s\n", string(farewell_result_error.message))
+		temporal_client.error_free(&farewell_result_error)
 		return 1
 	}
 	manager_stats := workflow_isolate.manager_stats(&executor_manager)
-	if result != "Hello from an isolated Workflow, Odin" ||
-	   run_stats.workflow_executions_completed != 1 ||
+	if greeting_result != "Hello from an isolated Workflow, Odin" ||
+	   farewell_result.message != "Goodbye from the shared registry, Odin" ||
+	   farewell_result.code != 42 || run_stats.workflow_executions_completed != 2 ||
 	   run_stats.workflow_activation_failures != expected_activation_failures ||
 	   manager_stats.child_exits != expected_child_exits ||
 	   manager_stats.activation_timeouts != expected_timeouts ||
-	   manager_stats.generations_started < 2 ||
+	   manager_stats.generations_started < 4 || manager_stats.graceful_shutdowns < 4 ||
+	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected isolation result=%q completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d routes=%d\n",
-			result,
+			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			greeting_result,
+			farewell_result.message,
+			farewell_result.code,
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			manager_stats.child_exits,
 			manager_stats.activation_timeouts,
 			manager_stats.generations_started,
 			manager_stats.evictions,
+			manager_stats.graceful_shutdowns,
+			manager_stats.capacity_rejections,
+			manager_stats.protocol_failures,
 			workflow_isolate.manager_route_count(&executor_manager),
 		)
 		return 1
 	}
 	fmt.printf(
-		"Core process isolation completed workflow_id=%s result=%q first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d aborted_children=%d protocol_failures=%d\n",
-		workflow_id,
-		result,
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
+		greeting_id,
+		farewell_id,
+		greeting_result,
+		farewell_result.message,
+		farewell_result.code,
+		workflow.registry_count(&registry),
 		first_mode,
 		manager_stats.generations_started,
 		manager_stats.child_exits,
@@ -205,6 +261,7 @@ run :: proc() -> int {
 		run_stats.workflow_replay_activations,
 		manager_stats.graceful_shutdowns,
 		manager_stats.aborted_children,
+		manager_stats.capacity_rejections,
 		manager_stats.protocol_failures,
 	)
 	return 0

@@ -146,6 +146,7 @@ Nexus_Operation_Registration :: struct {
 Workflow_Registration :: struct {
 	name:    string,
 	runtime: workflow.Fiber_Runtime,
+	external: bool,
 }
 
 Workflow_Metric_Instrument :: struct {
@@ -832,6 +833,9 @@ add_workflow_interceptor :: proc(
 		return error_from_string("Workflow outbound interceptor must implement an operation")
 	}
 	for &registration in worker.workflow_registrations {
+		if registration.external {
+			continue
+		}
 		add_error := workflow.fiber_runtime_add_outbound_interceptor(
 			&registration.runtime,
 			interceptor,
@@ -863,6 +867,9 @@ add_workflow_inbound_interceptor :: proc(
 		return error_from_string("Workflow inbound interceptor must implement an operation")
 	}
 	for &registration in worker.workflow_registrations {
+		if registration.external {
+			continue
+		}
 		add_error := workflow.fiber_runtime_add_inbound_interceptor(
 			&registration.runtime,
 			interceptor,
@@ -888,6 +895,9 @@ set_workflow_logger :: proc(worker: ^Worker, logger: workflow.Logger) -> Error {
 		return error_from_string("Workflow logger cannot be changed after worker.run starts")
 	}
 	for &registration in worker.workflow_registrations {
+		if registration.external {
+			continue
+		}
 		set_error := workflow.fiber_runtime_set_logger(&registration.runtime, logger)
 		if set_error.message != nil {
 			result := error_from_string(string(set_error.message))
@@ -1414,6 +1424,92 @@ workflow_runtime_namespace :: proc(worker: ^Worker) -> string {
 		return worker.namespace
 	}
 	return "default"
+}
+
+// register_external_workflow registers only the Workflow type manifest needed
+// for Core polling. Online activations must be handled by a configured
+// workflow_activation_processor; no callback or fiber runtime exists in this
+// parent Worker.
+register_external_workflow :: proc(worker: ^Worker, name: string) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.mode != .Online || worker.lifecycle != .Configuring {
+		return error_from_string("external workflows require a configuring online worker")
+	}
+	if len(name) == 0 {
+		return error_from_string("external workflow name is required")
+	}
+	for registration in worker.workflow_registrations {
+		if registration.name == name {
+			return error_from_string("workflow is already registered")
+		}
+	}
+	owned_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		return error_from_string("could not allocate external workflow name")
+	}
+	append(&worker.workflow_registrations, Workflow_Registration{
+		name = owned_name,
+		external = true,
+	})
+	return {}
+}
+
+// register_external_workflow_registry copies the registry's complete type
+// manifest atomically. Procedure pointers remain process-local and are
+// instantiated by workflow_isolate.Executor_Host in the child executable.
+register_external_workflow_registry :: proc(
+	worker: ^Worker,
+	registry: ^workflow.Registry,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.mode != .Online || worker.lifecycle != .Configuring {
+		return error_from_string("external Workflow registry requires a configuring online worker")
+	}
+	count := workflow.registry_count(registry)
+	if count == 0 {
+		return error_from_string("external Workflow registry is empty or uninitialized")
+	}
+	owned_names := make([dynamic]string, 0, count)
+	for index in 0 ..< count {
+		name, name_ok := workflow.registry_name(registry, index)
+		if !name_ok || len(name) == 0 {
+			for owned in owned_names {
+				delete(owned)
+			}
+			delete(owned_names)
+			return error_from_string("external Workflow registry contains an invalid name")
+		}
+		for registration in worker.workflow_registrations {
+			if registration.name == name {
+				for owned in owned_names {
+					delete(owned)
+				}
+				delete(owned_names)
+				return error_from_string("workflow is already registered")
+			}
+		}
+		owned_name, clone_error := strings.clone(name)
+		if clone_error != nil {
+			for owned in owned_names {
+				delete(owned)
+			}
+			delete(owned_names)
+			return error_from_string("could not allocate external Workflow registry manifest")
+		}
+		append(&owned_names, owned_name)
+	}
+	for owned_name in owned_names {
+		append(&worker.workflow_registrations, Workflow_Registration{
+			name = owned_name,
+			external = true,
+		})
+	}
+	delete(owned_names)
+	return {}
 }
 
 register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
@@ -2346,6 +2442,11 @@ process_workflow_activation :: proc(
 	}
 
 	registration := &worker.workflow_registrations[registration_index]
+	if registration.external {
+		return {}, error_from_string(
+			"external Workflow activation reached the in-process dispatcher",
+		)
+	}
 	processed = workflow.process_fiber_activation(&registration.runtime, data)
 	if route.initializes {
 		if workflow.fiber_runtime_has_run(&registration.runtime, route.run_id) {
@@ -3680,6 +3781,33 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		return {}, callback_policy_error
 	}
 	poll_workflows := len(worker.workflow_registrations) > 0
+	has_external_workflows := false
+	has_in_process_workflows := false
+	for registration in worker.workflow_registrations {
+		if registration.external {
+			has_external_workflows = true
+		} else {
+			has_in_process_workflows = true
+		}
+	}
+	if has_external_workflows && has_in_process_workflows {
+		return {}, error_from_string(
+			"external and in-process Workflow registrations cannot be mixed",
+		)
+	}
+	if has_external_workflows && options.workflow_activation_processor == nil {
+		return {}, error_from_string(
+			"external Workflow registrations require a Workflow activation processor",
+		)
+	}
+	if has_external_workflows &&
+	   (len(worker.workflow_inbound_interceptors) > 0 ||
+	    len(worker.workflow_interceptors) > 0 ||
+	    worker.workflow_logger.emit != nil) {
+		return {}, error_from_string(
+			"external Workflow logging and interceptors must be configured in the executor host",
+		)
+	}
 	poll_remote_activities := len(worker.activity_registrations) > 0 && !options.disable_activity_polling
 	poll_local_activities := len(worker.activity_registrations) > 0 && poll_workflows &&
 		!options.disable_activity_polling && options.enable_local_activities
@@ -3886,7 +4014,9 @@ close :: proc(worker: ^Worker) -> Error {
 		delete(registration.operation)
 	}
 	for &registration in worker.workflow_registrations {
-		workflow.fiber_runtime_close(&registration.runtime)
+		if !registration.external {
+			workflow.fiber_runtime_close(&registration.runtime)
+		}
 		delete(registration.name)
 	}
 	for workflow_run in worker.workflow_runs {

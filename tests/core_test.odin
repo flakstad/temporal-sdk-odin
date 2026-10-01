@@ -280,6 +280,158 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 	testing.expect_value(t, route.job_count, 1)
 }
 
+@(test)
+workflow_registry_instantiates_executor_host_and_external_worker_manifest :: proc(
+	t: ^testing.T,
+) {
+	registry := workflow.Registry{}
+	registry_init_error := workflow.registry_init(&registry)
+	testing.expect(t, registry_init_error.message == nil)
+	workflow.error_free(&registry_init_error)
+	first_error := workflow.registry_register_workflow(
+		&registry,
+		"registry-first",
+		registry_first_test_workflow,
+	)
+	second_error := workflow.registry_register_workflow(
+		&registry,
+		"registry-second",
+		registry_second_test_workflow,
+	)
+	duplicate_error := workflow.registry_register_workflow(
+		&registry,
+		"registry-first",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, first_error.message == nil)
+	testing.expect(t, second_error.message == nil)
+	testing.expect(t, duplicate_error.message != nil)
+	workflow.error_free(&first_error)
+	workflow.error_free(&second_error)
+	workflow.error_free(&duplicate_error)
+	testing.expect_value(t, workflow.registry_count(&registry), 2)
+
+	host := workflow_isolate.Executor_Host{}
+	host_init_error := workflow_isolate.executor_host_init(
+		&host,
+		&registry,
+		"registry-test-queue",
+		"registry-test-namespace",
+	)
+	testing.expectf(
+		t,
+		host_init_error.message == nil,
+		"executor_host_init failed: %s",
+		string(host_init_error.message),
+	)
+	workflow_isolate.host_error_free(&host_init_error)
+	defer workflow_isolate.executor_host_close(&host)
+
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	sdk_worker, create_error := worker.create(&client, "registry-test-queue")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	manifest_error := worker.register_external_workflow_registry(&sdk_worker, &registry)
+	testing.expect(t, manifest_error.message == nil)
+	worker.error_free(&manifest_error)
+	testing.expect_value(t, len(sdk_worker.workflow_registrations), 2)
+	if len(sdk_worker.workflow_registrations) == 2 {
+		testing.expect(t, sdk_worker.workflow_registrations[0].external)
+		testing.expect(t, sdk_worker.workflow_registrations[1].external)
+	}
+	_, missing_processor_error := worker.run(&sdk_worker)
+	testing.expect(t, missing_processor_error.message != nil)
+	worker.error_free(&missing_processor_error)
+	logger_error := worker.set_workflow_logger(
+		&sdk_worker,
+		workflow.Logger{emit = workflow_registry_test_log},
+	)
+	testing.expect(t, logger_error.message == nil)
+	worker.error_free(&logger_error)
+	_, misplaced_hooks_error := worker.run(
+		&sdk_worker,
+		worker.Run_Options{workflow_activation_processor = workflow_processor_test_invoke},
+	)
+	testing.expect(t, misplaced_hooks_error.message != nil)
+	if misplaced_hooks_error.message != nil {
+		testing.expect(
+			t,
+			strings.contains(
+				string(misplaced_hooks_error.message),
+				"must be configured in the executor host",
+			),
+		)
+	}
+	worker.error_free(&misplaced_hooks_error)
+
+	// Host runtimes own independent callback copies after the source manifest is
+	// released; procedure pointers are never serialized across the pipe.
+	workflow.registry_close(&registry)
+	input, input_error := codec.encode_json("Odin")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "registry-first",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "registry-host-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+			value = &initialize,
+		},
+	})
+	activation_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, process_error := workflow_isolate.executor_host_process_activation(
+		&host,
+		activation_bytes[:],
+	)
+	delete(activation_bytes)
+	testing.expect(t, process_error.message == nil)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, len(host.runs), 1)
+	workflow_isolate.host_error_free(&process_error)
+	workflow.error_free(&processed.error)
+	delete(processed.completion)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+			value = &eviction,
+		},
+	})
+	eviction_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	processed, process_error = workflow_isolate.executor_host_process_activation(
+		&host,
+		eviction_bytes[:],
+	)
+	delete(eviction_bytes)
+	testing.expect(t, process_error.message == nil)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	testing.expect_value(t, len(host.runs), 0)
+	workflow_isolate.host_error_free(&process_error)
+	workflow.error_free(&processed.error)
+	delete(processed.completion)
+}
+
 Workflow_Processor_Test_State :: struct {
 	called:             bool,
 	activation_length: int,
@@ -301,6 +453,8 @@ workflow_processor_test_invoke :: proc(
 		run_id = "external-processor-run",
 	}
 }
+
+workflow_registry_test_log :: proc(_: rawptr, _: ^workflow.Log_Record) {}
 
 @(test)
 worker_dispatches_online_activations_through_an_external_processor :: proc(t: ^testing.T) {

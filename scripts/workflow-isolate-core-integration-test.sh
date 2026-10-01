@@ -61,9 +61,14 @@ output="$(
   "$parent_binary" 2>&1
 )"
 echo "$output"
-grep -q 'Core process isolation completed' <<<"$output"
+grep -q 'Core registry isolation completed' <<<"$output"
+grep -q 'registry_types=2' <<<"$output"
+grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"
+grep -q 'farewell="Goodbye from the shared registry, Odin"' <<<"$output"
 grep -q "first_mode=$first_mode" <<<"$output"
-grep -q 'graceful_shutdowns=2' <<<"$output"
+grep -q 'graceful_shutdowns=4' <<<"$output"
+grep -q 'capacity_rejections=0' <<<"$output"
+grep -q 'protocol_failures=0' <<<"$output"
 if [[ "$first_mode" == "crash" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"

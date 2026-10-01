@@ -97,6 +97,45 @@ trailing data, limits, and invalid control frames. A 500-case property test
 generates binary run IDs, payloads up to 8 KiB, both data message kinds, and
 64-bit correlation IDs.
 
+## Shared registry and executor host
+
+Workflow procedure pointers cannot be serialized or transferred safely across
+an `exec` boundary. The implemented boundary instead compiles one application
+registration function into both processes and calls it independently:
+
+```text
+workflow_isolate_app.register
+        │
+        ├── parent Registry -> Workflow type-name manifest -> Core Worker
+        └── child Registry  -> independent Fiber_Runtime callbacks -> Executor_Host
+```
+
+`workflow.Registry` owns cloned type names and process-local callback factories.
+It supports string, generic Payload, repeated Payload, and typed JSON Workflow
+adapters. `registry_instantiate` creates an independent runtime for one type;
+the host owns that runtime after creation, so the source Registry can be closed.
+
+The parent calls `worker.register_external_workflow_registry`. This copies only
+the complete type-name manifest; those registrations contain no callback or
+fiber runtime. `worker.run` requires an external activation processor, rejects
+mixed in-process/external registrations, and rejects parent-side Workflow
+logging or interceptors because those hooks must execute in the child where the
+Workflow code runs.
+
+The child initializes `workflow_isolate.Executor_Host` from its independently
+constructed Registry. On `InitializeWorkflow`, the host selects the registered
+type, creates the run route, and sends the activation to that type's runtime.
+Later activations use the run-ID route until `RemoveFromCache`, which destroys
+the runtime instance and route. Unknown types become failed activation
+completions; they are never dispatched to an arbitrary callback.
+
+`examples/workflow_isolate_app` is the shared application package used by both
+parent and child. The live proof runs two types through one executor binary: a
+string Workflow and a typed-JSON Workflow. This proves the executable is an
+application host rather than a child hard-coded to one callback. A preflight
+manifest handshake is not implemented yet, so a parent/child build mismatch is
+currently discovered when the child rejects initialization.
+
 ## Core-integrated zero-cache proof
 
 The online Worker now has an experimental `workflow_activation_processor`
@@ -128,26 +167,29 @@ Run the complete proof with no pre-existing infrastructure:
 
 The script uses `temporal server start-dev --headless` when port 7233 is not
 already healthy. It does not use Docker or an external database. The example
-creates a Worker with `max_cached_workflows = 0` and one Workflow poller, then:
+creates a Worker with `max_cached_workflows = 0`, registers the shared two-type
+manifest, and then:
 
 1. generation 1 exits with status 86 before answering its first activation;
 2. the parent turns EOF into a failed `WorkflowActivationCompletion` rather
    than crashing the Worker;
 3. Core emits `RemoveFromCache`, which the parent acknowledges even though the
    failed child is already gone;
-4. generation 2 receives replay history, suspends at a durable timer, answers
-   successfully, consumes its zero-cache eviction, and exits cleanly;
-5. generation 3 replays history, receives the timer resolution, completes the
-   Workflow, consumes eviction, and exits cleanly; and
-6. the public Odin Client obtains `"Hello from an isolated Workflow, Odin"`
-   from the Temporal Service.
+4. later generations receive replay history, suspend at durable timers, answer
+   successfully, consume their zero-cache evictions, and exit cleanly;
+5. fresh generations replay history, receive timer resolutions, complete both
+   Workflows, consume eviction, and exit cleanly; and
+6. the public Odin Client obtains the exact string result
+   `"Hello from an isolated Workflow, Odin"` and decodes the typed JSON result
+   `{"message":"Goodbye from the shared registry, Odin","code":42}` from the
+   Temporal Service.
 
-The live assertion requires one activation failure, one child exit, one
-completed Workflow, no owned route at return, and at least two child
-generations. The observed CLI-dev-server path currently has exactly three
-generations, three evictions, two graceful shutdowns, one aborted crashed child,
-and zero protocol failures. Those exact counts are diagnostic rather than an
-API promise; Core may legitimately change activation batching.
+The live assertion requires one activation failure, one child exit, two
+completed Workflows, no owned route at return, both exact results, and no
+capacity or protocol failures. The observed CLI-dev-server path currently has
+five generations, five evictions, four graceful shutdowns, and one aborted
+crashed child. Those exact counts are diagnostic rather than an API promise;
+Core may legitimately change activation batching.
 
 The same script accepts
 `TEMPORAL_ODIN_ISOLATE_FIRST_MODE=hang`. That child deliberately stops before
@@ -205,12 +247,13 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- transfer Workflow registration metadata to independently launched executors
-  instead of compiling a dedicated child executable for this one Workflow;
+- add a preflight manifest/version handshake so parent/child registry mismatch
+  fails before polling or dispatch;
 - add bounded waiting/queue policy, graceful-shutdown deadlines, and crash-loop
   rate limiting;
-- carry replay-aware logs, metrics, interceptors, and diagnostics across the
-  process boundary without letting them affect commands;
+- configure replay-aware logs, metrics, interceptors, and diagnostics in the
+  executor host and carry observations back without letting them affect
+  commands;
 - preserve the complete `Process_Result` observation metadata across the
   boundary (the current parent reconstructs only terminal commands, timer
   starts, replay, history length, activation failure, and eviction);
@@ -218,10 +261,9 @@ still required:
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is generic registration transfer so one
-executor binary can host an application registry rather than this proof's
-dedicated Workflow. A separate shutdown deadline and crash-loop/backpressure
-policy should then harden manager teardown. Sticky per-run routing should
-follow only after those zero-cache failure paths are correct; it can reuse the
-manager and wire protocol while changing child lifetime to match Core's
-non-zero cache.
+The next discriminating vertical slice is a correlated startup handshake that
+compares the parent manifest with the child host before Core polling starts.
+Shutdown deadlines and crash-loop/backpressure policy should then harden manager
+teardown. Sticky per-run routing should follow only after those zero-cache
+failure paths are correct; it can reuse the manager and wire protocol while
+changing child lifetime to match Core's non-zero cache.

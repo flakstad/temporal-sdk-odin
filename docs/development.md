@@ -827,8 +827,22 @@ TEMPORAL_ODIN_ISOLATE_FIRST_MODE=hang \
   ./scripts/workflow-isolate-core-integration-test.sh
 ```
 
-Generic Workflow registry transfer, shutdown deadlines, queue/backpressure,
-and crash-loop policy remain outstanding.
+Parent and child now both call the same application-level
+`workflow_isolate_app.register` function. In the parent,
+`register_external_workflow_registry` copies only the Workflow type-name
+manifest into the Core Worker. In each child, `Executor_Host` instantiates
+independent callback runtimes from the Registry and routes initialization by
+Workflow type plus later activations by run ID. Procedure pointers never cross
+the pipe. The live test completes both a string Workflow and a typed-JSON
+Workflow through the same executor binary, after either a deliberate first
+child crash or timeout.
+
+External and in-process Workflow registrations cannot be mixed on one Worker.
+Workflow loggers and interceptors for external registrations must be configured
+inside the executor host; the parent rejects them rather than silently applying
+them to runtimes that will never execute. A parent/child manifest handshake,
+executor-host hook configuration, shutdown deadlines, queue/backpressure, and
+crash-loop policy remain outstanding.
 
 Workflows have the corresponding registration levels:
 

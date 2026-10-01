@@ -507,8 +507,14 @@ reusable bounded zero-cache manager with owned run-ID/generation routes,
 failed-until-eviction fencing, correlated private pipes, and generated
 statechart/PBT lifecycle coverage. A live hung-child test proves the optional
 activation deadline kills/reaps the executor and recovers through Core replay.
-It still lacks shutdown/backpressure and crash-loop policy, generic registry
-transfer, and sticky-cache execution.
+Parent and child now share one application registration function: the parent
+copies its Workflow type manifest into Core, while a generic child
+`Executor_Host` independently instantiates and routes the registered callbacks.
+One live Worker completes both string and typed-JSON Workflow types through the
+same executor binary. Procedure pointers never cross the process boundary. It
+still lacks a preflight parent/child manifest handshake, executor-host
+log/metric/interceptor configuration, shutdown/backpressure and crash-loop
+policy, and sticky-cache execution.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 
@@ -2241,6 +2247,7 @@ examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/workflow_isolate/ persistent per-run Workflow process spike
+examples/workflow_isolate_app/ shared parent/child Workflow registry
 examples/workflow_isolate_core/ Core-polled zero-cache crash/replay proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker

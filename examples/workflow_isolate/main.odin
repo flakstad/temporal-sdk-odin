@@ -9,41 +9,11 @@ import codec "../../temporal/codec"
 import proto "../../temporal/core/proto"
 import workflow "../../temporal/workflow"
 import workflow_isolate "../../temporal/workflow/isolate"
+import workflow_app "../workflow_isolate_app"
 
-WORKFLOW_TYPE :: "odin_isolated_workflow_spike"
-TASK_QUEUE :: "odin-isolated-workflow-spike"
+WORKFLOW_TYPE :: workflow_app.GREETING_WORKFLOW_TYPE
+TASK_QUEUE :: workflow_app.DEFAULT_TASK_QUEUE
 RUN_ID :: "isolated-workflow-run"
-
-isolated_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
-	workflow.sleep(ctx, time.Second)
-	return fmt.aprintf("Hello from an isolated Workflow, %s", name)
-}
-
-write_executor_error :: proc(request_id: u64, run_id: []u8, message: string) {
-	_ = workflow_isolate.write(os.stdout, {
-		kind = .Executor_Error,
-		request_id = request_id,
-		run_id = run_id,
-		payload = transmute([]u8)message,
-	})
-}
-
-completion_matches_run :: proc(data, expected_run_id: []u8) -> bool {
-	decode_arena: virtual.Arena
-	if virtual.arena_init_growing(&decode_arena) != nil {
-		return false
-	}
-	defer virtual.arena_destroy(&decode_arena)
-	previous_allocator := context.allocator
-	context.allocator = virtual.arena_allocator(&decode_arena)
-	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
-	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
-		data,
-		&completion,
-	)
-	context.allocator = previous_allocator
-	return decoded && bytes.equal(transmute([]u8)completion.run_id, expected_run_id)
-}
 
 run_child :: proc(
 	crash_on_first_activation := false,
@@ -58,92 +28,48 @@ run_child :: proc(
 	if len(task_queue) == 0 {
 		task_queue = TASK_QUEUE
 	}
-	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init(
-		&runtime,
-		WORKFLOW_TYPE,
-		task_queue,
-		isolated_workflow,
-	)
-	if init_error.message != nil {
-		fmt.eprintf("Could not initialize isolated Workflow runtime: %s\n", string(init_error.message))
-		workflow.error_free(&init_error)
+	if crash_on_first_activation || hang_on_first_activation {
+		request, read_error := workflow_isolate.read(os.stdin)
+		if read_error.kind != .None {
+			fmt.eprintf("Could not read fault-injection activation: %v\n", read_error.kind)
+			return 1
+		}
+		workflow_isolate.owned_frame_free(&request)
+		if crash_on_first_activation {
+			os.exit(86)
+		}
+		for {
+			time.sleep(time.Hour)
+		}
+	}
+	registry := workflow.Registry{}
+	registry_init_error := workflow.registry_init(&registry)
+	if registry_init_error.message != nil {
+		workflow.error_free(&registry_init_error)
 		return 1
 	}
-	defer workflow.fiber_runtime_close(&runtime)
-
-	for {
-		request, read_error := workflow_isolate.read(os.stdin)
-		if read_error.kind == .End_Of_Stream {
-			return 0
-		}
-		if read_error.kind != .None {
-			fmt.eprintf("Could not read isolation frame: %v\n", read_error.kind)
-			return 1
-		}
-		defer workflow_isolate.owned_frame_free(&request)
-
-		#partial switch request.frame.kind {
-		case .Activation:
-			if crash_on_first_activation {
-				os.exit(86)
-			}
-			if hang_on_first_activation {
-				for {
-					time.sleep(time.Hour)
-				}
-			}
-			processed := workflow.process_fiber_activation(&runtime, request.frame.payload)
-			if processed.completion == nil {
-				message := "Workflow activation produced no completion"
-				if processed.error.message != nil {
-					message = string(processed.error.message)
-				}
-				write_executor_error(request.frame.request_id, request.frame.run_id, message)
-				workflow.error_free(&processed.error)
-				return 1
-			}
-			if !completion_matches_run(processed.completion[:], request.frame.run_id) {
-				write_executor_error(
-					request.frame.request_id,
-					request.frame.run_id,
-					"Workflow activation run ID did not match its isolation route",
-				)
-				delete(processed.completion)
-				workflow.error_free(&processed.error)
-				return 1
-			}
-			response_run_id := request.frame.run_id
-			write_error := workflow_isolate.write(os.stdout, {
-				kind = .Completion,
-				request_id = request.frame.request_id,
-				run_id = response_run_id,
-				payload = processed.completion[:],
-			})
-			delete(processed.completion)
-			workflow.error_free(&processed.error)
-			if write_error.kind != .None {
-				fmt.eprintf("Could not write isolation completion: %v\n", write_error.kind)
-				return 1
-			}
-		case .Shutdown:
-			write_error := workflow_isolate.write(os.stdout, {
-				kind = .Shutdown_Acknowledged,
-				request_id = request.frame.request_id,
-			})
-			if write_error.kind != .None {
-				return 1
-			}
-			return 0
-		case:
-			write_executor_error(
-				request.frame.request_id,
-				request.frame.run_id,
-				"Workflow executor received an invalid request kind",
-			)
-			return 1
-		}
+	defer workflow.registry_close(&registry)
+	registration_error := workflow_app.register(&registry)
+	if registration_error.message != nil {
+		fmt.eprintf("Could not register executor Workflows: %s\n", string(registration_error.message))
+		workflow.error_free(&registration_error)
+		return 1
 	}
+	host := workflow_isolate.Executor_Host{}
+	host_init_error := workflow_isolate.executor_host_init(&host, &registry, task_queue)
+	if host_init_error.message != nil {
+		fmt.eprintf("Could not initialize Workflow executor host: %s\n", string(host_init_error.message))
+		workflow_isolate.host_error_free(&host_init_error)
+		return 1
+	}
+	defer workflow_isolate.executor_host_close(&host)
+	run_error := workflow_isolate.executor_host_run(&host)
+	if run_error.message != nil {
+		fmt.eprintf("Workflow executor host failed: %s\n", string(run_error.message))
+		workflow_isolate.host_error_free(&run_error)
+		return 1
+	}
+	return 0
 }
 
 Completion_Kind :: enum {

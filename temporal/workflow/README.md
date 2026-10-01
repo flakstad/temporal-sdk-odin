@@ -243,3 +243,25 @@ run.
 `temporal/worker` now provides experimental name-based Workflow registration
 and dispatch, but neither the fiber API nor its one-string codec is stable or a
 complete Workflow runtime. Do not build production Workflows against them.
+
+## Process-local Workflow registry
+
+`Registry` separates application registration from Worker ownership. Initialize
+it explicitly with `registry_init`, register string, Payload, repeated-Payload,
+or typed-JSON callbacks, and release it with `registry_close`. Names and adapter
+descriptors, including copied callback values, are owned by the Registry until
+it is closed.
+
+`registry_instantiate` creates an independent `Fiber_Runtime` and transfers its
+callback copy to the caller. This is the primitive used by
+`workflow/isolate.Executor_Host`. It does not serialize procedure pointers:
+isolated parent and child executables compile and call the same application
+registration function independently. The parent copies only the type-name
+manifest into `worker.register_external_workflow_registry`; the child owns the
+actual runtimes and selects one from `InitializeWorkflow.workflow_type`.
+
+Once initialized, `Executor_Host` owns its runtimes independently of the source
+Registry. Per-run instances remain routed to the selected runtime until Core
+sends `RemoveFromCache`. Parent-side Workflow loggers and interceptors do not
+apply to these child runtimes and are rejected by `worker.run`; executor-host
+configuration for those hooks is still outstanding.
