@@ -12505,6 +12505,30 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				process_error(&result, activation.run_id, message)
 				return
 			}
+			// Odin starts executing the synchronous Workflow procedure on the
+			// first fiber resume. Apply an initial activation's cancellation before
+			// that resume, matching async SDK runtimes which notify every activation
+			// job before polling the newly constructed main routine.
+			for initial_job in activation.jobs {
+				#partial switch initial_variant in initial_job.variant {
+				case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow:
+					if initial_variant.value == nil {
+						process_error(&result, activation.run_id, "Workflow cancellation has no active Workflow fiber")
+						return
+					}
+					context.allocator = instance.odin_context.allocator
+					cancellation_reason, allocation_error := strings.clone(
+						initial_variant.value.reason,
+					)
+					context.allocator = previous_allocator
+					if allocation_error != nil {
+						process_error(&result, activation.run_id, "could not preserve Workflow cancellation reason")
+						return
+					}
+					apply_fiber_cancellation(instance, cancellation_reason)
+				}
+				if instance.cancellation_requested do break
+			}
 			if activation.is_replaying {
 				runtime.replay_initializations += 1
 			}
@@ -12974,20 +12998,22 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Cancel_Workflow:
 			handled = true
-			if variant.value == nil || !instance_found || instance.phase == .Canceled || instance.phase == .Completed || instance.phase == .Failed {
+			if variant.value == nil || !instance_found || instance.terminal_command_sent {
 				process_error(&result, activation.run_id, "Workflow cancellation has no active Workflow fiber")
 				return
 			}
-			context.allocator = instance.odin_context.allocator
-			cancellation_reason, allocation_error := strings.clone(variant.value.reason)
-			context.allocator = previous_allocator
-			if allocation_error != nil {
-				process_error(&result, activation.run_id, "could not preserve Workflow cancellation reason")
-				return
+			if !instance.cancellation_requested {
+				context.allocator = instance.odin_context.allocator
+				cancellation_reason, allocation_error := strings.clone(variant.value.reason)
+				context.allocator = previous_allocator
+				if allocation_error != nil {
+					process_error(&result, activation.run_id, "could not preserve Workflow cancellation reason")
+					return
+				}
+				apply_fiber_cancellation(instance, cancellation_reason)
 			}
-			apply_fiber_cancellation(instance, cancellation_reason)
 			result.received_cancellation = true
-			result.cancellation_reason = cancellation_reason
+			result.cancellation_reason = instance.cancellation_reason
 
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer:
 			handled = true

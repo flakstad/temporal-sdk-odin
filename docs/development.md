@@ -2405,6 +2405,13 @@ The example stops after two durable Workflow Executions reach terminal state
 and Core evicts both cached fibers. `scripts/integration-test.sh` runs these
 server-backed paths automatically:
 
+```bash
+./scripts/child-cancellation-integration-test.sh
+```
+
+The focused script runs the explicit-cancellation and duplicate-child cleanup
+cases without the rest of the integration matrix.
+
 - successful typed child result delivery;
 - a codec-neutral three-argument Child Workflow start that preserves argument
   order, custom metadata, external payload details, and interceptor headers;
@@ -2418,7 +2425,9 @@ server-backed paths automatically:
   with custom metadata and external payload details; the initiated event must
   retain the command's UI summary;
 - explicit child cancellation through the Future while the parent remains live
-  and completes normally after observing the canceled child result;
+  and completes normally after observing the canceled child result; the child
+  is deliberately suspended before option-metadata assertions so cancellation
+  cannot race an unrelated early return;
 - a second start with the same running child ID, producing Core's
   `WorkflowAlreadyExists` start resolution before the first child is canceled;
 - two independent Workflows where one sends an external signal, waits for
@@ -2453,10 +2462,15 @@ its memo, typed Search Attribute, and priority, then checks the parent's Service
 history for ID reuse, memo, Search Attributes, priority, and static UserMetadata.
 A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
-the parent closes as canceled. External-operation unit tests inspect namespace,
-Workflow ID, Run ID, signal Payload, cancellation reason, success/failure cause,
-and fresh-stack replay bytes. The 500-case external Workflow property likewise
-varies its signal from zero through twelve ordered Payloads. The live and
+the parent closes as canceled. Another unit activation combines
+`InitializeWorkflow` and `CancelWorkflow` around an immediately returning
+procedure and requires cancellation to be installed before its first fiber
+resume. This covers the job batch observed live when a Child cancellation
+arrives before the Child's initial Workflow Task is handled.
+External-operation unit tests inspect namespace, Workflow ID, Run ID, signal
+Payload, cancellation reason, success/failure cause, and fresh-stack replay
+bytes. The 500-case external Workflow property likewise varies its signal from
+zero through twelve ordered Payloads. The live and
 property suites carry three and zero-to-twelve Continue-As-New arguments,
 respectively. Continue-As-New unit and property tests also cover replacement
 memo, typed Search Attributes, every versioning value, and exact

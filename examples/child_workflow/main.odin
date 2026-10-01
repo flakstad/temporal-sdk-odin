@@ -107,6 +107,13 @@ workflow_cancel_child_interceptor :: proc(
 }
 
 child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	// Cancellation scenarios deliberately stay suspended until Temporal
+	// delivers the parent request. They do not exercise the option metadata
+	// asserted by the ordinary success scenario below.
+	if strings.has_prefix(name, "cancel-") {
+		workflow.sleep(ctx, time.Hour)
+		return "child cancellation was not delivered"
+	}
 	interceptor_header: string
 	header_found, header_error := workflow.header_json(
 		ctx,
@@ -133,10 +140,6 @@ child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	   info.priority.fairness_key != "odin-child-fairness" ||
 	   info.priority.fairness_weight != 1.5 {
 		return "Child Workflow metadata options mismatch"
-	}
-	if strings.has_prefix(name, "cancel-") {
-		workflow.sleep(ctx, time.Hour)
-		return "child cancellation was not delivered"
 	}
 	message, allocation_error := strings.concatenate({"Hello from child, ", name})
 	if allocation_error != nil {

@@ -2283,6 +2283,10 @@ emit no timer command. Deadline state and commands are replay-identical.
 
 Returning from the Workflow while root cancellation is pending acknowledges it
 with `CancelWorkflowExecution`; the return value is not completed successfully.
+If Core includes `InitializeWorkflow` and `CancelWorkflow` in one initial
+activation, the root cancellation is installed before Odin first resumes the
+new stackful fiber, so the same rule holds even for an immediately returning
+procedure.
 Detached scope state is local to the currently running main or Update fiber.
 To let a detached handler finish, the main Workflow must itself use a detached
 scope around `workflow.await_all_handlers_finished(ctx)` after observing

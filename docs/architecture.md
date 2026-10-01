@@ -2702,6 +2702,17 @@ The Odin runtime now models the Workflow's root cancellation state explicitly:
    between main and Update fibers keeps their scopes independent even though
    their deterministic operation tables are shared.
 
+Core may place `InitializeWorkflow` and `CancelWorkflow` in the same initial
+activation when cancellation reaches a run before its first Workflow Task is
+handled. This crosses a subtle runtime boundary: creating an async Workflow
+future does not execute its body, while resuming Odin's stackful fiber starts
+the synchronous procedure immediately. Odin therefore scans the initial batch
+and marks the root token canceled before the first fiber resume. The ordinary
+job pass then consumes the cancellation idempotently. A procedure that returns
+in that first resume consequently emits `CancelWorkflowExecution`, consistent
+with the rule above, rather than racing a successful completion or failing the
+activation because its fiber is already terminal.
+
 The runtime now also exposes borrowed run-local `Cancellation_Token` values.
 The root token is linked to `CancelWorkflow`; `cancellation_child` creates an
 arbitrary downward-only relationship; and `cancellation_detached` creates an
