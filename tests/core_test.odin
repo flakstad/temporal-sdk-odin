@@ -219,6 +219,62 @@ workflow_isolation_protocol_rejects_corruption_limits_and_invalid_contracts :: p
 	testing.expect_value(t, validation_error.kind, workflow_isolate.Error_Kind.Invalid_Argument)
 }
 
+Workflow_Processor_Test_State :: struct {
+	called:             bool,
+	activation_length: int,
+	return_completion: bool,
+}
+
+workflow_processor_test_invoke :: proc(
+	user_data: rawptr,
+	activation: []u8,
+) -> workflow.Process_Result {
+	state := cast(^Workflow_Processor_Test_State)user_data
+	state.called = true
+	state.activation_length = len(activation)
+	if !state.return_completion {
+		return {}
+	}
+	return {
+		completion = workflow.encode_empty_activation_success("external-processor-run"),
+		run_id = "external-processor-run",
+	}
+}
+
+@(test)
+worker_dispatches_online_activations_through_an_external_processor :: proc(t: ^testing.T) {
+	activation := [?]u8{0, 1, 0, 2, 0xff}
+	state := Workflow_Processor_Test_State{return_completion = true}
+	options := worker.Run_Options{
+		workflow_activation_processor = workflow_processor_test_invoke,
+		workflow_activation_processor_data = &state,
+	}
+	processed, dispatch_error := worker.dispatch_workflow_activation(
+		nil,
+		options,
+		activation[:],
+	)
+	testing.expect(t, dispatch_error.message == nil)
+	testing.expect(t, state.called)
+	testing.expect_value(t, state.activation_length, len(activation))
+	testing.expect(t, processed.completion != nil)
+	testing.expect_value(t, processed.run_id, "external-processor-run")
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	worker.error_free(&dispatch_error)
+
+	state = {return_completion = false}
+	processed, dispatch_error = worker.dispatch_workflow_activation(
+		nil,
+		options,
+		activation[:],
+	)
+	testing.expect(t, dispatch_error.message != nil)
+	testing.expect(t, processed.completion == nil)
+	workflow.error_free(&processed.error)
+	worker.error_free(&dispatch_error)
+}
+
 Callback_Drain_Test_State :: struct {
 	release:  sync.Sema,
 	observed: bool,

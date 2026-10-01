@@ -3853,6 +3853,62 @@ properties Workflow queries `currentDetails` before a Signal permits it to
 close; the deployment acceptance Workflow also requires a non-empty version
 delivered by Core.
 
+## Core-connected Workflow process isolation
+
+The language boundary can now be replaced for online Workflow activations
+without moving any Temporal protocol responsibility out of Core. `worker.run`
+normally calls its in-process fiber dispatcher. When the experimental
+`Run_Options.workflow_activation_processor` callback is configured, the same
+borrowed `WorkflowActivation` bytes are handed to that callback serially and
+its owned `WorkflowActivationCompletion` bytes are passed unchanged to Core.
+Offline replay intentionally continues to use the ordinary in-process registry.
+
+No new C ABI is required. This path depends on the already-pinned bridge calls:
+
+- `temporal_core_worker_poll_workflow_activation` supplies the activation;
+- `temporal_core_worker_complete_workflow_activation` accepts success or
+  failed completion bytes;
+- `temporal_core_worker_initiate_shutdown` and the final shutdown poll/finalize
+  sequence retain ownership of Worker teardown; and
+- the existing generic WorkflowService RPC bridge starts the execution and
+  waits for its result through the public Odin Client.
+
+The child protocol carries the Core protobufs opaquely. The parent decodes only
+the routing fields (`run_id`, initialization, eviction, replay flag, history
+length, and Workflow type) and enough completion structure to maintain Worker
+statistics. Core remains responsible for history application and state
+machines; the child owns only the Odin registry, fiber stacks, and
+language-deterministic state for its cache lifetime.
+
+The first verified mode sets `max_cached_workflows = 0`. A child therefore
+serves one Workflow Task and is shut down only after the corresponding
+`RemoveFromCache` activation. A forced generation-1 exit becomes a failed
+activation completion. Core then emits language-failure eviction, and the
+Server retries the Workflow Task; fresh child generations rebuild Odin state
+from the history carried by later Core activations. Against the CLI dev server,
+the timer Workflow completes after three generations: crashed initial attempt,
+successful timer scheduling plus eviction, and replay/timer resolution plus
+terminal eviction.
+
+The cache/language-lifetime invariant is strict:
+
+```text
+Core cache entry exists  <=>  exactly one live Odin executor generation owns it
+```
+
+Zero-cache satisfies this with one process per successful Workflow Task.
+Future sticky mode must instead retain a run-routed child until Core eviction.
+Starting a new child for an incremental activation while Core still considers
+the old language cache entry live is invalid because the new process lacks the
+suspended fiber.
+
+The external processor itself is an Odin-only API seam and is still marked
+experimental. The single-session example lacks deadlines, bounded admission,
+generation fencing, generic registration transfer, and complete observation
+metadata. These are process-manager responsibilities, not additional Temporal
+protocol work. See `docs/workflow-isolation.md` for the executed recovery trace
+and remaining safety work.
+
 ### Local Activity boundary
 
 Local Activities do not bypass SDK Core. Odin emits the existing

@@ -782,11 +782,11 @@ property generates initial/maximum backoff, multipliers, and transition counts,
 requiring every delay to remain monotonic, overflow-safe in the generated
 domain, and exactly saturated at the configured maximum.
 
-### Per-run Workflow process boundary spike
+### Per-run Workflow process boundary
 
-The first fine-grained executor transport is documented in
-[`workflow-isolation.md`](workflow-isolation.md). It can be run without a
-Temporal Server:
+The fine-grained executor transport and its zero-cache Core integration are
+documented in [`workflow-isolation.md`](workflow-isolation.md). The transport
+can be run without a Temporal Server:
 
 ```bash
 ./scripts/build-examples.sh
@@ -796,9 +796,22 @@ TEMPORAL_ODIN_SKIP_BUILD=1 ./scripts/workflow-isolate-integration-test.sh
 The parent sends two correlated binary Core activations over bounded versioned
 frames to one child process. The child suspends a sequential Odin Workflow on a
 timer after the first activation, retains its fiber, resumes it on `FireTimer`,
-and returns the terminal Core completion. This proves the required per-run
-state lifetime, not integration with the Worker's Core poll loop. Unit and PBT
-coverage validates framing independently of the process example.
+and returns the terminal Core completion. Unit and PBT coverage validates
+framing independently of the process example.
+
+The complete Worker/Core/Server recovery proof is:
+
+```bash
+./scripts/workflow-isolate-core-integration-test.sh
+```
+
+It starts `temporal server start-dev --headless` when needed, deliberately
+crashes the first Workflow executor, reports that as an activation failure,
+consumes Core eviction, and requires a fresh child to replay and ultimately
+complete the Workflow. `max_cached_workflows = 0` intentionally aligns every
+child lifetime with one Core Workflow Task/cache lifetime. This is a verified
+zero-cache mode, not yet the reusable bounded process pool needed for general
+SDK configuration.
 
 Workflows have the corresponding registration levels:
 

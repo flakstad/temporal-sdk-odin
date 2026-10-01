@@ -276,6 +276,15 @@ Rejected_Workflow_Run :: struct {
 
 Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
 Worker_Ready_Proc :: #type proc(user_data: rawptr) -> bool
+// Workflow_Activation_Processor replaces the in-process Workflow dispatcher
+// for online Worker activations. It is an experimental process-isolation seam:
+// activation bytes are borrowed for this call, while the returned completion
+// and Error follow the ordinary owned workflow.Process_Result contract. The
+// callback runs serially on the Worker's Workflow poll thread.
+Workflow_Activation_Processor_Proc :: #type proc(
+	user_data: rawptr,
+	activation: []u8,
+) -> workflow.Process_Result
 
 Callback_Drain_Kind :: enum {
 	Activity,
@@ -325,6 +334,8 @@ Run_Options :: struct {
 	// Activity registrations on this Worker.
 	enable_local_activities:  bool,
 	on_workflow_activation:  Workflow_Activation_Observer,
+	workflow_activation_processor: Workflow_Activation_Processor_Proc,
+	workflow_activation_processor_data: rawptr,
 	// Called synchronously after Core validation and worker registration, but
 	// before polling. This permits same-Connection eager Workflow starts.
 	on_ready:                Worker_Ready_Proc,
@@ -2241,6 +2252,8 @@ Workflow_Activation_Route :: struct {
 	workflow_type: string,
 	initializes:   bool,
 	evicts:        bool,
+	is_replaying:  bool,
+	history_length: u32,
 	job_count:     int,
 }
 
@@ -2260,6 +2273,8 @@ decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activat
 		return
 	}
 	route.run_id = activation.run_id
+	route.is_replaying = activation.is_replaying
+	route.history_length = activation.history_length
 	route.job_count = len(activation.jobs)
 	for job in activation.jobs {
 		#partial switch variant in job.variant {
@@ -2399,6 +2414,27 @@ process_workflow_activation :: proc(
 		}
 	}
 	return
+}
+
+dispatch_workflow_activation :: proc(
+	worker: ^Worker,
+	options: Run_Options,
+	data: []u8,
+) -> (processed: workflow.Process_Result, error: Error) {
+	if options.workflow_activation_processor == nil {
+		return process_workflow_activation(worker, data)
+	}
+	processed = options.workflow_activation_processor(
+		options.workflow_activation_processor_data,
+		data,
+	)
+	if processed.completion == nil {
+		workflow.error_free(&processed.error)
+		return {}, error_from_string(
+			"external Workflow activation processor produced no completion",
+		)
+	}
+	return processed, {}
 }
 
 Callback_Drain_Watch :: struct {
@@ -3279,7 +3315,7 @@ run_workflow_loop :: proc(
 			break
 		}
 
-		processed, dispatch_error := process_workflow_activation(worker, poll.protobuf)
+		processed, dispatch_error := dispatch_workflow_activation(worker, options, poll.protobuf)
 		delete(poll.protobuf)
 		if dispatch_error.message != nil {
 			return stats, dispatch_error

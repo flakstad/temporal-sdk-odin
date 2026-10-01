@@ -28,12 +28,23 @@ write_executor_error :: proc(request_id: u64, run_id: []u8, message: string) {
 	})
 }
 
-run_child :: proc() -> int {
+run_child :: proc(
+	crash_on_first_activation := false,
+	requested_task_queue := "",
+) -> int {
+	task_queue_buffer: [256]u8
+	task_queue := requested_task_queue
+	if len(task_queue) == 0 {
+		task_queue = os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
+	}
+	if len(task_queue) == 0 {
+		task_queue = TASK_QUEUE
+	}
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
 		&runtime,
 		WORKFLOW_TYPE,
-		TASK_QUEUE,
+		task_queue,
 		isolated_workflow,
 	)
 	if init_error.message != nil {
@@ -56,6 +67,9 @@ run_child :: proc() -> int {
 
 		#partial switch request.frame.kind {
 		case .Activation:
+			if crash_on_first_activation {
+				os.exit(86)
+			}
 			processed := workflow.process_fiber_activation(&runtime, request.frame.payload)
 			if processed.completion == nil {
 				message := "Workflow activation produced no completion"
@@ -329,8 +343,19 @@ run_parent :: proc() -> int {
 }
 
 main :: proc() {
-	if len(os.args) == 2 && os.args[1] == "--child" {
-		os.exit(run_child())
+	if len(os.args) >= 2 && os.args[1] == "--child" {
+		task_queue := ""
+		if len(os.args) >= 3 {
+			task_queue = os.args[2]
+		}
+		os.exit(run_child(false, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-crash" {
+		task_queue := ""
+		if len(os.args) >= 3 {
+			task_queue = os.args[2]
+		}
+		os.exit(run_child(true, task_queue))
 	}
 	os.exit(run_parent())
 }

@@ -497,10 +497,14 @@ Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
 fresh-stack history replay, and Signal-driven completion. The whole-Worker
 supervisor contract is documented in
 [`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow or
-per-Activity subprocess pools are not implemented. A first
-[`docs/workflow-isolation.md`](docs/workflow-isolation.md) spike does prove a
-persistent child retaining one Workflow fiber across two versioned binary
-activation/completion exchanges; it is not connected to Core polling yet.
+per-Activity production subprocess pools are not implemented. The experimental
+[`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
+to online Core polling in zero-cache mode. Its live test deliberately crashes
+the first per-Workflow executor, submits a failed activation completion,
+acknowledges Core eviction, replays in fresh children, and obtains the durable
+timer Workflow result from the CLI dev server. The current implementation is a
+single-session example without deadlines, generation fencing, registry
+transfer, or a bounded reusable process pool.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 
@@ -2233,6 +2237,7 @@ examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/workflow_isolate/ persistent per-run Workflow process spike
+examples/workflow_isolate_core/ Core-polled zero-cache crash/replay proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker
