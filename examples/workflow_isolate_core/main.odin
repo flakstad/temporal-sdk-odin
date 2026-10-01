@@ -164,6 +164,7 @@ run :: proc() -> int {
 	first_argument := "--child-crash"
 	expected_child_exits := 1
 	expected_timeouts := 0
+	expected_protocol_failures := 0
 	expected_activation_failures := 1
 	activation_timeout := 5 * time.Second
 	switch first_mode {
@@ -173,6 +174,27 @@ run :: proc() -> int {
 		expected_child_exits = 0
 		expected_timeouts = 1
 		activation_timeout = 250 * time.Millisecond
+	case "late":
+		first_argument = "--child-late"
+		expected_child_exits = 0
+		expected_timeouts = 1
+		activation_timeout = 250 * time.Millisecond
+	case "stale":
+		first_argument = "--child-stale"
+		expected_child_exits = 0
+		expected_protocol_failures = 1
+	case "malformed-metadata":
+		first_argument = "--child-malformed-metadata"
+		expected_child_exits = 0
+		expected_protocol_failures = 1
+	case "malformed-completion":
+		first_argument = "--child-malformed-completion"
+		expected_child_exits = 0
+		expected_protocol_failures = 1
+	case "metadata-mismatch":
+		first_argument = "--child-metadata-mismatch"
+		expected_child_exits = 0
+		expected_protocol_failures = 1
 	case "normal":
 		first_argument = "--child"
 		expected_child_exits = 0
@@ -289,12 +311,13 @@ run :: proc() -> int {
 	   manager_stats.manifest_mismatches != 0 ||
 	   manager_stats.shutdown_timeouts != 0 ||
 	   manager_stats.crash_loop_rejections != 0 ||
-	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
+	   manager_stats.capacity_rejections != 0 ||
+	   manager_stats.protocol_failures != expected_protocol_failures ||
 	   observations.timer_commands_with_sequence != expected_timer_sequences ||
 	   observations.timer_commands_without_sequence != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
@@ -316,6 +339,7 @@ run :: proc() -> int {
 			manager_stats.crash_loop_rejections,
 			manager_stats.capacity_rejections,
 			manager_stats.protocol_failures,
+			expected_protocol_failures,
 			observations.timer_commands_with_sequence,
 			expected_timer_sequences,
 			observations.timer_commands_without_sequence,

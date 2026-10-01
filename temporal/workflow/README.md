@@ -302,3 +302,9 @@ and destroys its emitter independently. A successful emitter transfers to that
 runtime and its `destroy` callback runs exactly once at host close.
 Replay-history metrics are suppressed by the Workflow runtime before reaching
 the emitter.
+
+`scripts/workflow-isolate-protocol-fault-integration-test.sh` exercises stale
+request correlation, malformed metadata, malformed completion protobuf,
+metadata/completion terminal disagreement, and a response beyond the activation
+deadline against the CLI dev server. Every failed generation is aborted and
+reaped before Core eviction permits a replacement route.

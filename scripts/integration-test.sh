@@ -1070,6 +1070,9 @@ TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/workflow-isolate-core-integration-test.sh"
 
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/workflow-isolate-protocol-fault-integration-test.sh"
+
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &

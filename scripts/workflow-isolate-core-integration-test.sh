@@ -98,12 +98,17 @@ grep -q 'manifest_mismatches=0' <<<"$output"
 grep -q 'shutdown_timeouts=0' <<<"$output"
 grep -q 'crash_loop_rejections=0' <<<"$output"
 grep -q 'capacity_rejections=0' <<<"$output"
-grep -q 'protocol_failures=0' <<<"$output"
+if [[ "$first_mode" == "stale" || "$first_mode" == "malformed-metadata" ||
+      "$first_mode" == "malformed-completion" || "$first_mode" == "metadata-mismatch" ]]; then
+  grep -q 'protocol_failures=1' <<<"$output"
+else
+  grep -q 'protocol_failures=0' <<<"$output"
+fi
 grep -q 'missing_timer_sequences=0' <<<"$output"
 if [[ "$first_mode" == "crash" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"
-elif [[ "$first_mode" == "hang" ]]; then
+elif [[ "$first_mode" == "hang" || "$first_mode" == "late" ]]; then
   grep -q 'child_exits=0' <<<"$output"
   grep -q 'activation_timeouts=1' <<<"$output"
 fi

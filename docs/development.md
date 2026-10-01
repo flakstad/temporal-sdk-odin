@@ -827,6 +827,19 @@ TEMPORAL_ODIN_ISOLATE_FIRST_MODE=hang \
   ./scripts/workflow-isolate-core-integration-test.sh
 ```
 
+Run stale/malformed/mismatched/late executor responses through the same Core
+eviction and replay path with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-protocol-fault-integration-test.sh
+```
+
+The five cases require either one protocol failure or one activation timeout,
+one failed Workflow activation, complete child reaping, and successful durable
+results from replacement generations. A stale response never shares a pipe or
+route with its replacement generation.
+
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
 `register_external_workflow_registry` copies only the Workflow type-name

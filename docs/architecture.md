@@ -3296,7 +3296,9 @@ outbound interceptors through explicit host options; the live proof requires
 replay-suppressed interceptor logs on child stderr. A factory now creates and
 transfers one runtime-owned metric emitter per registered Workflow type, and the
 live proof requires the same replay-suppressed metric count. The next step is
-structured diagnostics. Production
+structured diagnostics. A five-case dev-server matrix now proves containment of
+stale correlation IDs, malformed metadata/completions, terminal metadata
+mismatches, and responses delayed beyond the activation deadline. Production
 hardening remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.

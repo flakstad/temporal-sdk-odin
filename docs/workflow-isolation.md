@@ -262,6 +262,23 @@ path observes exactly one timeout, kills and reaps the child, submits the failed
 completion, consumes eviction, replays in later generations, and returns the
 same durable result. No pipe-reader thread remains at shutdown.
 
+Run the protocol-fault matrix with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-protocol-fault-integration-test.sh
+```
+
+Against the CLI dev server, the first executor generation independently injects
+five faults: a stale request ID, invalid metadata JSON, invalid completion
+protobuf, metadata whose terminal flags disagree with the completion, and a
+response delayed beyond the activation deadline. Each protocol fault increments
+exactly one protocol failure; the delayed response increments exactly one
+timeout. The parent aborts and reaps that generation, submits one failed
+activation completion, waits for Core eviction, and completes both Workflows in
+fresh generations. Private pipes and generation-owned routes prevent a stale or
+late response from being consumed by the replacement.
+
 Set `TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky` to use
 `max_cached_workflows=100`. After one deliberately failed generation, the two
 Workflow runs each keep one child across timer suspension and resolution. The
@@ -335,9 +352,10 @@ still required:
 
 - where stderr is insufficient, add structured diagnostic-event transport
   without letting observations affect commands;
-- prove nondeterminism and malformed/late child completions against
-  `temporal server start-dev`;
+- prove a real nondeterministic Workflow completion/replay mismatch through the
+  isolated dev-server path;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
 The next discriminating vertical slice is structured executor diagnostics.
-Malformed/late completion tests remain part of the process hardening.
+Cross-platform pipe/process validation and nondeterminism recovery remain part
+of the process hardening.

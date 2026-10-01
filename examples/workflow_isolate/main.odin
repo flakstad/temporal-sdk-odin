@@ -15,6 +15,17 @@ WORKFLOW_TYPE :: workflow_app.GREETING_WORKFLOW_TYPE
 TASK_QUEUE :: workflow_app.DEFAULT_TASK_QUEUE
 RUN_ID :: "isolated-workflow-run"
 
+Child_Fault_Mode :: enum {
+	None,
+	Crash,
+	Hang,
+	Late,
+	Stale_Request,
+	Malformed_Metadata,
+	Malformed_Completion,
+	Metadata_Mismatch,
+}
+
 executor_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
 	if record == nil {
 		return
@@ -64,8 +75,7 @@ executor_execute_workflow_interceptor :: proc(
 }
 
 run_child :: proc(
-	crash_on_first_activation := false,
-	hang_on_first_activation := false,
+	fault_mode := Child_Fault_Mode.None,
 	requested_task_queue := "",
 ) -> int {
 	task_queue_buffer: [256]u8
@@ -109,7 +119,7 @@ run_child :: proc(
 		return 1
 	}
 	defer workflow_isolate.executor_host_close(&host)
-	if crash_on_first_activation || hang_on_first_activation {
+	if fault_mode != .None {
 		manifest_request, read_error := workflow_isolate.read(os.stdin)
 		if read_error.kind != .None ||
 		   manifest_request.frame.kind != .Manifest_Request {
@@ -132,10 +142,71 @@ run_child :: proc(
 			workflow_isolate.owned_frame_free(&request)
 			return 1
 		}
-		workflow_isolate.owned_frame_free(&request)
-		if crash_on_first_activation {
+		if fault_mode == .Crash {
+			workflow_isolate.owned_frame_free(&request)
 			os.exit(86)
 		}
+		if fault_mode == .Hang {
+			workflow_isolate.owned_frame_free(&request)
+			for {
+				time.sleep(time.Hour)
+			}
+		}
+		if fault_mode == .Late {
+			time.sleep(time.Second)
+		}
+		response_request_id := request.frame.request_id
+		metadata_payload := []u8{'{', '}'}
+		if fault_mode == .Stale_Request {
+			response_request_id -= 1
+		} else if fault_mode == .Malformed_Metadata {
+			metadata_payload = []u8{'{'}
+		} else if fault_mode == .Metadata_Mismatch {
+			metadata, metadata_ok := workflow_isolate.process_result_metadata_encode(
+				&workflow.Process_Result{},
+			)
+			if !metadata_ok {
+				workflow_isolate.owned_frame_free(&request)
+				return 1
+			}
+			metadata_payload = metadata
+			defer delete(metadata)
+		}
+		metadata_error := workflow_isolate.write(os.stdout, {
+			kind = .Completion_Metadata,
+			request_id = response_request_id,
+			run_id = request.frame.run_id,
+			payload = metadata_payload,
+		})
+		if metadata_error.kind != .None {
+			workflow_isolate.owned_frame_free(&request)
+			return 1
+		}
+		if fault_mode == .Malformed_Completion || fault_mode == .Metadata_Mismatch ||
+		   fault_mode == .Late {
+			completion_payload := []u8{0xff}
+			failure := workflow.Process_Result{}
+			if fault_mode == .Metadata_Mismatch || fault_mode == .Late {
+				failure = workflow.activation_failure_result(
+					string(request.frame.run_id),
+					"fault-injected executor completion",
+				)
+				completion_payload = failure.completion[:]
+			}
+			completion_error := workflow_isolate.write(os.stdout, {
+				kind = .Completion,
+				request_id = response_request_id,
+				run_id = request.frame.run_id,
+				payload = completion_payload,
+			})
+			delete(failure.completion)
+			workflow.error_free(&failure.error)
+			if completion_error.kind != .None {
+				workflow_isolate.owned_frame_free(&request)
+				return 1
+			}
+		}
+		workflow_isolate.owned_frame_free(&request)
 		for {
 			time.sleep(time.Hour)
 		}
@@ -398,21 +469,41 @@ main :: proc() {
 		if len(os.args) >= 3 {
 			task_queue = os.args[2]
 		}
-		os.exit(run_child(false, false, task_queue))
+		os.exit(run_child(.None, task_queue))
 	}
 	if len(os.args) >= 2 && os.args[1] == "--child-crash" {
 		task_queue := ""
 		if len(os.args) >= 3 {
 			task_queue = os.args[2]
 		}
-		os.exit(run_child(true, false, task_queue))
+		os.exit(run_child(.Crash, task_queue))
 	}
 	if len(os.args) >= 2 && os.args[1] == "--child-hang" {
 		task_queue := ""
 		if len(os.args) >= 3 {
 			task_queue = os.args[2]
 		}
-		os.exit(run_child(false, true, task_queue))
+		os.exit(run_child(.Hang, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-late" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Late, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-stale" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Stale_Request, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-malformed-metadata" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Malformed_Metadata, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-malformed-completion" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Malformed_Completion, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-metadata-mismatch" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Metadata_Mismatch, task_queue))
 	}
 	os.exit(run_parent())
 }
