@@ -299,6 +299,11 @@ run :: proc() -> int {
 		first_argument = "--child-panic"
 		expected_child_exits = 1
 		expect_panic_signal = true
+	case "infinite-loop":
+		first_argument = "--child-infinite-loop"
+		expected_child_exits = 0
+		expected_timeouts = 1
+		activation_timeout = 250 * time.Millisecond
 	case:
 		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_FIRST_MODE: %s\n", first_mode)
 		return 1

@@ -881,6 +881,18 @@ The child must print the intentional panic and terminate with `SIGTRAP` or
 results. This deliberately tests process recovery rather than installing a
 custom assertion handler or unwinding through the native fiber trampoline.
 
+Exercise a Workflow callback that never reaches a suspension boundary with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=infinite-loop \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+The executor enters a real infinite Odin loop. The 250 ms activation deadline
+must kill and reap it, increment exactly one timeout rather than a child-exit
+counter, and recover both executions through Core eviction and replay.
+
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
 `register_external_workflow_registry` copies only the Workflow type-name

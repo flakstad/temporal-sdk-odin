@@ -65,7 +65,8 @@ output="$(
 echo "$output"
 workflow_log_count="$(grep -c 'isolated-executor workflow_log message="workflow_started"' <<<"$output" || true)"
 expected_hook_count=2
-if [[ "$first_mode" == "stack-overflow" || "$first_mode" == "panic" ]]; then
+if [[ "$first_mode" == "stack-overflow" || "$first_mode" == "panic" ||
+      "$first_mode" == "infinite-loop" ]]; then
   expected_hook_count=3
 fi
 if [[ "$workflow_log_count" != "$expected_hook_count" ]]; then
@@ -122,7 +123,11 @@ if [[ "$first_mode" == "crash" || "$first_mode" == "stack-overflow" ||
     grep -q 'isolated-executor forcing Odin Workflow panic' <<<"$output"
     grep -q 'intentional isolated Workflow panic containment probe' <<<"$output"
   fi
-elif [[ "$first_mode" == "hang" || "$first_mode" == "late" ]]; then
+elif [[ "$first_mode" == "hang" || "$first_mode" == "late" ||
+        "$first_mode" == "infinite-loop" ]]; then
   grep -q 'child_exits=0' <<<"$output"
   grep -q 'activation_timeouts=1' <<<"$output"
+  if [[ "$first_mode" == "infinite-loop" ]]; then
+    grep -q 'isolated-executor entering infinite Odin Workflow loop' <<<"$output"
+  fi
 fi

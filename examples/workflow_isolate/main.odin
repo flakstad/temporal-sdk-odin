@@ -27,6 +27,7 @@ Child_Fault_Mode :: enum {
 	Nondeterministic,
 	Stack_Overflow,
 	Panic,
+	Infinite_Loop,
 }
 
 executor_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
@@ -118,6 +119,8 @@ run_child :: proc(
 		registry_revision = .Stack_Overflow
 	} else if fault_mode == .Panic {
 		registry_revision = .Panic
+	} else if fault_mode == .Infinite_Loop {
+		registry_revision = .Infinite_Loop
 	}
 	registration_error := workflow_app.register_revision(&registry, registry_revision)
 	if registration_error.message != nil {
@@ -147,7 +150,8 @@ run_child :: proc(
 	}
 	defer workflow_isolate.executor_host_close(&host)
 	if fault_mode != .None && fault_mode != .Nondeterministic &&
-	   fault_mode != .Stack_Overflow && fault_mode != .Panic {
+	   fault_mode != .Stack_Overflow && fault_mode != .Panic &&
+	   fault_mode != .Infinite_Loop {
 		manifest_request, read_error := workflow_isolate.read(os.stdin)
 		if read_error.kind != .None ||
 		   manifest_request.frame.kind != .Manifest_Request {
@@ -561,6 +565,10 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child-panic" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""
 		os.exit(run_child(.Panic, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-infinite-loop" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Infinite_Loop, task_queue))
 	}
 	os.exit(run_parent())
 }

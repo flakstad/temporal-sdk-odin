@@ -373,6 +373,21 @@ depending on target). The parent retains the signal number and drives the same
 failed-completion, Core eviction, and fresh-generation replay sequence. No
 attempt is made to unwind an Odin panic through the C/minicoro trampoline.
 
+An activation deadline also contains Workflow code that never yields:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=infinite-loop \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+This child enters an actual infinite loop inside the registered Workflow
+callback. After 250 ms the parent kills and reaps that executor, returns one
+failed activation completion, waits for Core eviction, and replays in an
+ordinary child. It records exactly one activation timeout and no spontaneous
+child exit. This deadline is process containment, not cooperative Workflow
+preemption: all in-memory work since the prior accepted activation is lost and
+must be deterministically reconstructed from history.
+
 ### Ownership at the experimental callback
 
 - Core's poll result owns the activation bytes. `worker.run` borrows them to the
@@ -435,4 +450,4 @@ still required:
 The next discriminating vertical slice is cross-platform pipe/process
 validation and packaging of the executor binary on the four supported target
 triples. Production isolation still needs policy and classification coverage
-for additional fatal native child exits and infinitely running Workflow code.
+for additional fatal native child exits, resource budgets, and pool scheduling.

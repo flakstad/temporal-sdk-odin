@@ -78,7 +78,9 @@ guard-page stack overflow inside one executor child, preserve the terminating
 signal, fail one Workflow Task, and recover through Core eviction/replay while
 the parent Worker stays alive. The whole-Worker supervisor remains necessary
 for in-process Workflows, Activities, Nexus callbacks, parent-process faults,
-and infinite executor children that exceed the manager's configured deadline.
+and deployments that do not enable the per-run manager. A live non-yielding
+Workflow proof now also kills and reaps its executor at the configured
+activation deadline before Core eviction/replay.
 
 This recovery model is why Workflow code must be deterministic and must not
 perform direct filesystem, network, database, wall-clock, or random side
