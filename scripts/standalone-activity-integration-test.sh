@@ -65,7 +65,7 @@ worker_pid=""
 cat "$worker_log"
 cat "$client_log"
 grep -q 'one Activity Task completed and worker shut down cleanly' "$worker_log"
-grep -q 'completed through the Odin Client: Hello Standalone Odin' "$client_log"
+grep -q 'completed, described, listed, counted, and deleted through the Odin Client: Hello Standalone Odin' "$client_log"
 
 for mode in cancel terminate; do
   STANDALONE_ACTIVITY_MODE="$mode" \
@@ -80,4 +80,4 @@ for mode in cancel terminate; do
   grep -q "was $expected_terminal and deleted through the Odin Client" "$client_log"
 done
 
-echo "Standalone Activity start/poll/result/cancel/terminate/delete integration passed."
+echo "Standalone Activity start/poll/describe/list/count/result/cancel/terminate/delete integration passed."

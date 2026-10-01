@@ -82,8 +82,9 @@ server_feature_evidence_name :: proc(evidence: Server_Feature_Evidence) -> strin
 }
 
 // server_feature_sdk_implemented describes the public Odin surface, not
-// server support. Standalone Activity Start/Poll and mutations now exist, but
-// Describe/List/Count and interceptor coverage remain, so it is still false.
+// server support. Standalone Activity Start/Poll/Describe, mutations, and
+// Visibility now exist, but Start metadata and interceptor coverage remain, so
+// it is still false.
 server_feature_sdk_implemented :: proc(feature: Server_Feature) -> bool {
 	switch feature {
 	case .Schedules, .Schedule_Count, .Nexus, .Standalone_Nexus, .Workflow_Pause:

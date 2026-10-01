@@ -748,21 +748,28 @@ Odin Client StartActivityExecution
   -> Odin Client PollActivityExecution
 ```
 
-The first public slice lives in `temporal/client/standalone_activity.odin` and
-exposes codec-neutral/JSON Start, an owned ID/Run-ID handle, monotonic bounded
-or Core-cancelable result waiting, recursive terminal Failure bytes, and
-cancel/terminate/delete. Start validates both close-timeout alternatives,
-Retry Policy, priority, and ID reuse/conflict policy. Poll clones the Run ID
-and result Payload before destroying its protobuf arena. No new C symbol is
-required: client operations use `temporal_core_client_rpc_call`, while task
-execution uses the established Core Activity Worker ABI.
+The public slice lives in `temporal/client/standalone_activity.odin` and
+`standalone_activity_visibility.odin`. It exposes codec-neutral/JSON Start, an
+owned ID/Run-ID handle, monotonic bounded or Core-cancelable result waiting,
+recursive terminal Failure bytes, cancel/terminate/delete, owned Describe
+snapshots, and paginated Visibility List/Count. Start validates both
+close-timeout alternatives, Retry Policy, priority, and ID reuse/conflict
+policy. Poll clones the Run ID and result Payload before destroying its
+protobuf arena. Describe additionally owns execution state, timing, optional
+input/outcome/heartbeat data, headers, Search Attributes, Links, Retry Policy,
+priority, UI metadata, and canonical Failure bytes. Callback variants remain
+owned canonical protobuf bytes until their still-evolving API deserves a
+stable Odin model. List pages own every summary and continuation token; Count
+owns codec-neutral group Payloads. No new C symbol is required: client
+operations use `temporal_core_client_rpc_call`, while task execution uses the
+established Core Activity Worker ABI.
 
 This was measured on both repository server baselines. CLI 1.5.1/Server 1.29.1
 returns gRPC 12/`UNIMPLEMENTED` for `StartActivityExecution`. CLI 1.9.1/Server
-1.32.0 live-proves successful Start/Poll/result through an Odin Worker plus
-scheduled-state cancellation, termination, and deletion. The SDK capability
-remains false until Describe/List/Count and Client outbound interceptors are
-implemented; generated protobuf roots already include the complete lifecycle.
+1.32.0 live-proves successful Start/Poll/Describe/result through an Odin Worker,
+Visibility List/Count with an exact Activity-ID query, and scheduled-state
+cancellation, termination, and deletion. The SDK capability remains false
+until Start metadata and Client outbound interceptors are implemented.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
 Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
@@ -3168,9 +3175,10 @@ retry, and replacement Odin worker. Fixed Workflow stacks now have a
 live-tested native guard page on macOS/Linux; they do not grow, and overflow is
 a process fault. Activity/Nexus shutdown now has a live-proven watchdog policy
 that observes, but never unsafely terminates, callbacks beyond a configured
-deadline. Standalone Activity Start/Poll/result plus cancel/terminate/delete is
-now live-proven against Server 1.32; the next slice is its owned Describe and
-Visibility List/Count surfaces plus Client interceptors. Infinite Workflow
+deadline. Standalone Activity Start/Poll/Describe/result,
+cancel/terminate/delete, and Visibility List/Count are now live-proven against
+Server 1.32; the next slice is Start metadata plus its Client interceptor
+family. Infinite Workflow
 code and SDK-managed subprocess execution remain process-boundary work. The capability inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.
@@ -3190,7 +3198,7 @@ a non-mutating probe exists.
 | Nexus from Workflows | Implemented | `GetSystemInfo.nexus` | Advertised and live-proven | Live suite exposed a timeout behavior change still under classification |
 | Standalone Nexus | Implemented | Safe count RPC | gRPC 12 `UNIMPLEMENTED` | Live-proven on 1.32.0 when `nexusoperation.enableStandalone=true` |
 | Workflow Pause/Unpause | Implemented | No safe probe or System Info bit | Unknown; no mutation is attempted | Live-proven on 1.32.0 |
-| Standalone Activity lifecycle | Partial: Start/Poll/result/cancel/terminate/delete | No safe probe; capability remains false | Start returns gRPC 12 `UNIMPLEMENTED` | Live-proven through an Odin Worker on 1.32.0 |
+| Standalone Activity lifecycle | Partial: Start/Poll/Describe/result/cancel/terminate/delete/List/Count | No safe probe; capability remains false | Start returns gRPC 12 `UNIMPLEMENTED` | Full listed slice live-proven through an Odin Worker on 1.32.0 |
 
 The matrix deliberately distinguishes “SDK surface absent”, “server said
 UNIMPLEMENTED”, and “not safely observed”. Authentication or namespace errors

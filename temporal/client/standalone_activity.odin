@@ -4,6 +4,7 @@ import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:encoding/uuid"
 import "core:math"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
@@ -60,6 +61,157 @@ Standalone_Activity_Poll_Result :: struct {
 	run_id:    string,
 	result:    codec.Payload,
 	has_result: bool,
+}
+
+Standalone_Activity_Status :: enum i32 {
+	Unspecified = 0,
+	Running = 1,
+	Completed = 2,
+	Failed = 3,
+	Canceled = 4,
+	Terminated = 5,
+	Timed_Out = 6,
+	Paused = 7,
+}
+
+Standalone_Activity_Retry_State :: enum i32 {
+	Unspecified = 0,
+	In_Progress = 1,
+	Non_Retryable_Failure = 2,
+	Timeout = 3,
+	Maximum_Attempts_Reached = 4,
+	Retry_Policy_Not_Set = 5,
+	Internal_Server_Error = 6,
+	Cancel_Requested = 7,
+}
+
+Describe_Standalone_Activity_Options :: struct {
+	include_input:             bool,
+	include_outcome:           bool,
+	include_heartbeat_details: bool,
+	include_last_failure:      bool,
+	long_poll_token:           []u8,
+	timeout:                   time.Duration,
+	cancellation_token:        ^Client_Cancellation_Token,
+}
+
+Standalone_Activity_Description :: struct {
+	activity_id:                 string,
+	run_id:                      string,
+	activity_type:               string,
+	task_queue:                  string,
+	status:                      Standalone_Activity_Status,
+	run_state:                   Pending_Activity_State,
+	schedule_to_close_timeout:   Optional_Duration,
+	schedule_to_start_timeout:   Optional_Duration,
+	start_to_close_timeout:      Optional_Duration,
+	heartbeat_timeout:           Optional_Duration,
+	start_delay:                 Optional_Duration,
+	execution_duration:          Optional_Duration,
+	current_retry_interval:      Optional_Duration,
+	schedule_time:               Optional_Time,
+	execution_time:              Optional_Time,
+	expiration_time:             Optional_Time,
+	close_time:                  Optional_Time,
+	last_heartbeat_time:         Optional_Time,
+	last_started_time:           Optional_Time,
+	last_attempt_complete_time:  Optional_Time,
+	next_attempt_schedule_time:  Optional_Time,
+	attempt:                     i32,
+	state_transition_count:      i64,
+	state_size_bytes:            i64,
+	total_heartbeat_count:       i64,
+	last_worker_identity:        string,
+	last_deployment_name:        string,
+	last_deployment_build_id:    string,
+	sdk_name:                    string,
+	sdk_version:                 string,
+	canceled_reason:             string,
+	retry_policy:                Retry_Policy,
+	has_retry_policy:            bool,
+	priority:                    Workflow_Priority,
+	retry_state:                 Standalone_Activity_Retry_State,
+	heartbeat_details:           [dynamic]codec.Payload,
+	headers:                     [dynamic]Named_Payload,
+	search_attributes:           [dynamic]Named_Payload,
+	links:                       [dynamic]Link,
+	static_summary:              string,
+	has_static_summary:          bool,
+	static_details:              string,
+	has_static_details:          bool,
+	input:                       [dynamic]codec.Payload,
+	result:                      [dynamic]codec.Payload,
+	last_failure_message:        string,
+	last_failure_proto:          []u8,
+	failure_kind:                Error_Kind,
+	failure_message:             string,
+	failure_proto:               []u8,
+	has_failure:                 bool,
+	completion_callback_protos:  [dynamic][]u8,
+	long_poll_token:             []u8,
+	allocator:                   mem.Allocator,
+}
+
+standalone_activity_description_free :: proc(description: ^Standalone_Activity_Description) {
+	if description == nil do return
+	allocator := description.allocator
+	if allocator.procedure == nil {
+		description^ = {}
+		return
+	}
+	strings_to_delete := []^string{
+		&description.activity_id,
+		&description.run_id,
+		&description.activity_type,
+		&description.task_queue,
+		&description.last_worker_identity,
+		&description.last_deployment_name,
+		&description.last_deployment_build_id,
+		&description.sdk_name,
+		&description.sdk_version,
+		&description.canceled_reason,
+		&description.priority.fairness_key,
+		&description.static_summary,
+		&description.static_details,
+		&description.last_failure_message,
+		&description.failure_message,
+	}
+	for value in strings_to_delete do delete(value^, allocator)
+	for error_type in description.retry_policy.non_retryable_error_types do delete(error_type, allocator)
+	delete(description.retry_policy.non_retryable_error_types)
+	for &payload in description.heartbeat_details do codec.payload_free(&payload)
+	for &entry in description.headers {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	for &entry in description.search_attributes {
+		delete(entry.key, allocator)
+		codec.payload_free(&entry.payload)
+	}
+	for &link in description.links do link_free(&link)
+	for &payload in description.input do codec.payload_free(&payload)
+	for &payload in description.result do codec.payload_free(&payload)
+	for callback in description.completion_callback_protos do delete(callback, allocator)
+	delete(description.heartbeat_details)
+	delete(description.headers)
+	delete(description.search_attributes)
+	delete(description.links)
+	delete(description.input)
+	delete(description.result)
+	delete(description.completion_callback_protos)
+	delete(description.last_failure_proto, allocator)
+	delete(description.failure_proto, allocator)
+	delete(description.long_poll_token, allocator)
+	description^ = {}
+}
+
+standalone_activity_description_error :: proc(
+	description: ^Standalone_Activity_Description,
+	kind: Error_Kind,
+	message: string,
+) -> (Standalone_Activity_Description, Error) {
+	standalone_activity_description_free(description)
+	return {}, error_from_string(kind, message)
 }
 
 standalone_activity_handle_free :: proc(handle: ^Standalone_Activity_Handle) {
@@ -391,6 +543,403 @@ decode_standalone_activity_poll_response :: proc(
 		return {}, false, error_from_string(.Malformed_Response, "standalone Activity outcome has no result or failure")
 	}
 	return result, false, {}
+}
+
+standalone_activity_status_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_ActivityExecutionStatus,
+) -> (Standalone_Activity_Status, bool) {
+	numeric := i32(value)
+	if numeric < i32(Standalone_Activity_Status.Unspecified) ||
+	   numeric > i32(Standalone_Activity_Status.Paused) {
+		return {}, false
+	}
+	return Standalone_Activity_Status(numeric), true
+}
+
+standalone_activity_run_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_PendingActivityState,
+) -> (Pending_Activity_State, bool) {
+	numeric := i32(value)
+	if numeric < i32(Pending_Activity_State.Unspecified) ||
+	   numeric > i32(Pending_Activity_State.Pause_Requested) {
+		return {}, false
+	}
+	return Pending_Activity_State(numeric), true
+}
+
+standalone_activity_retry_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_RetryState,
+) -> (Standalone_Activity_Retry_State, bool) {
+	numeric := i32(value)
+	if numeric < i32(Standalone_Activity_Retry_State.Unspecified) ||
+	   numeric > i32(Standalone_Activity_Retry_State.Cancel_Requested) {
+		return {}, false
+	}
+	return Standalone_Activity_Retry_State(numeric), true
+}
+
+standalone_activity_clone_failure_proto :: proc(
+	failure: ^proto.Temporal_Api_Failure_V1_Failure,
+	allocator: mem.Allocator,
+) -> ([]u8, bool) {
+	if failure == nil do return nil, true
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(failure)
+	defer delete(encoded)
+	return bytes.clone(encoded[:], allocator), true
+}
+
+standalone_activity_clone_payloads :: proc(
+	source: ^proto.Temporal_Api_Common_V1_Payloads,
+	target: ^[dynamic]codec.Payload,
+	allocator: mem.Allocator,
+) -> bool {
+	if source == nil do return true
+	for &value in source.payloads {
+		owned, ok := description_clone_payload(&value, allocator)
+		if !ok do return false
+		append(target, owned)
+	}
+	return true
+}
+
+standalone_activity_clone_retry_policy :: proc(
+	source: ^proto.Temporal_Api_Common_V1_RetryPolicy,
+	allocator: mem.Allocator,
+) -> (policy: Retry_Policy, present, ok: bool) {
+	if source == nil do return {}, false, true
+	policy.initial_interval = description_duration(source.initial_interval).value
+	policy.backoff_coefficient = source.backoff_coefficient
+	policy.maximum_interval = description_duration(source.maximum_interval).value
+	policy.maximum_attempts = source.maximum_attempts
+	policy.non_retryable_error_types = make([]string, len(source.non_retryable_error_types), allocator)
+	for value, index in source.non_retryable_error_types {
+		owned, cloned := description_clone_string(value, allocator)
+		if !cloned {
+			for existing in policy.non_retryable_error_types[:index] do delete(existing, allocator)
+			delete(policy.non_retryable_error_types)
+			return {}, true, false
+		}
+		policy.non_retryable_error_types[index] = owned
+	}
+	return policy, true, true
+}
+
+decode_standalone_activity_description :: proc(
+	data: []u8,
+	allocator := context.allocator,
+) -> (description: Standalone_Activity_Description, error: Error) {
+	if allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity description allocator is not initialized")
+	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize standalone Activity Describe arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse(data, &response)
+	context.allocator = previous_allocator
+	if !decoded || response.info == nil || len(response.run_id) == 0 ||
+	   len(response.info.activity_id) == 0 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed standalone Activity Describe response")
+	}
+
+	description.allocator = allocator
+	description.heartbeat_details = make([dynamic]codec.Payload, allocator)
+	description.headers = make([dynamic]Named_Payload, allocator)
+	description.search_attributes = make([dynamic]Named_Payload, allocator)
+	description.links = make([dynamic]Link, allocator)
+	description.input = make([dynamic]codec.Payload, allocator)
+	description.result = make([dynamic]codec.Payload, allocator)
+	description.completion_callback_protos = make([dynamic][]u8, allocator)
+	info := response.info
+	status_ok, state_ok: bool
+	description.status, status_ok = standalone_activity_status_from_proto(info.status)
+	description.run_state, state_ok = standalone_activity_run_state_from_proto(info.run_state)
+	if !status_ok || !state_ok {
+		return standalone_activity_description_error(
+			&description,
+			.Malformed_Response,
+			"Temporal returned an unknown standalone Activity state",
+		)
+	}
+	clone_targets := []struct {source: string, target: ^string}{
+		{info.activity_id, &description.activity_id},
+		{response.run_id, &description.run_id},
+		{info.task_queue, &description.task_queue},
+		{info.last_worker_identity, &description.last_worker_identity},
+		{info.sdk_name, &description.sdk_name},
+		{info.sdk_version, &description.sdk_version},
+		{info.canceled_reason, &description.canceled_reason},
+	}
+	ok := true
+	for target in clone_targets {
+		target.target^, ok = description_clone_string(target.source, allocator)
+		if !ok {
+			return standalone_activity_description_error(
+				&description,
+				.Malformed_Response,
+				"could not allocate standalone Activity description",
+			)
+		}
+	}
+	if info.activity_type != nil {
+		description.activity_type, ok = description_clone_string(info.activity_type.name, allocator)
+	}
+	if ok && info.last_deployment_version != nil {
+		description.last_deployment_name, ok = description_clone_string(
+			info.last_deployment_version.deployment_name,
+			allocator,
+		)
+		if ok {
+			description.last_deployment_build_id, ok = description_clone_string(
+				info.last_deployment_version.build_id,
+				allocator,
+			)
+		}
+	}
+	if !ok {
+		return standalone_activity_description_error(
+			&description,
+			.Malformed_Response,
+			"could not allocate standalone Activity description",
+		)
+	}
+	description.schedule_to_close_timeout = description_duration(info.schedule_to_close_timeout)
+	description.schedule_to_start_timeout = description_duration(info.schedule_to_start_timeout)
+	description.start_to_close_timeout = description_duration(info.start_to_close_timeout)
+	description.heartbeat_timeout = description_duration(info.heartbeat_timeout)
+	description.start_delay = description_duration(info.start_delay)
+	description.execution_duration = description_duration(info.execution_duration)
+	description.current_retry_interval = description_duration(info.current_retry_interval)
+	description.schedule_time = description_time(info.schedule_time)
+	description.execution_time = description_time(info.execution_time)
+	description.expiration_time = description_time(info.expiration_time)
+	description.close_time = description_time(info.close_time)
+	description.last_heartbeat_time = description_time(info.last_heartbeat_time)
+	description.last_started_time = description_time(info.last_started_time)
+	description.last_attempt_complete_time = description_time(info.last_attempt_complete_time)
+	description.next_attempt_schedule_time = description_time(info.next_attempt_schedule_time)
+	description.attempt = info.attempt
+	description.state_transition_count = info.state_transition_count
+	description.state_size_bytes = info.state_size_bytes
+	description.total_heartbeat_count = info.total_heartbeat_count
+	description.retry_policy,
+	description.has_retry_policy,
+	ok = standalone_activity_clone_retry_policy(info.retry_policy, allocator)
+	if ok do description.priority, ok = description_priority(info.priority, allocator)
+	if !ok {
+		return standalone_activity_description_error(
+			&description,
+			.Malformed_Response,
+			"could not copy standalone Activity policy",
+		)
+	}
+	if !standalone_activity_clone_payloads(info.heartbeat_details, &description.heartbeat_details, allocator) {
+		return standalone_activity_description_error(
+			&description,
+			.Payload_Conversion,
+			"could not copy standalone Activity heartbeat details",
+		)
+	}
+	if info.header != nil {
+		for entry in info.header.fields {
+			owned, cloned := description_clone_named_payload(entry.key, entry.value, allocator)
+			if !cloned {
+				return standalone_activity_description_error(
+					&description,
+					.Payload_Conversion,
+					"could not copy standalone Activity Header",
+				)
+			}
+			append(&description.headers, owned)
+		}
+	}
+	if info.search_attributes != nil {
+		for entry in info.search_attributes.indexed_fields {
+			owned, cloned := description_clone_named_payload(entry.key, entry.value, allocator)
+			if !cloned {
+				return standalone_activity_description_error(
+					&description,
+					.Payload_Conversion,
+					"could not copy standalone Activity Search Attribute",
+				)
+			}
+			append(&description.search_attributes, owned)
+		}
+	}
+	if info.user_metadata != nil {
+		description.static_summary, description.has_static_summary, ok =
+			description_decode_user_metadata_string(info.user_metadata.summary, allocator)
+		if ok {
+			description.static_details, description.has_static_details, ok =
+				description_decode_user_metadata_string(info.user_metadata.details, allocator)
+		}
+		if !ok {
+			return standalone_activity_description_error(
+				&description,
+				.Payload_Conversion,
+				"could not decode standalone Activity user metadata",
+			)
+		}
+	}
+	for &source_link in info.links {
+		owned_link, link_error := link_from_proto(&source_link, allocator)
+		if link_error.message != nil {
+			error_free(&link_error)
+			return standalone_activity_description_error(
+				&description,
+				.Malformed_Response,
+				"could not decode standalone Activity Link",
+			)
+		}
+		append(&description.links, owned_link)
+	}
+	description.last_failure_message, ok = description_failure_message(info.last_failure, allocator)
+	if ok {
+		description.last_failure_proto, ok = standalone_activity_clone_failure_proto(info.last_failure, allocator)
+	}
+	if !ok {
+		return standalone_activity_description_error(
+			&description,
+			.Malformed_Response,
+			"could not preserve standalone Activity attempt failure",
+		)
+	}
+	if !standalone_activity_clone_payloads(response.input, &description.input, allocator) {
+		return standalone_activity_description_error(
+			&description,
+			.Payload_Conversion,
+			"could not copy standalone Activity input",
+		)
+	}
+	if response.outcome != nil {
+		description.retry_state, ok = standalone_activity_retry_state_from_proto(response.outcome.retry_state)
+		if !ok {
+			return standalone_activity_description_error(
+				&description,
+				.Malformed_Response,
+				"Temporal returned an unknown standalone Activity retry state",
+			)
+		}
+		#partial switch outcome in response.outcome.value {
+		case proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome_Value_Result:
+			if outcome.value == nil ||
+			   !standalone_activity_clone_payloads(outcome.value, &description.result, allocator) {
+				return standalone_activity_description_error(
+					&description,
+					.Payload_Conversion,
+					"could not copy standalone Activity result",
+				)
+			}
+		case proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome_Value_Failure:
+			if outcome.value == nil {
+				return standalone_activity_description_error(
+					&description,
+					.Malformed_Response,
+					"standalone Activity failure outcome is missing",
+				)
+			}
+			description.failure_kind = standalone_activity_failure_kind(outcome.value)
+			description.failure_message, ok = description_failure_message(outcome.value, allocator)
+			if ok {
+				description.failure_proto, ok = standalone_activity_clone_failure_proto(outcome.value, allocator)
+			}
+			if !ok {
+				return standalone_activity_description_error(
+					&description,
+					.Malformed_Response,
+					"could not preserve standalone Activity outcome failure",
+				)
+			}
+			description.has_failure = true
+		case:
+			return standalone_activity_description_error(
+				&description,
+				.Malformed_Response,
+				"standalone Activity outcome has no result or failure",
+			)
+		}
+	}
+	for &callback in response.callbacks {
+		encoded := proto.encode_Temporal_Api_Activity_V1_CallbackInfo(&callback)
+		owned := bytes.clone(encoded[:], allocator)
+		delete(encoded)
+		append(&description.completion_callback_protos, owned)
+	}
+	description.long_poll_token = bytes.clone(response.long_poll_token, allocator)
+	return description, {}
+}
+
+describe_standalone_activity :: proc(
+	handle: ^Standalone_Activity_Handle,
+	options: Describe_Standalone_Activity_Options = {},
+	allocator := context.allocator,
+) -> (Standalone_Activity_Description, Error) {
+	if !standalone_activity_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
+	}
+	if allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity description allocator is not initialized")
+	}
+	if options.timeout < 0 {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity Describe timeout must not be negative")
+	}
+	if options.cancellation_token != nil && options.cancellation_token.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity Describe cancellation token is not initialized")
+	}
+	if len(options.long_poll_token) > 0 && len(handle.run_id) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity Run ID is required for long-poll Describe")
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_DescribeActivityExecutionRequest{
+		namespace = handle.client.namespace,
+		activity_id = handle.id,
+		run_id = handle.run_id,
+		include_input = options.include_input,
+		include_outcome = options.include_outcome,
+		long_poll_token = options.long_poll_token,
+		include_heartbeat_details = options.include_heartbeat_details,
+		include_last_failure = options.include_last_failure,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionRequest(&request)
+	defer delete(request_bytes)
+	timeout_millis := u32(10_000)
+	retry := true
+	if len(options.long_poll_token) > 0 do timeout_millis = 0
+	if options.timeout > 0 {
+		millis := i64(options.timeout / time.Millisecond)
+		if options.timeout % time.Millisecond != 0 do millis += 1
+		if millis > i64(4_294_967_295) do millis = i64(4_294_967_295)
+		timeout_millis = u32(millis)
+		retry = false
+	}
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"DescribeActivityExecution",
+		request_bytes[:],
+		retry = retry,
+		timeout_millis = timeout_millis,
+		cancellation_token = options.cancellation_token,
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		if options.timeout > 0 && update_poll_failure_is_timeout(
+			rpc_result.error.status_code,
+			string(rpc_result.error.message),
+			true,
+		) {
+			return {}, error_from_core(&rpc_result.error, .Wait_Timed_Out)
+		}
+		if options.cancellation_token != nil && rpc_result.error.status_code == 0 &&
+		   string(rpc_result.error.message) == "Cancelled" {
+			return {}, error_from_core(&rpc_result.error, .Wait_Canceled)
+		}
+		return {}, error_from_core(&rpc_result.error)
+	}
+	return decode_standalone_activity_description(rpc_result.protobuf, allocator)
 }
 
 poll_standalone_activity :: proc(

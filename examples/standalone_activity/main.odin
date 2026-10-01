@@ -15,6 +15,34 @@ fail :: proc(message: string, error: ^temporal_client.Error = nil) {
 	os.exit(1)
 }
 
+verify_visibility :: proc(client: ^temporal_client.Client, activity_id: string) {
+	query := fmt.aprintf("ActivityId = '%s'", activity_id)
+	defer delete(query)
+	for _ in 0 ..< 50 {
+		page, list_error := temporal_client.list_standalone_activities(
+			client,
+			{page_size = 100, query = query},
+		)
+		if list_error.message != nil do fail("Standalone Activity list failed", &list_error)
+		found := false
+		for execution in page.activities {
+			if execution.activity_id == activity_id {
+				found = true
+				break
+			}
+		}
+		temporal_client.standalone_activity_list_page_free(&page)
+
+		count, count_error := temporal_client.count_standalone_activities(client, query)
+		if count_error.message != nil do fail("Standalone Activity count failed", &count_error)
+		visible := found && count.count >= 1
+		temporal_client.standalone_activity_count_free(&count)
+		if visible do return
+		time.sleep(100 * time.Millisecond)
+	}
+	fail("Standalone Activity did not become visible through List/Count")
+}
+
 main :: proc() {
 	client, connect_error := temporal_client.connect()
 	if connect_error.message != nil do fail("Temporal connection failed", &connect_error)
@@ -46,6 +74,18 @@ main :: proc() {
 	if !handle.started_by_request || len(handle.run_id) == 0 {
 		fail("Temporal returned an invalid standalone Activity handle")
 	}
+	description, describe_error := temporal_client.describe_standalone_activity(
+		&handle,
+		{include_input = true, include_outcome = true},
+	)
+	if describe_error.message != nil do fail("Standalone Activity Describe failed", &describe_error)
+	if description.activity_id != handle.id || description.run_id != handle.run_id ||
+	   description.activity_type != "hello" || description.task_queue != task_queue ||
+	   len(description.input) != 1 {
+		temporal_client.standalone_activity_description_free(&description)
+		fail("Temporal returned an invalid standalone Activity description")
+	}
+	temporal_client.standalone_activity_description_free(&description)
 	if mode == "cancel" || mode == "terminate" {
 		mutation_error: temporal_client.Error
 		if mode == "cancel" {
@@ -88,8 +128,23 @@ main :: proc() {
 	if result != "Hello Standalone Odin" {
 		fail("Standalone Activity returned an unexpected result")
 	}
+	completed, completed_error := temporal_client.describe_standalone_activity(
+		&handle,
+		{include_input = true, include_outcome = true},
+	)
+	if completed_error.message != nil {
+		fail("Completed standalone Activity Describe failed", &completed_error)
+	}
+	if completed.status != .Completed || len(completed.input) != 1 || len(completed.result) != 1 {
+		temporal_client.standalone_activity_description_free(&completed)
+		fail("Completed standalone Activity description did not contain its outcome")
+	}
+	temporal_client.standalone_activity_description_free(&completed)
+	verify_visibility(&client, handle.id)
+	delete_error := temporal_client.delete_standalone_activity(&handle)
+	if delete_error.message != nil do fail("Standalone Activity deletion failed", &delete_error)
 	fmt.printf(
-		"Standalone Activity %s/%s completed through the Odin Client: %s\n",
+		"Standalone Activity %s/%s completed, described, listed, counted, and deleted through the Odin Client: %s\n",
 		handle.id,
 		handle.run_id,
 		result,

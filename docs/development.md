@@ -1354,17 +1354,22 @@ temporal server start-dev --headless
 ```
 
 The focused script uses a unique task queue. It starts an Activity directly
-from `examples/standalone_activity`, lets the existing `hello_activity` Worker
-receive it through Core's ordinary Activity task poll, and waits for the typed
-result through `PollActivityExecution`. Two workerless scheduled executions
-then prove request-cancel and immediate termination, typed terminal errors, and
-deletion.
+from `examples/standalone_activity`, reads an owned description, lets the
+existing `hello_activity` Worker receive it through Core's ordinary Activity
+task poll, and waits for the typed result through `PollActivityExecution`. It
+then describes the terminal input/outcome, retries an exact Activity-ID
+Visibility List/Count query until the eventually-consistent record appears,
+and deletes the execution. Two workerless scheduled executions prove
+request-cancel and immediate termination, typed terminal errors, and deletion.
 
 The public handle owns Activity/Run IDs and borrows the Client. Poll results
-own their Run ID, result Payload, and encoded recursive Failure. Start options
-and input Payload views are borrowed only for the synchronous call. The
-generated schema already contains Describe/List/Count; their allocator-owned
-public models and Client interceptors are the next standalone Activity slice.
+own their Run ID, result Payload, and encoded recursive Failure. Describe,
+List, and Count return allocator-owned snapshots and require their matching
+free procedures. Describe's callback entries are currently canonical protobuf
+bytes so no unstable callback union is exposed prematurely. Start options,
+Describe's long-poll token, list/count queries, and input Payload views are
+borrowed only for the synchronous call. Start metadata and typed Client
+outbound interceptors are the next standalone Activity slice.
 
 The suite then repeats that executable with the Core-only Nexus lifecycle
 spike:

@@ -25622,6 +25622,267 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 }
 
 @(test)
+standalone_activity_description_and_visibility_own_decoded_data :: proc(t: ^testing.T) {
+	schedule_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000}
+	execution_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_001}
+	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_005}
+	close_timeout := proto.Google_Protobuf_Duration{seconds = 60}
+	start_timeout := proto.Google_Protobuf_Duration{seconds = 10}
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge-card"}
+	priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 2,
+		fairness_key = "customer-42",
+		fairness_weight = 1.25,
+	}
+	retry_initial := proto.Google_Protobuf_Duration{seconds = 1}
+	retry_policy := proto.Temporal_Api_Common_V1_RetryPolicy{
+		initial_interval = &retry_initial,
+		backoff_coefficient = 2,
+		maximum_attempts = 3,
+	}
+	append(&retry_policy.non_retryable_error_types, "BadOrder")
+	defer delete(retry_policy.non_retryable_error_types)
+	input_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	result_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"charged"`)}
+	heartbeat_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`{"step":2}`)}
+	header_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"trace"`)}
+	search_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"order-42"`)}
+	summary_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Charge order"`)}
+	append(&summary_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	defer delete(summary_payload.metadata)
+	input_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	result_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	heartbeat_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	append(&input_payloads.payloads, input_payload)
+	append(&result_payloads.payloads, result_payload)
+	append(&heartbeat_payloads.payloads, heartbeat_payload)
+	defer delete(input_payloads.payloads)
+	defer delete(result_payloads.payloads)
+	defer delete(heartbeat_payloads.payloads)
+	header := proto.Temporal_Api_Common_V1_Header{}
+	append(
+		&header.fields,
+		proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+			key = "trace-id",
+			value = &header_payload,
+		},
+	)
+	defer delete(header.fields)
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	append(
+		&search_attributes.indexed_fields,
+		proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+			key = "OrderId",
+			value = &search_payload,
+		},
+	)
+	defer delete(search_attributes.indexed_fields)
+	metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{summary = &summary_payload}
+	workflow_link := proto.Temporal_Api_Common_V1_Link_Workflow{
+		namespace = "default",
+		workflow_id = "order-workflow",
+		run_id = "workflow-run",
+	}
+	link := proto.Temporal_Api_Common_V1_Link{
+		variant = proto.Temporal_Api_Common_V1_Link_Variant_Workflow{value = &workflow_link},
+	}
+	last_failure := proto.Temporal_Api_Failure_V1_Failure{message = "attempt failed"}
+	info := proto.Temporal_Api_Activity_V1_ActivityExecutionInfo{
+		activity_id = "activity-42",
+		run_id = "activity-run",
+		activity_type = &activity_type,
+		status = .ACTIVITY_EXECUTION_STATUS_COMPLETED,
+		run_state = .PENDING_ACTIVITY_STATE_STARTED,
+		task_queue = "payments",
+		schedule_to_close_timeout = &close_timeout,
+		start_to_close_timeout = &start_timeout,
+		retry_policy = &retry_policy,
+		heartbeat_details = &heartbeat_payloads,
+		attempt = 2,
+		schedule_time = &schedule_time,
+		execution_time = &execution_time,
+		close_time = &close_time,
+		last_failure = &last_failure,
+		last_worker_identity = "odin-worker",
+		priority = &priority,
+		state_transition_count = 7,
+		state_size_bytes = 512,
+		search_attributes = &search_attributes,
+		header = &header,
+		user_metadata = &metadata,
+		total_heartbeat_count = 2,
+		sdk_name = "temporal-sdk-odin",
+		sdk_version = "0.0.1-experimental",
+	}
+	append(&info.links, link)
+	defer delete(info.links)
+	outcome := proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome{
+		retry_state = .RETRY_STATE_MAXIMUM_ATTEMPTS_REACHED,
+		value = proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome_Value_Result{
+			value = &result_payloads,
+		},
+	}
+	callback_closed := proto.Temporal_Api_Activity_V1_CallbackInfo_ActivityClosed{}
+	callback_trigger := proto.Temporal_Api_Activity_V1_CallbackInfo_Trigger{
+		variant = proto.Temporal_Api_Activity_V1_CallbackInfo_Trigger_Variant_Activity_Closed{
+			value = &callback_closed,
+		},
+	}
+	callback_common := proto.Temporal_Api_Common_V1_Callback_Internal{data = []u8{1, 2, 3}}
+	callback := proto.Temporal_Api_Common_V1_Callback{
+		variant = proto.Temporal_Api_Common_V1_Callback_Variant_Internal{value = &callback_common},
+	}
+	callback_info := proto.Temporal_Api_Callback_V1_CallbackInfo{callback = &callback}
+	activity_callback := proto.Temporal_Api_Activity_V1_CallbackInfo{
+		trigger = &callback_trigger,
+		info = &callback_info,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse{
+		run_id = "activity-run",
+		info = &info,
+		input = &input_payloads,
+		outcome = &outcome,
+		long_poll_token = []u8{9, 8, 7},
+	}
+	append(&response.callbacks, activity_callback)
+	defer delete(response.callbacks)
+	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse(&response)
+	description, description_error := temporal_client.decode_standalone_activity_description(response_bytes[:])
+	delete(response_bytes)
+	defer temporal_client.standalone_activity_description_free(&description)
+	defer temporal_client.error_free(&description_error)
+	testing.expectf(t, description_error.message == nil, "Activity Describe decode failed: %s", string(description_error.message))
+	testing.expect_value(t, description.activity_id, "activity-42")
+	testing.expect_value(t, description.run_id, "activity-run")
+	testing.expect_value(t, description.activity_type, "charge-card")
+	testing.expect_value(t, description.status, temporal_client.Standalone_Activity_Status.Completed)
+	testing.expect_value(t, description.run_state, temporal_client.Pending_Activity_State.Started)
+	testing.expect(t, description.has_retry_policy)
+	testing.expect_value(t, len(description.retry_policy.non_retryable_error_types), 1)
+	testing.expect(t, description.priority.present)
+	testing.expect_value(t, description.priority.fairness_key, "customer-42")
+	testing.expect_value(t, len(description.heartbeat_details), 1)
+	testing.expect_value(t, len(description.headers), 1)
+	testing.expect_value(t, len(description.search_attributes), 1)
+	testing.expect_value(t, len(description.links), 1)
+	testing.expect(t, description.has_static_summary)
+	testing.expect_value(t, description.static_summary, "Charge order")
+	testing.expect_value(t, len(description.input), 1)
+	testing.expect_value(t, len(description.result), 1)
+	testing.expect_value(t, len(description.completion_callback_protos), 1)
+	testing.expect(t, len(description.last_failure_proto) > 0)
+	testing.expect(t, bytes.equal(description.long_poll_token, []u8{9, 8, 7}))
+
+	list_info := proto.Temporal_Api_Activity_V1_ActivityExecutionListInfo{
+		activity_id = "activity-42",
+		run_id = "activity-run",
+		activity_type = &activity_type,
+		schedule_time = &schedule_time,
+		execution_time = &execution_time,
+		close_time = &close_time,
+		status = .ACTIVITY_EXECUTION_STATUS_COMPLETED,
+		search_attributes = &search_attributes,
+		task_queue = "payments",
+		state_transition_count = 7,
+		state_size_bytes = 512,
+	}
+	list_response := proto.Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse{
+		next_page_token = []u8{4, 5, 6},
+	}
+	append(&list_response.executions, list_info)
+	list_bytes := proto.encode_Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse(&list_response)
+	delete(list_response.executions)
+	page, page_error := temporal_client.decode_standalone_activity_list_page(list_bytes[:])
+	delete(list_bytes)
+	defer temporal_client.standalone_activity_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expect(t, page_error.message == nil)
+	testing.expect_value(t, len(page.activities), 1)
+	if len(page.activities) == 1 {
+		testing.expect_value(t, page.activities[0].activity_id, "activity-42")
+		testing.expect_value(t, page.activities[0].status, temporal_client.Standalone_Activity_Status.Completed)
+		testing.expect_value(t, len(page.activities[0].search_attributes), 1)
+	}
+	testing.expect(t, bytes.equal(page.next_page_token, []u8{4, 5, 6}))
+
+	group_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Completed"`)}
+	count_response := proto.Temporal_Api_Workflowservice_V1_CountActivityExecutionsResponse{count = 1}
+	group := proto.Temporal_Api_Workflowservice_V1_CountActivityExecutionsResponse_AggregationGroup{count = 1}
+	append(&group.group_values, group_payload)
+	append(&count_response.groups, group)
+	count_bytes := proto.encode_Temporal_Api_Workflowservice_V1_CountActivityExecutionsResponse(&count_response)
+	delete(group.group_values)
+	delete(count_response.groups)
+	count, count_error := temporal_client.decode_standalone_activity_count(count_bytes[:])
+	delete(count_bytes)
+	defer temporal_client.standalone_activity_count_free(&count)
+	defer temporal_client.error_free(&count_error)
+	testing.expect(t, count_error.message == nil)
+	testing.expect_value(t, count.count, i64(1))
+	testing.expect_value(t, len(count.groups), 1)
+	if len(count.groups) == 1 {
+		testing.expect_value(t, len(count.groups[0].values), 1)
+	}
+}
+
+@(test)
+standalone_activity_decode_errors_release_partial_ownership :: proc(t: ^testing.T) {
+	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge-card"}
+	invalid_summary := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`"missing encoding metadata"`),
+	}
+	metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{summary = &invalid_summary}
+	info := proto.Temporal_Api_Activity_V1_ActivityExecutionInfo{
+		activity_id = "activity-owned-before-error",
+		run_id = "run-owned-before-error",
+		activity_type = &activity_type,
+		status = .ACTIVITY_EXECUTION_STATUS_COMPLETED,
+		run_state = .PENDING_ACTIVITY_STATE_STARTED,
+		task_queue = "payments",
+		user_metadata = &metadata,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse{
+		run_id = "run-owned-before-error",
+		info = &info,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse(&response)
+	description, description_error := temporal_client.decode_standalone_activity_description(encoded[:])
+	delete(encoded)
+	defer temporal_client.standalone_activity_description_free(&description)
+	defer temporal_client.error_free(&description_error)
+	testing.expect(t, description_error.message != nil)
+	testing.expect_value(t, len(description.activity_id), 0)
+
+	valid := proto.Temporal_Api_Activity_V1_ActivityExecutionListInfo{
+		activity_id = "valid-before-error",
+		run_id = "valid-run",
+		activity_type = &activity_type,
+		status = .ACTIVITY_EXECUTION_STATUS_COMPLETED,
+		task_queue = "payments",
+	}
+	invalid := proto.Temporal_Api_Activity_V1_ActivityExecutionListInfo{
+		activity_id = "invalid-status",
+		run_id = "invalid-run",
+		activity_type = &activity_type,
+		status = proto.Temporal_Api_Enums_V1_ActivityExecutionStatus(99),
+		task_queue = "payments",
+	}
+	list_response := proto.Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse{}
+	append(&list_response.executions, valid, invalid)
+	list_bytes := proto.encode_Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse(&list_response)
+	delete(list_response.executions)
+	page, page_error := temporal_client.decode_standalone_activity_list_page(list_bytes[:])
+	delete(list_bytes)
+	defer temporal_client.standalone_activity_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expect(t, page_error.message != nil)
+	testing.expect_value(t, len(page.activities), 0)
+}
+
+@(test)
 standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 	schedule_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 123}
 	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_010}
