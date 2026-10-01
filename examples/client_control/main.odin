@@ -142,6 +142,9 @@ run :: proc() -> int {
 	input_buffer: [1024]u8
 	reason_buffer: [512]u8
 	event_id_buffer: [32]u8
+	reset_signal_name_buffer: [128]u8
+	reset_signal_input_buffer: [1024]u8
+	reset_priority_buffer: [64]u8
 	action := env("TEMPORAL_CLIENT_ACTION", action_buffer[:])
 	workflow_id := env("TEMPORAL_CLIENT_WORKFLOW_ID", id_buffer[:])
 	if len(action) == 0 || len(workflow_id) == 0 {
@@ -199,11 +202,62 @@ run :: proc() -> int {
 			fmt.eprintln("TEMPORAL_CLIENT_RESET_EVENT_ID must be a positive integer")
 			return 2
 		}
+		post_reset_operations := make([dynamic]temporal_client.Post_Reset_Operation)
+		defer delete(post_reset_operations)
+		reset_signal_payload := codec.Payload{}
+		defer codec.payload_free(&reset_signal_payload)
+		reset_signal_inputs: [1]codec.Payload_View
+		reset_signal_name := env(
+			"TEMPORAL_CLIENT_RESET_SIGNAL_NAME",
+			reset_signal_name_buffer[:],
+		)
+		if len(reset_signal_name) > 0 {
+			reset_signal_input := env(
+				"TEMPORAL_CLIENT_RESET_SIGNAL_INPUT",
+				reset_signal_input_buffer[:],
+			)
+			payload_error: codec.Error
+			reset_signal_payload, payload_error = codec.encode_json(reset_signal_input)
+			if payload_error != .None {
+				fmt.eprintln("Could not encode post-reset Signal input")
+				return 1
+			}
+			reset_signal_inputs[0] = codec.payload_view(&reset_signal_payload)
+			append(&post_reset_operations, temporal_client.Post_Reset_Operation{
+				kind = .Signal_Workflow,
+				signal_workflow = {
+					signal_name = reset_signal_name,
+					inputs = reset_signal_inputs[:],
+				},
+			})
+		}
+		reset_priority_value := env(
+			"TEMPORAL_CLIENT_RESET_PRIORITY_KEY",
+			reset_priority_buffer[:],
+		)
+		priority := temporal_client.Priority{}
+		priority_path := [?]string{"priority"}
+		if len(reset_priority_value) > 0 {
+			parsed_priority, priority_ok := strconv.parse_i64(reset_priority_value)
+			if !priority_ok || parsed_priority <= 0 || parsed_priority > i64(max(i32)) {
+				fmt.eprintln("TEMPORAL_CLIENT_RESET_PRIORITY_KEY must be a positive 32-bit integer")
+				return 2
+			}
+			priority.priority_key = i32(parsed_priority)
+			append(&post_reset_operations, temporal_client.Post_Reset_Operation{
+				kind = .Update_Workflow_Options,
+				update_workflow_options = {
+					update_mask = priority_path[:],
+					priority = &priority,
+				},
+			})
+		}
 		reset_handle, reset_error := temporal_client.reset_workflow(
 			&handle,
 			{
 				workflow_task_finish_event_id = event_id,
 				reason = reason,
+				post_reset_operations = post_reset_operations[:],
 			},
 		)
 		if reset_error.message != nil {
@@ -212,10 +266,11 @@ run :: proc() -> int {
 		}
 		defer temporal_client.workflow_handle_free(&reset_handle)
 		fmt.printf(
-			"Odin client reset workflow_id=%s new_run_id=%s event_id=%d\n",
+			"Odin client reset workflow_id=%s new_run_id=%s event_id=%d post_reset_operations=%d\n",
 			workflow_id,
 			reset_handle.run_id,
 			event_id,
+			len(post_reset_operations),
 		)
 		return 0
 	case "query":

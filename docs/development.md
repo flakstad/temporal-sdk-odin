@@ -926,12 +926,29 @@ empty run ID targets the current execution. Signal, cancellation, and reset
 requests generate UUIDv4 deduplication IDs by default. Reset requires a positive
 Workflow Task completed/timed-out/failed/started event ID and returns a separate
 owned handle for the new run without changing the source handle. Its current
-options expose signal, Update, and Nexus reapply exclusions. The deprecated
-positive reapply enum and ordered post-reset operations remain raw protobuf-only;
-an empty exclusion list preserves Service behavior, whose pinned compatibility
-default reapplies signals. Signal and termination have codec-neutral Payload
+options expose signal, Update, and Nexus reapply exclusions plus ordered
+post-reset operations. The post-reset Signal arm carries repeated Payloads,
+Headers, and Links. The Workflow-options arm uses explicit mask paths to set or
+clear versioning override, priority, and time-skipping config. The deprecated
+positive reapply enum remains unset; an empty exclusion list preserves Service
+behavior, whose pinned compatibility default reapplies signals. Signal and termination have codec-neutral Payload
 forms, plus typed JSON helpers. The live suite invokes all four operations
 through `examples/client_control`.
+
+Run the focused newer-server proof with:
+
+```bash
+./scripts/post-reset-integration-test.sh
+```
+
+It resets a completed repeated-argument Workflow, atomically sets priority 2,
+completes the new run, requires `WORKFLOW_EXECUTION_OPTIONS_UPDATED` in history,
+and reads priority 2 back through Describe. CLI 1.9.1/Server 1.32.0 rejects the
+other schema-present arm with `unsupported post reset operation:
+*workflow.PostResetOperation_SignalWorkflow_`. Signal therefore remains exact
+wire/unit/PBT coverage rather than a live capability claim. The 500-case reset
+property generates 0–12 ordered Signal/option operations and preserves their
+kind, order, names, masks, and priorities through protobuf encoding.
 
 Queries use the same borrowed handle and Core generic-RPC path:
 

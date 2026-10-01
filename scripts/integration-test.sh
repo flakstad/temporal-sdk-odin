@@ -179,6 +179,8 @@ echo "$standalone_nexus_probe"
 if grep -q 'Standalone Nexus operation RPC is recognized' <<<"$standalone_nexus_probe"; then
   TEMPORAL_ODIN_SKIP_BUILD=1 \
     "$repo_root/scripts/standalone-nexus-integration-test.sh"
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+    "$repo_root/scripts/post-reset-integration-test.sh"
 else
   grep -q 'Standalone Nexus operation RPC is unavailable' <<<"$standalone_nexus_probe"
   echo "Skipping standalone Nexus integration: the connected Temporal Service does not expose the pre-release RPCs."

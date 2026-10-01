@@ -10027,6 +10027,257 @@ client_reset_request_preserves_target_and_reapply_exclusions :: proc(t: ^testing
 }
 
 @(test)
+client_reset_request_encodes_both_post_reset_operation_variants :: proc(t: ^testing.T) {
+	first_input, first_encode_error := codec.encode_json("first")
+	second_input, second_encode_error := codec.encode_json(42)
+	testing.expect(t, first_encode_error == .None && second_encode_error == .None)
+	defer codec.payload_free(&first_input)
+	defer codec.payload_free(&second_input)
+	inputs := [?]codec.Payload_View{
+		codec.payload_view(&first_input),
+		codec.payload_view(&second_input),
+	}
+	headers := temporal_client.Headers{}
+	header_init_error := temporal_client.headers_init(&headers)
+	testing.expect(t, header_init_error.message == nil)
+	temporal_client.error_free(&header_init_error)
+	defer temporal_client.headers_free(&headers)
+	header_error := temporal_client.headers_add_json(&headers, "reset-origin", "odin")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	links := [?]temporal_client.Link{{
+		kind = .Workflow,
+		workflow = {
+			namespace = "default",
+			workflow_id = "source-workflow",
+			run_id = "source-run",
+			reason = "post-reset signal",
+		},
+	}}
+	pinned := temporal_client.Workflow_Versioning_Override{
+		kind = .Pinned,
+		deployment_name = "orders",
+		build_id = "v2",
+	}
+	auto_upgrade := temporal_client.Workflow_Versioning_Override{kind = .Auto_Upgrade}
+	one_time := temporal_client.Workflow_Versioning_Override{
+		kind = .One_Time,
+		deployment_name = "orders",
+		build_id = "repair",
+	}
+	priority := temporal_client.Priority{
+		priority_key = 2,
+		fairness_key = "tenant-a",
+		fairness_weight = 1.5,
+	}
+	fast_forward := temporal_client.Workflow_Fast_Forward_Config{
+		id = "repair-window",
+		duration = 90 * time.Minute,
+	}
+	time_skipping := temporal_client.Workflow_Time_Skipping_Config{
+		enabled = true,
+		fast_forward = &fast_forward,
+		disable_propagation = true,
+		max_session_skip_count = 7,
+	}
+	all_paths := [?]string{"versioning_override", "priority", "time_skipping_config"}
+	versioning_path := [?]string{"versioning_override"}
+	operations := [?]temporal_client.Post_Reset_Operation{
+		{
+			kind = .Signal_Workflow,
+			signal_workflow = {
+				signal_name = "repair-ready",
+				inputs = inputs[:],
+				headers = &headers,
+				links = links[:],
+			},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {
+				update_mask = all_paths[:],
+				versioning_override = &pinned,
+				priority = &priority,
+				time_skipping_config = &time_skipping,
+			},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {
+				update_mask = versioning_path[:],
+				versioning_override = &auto_upgrade,
+			},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {
+				update_mask = versioning_path[:],
+				versioning_override = &one_time,
+			},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {update_mask = all_paths[:]},
+		},
+	}
+	encoded, encode_error := temporal_client.encode_reset_workflow_request(
+		"default",
+		"odin-client@test",
+		"workflow-id",
+		"run-id",
+		{
+			workflow_task_finish_event_id = 4,
+			reason = "repair with post-reset work",
+			request_id = "post-reset-request",
+			post_reset_operations = operations[:],
+		},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "post-reset encoding failed: %s", string(encode_error.message))
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	request := proto.Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, len(request.post_reset_operations), 5)
+	if len(request.post_reset_operations) != 5 do return
+
+	signal: ^proto.Temporal_Api_Workflow_V1_PostResetOperation_SignalWorkflow
+	#partial switch variant in request.post_reset_operations[0].variant {
+	case proto.Temporal_Api_Workflow_V1_PostResetOperation_Variant_Signal_Workflow:
+		signal = variant.value
+	}
+	testing.expect(t, signal != nil)
+	if signal != nil {
+		testing.expect_value(t, signal.signal_name, "repair-ready")
+		testing.expect(t, signal.input != nil)
+		if signal.input != nil {
+			testing.expect_value(t, len(signal.input.payloads), 2)
+			testing.expect_value(t, string(signal.input.payloads[0].data), `"first"`)
+			testing.expect_value(t, string(signal.input.payloads[1].data), "42")
+		}
+		testing.expect(t, signal.header != nil)
+		if signal.header != nil do testing.expect_value(t, len(signal.header.fields), 1)
+		testing.expect_value(t, len(signal.links), 1)
+	}
+
+	updates: [4]^proto.Temporal_Api_Workflow_V1_PostResetOperation_UpdateWorkflowOptions
+	for operation_index in 1..<5 {
+		#partial switch variant in request.post_reset_operations[operation_index].variant {
+		case proto.Temporal_Api_Workflow_V1_PostResetOperation_Variant_Update_Workflow_Options:
+			updates[operation_index - 1] = variant.value
+		}
+		testing.expect(t, updates[operation_index - 1] != nil)
+	}
+	if updates[0] != nil {
+		update := updates[0]
+		testing.expect_value(t, len(update.update_mask.paths), 3)
+		testing.expect(t, update.workflow_execution_options != nil)
+		if update.workflow_execution_options != nil {
+			options := update.workflow_execution_options
+			testing.expect(t, options.versioning_override != nil)
+			testing.expect(t, options.priority != nil)
+			testing.expect(t, options.time_skipping_config != nil)
+			if options.priority != nil {
+				testing.expect_value(t, options.priority.priority_key, i32(2))
+				testing.expect_value(t, options.priority.fairness_key, "tenant-a")
+			}
+			if options.time_skipping_config != nil {
+				testing.expect(t, options.time_skipping_config.enabled)
+				testing.expect_value(t, options.time_skipping_config.max_session_skip_count, i32(7))
+				testing.expect_value(t, options.time_skipping_config.fast_forward_config.id, "repair-window")
+				testing.expect_value(t, options.time_skipping_config.fast_forward_config.duration.seconds, i64(5400))
+			}
+			if options.versioning_override != nil {
+				#partial switch override in options.versioning_override.override {
+				case proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_Pinned:
+					testing.expect_value(t, override.value.version.deployment_name, "orders")
+					testing.expect_value(t, override.value.version.build_id, "v2")
+				}
+			}
+		}
+	}
+	if updates[1] != nil && updates[1].workflow_execution_options != nil {
+		#partial switch override in updates[1].workflow_execution_options.versioning_override.override {
+		case proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_Auto_Upgrade:
+			testing.expect(t, override.value)
+		}
+	}
+	if updates[2] != nil && updates[2].workflow_execution_options != nil {
+		#partial switch override in updates[2].workflow_execution_options.versioning_override.override {
+		case proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_One_Time:
+			testing.expect_value(t, override.value.target_deployment_version.build_id, "repair")
+		}
+	}
+	if updates[3] != nil {
+		testing.expect_value(t, len(updates[3].update_mask.paths), 3)
+		testing.expect(t, updates[3].workflow_execution_options != nil)
+		if updates[3].workflow_execution_options != nil {
+			testing.expect(t, updates[3].workflow_execution_options.versioning_override == nil)
+			testing.expect(t, updates[3].workflow_execution_options.priority == nil)
+			testing.expect(t, updates[3].workflow_execution_options.time_skipping_config == nil)
+		}
+	}
+}
+
+@(test)
+client_reset_request_rejects_invalid_post_reset_operations :: proc(t: ^testing.T) {
+	bad_override := temporal_client.Workflow_Versioning_Override{
+		kind = .One_Time,
+		deployment_name = "orders",
+	}
+	bad_fast_forward := temporal_client.Workflow_Fast_Forward_Config{id = "missing-duration"}
+	bad_time_skipping := temporal_client.Workflow_Time_Skipping_Config{
+		fast_forward = &bad_fast_forward,
+	}
+	unknown_path := [?]string{"unknown"}
+	duplicate_paths := [?]string{"priority", "priority"}
+	versioning_path := [?]string{"versioning_override"}
+	priority_path := [?]string{"priority"}
+	time_path := [?]string{"time_skipping_config"}
+	priority := temporal_client.Priority{priority_key = 1}
+	cases := [?]temporal_client.Post_Reset_Operation{
+		{},
+		{kind = .Signal_Workflow},
+		{kind = .Update_Workflow_Options},
+		{kind = .Update_Workflow_Options, update_workflow_options = {update_mask = unknown_path[:]}},
+		{kind = .Update_Workflow_Options, update_workflow_options = {update_mask = duplicate_paths[:]}},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {update_mask = priority_path[:], versioning_override = &bad_override},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {update_mask = versioning_path[:], priority = &priority},
+		},
+		{
+			kind = .Update_Workflow_Options,
+			update_workflow_options = {update_mask = time_path[:], time_skipping_config = &bad_time_skipping},
+		},
+	}
+	for operation in cases {
+		operations := [?]temporal_client.Post_Reset_Operation{operation}
+		encoded, encode_error := temporal_client.encode_reset_workflow_request(
+			"default",
+			"odin-client@test",
+			"workflow-id",
+			"run-id",
+			{workflow_task_finish_event_id = 4, post_reset_operations = operations[:]},
+		)
+		testing.expect(t, encode_error.kind == .Invalid_Argument)
+		testing.expect_value(t, len(encoded), 0)
+		delete(encoded)
+		temporal_client.error_free(&encode_error)
+	}
+}
+
+@(test)
 client_reset_request_rejects_invalid_event_id :: proc(t: ^testing.T) {
 	encoded, encode_error := temporal_client.encode_reset_workflow_request(
 		"orders",

@@ -863,6 +863,62 @@ Reset_Reapply_Exclude_Type :: enum {
 	Nexus,
 }
 
+Post_Reset_Operation_Kind :: enum {
+	Invalid,
+	Signal_Workflow,
+	Update_Workflow_Options,
+}
+
+Post_Reset_Signal_Workflow :: struct {
+	signal_name: string,
+	inputs:      []codec.Payload_View,
+	headers:     ^Headers,
+	links:       []Link,
+}
+
+Workflow_Versioning_Override_Kind :: enum {
+	Unspecified,
+	Pinned,
+	Auto_Upgrade,
+	One_Time,
+}
+
+// Deployment identity is required for One_Time and optional for Pinned. An
+// omitted Pinned version asks Server to retain the execution's current pin.
+Workflow_Versioning_Override :: struct {
+	kind:            Workflow_Versioning_Override_Kind,
+	deployment_name: string,
+	build_id:         string,
+}
+
+Workflow_Fast_Forward_Config :: struct {
+	id:       string,
+	duration: time.Duration,
+}
+
+Workflow_Time_Skipping_Config :: struct {
+	enabled:                bool,
+	fast_forward:           ^Workflow_Fast_Forward_Config,
+	disable_propagation:    bool,
+	max_session_skip_count: i32,
+}
+
+// update_mask uses the pinned proto field names: "versioning_override",
+// "priority", and "time_skipping_config". A masked field whose pointer is nil
+// is explicitly cleared by Server.
+Post_Reset_Update_Workflow_Options :: struct {
+	update_mask:          []string,
+	versioning_override:  ^Workflow_Versioning_Override,
+	priority:             ^Priority,
+	time_skipping_config: ^Workflow_Time_Skipping_Config,
+}
+
+Post_Reset_Operation :: struct {
+	kind:                    Post_Reset_Operation_Kind,
+	signal_workflow:         Post_Reset_Signal_Workflow,
+	update_workflow_options: Post_Reset_Update_Workflow_Options,
+}
+
 Reset_Workflow_Options :: struct {
 	// Must identify a WorkflowTaskCompleted, WorkflowTaskTimedOut,
 	// WorkflowTaskFailed, or WorkflowTaskStarted event in the selected run.
@@ -870,6 +926,7 @@ Reset_Workflow_Options :: struct {
 	reason:                        string,
 	request_id:                    string,
 	reapply_exclude_types:          []Reset_Reapply_Exclude_Type,
+	post_reset_operations:         []Post_Reset_Operation,
 }
 
 query_reject_condition_to_proto :: proc(
@@ -3103,6 +3160,307 @@ reset_reapply_exclude_type_to_proto :: proc(
 	return .RESET_REAPPLY_EXCLUDE_TYPE_UNSPECIFIED, false
 }
 
+post_reset_update_mask_kind :: proc(path: string) -> int {
+	switch path {
+	case "versioning_override":
+		return 1
+	case "priority":
+		return 2
+	case "time_skipping_config":
+		return 3
+	}
+	return 0
+}
+
+post_reset_operation_error :: proc(operation: Post_Reset_Operation) -> string {
+	switch operation.kind {
+	case .Signal_Workflow:
+		signal := operation.signal_workflow
+		if len(signal.signal_name) == 0 {
+			return "post-reset Workflow signal name must not be empty"
+		}
+		if signal.headers != nil && signal.headers.allocator.procedure == nil {
+			return "post-reset Workflow signal headers are not initialized"
+		}
+		for link in signal.links {
+			if message := link_error(link); len(message) > 0 do return message
+		}
+	case .Update_Workflow_Options:
+		update := operation.update_workflow_options
+		if len(update.update_mask) == 0 {
+			return "post-reset Workflow options update mask must not be empty"
+		}
+		masked: [4]bool
+		for path in update.update_mask {
+			kind := post_reset_update_mask_kind(path)
+			if kind == 0 {
+				return "post-reset Workflow options update mask contains an unsupported path"
+			}
+			if masked[kind] {
+				return "post-reset Workflow options update mask contains a duplicate path"
+			}
+			masked[kind] = true
+		}
+		if update.versioning_override != nil && !masked[1] {
+			return "post-reset versioning override requires its update-mask path"
+		}
+		if update.priority != nil && !masked[2] {
+			return "post-reset priority requires its update-mask path"
+		}
+		if update.time_skipping_config != nil && !masked[3] {
+			return "post-reset time-skipping config requires its update-mask path"
+		}
+		if update.versioning_override != nil {
+			override := update.versioning_override
+			has_deployment := len(override.deployment_name) > 0
+			has_build := len(override.build_id) > 0
+			if has_deployment != has_build {
+				return "Workflow versioning override requires both deployment name and build ID"
+			}
+			switch override.kind {
+			case .Pinned:
+			case .Auto_Upgrade:
+				if has_deployment {
+					return "Auto-Upgrade Workflow versioning override must not name a deployment version"
+				}
+			case .One_Time:
+				if !has_deployment {
+					return "one-time Workflow versioning override requires a deployment version"
+				}
+			case .Unspecified:
+				return "Workflow versioning override kind is invalid"
+			}
+		}
+		if update.priority != nil {
+			priority := update.priority
+			if priority.priority_key < 0 {
+				return "post-reset Workflow priority key must not be negative"
+			}
+			if len(priority.fairness_key) > 64 {
+				return "post-reset Workflow priority fairness key must not exceed 64 bytes"
+			}
+			if math.is_nan(priority.fairness_weight) || math.is_inf(priority.fairness_weight) ||
+			   priority.fairness_weight < 0 {
+				return "post-reset Workflow priority fairness weight must be finite and non-negative"
+			}
+		}
+		if update.time_skipping_config != nil {
+			config := update.time_skipping_config
+			if config.max_session_skip_count < 0 {
+				return "post-reset Workflow time-skipping count must not be negative"
+			}
+			if config.fast_forward != nil &&
+			   (len(config.fast_forward.id) == 0 || config.fast_forward.duration <= 0) {
+				return "post-reset Workflow fast-forward requires an ID and positive duration"
+			}
+		}
+	case .Invalid:
+		return "post-reset operation kind is invalid"
+	}
+	return ""
+}
+
+Post_Reset_Proto_Storage :: struct {
+	operations:             [dynamic]proto.Temporal_Api_Workflow_V1_PostResetOperation,
+	signals:                []proto.Temporal_Api_Workflow_V1_PostResetOperation_SignalWorkflow,
+	signal_inputs:          []proto.Temporal_Api_Common_V1_Payloads,
+	signal_payloads:        [][]proto.Temporal_Api_Common_V1_Payload,
+	signal_headers:         []proto.Temporal_Api_Common_V1_Header,
+	signal_header_payloads: [][]proto.Temporal_Api_Common_V1_Payload,
+	updates:                []proto.Temporal_Api_Workflow_V1_PostResetOperation_UpdateWorkflowOptions,
+	workflow_options:       []proto.Temporal_Api_Workflow_V1_WorkflowExecutionOptions,
+	update_masks:           []proto.Google_Protobuf_FieldMask,
+	versioning_overrides:   []proto.Temporal_Api_Workflow_V1_VersioningOverride,
+	pinned_overrides:       []proto.Temporal_Api_Workflow_V1_VersioningOverride_PinnedOverride,
+	one_time_overrides:     []proto.Temporal_Api_Workflow_V1_VersioningOverride_OneTimeOverride,
+	deployment_versions:    []proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion,
+	priorities:             []proto.Temporal_Api_Common_V1_Priority,
+	time_skipping_configs:  []proto.Temporal_Api_Common_V1_TimeSkippingConfig,
+	fast_forward_configs:   []proto.Temporal_Api_Common_V1_FastForwardConfig,
+	fast_forward_durations: []proto.Google_Protobuf_Duration,
+	links:                  Encoded_Link_Storage,
+}
+
+post_reset_proto_storage_make :: proc(operations: []Post_Reset_Operation) -> Post_Reset_Proto_Storage {
+	count := len(operations)
+	link_count := 0
+	for operation in operations {
+		if operation.kind == .Signal_Workflow do link_count += len(operation.signal_workflow.links)
+	}
+	return {
+		operations = make([dynamic]proto.Temporal_Api_Workflow_V1_PostResetOperation, 0, count),
+		signals = make([]proto.Temporal_Api_Workflow_V1_PostResetOperation_SignalWorkflow, count),
+		signal_inputs = make([]proto.Temporal_Api_Common_V1_Payloads, count),
+		signal_payloads = make([][]proto.Temporal_Api_Common_V1_Payload, count),
+		signal_headers = make([]proto.Temporal_Api_Common_V1_Header, count),
+		signal_header_payloads = make([][]proto.Temporal_Api_Common_V1_Payload, count),
+		updates = make([]proto.Temporal_Api_Workflow_V1_PostResetOperation_UpdateWorkflowOptions, count),
+		workflow_options = make([]proto.Temporal_Api_Workflow_V1_WorkflowExecutionOptions, count),
+		update_masks = make([]proto.Google_Protobuf_FieldMask, count),
+		versioning_overrides = make([]proto.Temporal_Api_Workflow_V1_VersioningOverride, count),
+		pinned_overrides = make([]proto.Temporal_Api_Workflow_V1_VersioningOverride_PinnedOverride, count),
+		one_time_overrides = make([]proto.Temporal_Api_Workflow_V1_VersioningOverride_OneTimeOverride, count),
+		deployment_versions = make([]proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion, count),
+		priorities = make([]proto.Temporal_Api_Common_V1_Priority, count),
+		time_skipping_configs = make([]proto.Temporal_Api_Common_V1_TimeSkippingConfig, count),
+		fast_forward_configs = make([]proto.Temporal_Api_Common_V1_FastForwardConfig, count),
+		fast_forward_durations = make([]proto.Google_Protobuf_Duration, count),
+		links = encoded_link_storage_make(link_count),
+	}
+}
+
+post_reset_proto_storage_free :: proc(storage: ^Post_Reset_Proto_Storage) {
+	if storage == nil do return
+	for index in 0..<len(storage.signals) {
+		free_start_proto_payloads(storage.signal_payloads[index])
+		free_start_proto_payloads(storage.signal_header_payloads[index])
+		delete(storage.signal_inputs[index].payloads)
+		delete(storage.signal_headers[index].fields)
+		delete(storage.signals[index].links)
+		delete(storage.update_masks[index].paths)
+	}
+	delete(storage.operations)
+	delete(storage.signals)
+	delete(storage.signal_inputs)
+	delete(storage.signal_payloads)
+	delete(storage.signal_headers)
+	delete(storage.signal_header_payloads)
+	delete(storage.updates)
+	delete(storage.workflow_options)
+	delete(storage.update_masks)
+	delete(storage.versioning_overrides)
+	delete(storage.pinned_overrides)
+	delete(storage.one_time_overrides)
+	delete(storage.deployment_versions)
+	delete(storage.priorities)
+	delete(storage.time_skipping_configs)
+	delete(storage.fast_forward_configs)
+	delete(storage.fast_forward_durations)
+	encoded_link_storage_free(&storage.links)
+	storage^ = {}
+}
+
+post_reset_operations_encode :: proc(
+	operations: []Post_Reset_Operation,
+	storage: ^Post_Reset_Proto_Storage,
+) -> Error {
+	if storage == nil {
+		return error_from_string(.Invalid_Argument, "post-reset protobuf storage is missing")
+	}
+	for operation, index in operations {
+		if message := post_reset_operation_error(operation); len(message) > 0 {
+			return error_from_string(.Invalid_Argument, message)
+		}
+		switch operation.kind {
+		case .Signal_Workflow:
+			source := operation.signal_workflow
+			signal := &storage.signals[index]
+			signal.signal_name = source.signal_name
+			if len(source.inputs) > 0 {
+				storage.signal_payloads[index] = make(
+					[]proto.Temporal_Api_Common_V1_Payload,
+					len(source.inputs),
+				)
+				for input, input_index in source.inputs {
+					storage.signal_payloads[index][input_index] = proto.encode_payload(input)
+					append(&storage.signal_inputs[index].payloads, storage.signal_payloads[index][input_index])
+				}
+				signal.input = &storage.signal_inputs[index]
+			}
+			if source.headers != nil && len(source.headers.entries) > 0 {
+				storage.signal_header_payloads[index] = make(
+					[]proto.Temporal_Api_Common_V1_Payload,
+					len(source.headers.entries),
+				)
+				for &entry, header_index in source.headers.entries {
+					storage.signal_header_payloads[index][header_index] = proto.encode_payload(
+						codec.payload_view(&entry.payload),
+					)
+				}
+				for entry, header_index in source.headers.entries {
+					append(&storage.signal_headers[index].fields, proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+						key = entry.key,
+						value = &storage.signal_header_payloads[index][header_index],
+					})
+				}
+				signal.header = &storage.signal_headers[index]
+			}
+			for link in source.links do append(&signal.links, encode_link(link, &storage.links))
+			append(&storage.operations, proto.Temporal_Api_Workflow_V1_PostResetOperation{
+				variant = proto.Temporal_Api_Workflow_V1_PostResetOperation_Variant_Signal_Workflow{
+					value = signal,
+				},
+			})
+		case .Update_Workflow_Options:
+			source := operation.update_workflow_options
+			update := &storage.updates[index]
+			options := &storage.workflow_options[index]
+			for path in source.update_mask do append(&storage.update_masks[index].paths, path)
+			update.workflow_execution_options = options
+			update.update_mask = &storage.update_masks[index]
+			if source.versioning_override != nil {
+				override := source.versioning_override
+				version := &storage.deployment_versions[index]
+				version.deployment_name = override.deployment_name
+				version.build_id = override.build_id
+				switch override.kind {
+				case .Pinned:
+					pinned := &storage.pinned_overrides[index]
+					pinned.behavior = .PINNED_OVERRIDE_BEHAVIOR_PINNED
+					if len(override.deployment_name) > 0 do pinned.version = version
+					storage.versioning_overrides[index].override = proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_Pinned{
+						value = pinned,
+					}
+				case .Auto_Upgrade:
+					storage.versioning_overrides[index].override = proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_Auto_Upgrade{
+						value = true,
+					}
+				case .One_Time:
+					one_time := &storage.one_time_overrides[index]
+					one_time.target_deployment_version = version
+					storage.versioning_overrides[index].override = proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_One_Time{
+						value = one_time,
+					}
+				case .Unspecified:
+				}
+				options.versioning_override = &storage.versioning_overrides[index]
+			}
+			if source.priority != nil {
+				storage.priorities[index] = {
+					priority_key = source.priority.priority_key,
+					fairness_key = source.priority.fairness_key,
+					fairness_weight = source.priority.fairness_weight,
+				}
+				options.priority = &storage.priorities[index]
+			}
+			if source.time_skipping_config != nil {
+				config := source.time_skipping_config
+				storage.time_skipping_configs[index] = {
+					enabled = config.enabled,
+					disable_propagation = config.disable_propagation,
+					max_session_skip_count = config.max_session_skip_count,
+				}
+				if config.fast_forward != nil {
+					storage.fast_forward_durations[index] = duration_proto(config.fast_forward.duration)
+					storage.fast_forward_configs[index] = {
+						id = config.fast_forward.id,
+						duration = &storage.fast_forward_durations[index],
+					}
+					storage.time_skipping_configs[index].fast_forward_config = &storage.fast_forward_configs[index]
+				}
+				options.time_skipping_config = &storage.time_skipping_configs[index]
+			}
+			append(&storage.operations, proto.Temporal_Api_Workflow_V1_PostResetOperation{
+				variant = proto.Temporal_Api_Workflow_V1_PostResetOperation_Variant_Update_Workflow_Options{
+					value = update,
+				},
+			})
+		case .Invalid:
+		}
+	}
+	return {}
+}
+
 encode_reset_workflow_request :: proc(
 	namespace, identity, workflow_id, run_id: string,
 	options: Reset_Workflow_Options,
@@ -3126,6 +3484,15 @@ encode_reset_workflow_request :: proc(
 		}
 		append(&exclude_types, proto_type)
 	}
+	post_reset_storage := post_reset_proto_storage_make(options.post_reset_operations)
+	defer post_reset_proto_storage_free(&post_reset_storage)
+	post_reset_error := post_reset_operations_encode(
+		options.post_reset_operations,
+		&post_reset_storage,
+	)
+	if post_reset_error.message != nil {
+		return nil, post_reset_error
+	}
 	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
 		workflow_id = workflow_id,
 		run_id = run_id,
@@ -3138,6 +3505,7 @@ encode_reset_workflow_request :: proc(
 		workflow_task_finish_event_id = options.workflow_task_finish_event_id,
 		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
 		reset_reapply_exclude_types = exclude_types,
+		post_reset_operations = post_reset_storage.operations,
 		identity = identity,
 	}
 	return proto.encode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest(

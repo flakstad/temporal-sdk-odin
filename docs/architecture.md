@@ -371,14 +371,25 @@ encodes the selected Workflow/run, positive Workflow Task boundary event ID,
 reason, request ID, client identity, and the modern repeated
 `ResetReapplyExcludeType` list. It leaves the deprecated `reset_reapply_type`
 field unset; the pinned schema documents signal reapplication as that field's
-compatibility default. `PostResetOperation` is present in the generated raw
-schema but is not yet exposed by the language-facing options. The Service
+compatibility default. The language-facing `Post_Reset_Operation` covers both
+pinned union arms. Signal operations borrow an ordered Payload list, Headers,
+and generic Links. Workflow-option operations pair an explicit `FieldMask` with
+nullable versioning override, priority, and time-skipping values; a masked nil
+pointer requests that Server clear the field. Pinned, Auto-Upgrade, and one-time
+deployment routing overrides encode through the modern oneof rather than its
+deprecated compatibility fields. The Service
 terminates the current run, creates the replacement run, and returns its Run
 ID. Odin decodes that response in a temporary arena and clones the IDs into a
 new owned `Workflow_Handle`; the input handle is borrowed and unchanged. The
 live CLI-devserver case resets a completed repeated-argument Workflow at event
 4, runs the replacement through the ordinary Core worker path, and requires the
-same typed result from the new Run ID. No C ABI symbol was added: this is exact
+same typed result from the new Run ID. A focused Server 1.32.0 run additionally
+sets priority 2 atomically, observes
+`WORKFLOW_EXECUTION_OPTIONS_UPDATED` in the new history before its first new
+Workflow Task, and reads the priority back through Describe. The same server
+rejects the schema-present Signal arm with `INVALID_ARGUMENT` and
+`unsupported post reset operation`; that arm therefore has exact wire/order
+coverage but is not advertised as live-capable. No C ABI symbol was added: this is exact
 WorkflowService protobuf generation above Core's generic RPC dispatcher.
 
 `client.Client` heap-owns a stable Core runtime and connection because
@@ -2886,10 +2897,12 @@ live-proven, and covered by typed Client outbound interceptors. Its typed
 Start/Describe data surface is also implemented; the Server 1.32 persistence
 and terminal-token limitations above remain explicit. Core log forwarding is
 now exposed with copied callback-scoped records and a lifecycle-tested
-process-wide route. The next smallest Client completeness milestone is exposing
-the pinned `PostResetOperation` union in Workflow reset options, then proving
-the supported post-reset operation through the CLI dev server without changing
-the existing reset defaults.
+process-wide route. Workflow reset now exposes both `PostResetOperation` arms,
+with atomic priority update proven on Server 1.32 and the unsupported Signal arm
+called out explicitly. The next smallest Client completeness milestone is the
+ordinary `UpdateWorkflowExecutionOptions` RPC, reusing the same validated
+versioning/priority/time-skipping model outside Reset and verifying read-back
+through Describe.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 

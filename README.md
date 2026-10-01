@@ -1016,6 +1016,15 @@ raw_update, err := temporal_client.start_update_payloads_with_options(
 defer temporal_client.update_handle_free(&raw_update)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 
+priority := temporal_client.Priority{priority_key = 2}
+priority_path := [?]string{"priority"}
+post_reset := [?]temporal_client.Post_Reset_Operation{{
+    kind = .Update_Workflow_Options,
+    update_workflow_options = {
+        update_mask = priority_path[:],
+        priority = &priority,
+    },
+}}
 reset_handle, err := temporal_client.reset_workflow(
     &handle,
     {
@@ -1025,6 +1034,7 @@ reset_handle, err := temporal_client.reset_workflow(
             .Updates,
             .Nexus,
         },
+        post_reset_operations = post_reset[:],
     },
 )
 defer temporal_client.workflow_handle_free(&reset_handle)
@@ -1067,11 +1077,17 @@ calls generate UUIDv4 request IDs unless the caller supplies one. A successful
 reset returns a new owned Workflow handle containing the new Run ID; it does not
 mutate the source handle. The reset point must be a Workflow Task completion,
 timeout, failure, or start event. The current surface supports the modern
-signal/Update/Nexus reapply-exclusion list. It deliberately leaves the
-deprecated positive reapply mode unset and does not yet expose post-reset
-operations. With an empty exclusion list, the pinned Temporal API documents
-signal reapplication as the compatibility default. Termination has plain,
-Payload, and typed JSON detail variants.
+signal/Update/Nexus reapply-exclusion list and both pinned
+`PostResetOperation` variants. Post-reset Signals carry ordered codec-neutral
+Payloads, Headers, and all six Link variants. Atomic Workflow-option updates
+use an explicit field mask and can set or clear versioning override, priority,
+and time-skipping configuration. It deliberately leaves the deprecated positive
+reapply mode unset. With an empty exclusion list, the pinned Temporal API
+documents signal reapplication as the compatibility default. Server 1.32
+live-proves post-reset priority updates but rejects the schema-present Signal
+variant as unsupported; its wire contract is unit- and property-tested until
+the Service implements it. Termination has plain, Payload, and typed JSON
+detail variants.
 
 The combined example now uses the reusable registration boundary:
 
