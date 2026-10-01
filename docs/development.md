@@ -741,6 +741,24 @@ also cover incomplete policy rejection and a semaphore-controlled pool drain.
 Workflow callbacks are excluded: an infinite Workflow invocation cannot yield
 to Core, so process supervision remains the only sound containment boundary.
 
+### Workflow process crash and replacement
+
+The external process contract is specified in
+[`supervision.md`](supervision.md). Its focused acceptance test is:
+
+```bash
+./scripts/workflow-crash-integration-test.sh
+```
+
+The first Odin Worker completes the initial Workflow Task and suspends a
+condition Workflow without any in-process continuation being durable. The test
+then sends `SIGKILL`, verifies that the CLI result wait remains open, and starts
+an identical Worker on the same unique task queue. After a Signal, the
+replacement must log a replay activation that reconstructs the waiting
+condition, process the new activation, and complete. This proves Server-owned
+durability and fresh-fiber reconstruction across abrupt process loss; it does
+not provide in-process panic recovery or an SDK-managed subprocess executor.
+
 Workflows have the corresponding registration levels:
 
 ```odin

@@ -3047,7 +3047,8 @@ Workflows are enabled.
    bounds the completion-handoff route set to four, and drains cleanly. A live
    shutdown case also validates the configurable grace delay, concurrent
    heartbeats, exact Core cancellation flags, completion flush, and clean
-   finalization. Activity-only process crash/replacement is live-proven; the
+   finalization. Activity-only process crash/replacement and suspended Workflow
+   process loss/replay on an identical replacement Worker are live-proven. The
    remaining concurrency risks are mixed-process panic containment, infinite
    Workflow code, and process-level recovery after an uncooperative callback
    notification.
@@ -3197,11 +3198,12 @@ wire-tested, and live-proven against Server 1.32. This completes the pinned
 standalone Activity client family. The next vertical milestone should return
 to production hardening of the Workflow runtime: isolate an uncooperative or
 panicking Workflow execution at a process boundary while preserving Core's
-task/completion lifecycle. A smaller precursor is a documented external-worker
-supervision contract and crash/restart acceptance test; an SDK-managed process
-pool should follow only if that evidence justifies the added runtime. Infinite
-Workflow code and SDK-managed subprocess execution remain process-boundary
-work. The capability inventory is now a
+task/completion lifecycle. The smaller precursor—an external-worker supervision
+contract plus an abrupt crash/restart acceptance test—is now documented and
+live-proven for a suspended Workflow. An SDK-managed process pool should follow
+only if this evidence justifies the added runtime. Infinite Workflow code and
+SDK-managed subprocess execution remain process-boundary work. The capability
+inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and

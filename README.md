@@ -471,8 +471,13 @@ deployment boundary: run Activities in an Activity-only Odin worker process
 under a supervisor. `./scripts/activity-panic-integration-test.sh` deliberately
 traps that process on attempt 1, starts a replacement Odin worker, and requires
 Temporal to redeliver attempt 2 and complete the still-running Workflow. A
-mixed Workflow/Activity process is not protected by this pattern, and the SDK
-does not yet manage a subprocess executor itself. Canceling a Client wait does not cancel an
+mixed Workflow/Activity process is not protected by this pattern. Suspended
+Workflow recovery is also live-proven: `./scripts/workflow-crash-integration-test.sh`
+kills the whole Worker after a committed Workflow Task, starts an identical
+replacement, and requires fresh-stack history replay plus Signal-driven
+completion. The production supervisor contract is documented in
+[`docs/supervision.md`](docs/supervision.md). The SDK does not yet manage a
+subprocess executor itself. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
 
