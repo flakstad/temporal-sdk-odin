@@ -27,6 +27,38 @@ TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" \
   "$repo_root/scripts/build-examples.sh"
 
 install_dir="${lib_dir%/lib}"
+target="$(basename "$install_dir")"
+fiber_library="$lib_dir/libtemporal_odin_fiber.a"
+case "$target" in
+  macos-*)
+    core_library="$lib_dir/libtemporalio_sdk_core_c_bridge.dylib"
+    invalid_core="$test_root/invalid-install-name.dylib"
+    cp "$core_library" "$invalid_core"
+    install_name_tool -id /tmp/libtemporalio_sdk_core_c_bridge.dylib "$invalid_core"
+    if "$repo_root/scripts/verify-native-link-policy.sh" \
+      "$target" "$invalid_core" "$fiber_library" >/dev/null 2>&1; then
+      echo "Native link policy accepted an absolute macOS install ID" >&2
+      exit 1
+    fi
+    ;;
+  linux-arm64)
+    core_library="$lib_dir/libtemporalio_sdk_core_c_bridge.so"
+    if "$repo_root/scripts/verify-native-link-policy.sh" \
+      linux-x86_64 "$core_library" "$fiber_library" >/dev/null 2>&1; then
+      echo "Native link policy accepted the wrong Linux architecture" >&2
+      exit 1
+    fi
+    ;;
+  linux-x86_64)
+    core_library="$lib_dir/libtemporalio_sdk_core_c_bridge.so"
+    if "$repo_root/scripts/verify-native-link-policy.sh" \
+      linux-arm64 "$core_library" "$fiber_library" >/dev/null 2>&1; then
+      echo "Native link policy accepted the wrong Linux architecture" >&2
+      exit 1
+    fi
+    ;;
+esac
+
 mv "$install_dir/README.md" "$install_dir/README.md.missing"
 if "$repo_root/scripts/install-native-package.sh" "$archive" "$test_root/install" >/dev/null 2>&1; then
   echo "Native package installer accepted an incomplete existing installation" >&2

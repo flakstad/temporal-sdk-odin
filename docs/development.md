@@ -154,7 +154,20 @@ explicit second argument to select another install root. The installer is
 idempotent for byte-identical content and refuses to overwrite an existing
 partial or different package. `scripts/native-package-integration-test.sh`
 proves install/reinstall, the full unit/property suites, all example links, and
-rejection of a deliberately wrong Core pin. CI runs it for every target.
+rejection of a deliberately wrong Core pin. It also mutates or mismatches a
+packaged library to prove that the loader-policy gate fails closed. CI runs it
+for every target.
+
+Every verified package is inspected by
+`scripts/verify-native-link-policy.sh`. On macOS, the Core dylib must be thin
+for the declared architecture, identify itself as
+`@rpath/libtemporalio_sdk_core_c_bridge.dylib`, contain no `LC_RPATH`, retain a
+valid linker signature, and depend only on Apple system libraries/frameworks.
+On Linux, it must have the declared ELF machine and exact bridge SONAME, contain
+no RPATH/RUNPATH, and use only the allowlisted glibc-era system libraries. The
+single real object in the static fiber archive must match the same architecture
+on both platforms. The application—not the artifact—chooses its runtime search
+path.
 
 `.github/workflows/ci.yml` runs the full unit/property suite, builds all
 examples, packages, and smoke-tests on macOS arm64/x86_64 and Linux glibc

@@ -142,4 +142,7 @@ if [[ "$smoke" == "--smoke" ]]; then
     -extra-linker-flags:"-L$package_root/lib -Wl,-rpath,$package_root/lib"
 fi
 
+"$repo_root/scripts/verify-native-link-policy.sh" \
+  "$target" "$core_path" "$fiber_path"
+
 echo "Verified native package target=$target core=$(manifest_value sdk_core_version) commit=$sdk_core_commit"

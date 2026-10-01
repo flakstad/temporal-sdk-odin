@@ -1146,8 +1146,12 @@ The distribution plan, with its current status, is:
 4. Partial: a verified local archive installer selects the current host and
    exact Core pin into an immutable revision/target path; remote release
    discovery/download is still pending.
-5. Partial: set `@rpath` on macOS and supply an application rpath on Linux;
-   complete `otool -L`/`readelf -d` policy checks on all hosted targets.
+5. Done in the package gate: macOS requires the exact `@rpath` install name,
+   a thin target-architecture dylib, no embedded `LC_RPATH`, a valid linker
+   signature, and system-only dependencies. Linux requires the exact SONAME,
+   target ELF machine, no embedded RPATH/RUNPATH, and an allowlisted glibc
+   dependency set. The static fiber object must match the package architecture.
+   The consuming application still supplies the runtime search path.
 6. Defined in CI: run ABI and init/shutdown smoke tests on every artifact;
    retain the deeper CLI-devserver suite as a separate integration gate.
 
@@ -1163,6 +1167,11 @@ that directory through `TEMPORAL_ODIN_NATIVE_LIB_DIR`, runs the full
 unit/property suites, and relinks every example without a Core Cargo build; it
 also rejects a deliberately wrong revision. The four CI jobs run the same
 install/consume test.
+`scripts/verify-native-link-policy.sh` independently audits the native loader
+contract with `otool`/`lipo`/`codesign` on macOS and `readelf` on Linux, plus
+`ar` for the static fiber shim. This prevents a package from carrying a build
+tree install name, the wrong architecture, an unexpected shared dependency, or
+an embedded library search path even when its checksums and ABI smoke test pass.
 The explicit `native/sdk-core-revision.txt` pin also lets the build work from a
 complete source archive where Git submodule metadata is unavailable.
 

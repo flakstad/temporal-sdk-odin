@@ -66,3 +66,12 @@ The installer first enforces the current host target and this checkout's exact
 installation returns the same `lib` directory; existing different or corrupt
 contents are rejected rather than replaced. This prevents generated Odin
 protobuf/raw ABI code from silently linking a different Core bridge.
+
+Verification also enforces the loader contract. macOS packages contain a thin
+dylib with the exact `@rpath` install name, no embedded `LC_RPATH`, a valid
+linker signature, and only system dependencies. Linux packages contain the
+declared ELF architecture and exact SONAME, no RPATH/RUNPATH, and only the
+allowlisted system dependencies. The static fiber archive is checked for one
+path-free object of the same architecture. These checks intentionally leave
+runtime library discovery to the consuming executable's rpath or deployment
+environment.

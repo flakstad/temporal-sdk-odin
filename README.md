@@ -842,6 +842,11 @@ changes, and a C header that differs from the checked-out bridge. Reinstalling
 the identical immutable package is idempotent; an incomplete or different
 package at the same revision/target path is never overwritten.
 
+Package verification also rejects a wrong native architecture, nonportable
+Core install name/SONAME, embedded library search paths, unexpected shared
+dependencies, and a mismatched fiber object. The final executable supplies the
+runtime search path to the immutable package directory.
+
 In one terminal, start the recommended local development server:
 
 ```bash
