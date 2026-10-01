@@ -20,6 +20,24 @@ Start_State :: struct {
 	farewell_error: temporal_client.Error,
 }
 
+Observation_Stats :: struct {
+	timer_commands_with_sequence: int,
+	timer_commands_without_sequence: int,
+}
+
+observations: Observation_Stats
+
+observe_activation :: proc(processed: ^workflow.Process_Result) {
+	if processed == nil || !processed.started_timer {
+		return
+	}
+	if processed.timer_seq == 0 {
+		observations.timer_commands_without_sequence += 1
+		return
+	}
+	observations.timer_commands_with_sequence += 1
+}
+
 start_when_ready :: proc(user_data: rawptr) -> bool {
 	state := cast(^Start_State)user_data
 	common_options := temporal_client.Start_Workflow_Options{
@@ -200,6 +218,7 @@ run :: proc() -> int {
 		max_workflow_executions = 2,
 		workflow_activation_processor = workflow_isolate.manager_process_activation,
 		workflow_activation_processor_data = &executor_manager,
+		on_workflow_activation = observe_activation,
 		on_ready = start_when_ready,
 		on_ready_data = &start,
 	})
@@ -255,6 +274,7 @@ run :: proc() -> int {
 	}
 	expected_graceful_shutdowns := expected_generations - expected_activation_failures + 1
 	expected_incremental_activations := 2
+	expected_timer_sequences := cache_mode == "sticky" ? 2 : 4
 	if greeting_result != "Hello from an isolated Workflow, Odin" ||
 	   farewell_result.message != "Goodbye from the shared registry, Odin" ||
 	   farewell_result.code != 42 || run_stats.workflow_executions_completed != 2 ||
@@ -270,9 +290,11 @@ run :: proc() -> int {
 	   manager_stats.shutdown_timeouts != 0 ||
 	   manager_stats.crash_loop_rejections != 0 ||
 	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
+	   observations.timer_commands_with_sequence != expected_timer_sequences ||
+	   observations.timer_commands_without_sequence != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
@@ -294,12 +316,15 @@ run :: proc() -> int {
 			manager_stats.crash_loop_rejections,
 			manager_stats.capacity_rejections,
 			manager_stats.protocol_failures,
+			observations.timer_commands_with_sequence,
+			expected_timer_sequences,
+			observations.timer_commands_without_sequence,
 			workflow_isolate.manager_route_count(&executor_manager),
 		)
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d missing_timer_sequences=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
@@ -322,6 +347,8 @@ run :: proc() -> int {
 		manager_stats.aborted_children,
 		manager_stats.capacity_rejections,
 		manager_stats.protocol_failures,
+		observations.timer_commands_with_sequence,
+		observations.timer_commands_without_sequence,
 	)
 	return 0
 }

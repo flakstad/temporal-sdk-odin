@@ -9,7 +9,7 @@ import "core:mem"
 import "core:os"
 
 MAGIC :: u32(0x544f4953) // "TOIS": Temporal Odin isolation stream.
-VERSION :: u16(2)
+VERSION :: u16(3)
 HEADER_SIZE :: 24
 
 Kind :: enum u16 {
@@ -20,6 +20,7 @@ Kind :: enum u16 {
 	Executor_Error         = 5,
 	Manifest_Request       = 6,
 	Manifest               = 7,
+	Completion_Metadata    = 8,
 }
 
 Error_Kind :: enum {
@@ -80,7 +81,7 @@ owned_frame_free :: proc(frame: ^Owned_Frame) {
 kind_valid :: proc(kind: Kind) -> bool {
 	switch kind {
 	case .Activation, .Completion, .Shutdown, .Shutdown_Acknowledged, .Executor_Error,
-	     .Manifest_Request, .Manifest:
+	     .Manifest_Request, .Manifest, .Completion_Metadata:
 		return true
 	}
 	return false
@@ -98,7 +99,8 @@ frame_validate :: proc(frame: Frame, limits := DEFAULT_LIMITS) -> Error {
 	if !kind_valid(frame.kind) {
 		return {kind = .Invalid_Kind}
 	}
-	if frame.kind == .Activation || frame.kind == .Completion {
+	if frame.kind == .Activation || frame.kind == .Completion ||
+	   frame.kind == .Completion_Metadata {
 		if len(frame.run_id) == 0 || len(frame.payload) == 0 {
 			return {kind = .Invalid_Argument}
 		}

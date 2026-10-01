@@ -75,18 +75,21 @@ if [[ "$cache_mode" == "sticky" ]]; then
   grep -q 'graceful_shutdowns=3' <<<"$output"
   grep -q 'manifest_handshakes=4' <<<"$output"
   grep -q 'incremental_activations=2' <<<"$output"
+  grep -q 'timer_sequences=2' <<<"$output"
 else
   grep -q 'generations=5' <<<"$output"
   grep -q 'evictions=5' <<<"$output"
   grep -q 'graceful_shutdowns=5' <<<"$output"
   grep -q 'manifest_handshakes=6' <<<"$output"
   grep -q 'incremental_activations=2' <<<"$output"
+  grep -q 'timer_sequences=4' <<<"$output"
 fi
 grep -q 'manifest_mismatches=0' <<<"$output"
 grep -q 'shutdown_timeouts=0' <<<"$output"
 grep -q 'crash_loop_rejections=0' <<<"$output"
 grep -q 'capacity_rejections=0' <<<"$output"
 grep -q 'protocol_failures=0' <<<"$output"
+grep -q 'missing_timer_sequences=0' <<<"$output"
 if [[ "$first_mode" == "crash" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"

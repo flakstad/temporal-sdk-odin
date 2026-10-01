@@ -163,6 +163,30 @@ exchange :: proc(
 		fmt.eprintf("Could not send activation %d: %v\n", request_id, write_error.kind)
 		return
 	}
+	metadata_frame, metadata_read_error := workflow_isolate.read(output)
+	defer workflow_isolate.owned_frame_free(&metadata_frame)
+	if metadata_read_error.kind != .None {
+		fmt.eprintf("Could not read completion metadata %d: %v\n", request_id, metadata_read_error.kind)
+		return
+	}
+	if metadata_frame.frame.kind == .Executor_Error {
+		fmt.eprintf("Executor rejected activation %d: %s\n", request_id, string(metadata_frame.frame.payload))
+		return {}, false
+	}
+	if metadata_frame.frame.kind != .Completion_Metadata ||
+	   metadata_frame.frame.request_id != request_id ||
+	   !bytes.equal(metadata_frame.frame.run_id, transmute([]u8)string(RUN_ID)) {
+		fmt.eprintf("Executor returned mismatched completion metadata for activation %d\n", request_id)
+		return {}, false
+	}
+	metadata, metadata_ok := workflow_isolate.process_result_metadata_decode(
+		metadata_frame.frame.payload,
+	)
+	if !metadata_ok {
+		fmt.eprintf("Executor returned malformed completion metadata for activation %d\n", request_id)
+		return {}, false
+	}
+	workflow_isolate.process_result_metadata_free(&metadata)
 	read_error: workflow_isolate.Error
 	response, read_error = workflow_isolate.read(output)
 	if read_error.kind != .None {

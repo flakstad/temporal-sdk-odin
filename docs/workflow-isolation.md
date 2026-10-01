@@ -58,14 +58,15 @@ Every frame has this big-endian header:
 | Offset | Width | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `TOIS` |
-| 4 | 2 | protocol version, currently `2` |
+| 4 | 2 | protocol version, currently `3` |
 | 6 | 2 | message kind |
 | 8 | 8 | request/correlation ID |
 | 16 | 4 | run-ID byte length |
 | 20 | 4 | payload byte length |
 
-The body is the run ID followed by the payload. `Activation` and `Completion`
-frames require both fields. Shutdown frames require neither. The default
+The body is the run ID followed by the payload. `Activation`,
+`Completion_Metadata`, and `Completion` frames require both fields. Shutdown
+frames require neither. The default
 decoder rejects run IDs over 1 KiB, payloads over 32 MiB, unknown kinds,
 unsupported versions, truncation, and trailing bytes before allocating or
 dispatching runtime work. Binary payloads and embedded zero bytes are preserved.
@@ -143,6 +144,17 @@ Every per-task child repeats the correlated handshake before receiving its first
 activation, covering a replaced or inconsistent executable after preflight.
 Malformed or mismatched manifests are protocol failures and the child is reaped.
 
+Protocol version 3 adds one `Completion_Metadata` frame immediately before each
+opaque Core `Completion`. Its payload is an internal JSON encoding of the
+child's complete `workflow.Process_Result`, except that `completion` and
+`run_id` are deliberately omitted: the following protobuf completion and the
+correlated frame run ID remain authoritative. The parent decodes the metadata,
+checks its activation-failure and terminal-command flags against the protobuf,
+then supplies all language-runtime counters, wait state, cancellation detail,
+and owned error text to the ordinary Worker observer/statistics path. A
+metadata mismatch is a protocol failure; metadata can never change commands
+submitted to Core.
+
 ## Core-integrated cache proofs
 
 The online Worker now has an experimental `workflow_activation_processor`
@@ -211,6 +223,12 @@ manifest, and then:
    `{"message":"Goodbye from the shared registry, Odin","code":42}` from the
    Temporal Service.
 
+The parent observer also requires a non-zero child-reported `timer_seq` for
+every `StartTimer`. That sequence is not reconstructed from the Core completion
+by the parent, so this is live evidence that v3 observation metadata crosses
+the process boundary. The zero-cache path observes four such commands because
+both timer schedules are replayed; sticky mode observes two.
+
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
 capacity, shutdown, crash-loop, or protocol failures. The observed
@@ -252,6 +270,13 @@ history drive a fresh Odin runtime. Temporal remains the durable state owner.
   `owned_frame_free`.
 - The callback returns an owned completion buffer. `worker.run` submits it to
   Core and deletes it after the synchronous bridge call returns.
+- The child metadata encoder borrows `Process_Result` only for synchronous JSON
+  encoding. The parent decoder owns its error bytes and cancellation-reason
+  string. The returned Worker result owns the error bytes; the manager retains
+  the cancellation-reason allocation until the next serial activation or
+  `manager_close`, matching the callback's borrowed-field lifetime.
+- Replay flag, history length, eviction status, and reported run ID continue to
+  come from the parent-decoded activation/route, not child metadata.
 - Every started child is reaped. Normal eviction uses a correlated shutdown
   handshake; EOF/protocol failure closes pipes, kills only when necessary, and
   waits for the process.
@@ -294,15 +319,12 @@ still required:
 - configure replay-aware logs, metrics, interceptors, and diagnostics in the
   executor host and carry observations back without letting them affect
   commands;
-- preserve the complete `Process_Result` observation metadata across the
-  boundary (the current parent reconstructs only terminal commands, timer
-  starts, replay, history length, activation failure, and eviction);
 - prove nondeterminism and malformed/late child completions against
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
 The next discriminating vertical slice is executor-host observability and
 configuration: replay-aware logging, metrics, and interceptor installation must
-run in the child while observations cross back without affecting deterministic
-commands. Complete `Process_Result` observation metadata and malformed/late
-completion tests remain part of that hardening.
+run in the child, while their diagnostic events cross back independently of
+deterministic commands. Malformed/late completion tests remain part of that
+hardening.

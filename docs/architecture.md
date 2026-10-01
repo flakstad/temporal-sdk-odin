@@ -3288,9 +3288,11 @@ immediate rather than deadlocking the serial poll thread; and a cooldown circuit
 breaker bounds consecutive executor failures. Sticky per-run routing with a
 non-zero Core cache is now live-proven: two
 successful children retain two timer Workflows across incremental activations,
-while an initial crash or timeout still evicts and recovers. The next step is
-executor-host observability and complete result metadata. Production hardening
-remains process-boundary work. The
+while an initial crash or timeout still evicts and recovers. Protocol v3 now
+carries the complete language `Process_Result` separately from the authoritative
+opaque Core completion, with live observer evidence for timer sequence fields.
+The next step is executor-host log/metric/interceptor configuration. Production
+hardening remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3886,10 +3888,14 @@ No new C ABI is required. This path depends on the already-pinned bridge calls:
 
 The child protocol carries the Core protobufs opaquely. The parent decodes only
 the routing fields (`run_id`, initialization, eviction, replay flag, history
-length, and Workflow type) and enough completion structure to maintain Worker
-statistics. Core remains responsible for history application and state
-machines; the child owns only the Odin registry, fiber stacks, and
-language-deterministic state for its cache lifetime.
+length, and Workflow type) and terminal completion structure needed to validate
+child observation metadata. Protocol v3 sends a separate JSON
+`Completion_Metadata` frame containing the complete language
+`workflow.Process_Result`, excluding its completion bytes and duplicate run ID.
+The protobuf remains authoritative: inconsistent terminal flags reject the
+session, and metadata never alters commands. Core remains responsible for
+history application and state machines; the child owns only the Odin registry,
+fiber stacks, and language-deterministic state for its cache lifetime.
 
 Native procedure pointers are process-local and are never serialized. The
 application exposes one ordinary Odin registration function and compiles it into
@@ -3907,7 +3913,8 @@ External registrations are metadata-only in the parent and cannot be mixed
 with in-process registrations. An external activation processor is mandatory.
 Parent-side Workflow loggers and interceptors are rejected because the parent
 has no executing runtime; equivalent hooks must eventually be configured on the
-executor host. Protocol version 2 adds an ordered, length-prefixed type manifest.
+executor host. Protocol version 2 adds an ordered, length-prefixed type manifest;
+version 3 adds the correlated observation-metadata frame.
 `manager_verify_host` compares it in a temporary child before polling, and every
 executor generation repeats the correlated handshake before activation. A
 mismatch is therefore rejected and reaped without running Workflow code.
@@ -3956,9 +3963,11 @@ Shutdown deadlines now kill/reap both missing acknowledgements and processes
 that acknowledge but do not exit. Capacity exhaustion fails immediately because
 waiting on the serial activation thread would prevent eviction from releasing a
 slot. A configurable consecutive-failure breaker prevents unbounded respawn and
-admits a trial after cooldown. Executor-host observability hooks and complete
-observation metadata remain process-manager responsibilities, not additional
-Temporal protocol work. See
+admits a trial after cooldown. Complete observation metadata is now preserved
+through the process manager and fed to ordinary Worker statistics/observers;
+the live proof checks child-only timer sequence values in zero- and sticky-cache
+modes. Executor-host log, metric, and interceptor hooks remain language-runtime
+work, not additional Temporal protocol work. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

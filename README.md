@@ -519,8 +519,13 @@ deadline, full capacity rejects without blocking the serial Core poll thread,
 and an optional cooldown circuit breaker bounds consecutive executor failures.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
-timeout recovery still evict and replay safely. It still lacks executor-host
-log/metric/interceptor configuration and production pool hardening.
+timeout recovery still evict and replay safely. Protocol v3 carries the child's
+complete language `Process_Result` in a separate diagnostic frame, validates
+terminal flags against the unchanged Core completion, and restores normal
+Worker statistics/observer visibility. The live proof checks timer sequence
+fields that the parent cannot infer from the completion. It still lacks
+executor-host log/metric/interceptor configuration and production pool
+hardening.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 

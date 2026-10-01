@@ -854,11 +854,18 @@ External and in-process Workflow registrations cannot be mixed on one Worker.
 Workflow loggers and interceptors for external registrations must be configured
 inside the executor host; the parent rejects them rather than silently applying
 them to runtimes that will never execute. Protocol version 2 encodes the ordered
-type-name manifest with explicit lengths. `manager_verify_host` verifies the
+type-name manifest with explicit lengths. Protocol version 3 adds a correlated
+JSON `Completion_Metadata` frame before the opaque protobuf completion. It
+preserves the complete child `Process_Result` for Worker statistics and
+observers; the parent validates terminal flags against the authoritative
+completion and uses activation routing as the source of replay/history/eviction
+fields. `manager_verify_host` verifies the
 ordinary child before `worker.run`, and every task child repeats the handshake
 before its first activation. The zero-cache crash and hang paths each require
 six successful handshakes; sticky mode requires four. All require zero
-mismatches. Executor-host hook configuration remains outstanding.
+mismatches. The live observer requires four non-zero child timer sequences in
+zero-cache replay and two in sticky mode. Executor-host hook configuration
+remains outstanding.
 
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity

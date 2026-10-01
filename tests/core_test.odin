@@ -220,6 +220,104 @@ workflow_isolation_protocol_rejects_corruption_limits_and_invalid_contracts :: p
 }
 
 @(test)
+workflow_isolation_process_metadata_roundtrips_observer_fields :: proc(t: ^testing.T) {
+	result := workflow.Process_Result{
+		completion = make([dynamic]u8),
+		run_id = "excluded-run-id",
+		error = workflow.error_from_string("activation detail"),
+		activation_failed = true,
+		scheduled_activity = true,
+		scheduled_activity_count = 2,
+		scheduled_local_activity_count = 3,
+		scheduled_nexus_operation_count = 4,
+		started_child_workflow_count = 5,
+		signaled_external_workflow_count = 6,
+		requested_external_workflow_cancellation_count = 7,
+		received_signal = true,
+		received_signal_count = 8,
+		signal_handlers_started = 9,
+		signal_handlers_completed = 10,
+		unfinished_signal_handlers = 11,
+		warned_unfinished_signal_handlers = 12,
+		queries_answered = 13,
+		queries_failed = 14,
+		updates_accepted = 15,
+		updates_rejected = 16,
+		updates_completed = 17,
+		unfinished_update_handlers = 18,
+		warned_unfinished_update_handlers = 19,
+		waiting_selector = true,
+		started_timer = true,
+		timer_seq = 20,
+		received_cancellation = true,
+		cancellation_reason = "cancel metadata",
+		requested_activity_cancellation_count = 21,
+		requested_local_activity_cancellation_count = 22,
+		requested_child_workflow_cancellation_count = 23,
+		patch_markers_emitted = 24,
+		deprecated_patch_markers_emitted = 25,
+		search_attribute_upserts = 26,
+		memo_upserts = 27,
+		is_replaying = true,
+		history_length = 28,
+	}
+	defer {
+		delete(result.completion)
+		workflow.error_free(&result.error)
+	}
+	encoded, encode_ok := workflow_isolate.process_result_metadata_encode(&result)
+	testing.expect(t, encode_ok)
+	defer delete(encoded)
+	decoded, decode_ok := workflow_isolate.process_result_metadata_decode(encoded)
+	testing.expect(t, decode_ok)
+	defer workflow_isolate.process_result_metadata_free(&decoded)
+	testing.expect(t, decoded.completion == nil)
+	testing.expect_value(t, decoded.run_id, "")
+	testing.expect_value(t, string(decoded.error.message), "activation detail")
+	testing.expect_value(t, decoded.cancellation_reason, "cancel metadata")
+	testing.expect_value(t, decoded.received_signal_count, 8)
+	testing.expect_value(t, decoded.warned_unfinished_signal_handlers, 12)
+	testing.expect_value(t, decoded.queries_answered, 13)
+	testing.expect_value(t, decoded.updates_completed, 17)
+	testing.expect_value(t, decoded.warned_unfinished_update_handlers, 19)
+	testing.expect_value(t, decoded.requested_local_activity_cancellation_count, 22)
+	testing.expect_value(t, decoded.memo_upserts, 27)
+	testing.expect_value(t, decoded.history_length, u32(28))
+	reencoded, reencode_ok := workflow_isolate.process_result_metadata_encode(&decoded)
+	testing.expect(t, reencode_ok)
+	defer delete(reencoded)
+	testing.expect(t, bytes.equal(encoded, reencoded))
+	frame_error := workflow_isolate.frame_validate({
+		kind = .Completion_Metadata,
+		request_id = 99,
+		run_id = transmute([]u8)string("metadata-run"),
+		payload = encoded,
+	})
+	testing.expect_value(t, frame_error.kind, workflow_isolate.Error_Kind.None)
+	failure := workflow.activation_failure_result("metadata-run", "expected failure")
+	defer {
+		delete(failure.completion)
+		workflow.error_free(&failure.error)
+	}
+	authoritative_metadata := workflow.Process_Result{activation_failed = true}
+	testing.expect(
+		t,
+		workflow_isolate.metadata_matches_completion(
+			&authoritative_metadata,
+			failure.completion[:],
+		),
+	)
+	authoritative_metadata.activation_failed = false
+	testing.expect(
+		t,
+		!workflow_isolate.metadata_matches_completion(
+			&authoritative_metadata,
+			failure.completion[:],
+		),
+	)
+}
+
+@(test)
 workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T) {
 	command := [?]string{"executor", "--child"}
 	manager := workflow_isolate.Manager{}

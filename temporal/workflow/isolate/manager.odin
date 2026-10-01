@@ -209,6 +209,7 @@ Manager :: struct {
 	consecutive_failures: int,
 	last_failure:         time.Tick,
 	report_run_id:      string,
+	report_cancellation_reason: string,
 	stats:              Manager_Stats,
 	initialized:        bool,
 }
@@ -405,6 +406,7 @@ manager_close :: proc(manager: ^Manager) {
 	free_command(&manager.first_command)
 	delete(manager.expected_manifest)
 	delete(manager.report_run_id)
+	delete(manager.report_cancellation_reason)
 	manager^ = {}
 }
 
@@ -706,7 +708,11 @@ session_exchange :: proc(
 	manager: ^Manager,
 	route: ^Executor_Route,
 	activation: []u8,
-) -> (completion: [dynamic]u8, failure: Exchange_Failure) {
+) -> (
+	completion: [dynamic]u8,
+	metadata: workflow.Process_Result,
+	failure: Exchange_Failure,
+) {
 	route.session.request_id += 1
 	request_id := route.session.request_id
 	write_error := write(route.session.input, {
@@ -717,29 +723,62 @@ session_exchange :: proc(
 	})
 	if write_error.kind != .None {
 		if write_error.kind == .IO || write_error.kind == .Truncated {
-			return nil, .Child_Exit
+			return nil, {}, .Child_Exit
 		}
-		return nil, .Protocol
+		return nil, {}, .Protocol
 	}
-	response, read_error, read_failure := read_with_timeout(manager, &route.session)
-	defer owned_frame_free(&response)
+	metadata_response, read_error, read_failure := read_with_timeout(manager, &route.session)
 	if read_failure != .None {
-		return nil, read_failure
+		owned_frame_free(&metadata_response)
+		return nil, {}, read_failure
 	}
 	if read_error.kind != .None {
+		owned_frame_free(&metadata_response)
 		if read_error.kind == .End_Of_Stream || read_error.kind == .IO {
-			return nil, .Child_Exit
+			return nil, {}, .Child_Exit
 		}
-		return nil, .Protocol
+		return nil, {}, .Protocol
+	}
+	if metadata_response.frame.kind != .Completion_Metadata ||
+	   metadata_response.frame.request_id != request_id ||
+	   !bytes.equal(metadata_response.frame.run_id, transmute([]u8)route.run_id) {
+		owned_frame_free(&metadata_response)
+		return nil, {}, .Protocol
+	}
+	decoded_metadata, metadata_ok := process_result_metadata_decode(
+		metadata_response.frame.payload,
+	)
+	owned_frame_free(&metadata_response)
+	if !metadata_ok {
+		return nil, {}, .Protocol
+	}
+	metadata = decoded_metadata
+	response, completion_read_error, completion_read_failure := read_with_timeout(
+		manager,
+		&route.session,
+	)
+	defer owned_frame_free(&response)
+	if completion_read_failure != .None {
+		process_result_metadata_free(&metadata)
+		return nil, {}, completion_read_failure
+	}
+	if completion_read_error.kind != .None {
+		process_result_metadata_free(&metadata)
+		if completion_read_error.kind == .End_Of_Stream ||
+		   completion_read_error.kind == .IO {
+			return nil, {}, .Child_Exit
+		}
+		return nil, {}, .Protocol
 	}
 	if response.frame.kind != .Completion ||
 	   response.frame.request_id != request_id ||
 	   !bytes.equal(response.frame.run_id, transmute([]u8)route.run_id) {
-		return nil, .Protocol
+		process_result_metadata_free(&metadata)
+		return nil, {}, .Protocol
 	}
 	completion = make([dynamic]u8, 0, len(response.frame.payload))
 	append(&completion, ..response.frame.payload)
-	return completion, .None
+	return completion, metadata, .None
 }
 
 inspect_completion :: proc(data: []u8, result: ^workflow.Process_Result) -> bool {
@@ -789,12 +828,45 @@ inspect_completion :: proc(data: []u8, result: ^workflow.Process_Result) -> bool
 set_report_run_id :: proc(manager: ^Manager, run_id: string) -> bool {
 	delete(manager.report_run_id)
 	manager.report_run_id = ""
+	delete(manager.report_cancellation_reason)
+	manager.report_cancellation_reason = ""
 	owned, clone_error := strings.clone(run_id)
 	if clone_error != nil {
 		return false
 	}
 	manager.report_run_id = owned
 	return true
+}
+
+metadata_matches_completion :: proc(
+	metadata: ^workflow.Process_Result,
+	completion: []u8,
+) -> bool {
+	authoritative := workflow.Process_Result{}
+	if !inspect_completion(completion, &authoritative) {
+		return false
+	}
+	return metadata.activation_failed == authoritative.activation_failed &&
+	       metadata.completed == authoritative.completed &&
+	       metadata.canceled_workflow == authoritative.canceled_workflow &&
+	       metadata.continued_as_new == authoritative.continued_as_new &&
+	       metadata.started_timer == authoritative.started_timer
+}
+
+adopt_exchange_result :: proc(
+	manager: ^Manager,
+	metadata: workflow.Process_Result,
+	completion: [dynamic]u8,
+	route: Activation_Route,
+) -> workflow.Process_Result {
+	result := metadata
+	result.completion = completion
+	result.run_id = manager.report_run_id
+	result.is_replaying = route.is_replaying
+	result.history_length = route.history_length
+	result.evicted = route.evicts
+	manager.report_cancellation_reason = result.cancellation_reason
+	return result
 }
 
 failure_result :: proc(manager: ^Manager, run_id, message: string) -> workflow.Process_Result {
@@ -871,13 +943,15 @@ manager_process_activation :: proc(
 		}
 		route := &manager.routes[route_index]
 		if route.state == .Live {
-			completion, exchange_failure := session_exchange(manager, route, activation)
-			if exchange_failure == .None && inspect_completion(completion[:], &result) {
+			completion, metadata, exchange_failure := session_exchange(manager, route, activation)
+			if exchange_failure == .None &&
+			   metadata_matches_completion(&metadata, completion[:]) {
 				manager_record_success(manager)
 				delete(result.completion)
-				result.completion = completion
+				result = adopt_exchange_result(manager, metadata, completion, route_info)
 			} else {
 				delete(completion)
+				process_result_metadata_free(&metadata)
 				if exchange_failure != .None {
 					record_exchange_failure(manager, route, exchange_failure)
 				} else {
@@ -938,8 +1012,9 @@ manager_process_activation :: proc(
 	}
 
 	route := &manager.routes[route_index]
-	completion, exchange_failure := session_exchange(manager, route, activation)
+	completion, metadata, exchange_failure := session_exchange(manager, route, activation)
 	if exchange_failure != .None {
+		process_result_metadata_free(&metadata)
 		record_exchange_failure(manager, route, exchange_failure)
 		return failure_result(
 			manager,
@@ -947,14 +1022,9 @@ manager_process_activation :: proc(
 			exchange_failure_message(exchange_failure),
 		)
 	}
-	result := workflow.Process_Result{
-		completion = completion,
-		run_id = manager.report_run_id,
-		is_replaying = route_info.is_replaying,
-		history_length = route_info.history_length,
-	}
-	if !inspect_completion(completion[:], &result) {
-		delete(result.completion)
+	if !metadata_matches_completion(&metadata, completion[:]) {
+		delete(completion)
+		process_result_metadata_free(&metadata)
 		manager.stats.protocol_failures += 1
 		manager_record_failure(manager)
 		session_abort(manager, &route.session)
@@ -965,6 +1035,7 @@ manager_process_activation :: proc(
 			"isolated Workflow executor returned a malformed completion",
 		)
 	}
+	result := adopt_exchange_result(manager, metadata, completion, route_info)
 	manager_record_success(manager)
 	route.state, _ = lifecycle_step(route.state, .Activation_Succeeded)
 	return result

@@ -375,6 +375,34 @@ executor_host_run :: proc(
 				owned_frame_free(&request)
 				return host_error("Workflow completion run ID does not match its executor route")
 			}
+			metadata, metadata_ok := process_result_metadata_encode(&processed)
+			if !metadata_ok {
+				host_write_executor_error(
+					output,
+					request.frame.request_id,
+					request.frame.run_id,
+					"Workflow executor could not encode completion metadata",
+				)
+				host_error_free(&process_error)
+				workflow.error_free(&processed.error)
+				delete(processed.completion)
+				owned_frame_free(&request)
+				return host_error("Workflow executor could not encode completion metadata")
+			}
+			metadata_write_error := write(output, {
+				kind = .Completion_Metadata,
+				request_id = request.frame.request_id,
+				run_id = request.frame.run_id,
+				payload = metadata,
+			})
+			delete(metadata)
+			if metadata_write_error.kind != .None {
+				host_error_free(&process_error)
+				workflow.error_free(&processed.error)
+				delete(processed.completion)
+				owned_frame_free(&request)
+				return host_error("could not write Workflow executor completion metadata")
+			}
 			write_error := write(output, {
 				kind = .Completion,
 				request_id = request.frame.request_id,

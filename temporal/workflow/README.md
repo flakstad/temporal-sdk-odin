@@ -266,6 +266,14 @@ length-prefixed manifest. A manager configured with `expected_registry` can call
 the manifest exchange before its first activation. Registry ownership remains
 local to each process throughout the handshake.
 
+Protocol v3 sends a `Completion_Metadata` frame before each opaque Core
+completion. It JSON-encodes the complete language `Process_Result` except for
+completion bytes and the duplicate run ID. The parent validates terminal flags
+against the protobuf completion, keeps route-derived replay/history/eviction
+fields authoritative, and forwards the remaining child counters and wait state
+to Worker statistics and activation observers. Metadata is diagnostic and can
+never add, remove, or alter Temporal commands.
+
 The per-run isolation manager accepts independent `activation_timeout` and
 `shutdown_timeout` values. A positive shutdown deadline covers both the
 acknowledgement and final process exit and always reaps the child. Capacity
