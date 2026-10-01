@@ -54,6 +54,22 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.ExecuteMultiOperationResponse \
   temporal.api.workflowservice.v1.GetSystemInfoRequest \
   temporal.api.workflowservice.v1.GetSystemInfoResponse \
+  temporal.api.workflowservice.v1.StartActivityExecutionRequest \
+  temporal.api.workflowservice.v1.StartActivityExecutionResponse \
+  temporal.api.workflowservice.v1.PollActivityExecutionRequest \
+  temporal.api.workflowservice.v1.PollActivityExecutionResponse \
+  temporal.api.workflowservice.v1.DescribeActivityExecutionRequest \
+  temporal.api.workflowservice.v1.DescribeActivityExecutionResponse \
+  temporal.api.workflowservice.v1.RequestCancelActivityExecutionRequest \
+  temporal.api.workflowservice.v1.RequestCancelActivityExecutionResponse \
+  temporal.api.workflowservice.v1.TerminateActivityExecutionRequest \
+  temporal.api.workflowservice.v1.TerminateActivityExecutionResponse \
+  temporal.api.workflowservice.v1.DeleteActivityExecutionRequest \
+  temporal.api.workflowservice.v1.DeleteActivityExecutionResponse \
+  temporal.api.workflowservice.v1.ListActivityExecutionsRequest \
+  temporal.api.workflowservice.v1.ListActivityExecutionsResponse \
+  temporal.api.workflowservice.v1.CountActivityExecutionsRequest \
+  temporal.api.workflowservice.v1.CountActivityExecutionsResponse \
   temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest \
   temporal.api.workflowservice.v1.StartNexusOperationExecutionResponse \
   temporal.api.workflowservice.v1.PollNexusOperationExecutionRequest \

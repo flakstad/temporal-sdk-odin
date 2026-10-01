@@ -1341,6 +1341,31 @@ result, a 500-case property varies all thirteen capability bits, and the Client
 interceptor property includes the result-bearing operation. The live example
 also requires its interceptor to enter before and unwind after the Core RPC.
 
+### Standalone Activities
+
+Standalone Activities require a newer Service than the repository's original
+CLI 1.5.1/Server 1.29.1 baseline. The old baseline returns gRPC status 12 for
+`StartActivityExecution`. Temporal CLI 1.9.1/Server 1.32.0 accepts the first
+Odin client slice with its default dev-server configuration:
+
+```bash
+temporal server start-dev --headless
+./scripts/standalone-activity-integration-test.sh
+```
+
+The focused script uses a unique task queue. It starts an Activity directly
+from `examples/standalone_activity`, lets the existing `hello_activity` Worker
+receive it through Core's ordinary Activity task poll, and waits for the typed
+result through `PollActivityExecution`. Two workerless scheduled executions
+then prove request-cancel and immediate termination, typed terminal errors, and
+deletion.
+
+The public handle owns Activity/Run IDs and borrows the Client. Poll results
+own their Run ID, result Payload, and encoded recursive Failure. Start options
+and input Payload views are borrowed only for the synchronous call. The
+generated schema already contains Describe/List/Count; their allocator-owned
+public models and Client interceptors are the next standalone Activity slice.
+
 The suite then repeats that executable with the Core-only Nexus lifecycle
 spike:
 

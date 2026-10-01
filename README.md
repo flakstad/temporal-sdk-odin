@@ -26,8 +26,14 @@ feature is live-proven against Temporal Server 1.32.0 with
 `nexusoperation.enableStandalone=true`; the
 repository's established CLI 1.5.1/Server 1.29.1 baseline correctly
 capability-probes as unsupported. The same Odin Nexus Worker handles both
-Workflow-originated and standalone operations. The Client now
-preserves terminal Workflow and Update Failure protobufs and decodes all ten
+Workflow-originated and standalone operations. The first standalone Activity
+slice now exposes typed Payload/JSON Start,
+an owned execution handle, bounded/cancelable Poll/result waiting, typed
+terminal failures, and cancel/terminate/delete. Server 1.32 dispatches the
+resulting task through the unchanged Core Activity poll path to the existing
+Odin Worker. Server 1.29 returns gRPC 12/`UNIMPLEMENTED`. Describe/List/Count,
+start metadata, and Client interceptors remain before this surface is called
+complete. The Client preserves terminal Workflow and Update Failure protobufs and decodes all ten
 current Temporal Failure variants into an allocator-owned recursive Odin tree.
 The live suite proves an unhandled `ActivityFailure -> ApplicationFailure`
 chain from Odin Activity through Server history and back to the Odin Client. It
@@ -404,9 +410,10 @@ Only gRPC status 12/`UNIMPLEMENTED` is classified as `Unsupported`. Permission,
 namespace, authentication, and transport failures remain `Unknown` and are
 returned to the caller. A false System Info bit is also `Unknown`, because the
 feature may merely be disabled. The default probes never mutate server state;
-Workflow Pause therefore remains unknown, and standalone Activity reports
-`sdk_implemented=false` until the complete Start/Poll/Describe lifecycle is in
-the public Odin API. No result is inferred from a parsed server version.
+Workflow Pause therefore remains unknown. Standalone Activity still reports
+`sdk_implemented=false`: Start/Poll/result and cancel/terminate/delete now
+exist, but Describe/List/Count and interceptor coverage remain. No result is
+inferred from a parsed server version.
 
 `activity.info(ctx)`
 now exposes the Core-delivered execution

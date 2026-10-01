@@ -34,6 +34,10 @@ Error_Kind :: enum {
 	Nexus_Operation_Canceled,
 	Nexus_Operation_Terminated,
 	Nexus_Operation_Timed_Out,
+	Standalone_Activity_Failed,
+	Standalone_Activity_Canceled,
+	Standalone_Activity_Terminated,
+	Standalone_Activity_Timed_Out,
 	Wait_Canceled,
 	Wait_Timed_Out,
 }

@@ -25481,6 +25481,147 @@ standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
 }
 
 @(test)
+standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"Odin"`))
+	defer codec.payload_free(&input)
+	metadata_error := codec.payload_add_metadata(
+		&input,
+		"encoding",
+		transmute([]u8)string("json/plain"),
+	)
+	testing.expect_value(t, metadata_error, codec.Error.None)
+	retry_policy := temporal_client.Retry_Policy{
+		initial_interval = time.Second,
+		backoff_coefficient = 2,
+		maximum_interval = 10 * time.Second,
+		maximum_attempts = 4,
+		non_retryable_error_types = []string{"BadOrder"},
+	}
+	priority := temporal_client.Priority{priority_key = 3, fairness_key = "customer-42", fairness_weight = 1.5}
+	request_bytes, request_error := temporal_client.encode_start_standalone_activity_request(
+		"orders",
+		"odin-client",
+		codec.payload_view(&input),
+		{
+			id = "activity-1",
+			activity_type = "charge-card",
+			task_queue = "payments",
+			request_id = "request-1",
+			schedule_to_close_timeout = time.Minute,
+			schedule_to_start_timeout = 5 * time.Second,
+			start_to_close_timeout = 30 * time.Second,
+			heartbeat_timeout = 3 * time.Second,
+			start_delay = 250 * time.Millisecond,
+			retry_policy = &retry_policy,
+			priority = &priority,
+			id_reuse_policy = .Reject_Duplicate,
+			id_conflict_policy = .Use_Existing,
+		},
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expectf(t, request_error.message == nil, "Activity start encode failed: %s", string(request_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_StartActivityExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartActivityExecutionRequest(request_bytes[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	if decoded {
+		testing.expect_value(t, request.namespace, "orders")
+		testing.expect_value(t, request.identity, "odin-client")
+		testing.expect_value(t, request.activity_id, "activity-1")
+		testing.expect(t, request.activity_type != nil && request.activity_type.name == "charge-card")
+		testing.expect(t, request.task_queue != nil && request.task_queue.name == "payments")
+		testing.expect_value(t, request.id_reuse_policy, proto.Temporal_Api_Enums_V1_ActivityIdReusePolicy.ACTIVITY_ID_REUSE_POLICY_REJECT_DUPLICATE)
+		testing.expect_value(t, request.id_conflict_policy, proto.Temporal_Api_Enums_V1_ActivityIdConflictPolicy.ACTIVITY_ID_CONFLICT_POLICY_USE_EXISTING)
+		testing.expect(t, request.input != nil && len(request.input.payloads) == 1)
+		if request.input != nil && len(request.input.payloads) == 1 {
+			testing.expect(t, bytes.equal(request.input.payloads[0].data, input.data))
+		}
+		testing.expect(t, request.retry_policy != nil)
+		if request.retry_policy != nil {
+			testing.expect_value(t, request.retry_policy.maximum_attempts, i32(4))
+			testing.expect_value(t, len(request.retry_policy.non_retryable_error_types), 1)
+		}
+		testing.expect(t, request.priority != nil)
+		if request.priority != nil {
+			testing.expect_value(t, request.priority.priority_key, i32(3))
+			testing.expect_value(t, request.priority.fairness_key, "customer-42")
+		}
+	}
+	virtual.arena_destroy(&decode_arena)
+
+	invalid_bytes, invalid_error := temporal_client.encode_start_standalone_activity_request(
+		"orders",
+		"odin-client",
+		codec.payload_view(&input),
+		{id = "missing-timeout", activity_type = "charge-card", task_queue = "payments"},
+	)
+	delete(invalid_bytes)
+	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&invalid_error)
+
+	result_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"charged"`)}
+	result_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	append(&result_payloads.payloads, result_payload)
+	defer delete(result_payloads.payloads)
+	outcome := proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome{
+		value = proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome_Value_Result{
+			value = &result_payloads,
+		},
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse{
+		run_id = "run-1",
+		outcome = &outcome,
+	}
+	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&response)
+	result, empty, poll_error := temporal_client.decode_standalone_activity_poll_response(response_bytes[:])
+	delete(response_bytes)
+	defer temporal_client.standalone_activity_poll_result_free(&result)
+	defer temporal_client.error_free(&poll_error)
+	testing.expect(t, poll_error.message == nil && !empty && result.has_result)
+	testing.expect_value(t, result.run_id, "run-1")
+	testing.expect(t, bytes.equal(result.result.data, result_payload.data))
+
+	canceled_info := proto.Temporal_Api_Failure_V1_CanceledFailureInfo{}
+	canceled_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "Activity canceled",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Canceled_Failure_Info{
+			value = &canceled_info,
+		},
+	}
+	failure_outcome := proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome{
+		value = proto.Temporal_Api_Activity_V1_ActivityExecutionOutcome_Value_Failure{
+			value = &canceled_failure,
+		},
+	}
+	failure_response := proto.Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse{
+		run_id = "run-2",
+		outcome = &failure_outcome,
+	}
+	failure_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&failure_response)
+	failed_result, failed_empty, activity_error := temporal_client.decode_standalone_activity_poll_response(failure_bytes[:])
+	delete(failure_bytes)
+	defer temporal_client.standalone_activity_poll_result_free(&failed_result)
+	defer temporal_client.error_free(&activity_error)
+	testing.expect(t, !failed_empty)
+	testing.expect_value(t, activity_error.kind, temporal_client.Error_Kind.Standalone_Activity_Canceled)
+	testing.expect(t, len(activity_error.details) > 0)
+
+	empty_response := proto.Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse{}
+	empty_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&empty_response)
+	empty_result, is_empty, empty_error := temporal_client.decode_standalone_activity_poll_response(empty_bytes[:])
+	delete(empty_bytes)
+	defer temporal_client.standalone_activity_poll_result_free(&empty_result)
+	defer temporal_client.error_free(&empty_error)
+	testing.expect(t, is_empty && empty_error.message == nil)
+}
+
+@(test)
 standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 	schedule_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 123}
 	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_010}
