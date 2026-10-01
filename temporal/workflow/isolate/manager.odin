@@ -137,6 +137,7 @@ Manager_Diagnostic_Observer :: #type proc(
 )
 
 DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION :: 256
+DEFAULT_MAXIMUM_DIAGNOSTIC_PAYLOAD_BYTES_PER_ACTIVATION :: 1024 * 1024
 
 Manager_Options :: struct {
 	// command is copied by manager_init and executed for ordinary generations.
@@ -160,6 +161,9 @@ Manager_Options :: struct {
 	diagnostic_observer_data: rawptr,
 	// Zero selects the default. This bounds untrusted child frame streams.
 	maximum_diagnostics_per_activation: int,
+	// Counts the complete encoded Diagnostic payload, including its one-byte
+	// kind discriminator. Zero selects the default cumulative byte budget.
+	maximum_diagnostic_payload_bytes_per_activation: int,
 }
 
 Crash_Loop_Policy :: struct {
@@ -198,6 +202,7 @@ Manager_Stats :: struct {
 	crash_loop_recoveries: int,
 	incremental_activations: int,
 	diagnostics_received: int,
+	diagnostic_budget_rejections: int,
 }
 
 Child_Session :: struct {
@@ -234,6 +239,7 @@ Manager :: struct {
 	diagnostic_observer: Manager_Diagnostic_Observer,
 	diagnostic_observer_data: rawptr,
 	maximum_diagnostics_per_activation: int,
+	maximum_diagnostic_payload_bytes_per_activation: int,
 	stats:              Manager_Stats,
 	initialized:        bool,
 }
@@ -280,6 +286,9 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	if options.maximum_diagnostics_per_activation < 0 {
 		return manager_error("Workflow executor diagnostic limit must not be negative")
 	}
+	if options.maximum_diagnostic_payload_bytes_per_activation < 0 {
+		return manager_error("Workflow executor diagnostic byte budget must not be negative")
+	}
 	if options.activation_timeout < 0 || options.shutdown_timeout < 0 {
 		return manager_error("Workflow executor timeouts must not be negative")
 	}
@@ -323,6 +332,12 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	if manager.maximum_diagnostics_per_activation == 0 {
 		manager.maximum_diagnostics_per_activation =
 			DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION
+	}
+	manager.maximum_diagnostic_payload_bytes_per_activation =
+		options.maximum_diagnostic_payload_bytes_per_activation
+	if manager.maximum_diagnostic_payload_bytes_per_activation == 0 {
+		manager.maximum_diagnostic_payload_bytes_per_activation =
+			DEFAULT_MAXIMUM_DIAGNOSTIC_PAYLOAD_BYTES_PER_ACTIVATION
 	}
 	manager.routes = make([dynamic]Executor_Route, 0, options.maximum_executors)
 	manager.initialized = true
@@ -461,6 +476,19 @@ find_route :: proc(manager: ^Manager, run_id: string) -> (index: int, found: boo
 
 capacity_allows_start :: proc(route_count, maximum_executors: int) -> bool {
 	return route_count >= 0 && maximum_executors > 0 && route_count < maximum_executors
+}
+
+// diagnostic_payload_budget_consume is pure and avoids addition overflow. On
+// rejection it leaves consumed unchanged; the exchange caller treats rejection
+// as terminal and aborts that executor session.
+diagnostic_payload_budget_consume :: proc(
+	consumed, next_payload_bytes, maximum: int,
+) -> (updated: int, allowed: bool) {
+	if consumed < 0 || next_payload_bytes < 0 || maximum <= 0 ||
+	   consumed > maximum || next_payload_bytes > maximum - consumed {
+		return consumed, false
+	}
+	return consumed + next_payload_bytes, true
 }
 
 // crash_loop_allows_start is pure so generated tests can check the breaker
@@ -786,6 +814,7 @@ session_exchange :: proc(
 	exchange_started := time.tick_now()
 	metadata_response: Owned_Frame
 	diagnostic_count := 0
+	diagnostic_payload_bytes := 0
 	for {
 		read_error: Error
 		read_failure: Exchange_Failure
@@ -810,6 +839,17 @@ session_exchange :: proc(
 		}
 		diagnostic_count += 1
 		if diagnostic_count > manager.maximum_diagnostics_per_activation {
+			owned_frame_free(&metadata_response)
+			return nil, {}, .Protocol
+		}
+		budget_allowed: bool
+		diagnostic_payload_bytes, budget_allowed = diagnostic_payload_budget_consume(
+			diagnostic_payload_bytes,
+			len(metadata_response.frame.payload),
+			manager.maximum_diagnostic_payload_bytes_per_activation,
+		)
+		if !budget_allowed {
+			manager.stats.diagnostic_budget_rejections += 1
 			owned_frame_free(&metadata_response)
 			return nil, {}, .Protocol
 		}

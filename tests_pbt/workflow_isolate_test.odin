@@ -69,6 +69,63 @@ workflow_isolation_frames_roundtrip_generated_binary_payloads :: proc(t: ^testin
 	pbt.require_pass(t, result)
 }
 
+workflow_isolation_diagnostic_budget_property :: proc(t: ^pbt.T) -> pbt.Result {
+	maximum := pbt.draw(t, pbt.int_range(1, 1_048_576))
+	payloads := pbt.draw(t, pbt.array(pbt.int_range(0, 65_536), 0, 128))
+	consumed := 0
+	reference: u64
+	rejected := false
+	for payload_bytes in payloads {
+		updated, allowed := workflow_isolate.diagnostic_payload_budget_consume(
+			consumed,
+			payload_bytes,
+			maximum,
+		)
+		reference_allowed := reference + u64(payload_bytes) <= u64(maximum)
+		if allowed != reference_allowed {
+			return pbt.fail("diagnostic byte budget diverged from wide reference arithmetic")
+		}
+		if allowed {
+			reference += u64(payload_bytes)
+			if updated != int(reference) {
+				return pbt.fail("diagnostic byte budget returned the wrong cumulative total")
+			}
+			consumed = updated
+		} else {
+			rejected = true
+			if updated != consumed {
+				return pbt.fail("rejected diagnostic changed the authoritative byte total")
+			}
+		}
+	}
+	force_boundary := pbt.draw(t, pbt.boolean())
+	if force_boundary {
+		updated, allowed := workflow_isolate.diagnostic_payload_budget_consume(
+			consumed,
+			maximum - consumed,
+			maximum,
+		)
+		if !allowed || updated != maximum {
+			return pbt.fail("diagnostic byte budget rejected its exact remaining capacity")
+		}
+		consumed = updated
+	}
+	pbt.cover(t, consumed == maximum, 35, "exact byte-budget boundary")
+	pbt.cover(t, rejected, 70, "diagnostic rejected by byte budget")
+	return pbt.pass()
+}
+
+@(test)
+workflow_executor_diagnostic_byte_budget_matches_wide_model :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow executor diagnostic byte budget matches wide model",
+		workflow_isolation_diagnostic_budget_property,
+		{num_tests = 1000, seed = 0x4449_4147_4255_4447},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 Lifecycle_Observation :: struct {
 	effect: workflow_isolate.Lifecycle_Effect,
 	seen:   bool,

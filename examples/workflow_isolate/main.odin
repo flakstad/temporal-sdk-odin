@@ -24,6 +24,7 @@ Child_Fault_Mode :: enum {
 	Malformed_Metadata,
 	Malformed_Completion,
 	Metadata_Mismatch,
+	Diagnostic_Budget,
 	Nondeterministic,
 	Stack_Overflow,
 	Panic,
@@ -177,6 +178,32 @@ run_child :: proc(
 		if fault_mode == .Crash {
 			workflow_isolate.owned_frame_free(&request)
 			os.exit(86)
+		}
+		if fault_mode == .Diagnostic_Budget {
+			diagnostic, diagnostic_ok := workflow_isolate.diagnostic_encode(
+				.Application,
+				transmute([]u8)string(
+					"diagnostic-payload-deliberately-exceeds-the-complete-activation-byte-budget",
+				),
+			)
+			if !diagnostic_ok {
+				workflow_isolate.owned_frame_free(&request)
+				return 1
+			}
+			diagnostic_error := workflow_isolate.write(os.stdout, {
+				kind = .Diagnostic,
+				request_id = request.frame.request_id,
+				run_id = request.frame.run_id,
+				payload = diagnostic,
+			})
+			delete(diagnostic)
+			workflow_isolate.owned_frame_free(&request)
+			if diagnostic_error.kind != .None {
+				return 1
+			}
+			for {
+				time.sleep(time.Hour)
+			}
 		}
 		if fault_mode == .Hang {
 			workflow_isolate.owned_frame_free(&request)
@@ -553,6 +580,10 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child-metadata-mismatch" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""
 		os.exit(run_child(.Metadata_Mismatch, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-diagnostic-budget" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Diagnostic_Budget, task_queue))
 	}
 	if len(os.args) >= 2 && os.args[1] == "--child-nondeterministic" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""

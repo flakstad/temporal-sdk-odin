@@ -1032,9 +1032,14 @@ and opaque non-empty payload. The host heap-clones it, avoiding the Workflow
 arena allocator active inside logger/metric callbacks. `Manager_Options` accepts
 a synchronous borrowed `diagnostic_observer`; the live proof requires two log
 and two metric events with non-zero generation IDs. Zero
-`maximum_diagnostics_per_activation` selects the bounded default of 256. One
-monotonic activation deadline spans all diagnostic, metadata, and completion
-reads rather than restarting per frame.
+`maximum_diagnostics_per_activation` selects the bounded default of 256.
+`maximum_diagnostic_payload_bytes_per_activation` selects a separate cumulative
+encoded-payload budget whose default is 1 MiB. Admission is overflow-safe and a
+rejected frame is never delivered to the observer. One monotonic activation
+deadline spans all diagnostic, metadata, and completion reads rather than
+restarting per frame. The `diagnostic-budget` live fault sends one correctly
+correlated oversized frame, requires one protocol/budget rejection, Core
+eviction, and successful replay in a fresh child.
 
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity

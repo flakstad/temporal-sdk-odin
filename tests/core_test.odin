@@ -352,6 +352,13 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 	invalid_error = workflow_isolate.manager_init(&manager, {
 		command = command[:],
 		maximum_executors = 1,
+		maximum_diagnostic_payload_bytes_per_activation = -1,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_error = workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
 		activation_timeout = -time.Millisecond,
 	})
 	testing.expect(t, invalid_error.message != nil)
@@ -385,6 +392,20 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 		manager.maximum_diagnostics_per_activation,
 		workflow_isolate.DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION,
 	)
+	testing.expect_value(
+		t,
+		manager.maximum_diagnostic_payload_bytes_per_activation,
+		workflow_isolate.DEFAULT_MAXIMUM_DIAGNOSTIC_PAYLOAD_BYTES_PER_ACTIVATION,
+	)
+	consumed, budget_allowed := workflow_isolate.diagnostic_payload_budget_consume(7, 9, 16)
+	testing.expect(t, budget_allowed)
+	testing.expect_value(t, consumed, 16)
+	consumed, budget_allowed = workflow_isolate.diagnostic_payload_budget_consume(consumed, 1, 16)
+	testing.expect(t, !budget_allowed)
+	testing.expect_value(t, consumed, 16)
+	consumed, budget_allowed = workflow_isolate.diagnostic_payload_budget_consume(1, max(int), max(int))
+	testing.expect(t, !budget_allowed)
+	testing.expect_value(t, consumed, 1)
 	testing.expect(t, workflow_isolate.capacity_allows_start(0, 1))
 	testing.expect(t, !workflow_isolate.capacity_allows_start(1, 1))
 	allowed, reset := workflow_isolate.crash_loop_allows_start(2, 99 * time.Millisecond, {

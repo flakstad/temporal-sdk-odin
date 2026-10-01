@@ -186,9 +186,12 @@ Protocol version 4 permits zero or more correlated `Diagnostic` frames before
 borrowed by the parent observer only for its synchronous callback. Diagnostic
 frames must match both request ID and run ID. They are never interpreted as
 commands and cannot replace completion metadata or the Core protobuf.
-The manager accepts at most 256 diagnostics per activation by default, and one
-activation deadline covers the complete diagnostic/metadata/completion stream;
-a child cannot keep resetting the deadline by sending observations.
+The manager accepts at most 256 diagnostics and 1 MiB of cumulative encoded
+diagnostic payload per activation by default. Both limits are configurable;
+the byte accounting includes the kind discriminator and uses subtraction-based
+overflow-safe admission. One activation deadline covers the complete
+diagnostic/metadata/completion stream, so a child cannot keep resetting the
+deadline by sending observations.
 
 `executor_host_emit_diagnostic` clones payloads onto the process heap even when
 called from Workflow code with its arena allocator active. The host owns and
@@ -308,11 +311,13 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
 ```
 
 Against the CLI dev server, the first executor generation independently injects
-five faults: a stale request ID, invalid metadata JSON, invalid completion
-protobuf, metadata whose terminal flags disagree with the completion, and a
-response delayed beyond the activation deadline. Each protocol fault increments
-exactly one protocol failure; the delayed response increments exactly one
-timeout. The parent aborts and reaps that generation, submits one failed
+six faults: a stale request ID, invalid metadata JSON, invalid completion
+protobuf, metadata whose terminal flags disagree with the completion, a
+Diagnostic larger than the complete activation byte budget, and a response
+delayed beyond the activation deadline. Each protocol fault increments exactly
+one protocol failure; the oversized observation also increments
+`diagnostic_budget_rejections`, while the delayed response increments exactly
+one timeout. The parent aborts and reaps that generation, submits one failed
 activation completion, waits for Core eviction, and completes both Workflows in
 fresh generations. Private pipes and generation-owned routes prevent a stale or
 late response from being consumed by the replacement.
@@ -448,10 +453,12 @@ one through eight. It requires route count never to exceed capacity, every
 owned route to have a generation, and a failed generation never to change
 before eviction. A third 1,000-case property varies breaker threshold, failure
 count, cooldown, and elapsed time; it requires rejection before cooldown and
-exactly one reset/admission decision at or after the boundary. The existing
-500-case framing property remains independent. A process-backed unit test then
-proves two real child exits open the breaker and the third initialization starts
-no process.
+exactly one reset/admission decision at or after the boundary. A fourth
+1,000-case property compares cumulative diagnostic-byte admission with wide
+reference arithmetic, including exact-capacity and rejected-frame behavior.
+The existing 500-case framing property remains independent. A process-backed
+unit test then proves two real child exits open the breaker and the third
+initialization starts no process.
 
 Generation fencing currently comes from route ownership as well as the model:
 each generation has private pipes and monotonically correlated request IDs.
@@ -463,6 +470,7 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The four-target
 CI matrix now builds, relocates, loads, and executes the application bundle,
 covering the basic pipe, process, architecture, and loader contracts.
-Production isolation still needs resource budgets, pool scheduling, release
-signing/notarization, and broader policy/classification coverage for fatal
-native child exits.
+Production isolation still needs OS-level CPU/memory budgets, pool scheduling,
+release signing/notarization, and broader policy/classification coverage for
+fatal native child exits. Protocol output now has count, cumulative byte, and
+monotonic time budgets.

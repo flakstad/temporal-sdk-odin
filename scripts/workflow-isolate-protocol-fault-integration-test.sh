@@ -12,6 +12,7 @@ for fault_mode in \
   malformed-metadata \
   malformed-completion \
   metadata-mismatch \
+  diagnostic-budget \
   late; do
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky \

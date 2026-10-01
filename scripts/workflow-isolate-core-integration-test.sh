@@ -104,10 +104,16 @@ grep -q 'shutdown_timeouts=0' <<<"$output"
 grep -q 'crash_loop_rejections=0' <<<"$output"
 grep -q 'capacity_rejections=0' <<<"$output"
 if [[ "$first_mode" == "stale" || "$first_mode" == "malformed-metadata" ||
-      "$first_mode" == "malformed-completion" || "$first_mode" == "metadata-mismatch" ]]; then
+      "$first_mode" == "malformed-completion" || "$first_mode" == "metadata-mismatch" ||
+      "$first_mode" == "diagnostic-budget" ]]; then
   grep -q 'protocol_failures=1' <<<"$output"
 else
   grep -q 'protocol_failures=0' <<<"$output"
+fi
+if [[ "$first_mode" == "diagnostic-budget" ]]; then
+  grep -q 'diagnostic_budget_rejections=1' <<<"$output"
+else
+  grep -q 'diagnostic_budget_rejections=0' <<<"$output"
 fi
 grep -q 'missing_timer_sequences=0' <<<"$output"
 grep -q 'diagnostic_logs=2' <<<"$output"

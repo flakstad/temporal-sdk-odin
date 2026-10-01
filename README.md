@@ -528,6 +528,8 @@ Worker statistics/observer visibility. Protocol v4 additionally carries
 correlated, discriminated log/metric/application diagnostics to a borrowed
 parent observer. The live proof checks timer sequence fields that the parent
 cannot infer from the completion and exactly four structured diagnostic events.
+Each activation has independent default limits of 256 observations, 1 MiB of
+cumulative encoded diagnostic payload, and one monotonic response deadline.
 An additional sticky-cache proof records a durable Timer with the ordinary
 child, replays it with incompatible code behind the same type manifest, and
 requires both Core's `NONDETERMINISM` eviction and terminal `[TMPRL1100]`
@@ -546,9 +548,9 @@ It still lacks production pool hardening.
 Replay-aware child logging, per-runtime metric-emitter creation, and
 inbound/outbound interceptor configuration are now explicit host options; the
 live proof requires exactly two non-replay interceptor logs and metrics in both
-cache modes. A separate five-case fault matrix proves that stale, malformed,
-mismatched, and late child responses fail only one Workflow Task and recover
-through Core eviction and fresh-generation replay.
+cache modes. A separate six-case fault matrix proves that stale, malformed,
+mismatched, oversized-diagnostic, and late child responses fail only one
+Workflow Task and recover through Core eviction and fresh-generation replay.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 
