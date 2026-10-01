@@ -1158,7 +1158,9 @@ Or, with that server already running, execute only the focused proof:
 ```
 
 The focused test reaches a durable Signal wait, pauses the Workflow through the
-public intercepted Client API, verifies Paused status and Query rejection,
+public intercepted Client API, verifies the owned pause identity/reason/time
+through Odin `DescribeWorkflowExecution`, then checks Paused status and Query
+rejection,
 sends a Signal, and proves no Odin activation processes it before Unpause. It
 then unpauses, completes normally, and requires both pause history events. The
 request wire contract and interceptor nesting have direct unit coverage; a
@@ -1768,7 +1770,9 @@ counts, IDs, event types, versions, task IDs, ignore flags, archival state, and
 opaque pagination tokens. It destroys the source response and requires every
 owned event plus its canonical protobuf encoding to remain readable. Focused
 unit tests perform the same arena-lifetime check for rich Describe results,
-including memo/Search Attribute Payloads and pending execution summaries. The
+including memo/Search Attribute Payloads, Workflow pause metadata, pending
+Activity/child/Nexus summaries, recursive Nexus failures, and owned canonical
+callback protobufs. The
 Visibility property adds 500 pages with zero to sixteen execution summaries,
 all current Workflow status values, and opaque terminal/non-terminal tokens,
 plus zero to eight grouped count results with arbitrary ASCII Payload bytes.

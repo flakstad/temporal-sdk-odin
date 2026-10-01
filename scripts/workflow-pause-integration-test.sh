@@ -76,6 +76,14 @@ grep -q 'Client Workflow pause interceptor entered kind=Pause' "$output_log"
 grep -q 'Client Workflow pause interceptor exited after Core' "$output_log"
 grep -q 'operation=pause accepted' "$output_log"
 
+TEMPORAL_CLIENT_ACTION=describe \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$output_log"
+cat "$output_log"
+grep -q 'status=Paused paused=true' "$output_log"
+grep -q 'pause_reason="downstream dependency outage"' "$output_log"
+
 temporal workflow describe \
   --workflow-id "$workflow_id" \
   --command-timeout 10s \

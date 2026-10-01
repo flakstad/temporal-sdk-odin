@@ -24839,6 +24839,39 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		state = .PENDING_WORKFLOW_TASK_STATE_SCHEDULED,
 		attempt = 3,
 	}
+	nexus_failure := proto.Temporal_Api_Failure_V1_Failure{message = "endpoint unavailable"}
+	cancellation_failure := proto.Temporal_Api_Failure_V1_Failure{message = "cancel retry"}
+	nexus_cancellation := proto.Temporal_Api_Workflow_V1_NexusOperationCancellationInfo{
+		state = .NEXUS_OPERATION_CANCELLATION_STATE_BACKING_OFF,
+		attempt = 2,
+		last_attempt_failure = &cancellation_failure,
+		blocked_reason = "endpoint circuit open",
+	}
+	pending_nexus := proto.Temporal_Api_Workflow_V1_PendingNexusOperationInfo{
+		endpoint = "payments",
+		service = "PaymentService",
+		operation = "charge",
+		operation_id = "operation-42",
+		operation_token = "token-42",
+		state = .PENDING_NEXUS_OPERATION_STATE_BACKING_OFF,
+		attempt = 3,
+		last_attempt_failure = &nexus_failure,
+		cancellation_info = &nexus_cancellation,
+		scheduled_event_id = 23,
+		blocked_reason = "retrying",
+	}
+	workflow_closed := proto.Temporal_Api_Workflow_V1_CallbackInfo_WorkflowClosed{}
+	callback_trigger := proto.Temporal_Api_Workflow_V1_CallbackInfo_Trigger{
+		variant = proto.Temporal_Api_Workflow_V1_CallbackInfo_Trigger_Variant_Workflow_Closed{
+			value = &workflow_closed,
+		},
+	}
+	callback := proto.Temporal_Api_Workflow_V1_CallbackInfo{
+		trigger = &callback_trigger,
+		state = .CALLBACK_STATE_SCHEDULED,
+		attempt = 1,
+		request_id = "callback-request",
+	}
 	info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionInfo{
 		execution = &execution,
 		type = &workflow_type,
@@ -24861,7 +24894,16 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		workflow_run_timeout = &run_timeout,
 		user_metadata = &user_metadata,
 	}
-	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{cancel_requested = true}
+	paused_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_003}
+	pause_info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionPauseInfo{
+		identity = "operator-1",
+		paused_time = &paused_time,
+		reason = "incident",
+	}
+	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{
+		cancel_requested = true,
+		pause_info = &pause_info,
+	}
 	response := proto.Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse{
 		execution_config = &config,
 		workflow_execution_info = &info,
@@ -24870,8 +24912,12 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	}
 	defer delete(response.pending_activities)
 	defer delete(response.pending_children)
+	defer delete(response.pending_nexus_operations)
+	defer delete(response.callbacks)
 	append(&response.pending_activities, pending_activity)
 	append(&response.pending_children, pending_child)
+	append(&response.pending_nexus_operations, pending_nexus)
+	append(&response.callbacks, callback)
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse(&response)
 	description, decode_error := temporal_client.decode_workflow_description(encoded[:])
 	delete(encoded)
@@ -24903,6 +24949,33 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(description.pending_activities[0].heartbeat_details), 1)
 	testing.expect_value(t, len(description.pending_children), 1)
 	testing.expect_value(t, description.pending_children[0].parent_close_policy, temporal_client.Parent_Close_Policy.Request_Cancel)
+	testing.expect(t, description.pause_info.present)
+	testing.expect_value(t, description.pause_info.identity, "operator-1")
+	testing.expect_value(t, description.pause_info.reason, "incident")
+	testing.expect(t, description.pause_info.paused_time.present)
+	testing.expect_value(t, len(description.pending_nexus_operations), 1)
+	described_nexus := &description.pending_nexus_operations[0]
+	testing.expect_value(t, described_nexus.operation_id, "operation-42")
+	testing.expect_value(t, described_nexus.state, temporal_client.Pending_Nexus_Operation_State.Backing_Off)
+	testing.expect_value(t, described_nexus.last_failure_message, "endpoint unavailable")
+	testing.expect(t, len(described_nexus.last_failure_proto) > 0)
+	testing.expect(t, described_nexus.cancellation.present)
+	testing.expect_value(
+		t,
+		described_nexus.cancellation.state,
+		temporal_client.Nexus_Operation_Cancellation_State.Backing_Off,
+	)
+	testing.expect_value(t, described_nexus.cancellation.last_failure_message, "cancel retry")
+	testing.expect_value(t, len(description.callback_protos), 1)
+	callback_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&callback_arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&callback_arena)
+	decoded_callback := proto.Temporal_Api_Workflow_V1_CallbackInfo{}
+	testing.expect(t, proto.decode_Temporal_Api_Workflow_V1_CallbackInfo(description.callback_protos[0], &decoded_callback))
+	context.allocator = previous_allocator
+	testing.expect_value(t, decoded_callback.request_id, "callback-request")
+	virtual.arena_destroy(&callback_arena)
 	testing.expect(t, description.pending_workflow_task.present)
 }
 

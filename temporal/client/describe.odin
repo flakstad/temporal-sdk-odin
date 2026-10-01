@@ -1,5 +1,6 @@
 package client
 
+import "core:bytes"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
@@ -101,6 +102,34 @@ Pending_Workflow_Task :: struct {
 	attempt:                 i32,
 }
 
+Workflow_Pause_Info :: struct {
+	present:     bool,
+	identity:    string,
+	reason:      string,
+	paused_time: Optional_Time,
+}
+
+Pending_Nexus_Operation :: struct {
+	endpoint:                   string,
+	service:                    string,
+	operation:                  string,
+	operation_id:               string,
+	operation_token:            string,
+	state:                      Pending_Nexus_Operation_State,
+	attempt:                    i32,
+	scheduled_event_id:         i64,
+	schedule_to_close_timeout:  Optional_Duration,
+	schedule_to_start_timeout:  Optional_Duration,
+	start_to_close_timeout:     Optional_Duration,
+	scheduled_time:             Optional_Time,
+	last_attempt_complete_time: Optional_Time,
+	next_attempt_schedule_time: Optional_Time,
+	last_failure_message:       string,
+	last_failure_proto:         []u8,
+	blocked_reason:             string,
+	cancellation:               Nexus_Operation_Cancellation_Description,
+}
+
 Workflow_Description :: struct {
 	workflow_id:                 string,
 	run_id:                      string,
@@ -130,7 +159,12 @@ Workflow_Description :: struct {
 	search_attributes:           [dynamic]Named_Payload,
 	pending_activities:          [dynamic]Pending_Activity,
 	pending_children:            [dynamic]Pending_Child_Workflow,
+	pending_nexus_operations:    [dynamic]Pending_Nexus_Operation,
 	pending_workflow_task:       Pending_Workflow_Task,
+	pause_info:                  Workflow_Pause_Info,
+	// Callback schemas are still evolving upstream. Preserve each complete
+	// CallbackInfo as owned canonical protobuf until the Odin model stabilizes.
+	callback_protos:             [dynamic][]u8,
 	allocator:                   mem.Allocator,
 }
 
@@ -243,6 +277,16 @@ description_failure_message :: proc(
 	return description_clone_string(current.message, allocator)
 }
 
+description_failure_proto :: proc(
+	failure: ^proto.Temporal_Api_Failure_V1_Failure,
+	allocator: mem.Allocator,
+) -> ([]u8, bool) {
+	if failure == nil do return nil, true
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(failure)
+	defer delete(encoded)
+	return bytes.clone(encoded[:], allocator), true
+}
+
 workflow_description_free :: proc(description: ^Workflow_Description) {
 	if description == nil {
 		return
@@ -260,6 +304,8 @@ workflow_description_free :: proc(description: ^Workflow_Description) {
 	delete(description.static_summary, allocator)
 	delete(description.static_details, allocator)
 	delete(description.priority.fairness_key, allocator)
+	delete(description.pause_info.identity, allocator)
+	delete(description.pause_info.reason, allocator)
 	for &entry in description.memo {
 		delete(entry.key, allocator)
 		codec.payload_free(&entry.payload)
@@ -276,10 +322,16 @@ workflow_description_free :: proc(description: ^Workflow_Description) {
 		delete(child.run_id, allocator)
 		delete(child.workflow_type, allocator)
 	}
+	for &operation in description.pending_nexus_operations {
+		pending_nexus_operation_free(&operation, allocator)
+	}
+	for callback in description.callback_protos do delete(callback, allocator)
 	delete(description.memo)
 	delete(description.search_attributes)
 	delete(description.pending_activities)
 	delete(description.pending_children)
+	delete(description.pending_nexus_operations)
+	delete(description.callback_protos)
 	description^ = {}
 }
 
@@ -297,6 +349,23 @@ pending_activity_free :: proc(activity: ^Pending_Activity, allocator: mem.Alloca
 	}
 	delete(activity.heartbeat_details)
 	activity^ = {}
+}
+
+pending_nexus_operation_free :: proc(operation: ^Pending_Nexus_Operation, allocator: mem.Allocator) {
+	if operation == nil do return
+	delete(operation.endpoint, allocator)
+	delete(operation.service, allocator)
+	delete(operation.operation, allocator)
+	delete(operation.operation_id, allocator)
+	delete(operation.operation_token, allocator)
+	delete(operation.last_failure_message, allocator)
+	delete(operation.last_failure_proto, allocator)
+	delete(operation.blocked_reason, allocator)
+	delete(operation.cancellation.last_failure_message, allocator)
+	delete(operation.cancellation.last_failure_proto, allocator)
+	delete(operation.cancellation.blocked_reason, allocator)
+	delete(operation.cancellation.reason, allocator)
+	operation^ = {}
 }
 
 decode_workflow_description :: proc(
@@ -322,6 +391,8 @@ decode_workflow_description :: proc(
 	description.search_attributes = make([dynamic]Named_Payload, allocator)
 	description.pending_activities = make([dynamic]Pending_Activity, allocator)
 	description.pending_children = make([dynamic]Pending_Child_Workflow, allocator)
+	description.pending_nexus_operations = make([dynamic]Pending_Nexus_Operation, allocator)
+	description.callback_protos = make([dynamic][]u8, allocator)
 	failed := false
 	defer if failed {
 		workflow_description_free(&description)
@@ -368,6 +439,20 @@ decode_workflow_description :: proc(
 	description.external_payload_count = info.external_payload_count
 	if response.workflow_extended_info != nil {
 		description.cancel_requested = response.workflow_extended_info.cancel_requested
+		if response.workflow_extended_info.pause_info != nil {
+			source := response.workflow_extended_info.pause_info
+			description.pause_info.present = true
+			description.pause_info.paused_time = description_time(source.paused_time)
+			pause_ok: bool
+			description.pause_info.identity, pause_ok = description_clone_string(source.identity, allocator)
+			if pause_ok {
+				description.pause_info.reason, pause_ok = description_clone_string(source.reason, allocator)
+			}
+			if !pause_ok {
+				failed = true
+				return {}, error_from_string(.Malformed_Response, "could not allocate Workflow pause info")
+			}
+		}
 	}
 	priority_ok: bool
 	description.priority, priority_ok = description_priority(info.priority, allocator)
@@ -494,6 +579,63 @@ decode_workflow_description :: proc(
 			return {}, error_from_string(.Malformed_Response, "could not allocate pending child Workflow description")
 		}
 		append(&description.pending_children, child)
+	}
+
+	for source in response.pending_nexus_operations {
+		operation := Pending_Nexus_Operation{
+			attempt = source.attempt,
+			scheduled_event_id = source.scheduled_event_id,
+			schedule_to_close_timeout = description_duration(source.schedule_to_close_timeout),
+			schedule_to_start_timeout = description_duration(source.schedule_to_start_timeout),
+			start_to_close_timeout = description_duration(source.start_to_close_timeout),
+			scheduled_time = description_time(source.scheduled_time),
+			last_attempt_complete_time = description_time(source.last_attempt_complete_time),
+			next_attempt_schedule_time = description_time(source.next_attempt_schedule_time),
+		}
+		ok: bool
+		operation.state, ok = pending_nexus_operation_state_from_proto(source.state)
+		operation_clone_targets := []struct {
+			source: string,
+			target: ^string,
+		}{
+			{source.endpoint, &operation.endpoint},
+			{source.service, &operation.service},
+			{source.operation, &operation.operation},
+			{source.operation_id, &operation.operation_id},
+			{source.operation_token, &operation.operation_token},
+			{source.blocked_reason, &operation.blocked_reason},
+		}
+		for target in operation_clone_targets {
+			if !ok do break
+			target.target^, ok = description_clone_string(target.source, allocator)
+		}
+		if ok do operation.last_failure_message, ok = description_failure_message(source.last_attempt_failure, allocator)
+		if ok do operation.last_failure_proto, ok = description_failure_proto(source.last_attempt_failure, allocator)
+		if ok && source.cancellation_info != nil {
+			cancellation := source.cancellation_info
+			operation.cancellation.present = true
+			operation.cancellation.requested_time = description_time(cancellation.requested_time)
+			operation.cancellation.state, ok = nexus_operation_cancellation_state_from_proto(cancellation.state)
+			operation.cancellation.attempt = cancellation.attempt
+			operation.cancellation.last_attempt_complete_time = description_time(cancellation.last_attempt_complete_time)
+			operation.cancellation.next_attempt_schedule_time = description_time(cancellation.next_attempt_schedule_time)
+			if ok do operation.cancellation.last_failure_message, ok = description_failure_message(cancellation.last_attempt_failure, allocator)
+			if ok do operation.cancellation.last_failure_proto, ok = description_failure_proto(cancellation.last_attempt_failure, allocator)
+			if ok do operation.cancellation.blocked_reason, ok = description_clone_string(cancellation.blocked_reason, allocator)
+		}
+		if !ok {
+			pending_nexus_operation_free(&operation, allocator)
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not decode pending Nexus operation")
+		}
+		append(&description.pending_nexus_operations, operation)
+	}
+
+	for &source in response.callbacks {
+		encoded_callback := proto.encode_Temporal_Api_Workflow_V1_CallbackInfo(&source)
+		owned_callback := bytes.clone(encoded_callback[:], allocator)
+		delete(encoded_callback)
+		append(&description.callback_protos, owned_callback)
 	}
 
 	if response.pending_workflow_task != nil {

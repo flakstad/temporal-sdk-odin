@@ -338,6 +338,24 @@ run :: proc() -> int {
 			options.update_time.present,
 		)
 		return 0
+	case "describe":
+		description, describe_error := temporal_client.describe_workflow(&handle)
+		if describe_error.message != nil {
+			print_error(action, &describe_error)
+			return 1
+		}
+		defer temporal_client.workflow_description_free(&description)
+		fmt.printf(
+			"Odin client described workflow_id=%s status=%v paused=%v pause_identity=%q pause_reason=%q pending_nexus=%d callbacks=%d\n",
+			workflow_id,
+			description.status,
+			description.pause_info.present,
+			description.pause_info.identity,
+			description.pause_info.reason,
+			len(description.pending_nexus_operations),
+			len(description.callback_protos),
+		)
+		return 0
 	case "query":
 		query_name := env("TEMPORAL_CLIENT_QUERY_NAME", name_buffer[:])
 		if len(query_name) == 0 {
