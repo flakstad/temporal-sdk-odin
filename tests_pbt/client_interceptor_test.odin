@@ -66,6 +66,32 @@ client_interceptor_property_signal_with_start :: proc(
 	return result, result_error
 }
 
+client_interceptor_property_update_with_start :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Update_With_Start_Input,
+	next: temporal_client.Client_Update_With_Start_Next,
+) -> (result: temporal_client.Update_With_Start_Result, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	start_error := temporal_client.headers_add_json(input.start_headers, "generated-depth", node.id)
+	if start_error.message != nil {
+		return {}, start_error
+	}
+	update_error := temporal_client.headers_add_json(input.update_headers, "generated-depth", node.id)
+	if update_error.message != nil {
+		return {}, update_error
+	}
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = temporal_client.client_update_with_start_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
 client_interceptor_property_get_result :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_Get_Result_Input,
@@ -333,7 +359,7 @@ client_interceptor_property_count_nexus_operations :: proc(user_data: rawptr, in
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 20))
+	operation := pbt.draw(t, pbt.int_range(0, 21))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -350,6 +376,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 14, 3.0, "Update wait operation")
 	pbt.cover(t, operation >= 15 && operation <= 18, 12.0, "Nexus lifecycle operation")
 	pbt.cover(t, operation == 19 || operation == 20, 6.0, "Nexus Visibility operation")
+	pbt.cover(t, operation == 21, 3.0, "Update-With-Start operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -409,6 +436,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.list_nexus_operations = client_interceptor_property_list_nexus_operations
 		case 20:
 			interceptor.count_nexus_operations = client_interceptor_property_count_nexus_operations
+		case 21:
+			interceptor.update_with_start = client_interceptor_property_update_with_start
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -553,6 +582,24 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		count: temporal_client.Nexus_Operation_Count
 		count, operation_error = temporal_client.count_nexus_operations(&client)
 		temporal_client.nexus_operation_count_free(&count)
+	case 21:
+		result: temporal_client.Update_With_Start_Result
+		result, operation_error = temporal_client.update_with_start_payload(
+			&client,
+			"property_workflow",
+			{},
+			"property-update",
+			{},
+			{
+				start_options = {
+					id = "property-workflow",
+					task_queue = "property-queue",
+					id_conflict_policy = .Use_Existing,
+				},
+				update_options = {headers = &headers},
+			},
+		)
+		temporal_client.update_with_start_result_free(&result)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

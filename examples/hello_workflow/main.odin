@@ -1973,6 +1973,7 @@ main :: proc() {
 	expect_cross_routine_cancellation := scenario == "cross-routine-cancellation"
 	expect_cancellation_deadline := scenario == "cancellation-deadline"
 	expect_update := scenario == "update"
+	expect_update_with_start := scenario == "update-with-start"
 	expect_abandon_update := scenario == "abandon-update"
 	expect_cancel_update := scenario == "cancel-update"
 	expect_signal_handler := scenario == "signal-handler"
@@ -2006,7 +2007,7 @@ main :: proc() {
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition ? 0 : (expect_update ? 4 : ((expect_signal_handler || expect_local_activity_retry || expect_join) ? 2 : 1)),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition ? 0 : (expect_update ? 4 : (expect_update_with_start ? 3 : ((expect_signal_handler || expect_local_activity_retry || expect_join) ? 2 : 1))),
 			max_workflow_executions = expect_schedule_backfill ? 3 : 1,
 			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
@@ -2108,6 +2109,16 @@ main :: proc() {
 			     run_stats.workflow_updates_completed != 1 ||
 			     run_stats.workflow_updates_rejected != 0)) {
 				fmt.eprintln("Command-only Workflow path produced unexpected worker stats")
+				failed = true
+			}
+		} else if expect_update_with_start {
+			if run_stats.activity_tasks_completed != 3 ||
+			   run_stats.workflow_signals_received != 1 ||
+			   run_stats.workflow_updates_accepted != 2 ||
+			   run_stats.workflow_updates_completed != 2 ||
+			   run_stats.workflow_updates_rejected != 0 ||
+			   run_stats.timers_canceled != 1 {
+				fmt.eprintln("Update-With-Start Workflow stats did not match")
 				failed = true
 			}
 		} else if expect_local_activity_retry {

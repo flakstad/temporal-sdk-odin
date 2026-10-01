@@ -170,6 +170,11 @@ first call creates an execution, the second reuses its run, and both Signal
 headers reach Odin Workflow code. Temporal's request has one Signal header map,
 not independent start and Signal headers; the Odin API makes that limitation
 explicit and rejects eager-start intent on this RPC.
+Update-With-Start is also live-proven through Core's generic Client bridge and
+the Service's atomic `ExecuteMultiOperation` RPC. A missing Workflow is created
+and updated; a second call reuses the same run and applies another Update. The
+Odin API requires `.Use_Existing` and rejects cron, eager start, and start delay
+because those combinations are forbidden by the upstream wire contract.
 The same owned `Headers` builder now drives ordinary Client Signals and
 Workflow-originated remote/Local Activities, Child Workflow starts, and
 child/external Workflow Signals. Incoming Signal metadata remains borrowed
@@ -430,8 +435,9 @@ trace_activity :: proc(
 ```
 
 Client connections accept an ordered `[]Client_Interceptor`. The current
-typesafe outbound surface wraps Workflow start, Signal-With-Start, Signal,
-Query, Workflow result waiting, Update start/result waiting, cancellation,
+typesafe outbound surface wraps Workflow start, Signal-With-Start,
+Update-With-Start, Signal, Query, Workflow result waiting, Update start/result
+waiting, cancellation,
 termination, and Workflow
 Visibility list/count, standalone Nexus start/poll/describe, cancel/terminate/
 delete, list/count, plus Schedule
@@ -797,6 +803,35 @@ signaled, err := temporal_client.signal_with_start_workflow_json(
 )
 defer temporal_client.workflow_handle_free(&signaled)
 // signaled.started_by_request distinguishes create from reuse.
+
+update_headers := temporal_client.Headers{}
+err = temporal_client.headers_init(&update_headers)
+defer temporal_client.headers_free(&update_headers)
+err = temporal_client.headers_add_json(&update_headers, "trace-id", trace_id)
+
+atomic, err := temporal_client.update_with_start_json(
+    &client,
+    "order_workflow",
+    order,
+    "set_reference",
+    Set_Reference_Input{reference = "external-42"},
+    {
+        start_options = {
+            id = "order-42",
+            task_queue = "orders",
+            id_conflict_policy = .Use_Existing,
+        },
+        update_options = {
+            update_id = "set-reference-42",
+            headers = &update_headers,
+        },
+    },
+)
+defer temporal_client.update_with_start_result_free(&atomic)
+// atomic.workflow.started_by_request distinguishes creation from attachment.
+
+update_result: Set_Reference_Output
+err = temporal_client.wait_update_json(&atomic.update, &update_result)
 
 result: Order_Result
 err = temporal_client.get_result_json(&handle, &result)
@@ -1922,6 +1957,7 @@ temporal/failure/         owned recursive Temporal Failure model
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
+examples/update_with_start/ atomic create-or-attach Update proof
 examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner

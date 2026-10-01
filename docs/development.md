@@ -980,6 +980,25 @@ Workflow to completion. CLI 1.9.1/Server 1.32.0 omits the response's newer
 response have direct wire/ownership tests; the 500-case reset property exercises
 the shared option encoder across arbitrary ordered operations.
 
+Run the focused atomic Update-With-Start proof with a local dev server that has
+the multi-operation endpoint enabled:
+
+```bash
+temporal server start-dev \
+  --headless \
+  --dynamic-config-value frontend.enableExecuteMultiOperation=true
+
+./scripts/update-with-start-integration-test.sh
+```
+
+The test starts the Odin Workflow/Activity Worker, calls
+`ExecuteMultiOperation` through Core against a missing Workflow ID, waits for
+the Update result, repeats the call against the running execution, and requires
+the same Run ID with `started_by_request=false`. It then signals the Workflow
+to completion. `scripts/integration-test.sh` enables the same dev-server flag
+and runs this proof automatically. Exact wire/ownership tests cover the two
+nested responses, and a 500-case property varies both 0–12 argument lists.
+
 Workflow Pause is a feature-gated experimental Service API. Start a compatible
 local server explicitly:
 

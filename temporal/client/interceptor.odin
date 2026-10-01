@@ -31,6 +31,33 @@ Client_Start_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Start_Workflow_Next,
 ) -> (Workflow_Handle, Error)
 
+Client_Update_With_Start_Input :: struct {
+	client:           ^Client,
+	workflow_type:    string,
+	workflow_inputs:  []activity_codec.Payload_View,
+	update_name:      string,
+	update_inputs:    []activity_codec.Payload_View,
+	options:          Update_With_Start_Options,
+	start_headers:    ^Headers,
+	update_headers:   ^Headers,
+}
+
+Client_Update_With_Start_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Update_With_Start_Input,
+) -> (Update_With_Start_Result, Error)
+
+Client_Update_With_Start_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Update_With_Start_Next_Proc,
+}
+
+Client_Update_With_Start_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Update_With_Start_Input,
+	next: Client_Update_With_Start_Next,
+) -> (Update_With_Start_Result, Error)
+
 Client_Signal_With_Start_Input :: struct {
 	client:         ^Client,
 	workflow_type:  string,
@@ -531,6 +558,7 @@ Client_Connection_Mutation_Interceptor_Proc :: #type proc(user_data: rawptr, inp
 Client_Interceptor :: struct {
 	user_data:          rawptr,
 	start_workflow:     Client_Start_Workflow_Interceptor_Proc,
+	update_with_start:  Client_Update_With_Start_Interceptor_Proc,
 	signal_with_start:  Client_Signal_With_Start_Interceptor_Proc,
 	signal_workflow:    Client_Signal_Workflow_Interceptor_Proc,
 	query_workflow:     Client_Query_Workflow_Interceptor_Proc,
@@ -565,6 +593,16 @@ client_start_workflow_next :: proc(
 ) -> (Workflow_Handle, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid start Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_update_with_start_next :: proc(
+	next: Client_Update_With_Start_Next,
+	input: ^Client_Update_With_Start_Input,
+) -> (Update_With_Start_Result, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Update-With-Start interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -865,6 +903,27 @@ client_start_workflow_chain :: proc(
 		)
 	}
 	return start_workflow_payload_terminal(input)
+}
+
+client_update_with_start_chain :: proc(
+	data: rawptr,
+	input: ^Client_Update_With_Start_Input,
+) -> (Update_With_Start_Result, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Update-With-Start interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.update_with_start == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.update_with_start(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_update_with_start_chain},
+		)
+	}
+	return update_with_start_payloads_terminal(input)
 }
 
 client_signal_with_start_chain :: proc(

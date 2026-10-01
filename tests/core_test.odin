@@ -65,6 +65,7 @@ Client_Interceptor_Test_State :: struct {
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
+	update_start_input_seen: bool,
 	get_result_input_seen:   bool,
 	list_query_seen:         bool,
 	count_query_seen:        bool,
@@ -140,6 +141,59 @@ client_interceptor_test_signal_with_start :: proc(
 		result_error = temporal_client.error_from_string(.Rpc, "Signal-With-Start short circuit")
 	} else {
 		result, result_error = temporal_client.client_signal_with_start_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_update_with_start :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Update_With_Start_Input,
+	next: temporal_client.Client_Update_With_Start_Next,
+) -> (temporal_client.Update_With_Start_Result, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 2 {
+		start_value, update_value: int
+		start_found, update_found := false, false
+		for &entry in input.start_headers.entries {
+			if entry.key == "update-with-start" {
+				start_found = codec.decode_json(codec.payload_view(&entry.payload), &start_value) == .None
+			}
+		}
+		for &entry in input.update_headers.entries {
+			if entry.key == "update-with-start" {
+				update_found = codec.decode_json(codec.payload_view(&entry.payload), &update_value) == .None
+			}
+		}
+		node.state.update_start_input_seen = start_found && update_found &&
+			start_value == 1 && update_value == 11 &&
+			input.workflow_type == "order_workflow" && input.update_name == "set_reference"
+	}
+	start_header_error := temporal_client.headers_add_json(
+		input.start_headers,
+		"update-with-start",
+		node.id,
+	)
+	if start_header_error.message != nil {
+		return {}, start_header_error
+	}
+	update_header_error := temporal_client.headers_add_json(
+		input.update_headers,
+		"update-with-start",
+		node.id + 10,
+	)
+	if update_header_error.message != nil {
+		return {}, update_header_error
+	}
+	result: temporal_client.Update_With_Start_Result
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Update-With-Start short circuit")
+	} else {
+		result, result_error = temporal_client.client_update_with_start_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -9541,6 +9595,77 @@ client_signal_with_start_interceptors_nest_and_isolate_signal_headers :: proc(t:
 }
 
 @(test)
+client_update_with_start_interceptors_nest_and_isolate_both_headers :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		namespace = "default",
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			update_with_start = client_interceptor_test_update_with_start,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			update_with_start = client_interceptor_test_update_with_start,
+		},
+	)
+	start_metadata := temporal_client.Start_Metadata{}
+	metadata_error := temporal_client.start_metadata_init(&start_metadata)
+	testing.expect(t, metadata_error.message == nil)
+	temporal_client.error_free(&metadata_error)
+	defer temporal_client.start_metadata_free(&start_metadata)
+	testing.expect(t, temporal_client.start_metadata_add_header_json(&start_metadata, "caller-start", "original").message == nil)
+	update_headers := temporal_client.Headers{}
+	headers_error := temporal_client.headers_init(&update_headers)
+	testing.expect(t, headers_error.message == nil)
+	temporal_client.error_free(&headers_error)
+	defer temporal_client.headers_free(&update_headers)
+	testing.expect(t, temporal_client.headers_add_json(&update_headers, "caller-update", "original").message == nil)
+	workflow_input, _ := codec.encode_json("workflow")
+	update_input, _ := codec.encode_json("update")
+	defer codec.payload_free(&workflow_input)
+	defer codec.payload_free(&update_input)
+	workflow_inputs := [?]codec.Payload_View{codec.payload_view(&workflow_input)}
+	update_inputs := [?]codec.Payload_View{codec.payload_view(&update_input)}
+
+	_, update_error := temporal_client.update_with_start_payloads(
+		&client,
+		"order_workflow",
+		workflow_inputs[:],
+		"set_reference",
+		update_inputs[:],
+		{
+			start_options = {
+				id = "order-42",
+				task_queue = "orders",
+				id_conflict_policy = .Use_Existing,
+				metadata = &start_metadata,
+			},
+			update_options = {headers = &update_headers},
+		},
+	)
+	defer temporal_client.error_free(&update_error)
+	testing.expect_value(t, update_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(update_error.message), "Update-With-Start short circuit")
+	testing.expect(t, state.update_start_input_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+	testing.expect_value(t, len(start_metadata.headers), 1)
+	testing.expect_value(t, len(update_headers.entries), 1)
+}
+
+@(test)
 client_result_interceptors_wrap_follow_run_operation_and_own_payload :: proc(t: ^testing.T) {
 	state := Client_Interceptor_Test_State{}
 	first := Client_Interceptor_Test_Node{state = &state, id = 1}
@@ -10700,6 +10825,198 @@ client_update_projects_identity_and_headers :: proc(t: ^testing.T) {
 			codec.payload_free(&owned_header)
 		}
 	}
+}
+
+@(test)
+client_update_with_start_encodes_atomic_operation_pair :: proc(t: ^testing.T) {
+	start_headers := temporal_client.Headers{}
+	start_headers_error := temporal_client.headers_init(&start_headers)
+	testing.expect(t, start_headers_error.message == nil)
+	temporal_client.error_free(&start_headers_error)
+	defer temporal_client.headers_free(&start_headers)
+	testing.expect(t, temporal_client.headers_add_json(&start_headers, "start", "header").message == nil)
+	update_headers := temporal_client.Headers{}
+	update_headers_error := temporal_client.headers_init(&update_headers)
+	testing.expect(t, update_headers_error.message == nil)
+	temporal_client.error_free(&update_headers_error)
+	defer temporal_client.headers_free(&update_headers)
+	testing.expect(t, temporal_client.headers_add_json(&update_headers, "update", "header").message == nil)
+	workflow_first, _ := codec.encode_json("workflow-first")
+	workflow_second, _ := codec.encode_json(2)
+	update_first, _ := codec.encode_json("update-first")
+	update_second, _ := codec.encode_json(true)
+	defer codec.payload_free(&workflow_first)
+	defer codec.payload_free(&workflow_second)
+	defer codec.payload_free(&update_first)
+	defer codec.payload_free(&update_second)
+	workflow_inputs := [?]codec.Payload_View{
+		codec.payload_view(&workflow_first),
+		codec.payload_view(&workflow_second),
+	}
+	update_inputs := [?]codec.Payload_View{
+		codec.payload_view(&update_first),
+		codec.payload_view(&update_second),
+	}
+	encoded, encode_error := temporal_client.encode_update_with_start_request_payloads(
+		"default",
+		"order_workflow",
+		workflow_inputs[:],
+		"set_reference",
+		update_inputs[:],
+		{
+			start_options = {
+				id = "order-42",
+				task_queue = "orders",
+				request_id = "start-request",
+				id_conflict_policy = .Use_Existing,
+			},
+			update_options = {update_id = "update-42"},
+		},
+		&start_headers,
+		&update_headers,
+		"update-request",
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "Update-With-Start encoding failed: %s", string(encode_error.message))
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest(
+		encoded[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "default")
+	testing.expect_value(t, request.resource_id, "order-42")
+	testing.expect_value(t, len(request.operations), 2)
+	if len(request.operations) != 2 do return
+	start, start_ok := request.operations[0].operation.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Start_Workflow)
+	update, update_ok := request.operations[1].operation.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Update_Workflow)
+	testing.expect(t, start_ok && start.value != nil)
+	testing.expect(t, update_ok && update.value != nil)
+	if !start_ok || start.value == nil || !update_ok || update.value == nil do return
+	testing.expect_value(t, start.value.workflow_id, "order-42")
+	testing.expect_value(t, start.value.workflow_type.name, "order_workflow")
+	testing.expect_value(t, start.value.task_queue.name, "orders")
+	testing.expect_value(t, start.value.request_id, "start-request")
+	testing.expect(
+		t,
+		start.value.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	)
+	testing.expect_value(t, len(start.value.input.payloads), 2)
+	testing.expect_value(t, string(start.value.input.payloads[0].data), `"workflow-first"`)
+	testing.expect_value(t, string(start.value.input.payloads[1].data), "2")
+	testing.expect(t, start.value.header != nil && len(start.value.header.fields) == 1)
+	testing.expect_value(t, update.value.namespace, "default")
+	testing.expect_value(t, update.value.workflow_execution.workflow_id, "order-42")
+	testing.expect_value(t, update.value.workflow_execution.run_id, "")
+	testing.expect_value(t, update.value.first_execution_run_id, "")
+	testing.expect(t, update.value.wait_policy.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED)
+	testing.expect_value(t, update.value.request.meta.update_id, "update-42")
+	testing.expect_value(t, update.value.request.input.name, "set_reference")
+	testing.expect_value(t, len(update.value.request.input.args.payloads), 2)
+	testing.expect_value(t, string(update.value.request.input.args.payloads[0].data), `"update-first"`)
+	testing.expect_value(t, string(update.value.request.input.args.payloads[1].data), "true")
+	testing.expect(t, update.value.request.input.header != nil && len(update.value.request.input.header.fields) == 1)
+}
+
+@(test)
+client_update_with_start_rejects_non_atomic_start_options :: proc(t: ^testing.T) {
+	input := codec.payload_create(transmute([]u8)string(`"input"`))
+	defer codec.payload_free(&input)
+	invalid_options := [?]temporal_client.Update_With_Start_Options{
+		{start_options = {id = "id", task_queue = "queue"}},
+		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Fail}},
+		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Use_Existing, cron_schedule = "* * * * *"}},
+		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Use_Existing, start_delay = time.Second}},
+		{start_options = {id = "id", task_queue = "queue", id_conflict_policy = .Use_Existing, enable_eager_workflow_start = true}},
+	}
+	inputs := [?]codec.Payload_View{codec.payload_view(&input)}
+	for options in invalid_options {
+		encoded, encode_error := temporal_client.encode_update_with_start_request_payloads(
+			"default",
+			"workflow",
+			inputs[:],
+			"update",
+			inputs[:],
+			options,
+		)
+		delete(encoded)
+		testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+		testing.expect(t, encode_error.message != nil)
+		temporal_client.error_free(&encode_error)
+	}
+}
+
+@(test)
+client_update_with_start_response_owns_both_handles_and_immediate_outcome :: proc(t: ^testing.T) {
+	start_response := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionResponse{
+		run_id = "run-42",
+		first_execution_run_id = "first-run-42",
+		started = true,
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "order-42",
+		run_id = "run-42",
+	}
+	update_ref := proto.Temporal_Api_Update_V1_UpdateRef{
+		workflow_execution = &execution,
+		update_id = "update-42",
+	}
+	result_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"updated"`)}
+	result_payloads := proto.Temporal_Api_Common_V1_Payloads{}
+	defer delete(result_payloads.payloads)
+	append(&result_payloads.payloads, result_payload)
+	outcome := proto.Temporal_Api_Update_V1_Outcome{
+		value = proto.Temporal_Api_Update_V1_Outcome_Value_Success{value = &result_payloads},
+	}
+	update_response := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse{
+		update_ref = &update_ref,
+		outcome = &outcome,
+		stage = .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse{}
+	defer delete(response.responses)
+	append(
+		&response.responses,
+		proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response{
+			response = proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response_Response_Start_Workflow{value = &start_response},
+		},
+		proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response{
+			response = proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response_Response_Update_Workflow{value = &update_response},
+		},
+	)
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse(&response)
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{connection = &connection}
+	result, decode_error := temporal_client.decode_update_with_start_response(
+		&client,
+		"order-42",
+		encoded[:],
+	)
+	delete(encoded)
+	defer temporal_client.update_with_start_result_free(&result)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "Update-With-Start response failed: %s", string(decode_error.message))
+	testing.expect_value(t, result.workflow.id, "order-42")
+	testing.expect_value(t, result.workflow.run_id, "run-42")
+	testing.expect_value(t, result.workflow.first_execution_run_id, "first-run-42")
+	testing.expect(t, result.workflow.started_by_request)
+	testing.expect_value(t, result.update.workflow_id, "order-42")
+	testing.expect_value(t, result.update.run_id, "run-42")
+	testing.expect_value(t, result.update.update_id, "update-42")
+	testing.expect(t, result.update.outcome_present)
+	owned, wait_error := temporal_client.wait_update_payload(&result.update)
+	defer codec.payload_free(&owned)
+	defer temporal_client.error_free(&wait_error)
+	testing.expect(t, wait_error.message == nil)
+	testing.expect_value(t, string(owned.data), `"updated"`)
 }
 
 @(test)

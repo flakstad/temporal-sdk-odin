@@ -433,3 +433,146 @@ update_requests_preserve_generated_headers :: proc(t: ^testing.T) {
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+update_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
+	workflow_count := pbt.draw(t, pbt.int_range(0, 12))
+	update_count := pbt.draw(t, pbt.int_range(0, 12))
+	pbt.cover(t, workflow_count == 0, 2.0, "zero Workflow arguments")
+	pbt.cover(t, update_count == 0, 2.0, "zero Update-With-Start arguments")
+	pbt.cover(t, workflow_count >= 8 && update_count >= 8, 5.0, "many arguments in both operations")
+
+	workflow_values: [12]string
+	workflow_payloads: [12]codec.Payload
+	workflow_views: [12]codec.Payload_View
+	update_values: [12]string
+	update_payloads: [12]codec.Payload
+	update_views: [12]codec.Payload_View
+	defer {
+		for index in 0..<workflow_count do codec.payload_free(&workflow_payloads[index])
+		for index in 0..<update_count do codec.payload_free(&update_payloads[index])
+	}
+	for index in 0..<workflow_count {
+		workflow_values[index] = pbt.draw(t, pbt.string_ascii(0, 72))
+		workflow_payloads[index] = codec.payload_create(transmute([]u8)workflow_values[index])
+		workflow_views[index] = codec.payload_view(&workflow_payloads[index])
+	}
+	for index in 0..<update_count {
+		update_values[index] = pbt.draw(t, pbt.string_ascii(0, 72))
+		update_payloads[index] = codec.payload_create(transmute([]u8)update_values[index])
+		update_views[index] = codec.payload_view(&update_payloads[index])
+	}
+
+	encoded, encode_error := temporal_client.encode_update_with_start_request_payloads(
+		"property-namespace",
+		"property_workflow",
+		workflow_views[:workflow_count],
+		"property-update",
+		update_views[:update_count],
+		{
+			start_options = {
+				id = "property-workflow-id",
+				task_queue = "property-queue",
+				request_id = "property-start-request-id",
+				id_conflict_policy = .Use_Existing,
+			},
+			update_options = {update_id = "property-update-id"},
+		},
+		nil,
+		nil,
+		"property-update-request-id",
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	if encode_error.message != nil {
+		return pbt.fail("valid generated Update-With-Start request was rejected")
+	}
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return pbt.error("could not initialize Update-With-Start property arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest(
+		encoded[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	if !decoded || request.namespace != "property-namespace" ||
+	   request.resource_id != "property-workflow-id" || len(request.operations) != 2 {
+		return pbt.fail("generated Update-With-Start envelope changed during round trip")
+	}
+	start, start_ok := request.operations[0].operation.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Start_Workflow)
+	update, update_ok := request.operations[1].operation.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Update_Workflow)
+	if !start_ok || start.value == nil || start.value.input == nil ||
+	   !update_ok || update.value == nil || update.value.workflow_execution == nil ||
+	   update.value.request == nil || update.value.request.meta == nil ||
+	   update.value.request.input == nil || update.value.request.input.args == nil {
+		return pbt.fail("generated Update-With-Start operations did not decode")
+	}
+	if start.value.workflow_id != "property-workflow-id" ||
+	   start.value.workflow_id_conflict_policy != .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING ||
+	   len(start.value.input.payloads) != workflow_count ||
+	   update.value.workflow_execution.workflow_id != "property-workflow-id" ||
+	   len(update.value.workflow_execution.run_id) != 0 ||
+	   len(update.value.first_execution_run_id) != 0 ||
+	   update.value.request.meta.update_id != "property-update-id" ||
+	   update.value.request.request_id != "property-update-request-id" ||
+	   len(update.value.request.input.args.payloads) != update_count {
+		return pbt.fail("generated Update-With-Start fields changed during round trip")
+	}
+	for index in 0..<workflow_count {
+		if !bytes.equal(
+			start.value.input.payloads[index].data,
+			transmute([]u8)workflow_values[index],
+		) {
+			return pbt.fail("generated Workflow argument order changed")
+		}
+	}
+	for index in 0..<update_count {
+		if !bytes.equal(
+			update.value.request.input.args.payloads[index].data,
+			transmute([]u8)update_values[index],
+		) {
+			return pbt.fail("generated Update argument order changed")
+		}
+	}
+	reencoded, reencode_error := temporal_client.encode_update_with_start_request_payloads(
+		"property-namespace",
+		"property_workflow",
+		workflow_views[:workflow_count],
+		"property-update",
+		update_views[:update_count],
+		{
+			start_options = {
+				id = "property-workflow-id",
+				task_queue = "property-queue",
+				request_id = "property-start-request-id",
+				id_conflict_policy = .Use_Existing,
+			},
+			update_options = {update_id = "property-update-id"},
+		},
+		nil,
+		nil,
+		"property-update-request-id",
+	)
+	defer delete(reencoded)
+	defer temporal_client.error_free(&reencode_error)
+	if reencode_error.message != nil || !bytes.equal(encoded[:], reencoded[:]) {
+		return pbt.fail("generated Update-With-Start request bytes were not deterministic")
+	}
+	return pbt.pass()
+}
+
+@(test)
+update_with_start_requests_preserve_atomic_shape :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Update-With-Start preserves atomic operation order and both argument lists",
+		update_with_start_request_property,
+		{num_tests = 500, seed = 0x5550_4457_5354_4152},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

@@ -102,6 +102,7 @@ if ! temporal operator cluster health \
   temporal server start-dev \
     --headless \
     --log-level error \
+    --dynamic-config-value 'frontend.enableExecuteMultiOperation=true' \
     --dynamic-config-value 'system.enableActivityEagerExecution=true' \
     >"$server_log" 2>&1 &
   server_pid=$!
@@ -130,6 +131,9 @@ fi
 "$repo_root/scripts/build-examples.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/update-with-start-integration-test.sh"
 
 forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \
   TEMPORAL_CORE_LOG_FILTER=trace \

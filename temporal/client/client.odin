@@ -818,6 +818,21 @@ Update_Workflow_Options :: struct {
 	headers:   ^Headers,
 }
 
+// Update_With_Start_Options describes the two operations Temporal starts
+// atomically. Use_Existing is required so the Update can attach to an already
+// running execution instead of failing the Start operation.
+Update_With_Start_Options :: struct {
+	start_options:  Start_Workflow_Options,
+	update_options: Update_Workflow_Options,
+}
+
+// Update_With_Start_Result owns both handles returned by ExecuteMultiOperation.
+// Neither handle owns the Client, which must remain open while either is used.
+Update_With_Start_Result :: struct {
+	workflow: Workflow_Handle,
+	update:   Update_Handle,
+}
+
 Client_Cancellation_Token :: temporal_core.Rpc_Cancellation_Token
 
 client_cancellation_token_create :: proc() -> Client_Cancellation_Token {
@@ -984,6 +999,15 @@ update_handle_free :: proc(handle: ^Update_Handle) {
 	delete(handle.outcome_error.message, heap)
 	delete(handle.outcome_error.details, heap)
 	handle^ = {}
+}
+
+update_with_start_result_free :: proc(result: ^Update_With_Start_Result) {
+	if result == nil {
+		return
+	}
+	workflow_handle_free(&result.workflow)
+	update_handle_free(&result.update)
+	result^ = {}
 }
 
 get_update_handle :: proc(
@@ -1655,6 +1679,368 @@ start_workflow_json :: proc(
 	}
 	defer codec.payload_free(&payload)
 	return start_workflow_payload(client, workflow_type, codec.payload_view(&payload), options)
+}
+
+update_with_start_options_error :: proc(options: Update_With_Start_Options) -> string {
+	if message := start_workflow_options_error(options.start_options); len(message) > 0 {
+		return message
+	}
+	if options.start_options.id_conflict_policy != .Use_Existing {
+		return "Update-With-Start requires the Use_Existing Workflow ID conflict policy"
+	}
+	if len(options.start_options.cron_schedule) > 0 {
+		return "Update-With-Start cannot use a cron schedule"
+	}
+	if options.start_options.enable_eager_workflow_start {
+		return "Update-With-Start cannot request eager Workflow execution"
+	}
+	if options.start_options.start_delay != 0 {
+		return "Update-With-Start cannot use a Workflow start delay"
+	}
+	return ""
+}
+
+// encode_update_with_start_request_payloads builds Temporal's only currently
+// valid ExecuteMultiOperation shape: [StartWorkflow, UpdateWorkflow]. It
+// decodes and nests the ordinary request encodings so those two established
+// wire boundaries remain the single source of truth.
+encode_update_with_start_request_payloads :: proc(
+	namespace, workflow_type: string,
+	workflow_inputs: []codec.Payload_View,
+	update_name: string,
+	update_inputs: []codec.Payload_View,
+	options: Update_With_Start_Options,
+	start_headers: ^Headers = nil,
+	update_headers: ^Headers = nil,
+	explicit_update_request_id := "",
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if message := update_with_start_options_error(options); len(message) > 0 {
+		return nil, error_from_string(.Invalid_Argument, message)
+	}
+	if len(update_name) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow Update name must not be empty")
+	}
+	update_options := options.update_options
+	if update_headers != nil {
+		update_options.headers = update_headers
+	}
+	start_bytes, start_error := encode_start_workflow_request_payloads(
+		namespace,
+		workflow_type,
+		workflow_inputs,
+		options.start_options,
+		start_headers,
+	)
+	if start_error.message != nil {
+		return nil, start_error
+	}
+	defer delete(start_bytes)
+	update_bytes, update_error := encode_update_workflow_request_payloads(
+		namespace,
+		options.start_options.id,
+		"",
+		"",
+		update_name,
+		update_inputs,
+		update_options,
+		explicit_update_request_id,
+	)
+	if update_error.message != nil {
+		return nil, update_error
+	}
+	defer delete(update_bytes)
+
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return nil, error_from_string(.Payload_Conversion, "could not initialize Update-With-Start request arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	start_request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
+	update_request := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest{}
+	start_decoded := proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
+		start_bytes[:],
+		&start_request,
+	)
+	update_decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionRequest(
+		update_bytes[:],
+		&update_request,
+	)
+	context.allocator = previous_allocator
+	if !start_decoded || !update_decoded {
+		return nil, error_from_string(.Payload_Conversion, "could not compose Update-With-Start request")
+	}
+
+	operations := make(
+		[dynamic]proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation,
+		0,
+		2,
+	)
+	defer delete(operations)
+	append(
+		&operations,
+		proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation{
+			operation = proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Start_Workflow{
+				value = &start_request,
+			},
+		},
+		proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation{
+			operation = proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest_Operation_Operation_Update_Workflow{
+				value = &update_request,
+			},
+		},
+	)
+	request := proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest{
+		namespace = namespace,
+		operations = operations,
+		resource_id = options.start_options.id,
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_ExecuteMultiOperationRequest(&request), {}
+}
+
+preserve_update_handle :: proc(
+	client: ^Client,
+	response: ^proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionResponse,
+) -> (Update_Handle, Error) {
+	if response == nil || response.update_ref == nil ||
+	   response.update_ref.workflow_execution == nil ||
+	   len(response.update_ref.workflow_execution.workflow_id) == 0 ||
+	   len(response.update_ref.update_id) == 0 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Update response")
+	}
+	accepted := response.outcome != nil ||
+		response.stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED ||
+		response.stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED
+	if !accepted {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned Update-With-Start before Update acceptance")
+	}
+	handle, handle_error := get_update_handle(
+		client,
+		response.update_ref.workflow_execution.workflow_id,
+		response.update_ref.workflow_execution.run_id,
+		response.update_ref.update_id,
+	)
+	if handle_error.message != nil {
+		return {}, handle_error
+	}
+	if response.outcome != nil {
+		heap := allocator_runtime.heap_allocator()
+		previous_allocator := context.allocator
+		context.allocator = heap
+		handle.outcome, handle.outcome_error = update_outcome_payload(response.outcome)
+		context.allocator = previous_allocator
+		if handle.outcome_error.message != nil &&
+		   handle.outcome_error.kind != .Workflow_Update_Failed {
+			error := handle.outcome_error
+			handle.outcome_error = {}
+			update_handle_free(&handle)
+			return {}, error
+		}
+		handle.outcome_present = true
+	}
+	return handle, {}
+}
+
+decode_update_with_start_response :: proc(
+	client: ^Client,
+	workflow_id: string,
+	data: []u8,
+) -> (Update_With_Start_Result, Error) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize Update-With-Start response arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse(data, &response)
+	context.allocator = previous_allocator
+	if !decoded || len(response.responses) != 2 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Update-With-Start response")
+	}
+	start_variant, start_ok := response.responses[0].response.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response_Response_Start_Workflow)
+	update_variant, update_ok := response.responses[1].response.(proto.Temporal_Api_Workflowservice_V1_ExecuteMultiOperationResponse_Response_Response_Update_Workflow)
+	if !start_ok || start_variant.value == nil || len(start_variant.value.run_id) == 0 ||
+	   !update_ok || update_variant.value == nil {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned Update-With-Start operations out of order")
+	}
+	first_execution_run_id := start_variant.value.first_execution_run_id
+	if len(first_execution_run_id) == 0 {
+		first_execution_run_id = start_variant.value.run_id
+	}
+	workflow_handle, workflow_error := get_workflow_handle(
+		client,
+		workflow_id,
+		start_variant.value.run_id,
+		first_execution_run_id,
+	)
+	if workflow_error.message != nil {
+		return {}, workflow_error
+	}
+	workflow_handle.started_by_request = start_variant.value.started
+	workflow_handle.eager_execution_accepted = false
+	update_handle, update_error := preserve_update_handle(client, update_variant.value)
+	if update_error.message != nil {
+		workflow_handle_free(&workflow_handle)
+		return {}, update_error
+	}
+	if update_handle.workflow_id != workflow_id ||
+	   (len(update_handle.run_id) > 0 && update_handle.run_id != workflow_handle.run_id) {
+		workflow_handle_free(&workflow_handle)
+		update_handle_free(&update_handle)
+		return {}, error_from_string(.Malformed_Response, "Temporal returned mismatched Update-With-Start handles")
+	}
+	return {workflow = workflow_handle, update = update_handle}, {}
+}
+
+update_with_start_payloads_unintercepted :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_inputs: []codec.Payload_View,
+	update_name: string,
+	update_inputs: []codec.Payload_View,
+	options: Update_With_Start_Options,
+	start_headers, update_headers: ^Headers,
+) -> (Update_With_Start_Result, Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal client is not connected")
+	}
+	request_bytes, request_error := encode_update_with_start_request_payloads(
+		client.namespace,
+		workflow_type,
+		workflow_inputs,
+		update_name,
+		update_inputs,
+		options,
+		start_headers,
+		update_headers,
+	)
+	if request_error.message != nil {
+		return {}, request_error
+	}
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		client.connection,
+		.Workflow,
+		"ExecuteMultiOperation",
+		request_bytes[:],
+		timeout_millis = 0,
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		return {}, error_from_core(&rpc_result.error)
+	}
+	return decode_update_with_start_response(client, options.start_options.id, rpc_result.protobuf)
+}
+
+update_with_start_payloads_terminal :: proc(
+	input: ^Client_Update_With_Start_Input,
+) -> (Update_With_Start_Result, Error) {
+	if input == nil || input.start_headers == nil || input.update_headers == nil ||
+	   input.start_headers.allocator.procedure == nil ||
+	   input.update_headers.allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Update-With-Start interceptor input is invalid")
+	}
+	return update_with_start_payloads_unintercepted(
+		input.client,
+		input.workflow_type,
+		input.workflow_inputs,
+		input.update_name,
+		input.update_inputs,
+		input.options,
+		input.start_headers,
+		input.update_headers,
+	)
+}
+
+update_with_start_payloads :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_inputs: []codec.Payload_View,
+	update_name: string,
+	update_inputs: []codec.Payload_View,
+	options: Update_With_Start_Options,
+) -> (Update_With_Start_Result, Error) {
+	start_headers := Headers{}
+	start_headers_error := client_start_interceptor_headers_init(
+		&start_headers,
+		options.start_options.metadata,
+	)
+	if start_headers_error.message != nil {
+		return {}, start_headers_error
+	}
+	defer headers_free(&start_headers)
+	update_headers := Headers{}
+	update_headers_error := client_interceptor_headers_init(
+		&update_headers,
+		options.update_options.headers,
+	)
+	if update_headers_error.message != nil {
+		return {}, update_headers_error
+	}
+	defer headers_free(&update_headers)
+	input := Client_Update_With_Start_Input{
+		client = client,
+		workflow_type = workflow_type,
+		workflow_inputs = workflow_inputs,
+		update_name = update_name,
+		update_inputs = update_inputs,
+		options = options,
+		start_headers = &start_headers,
+		update_headers = &update_headers,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_update_with_start_chain(&state, &input)
+}
+
+update_with_start_payload :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_input: codec.Payload_View,
+	update_name: string,
+	update_input: codec.Payload_View,
+	options: Update_With_Start_Options,
+) -> (Update_With_Start_Result, Error) {
+	workflow_inputs := [?]codec.Payload_View{workflow_input}
+	update_inputs := [?]codec.Payload_View{update_input}
+	return update_with_start_payloads(
+		client,
+		workflow_type,
+		workflow_inputs[:],
+		update_name,
+		update_inputs[:],
+		options,
+	)
+}
+
+update_with_start_json :: proc(
+	client: ^Client,
+	workflow_type: string,
+	workflow_input: $Workflow_Input,
+	update_name: string,
+	update_input: $Update_Input,
+	options: Update_With_Start_Options,
+) -> (Update_With_Start_Result, Error) {
+	workflow_payload, workflow_encode_error := codec.encode_json(workflow_input)
+	if workflow_encode_error != .None {
+		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow input")
+	}
+	defer codec.payload_free(&workflow_payload)
+	update_payload, update_encode_error := codec.encode_json(update_input)
+	if update_encode_error != .None {
+		return {}, error_from_string(.Payload_Conversion, "could not encode Workflow Update input")
+	}
+	defer codec.payload_free(&update_payload)
+	return update_with_start_payload(
+		client,
+		workflow_type,
+		codec.payload_view(&workflow_payload),
+		update_name,
+		codec.payload_view(&update_payload),
+		options,
+	)
 }
 
 signal_with_start_options_error :: proc(options: Signal_With_Start_Options) -> string {

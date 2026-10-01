@@ -249,6 +249,45 @@ default. The response's `started` bit becomes
 `Workflow_Handle.started_by_request`, allowing callers to distinguish creation
 from reuse without comparing histories.
 
+Update-With-Start uses WorkflowService `ExecuteMultiOperation`, again through
+the existing generic `temporal_core_client_rpc_call` C symbol. The pinned API
+currently accepts exactly two operations, in this order:
+`[StartWorkflowExecutionRequest, UpdateWorkflowExecutionRequest]`. Core owns
+transport, retry, authentication, and gRPC status propagation; the Service
+starts both operations atomically. Odin owns the language-level composition,
+Payload/header codecs, request IDs, response validation, and the two returned
+handles. This matches Temporal's documented semantics: a missing Workflow is
+started and receives the Update, while a running Workflow is reused and
+receives the same Update atomically.
+
+The public `update_with_start_*` family deliberately requires
+`Workflow_Id_Conflict_Policy.Use_Existing`. It also rejects cron, eager start,
+and start delay because the upstream multi-operation request explicitly
+forbids those Start fields. The nested Update must omit both Run ID selectors;
+Odin constructs it from the Start Workflow ID and waits for at least Accepted.
+Independent start and Update Header builders are possible here because the
+operations retain their ordinary request messages. A dedicated outbound
+interceptor exposes both isolated working maps and both ordered argument
+slices; ordinary Start and Update interceptors do not run a second time.
+
+Implementation reuses the established request encoders, decodes their bytes
+into one temporary arena, nests those messages, and immediately encodes the
+outer request. No arena pointer escapes the call. The C response buffer remains
+alive while the outer response and both nested messages are decoded. Odin then
+heap-clones Workflow/Run/Update IDs and any immediate Update outcome before
+freeing that buffer. `Update_With_Start_Result` owns one `Workflow_Handle` and
+one `Update_Handle`; `update_with_start_result_free` releases both, while the
+Client remains borrowed. The response must contain exactly Start then Update,
+and both returned references must identify the same execution.
+
+This slice adds generated roots for `ExecuteMultiOperationRequest/Response`,
+but no raw C binding or new native symbol. It is covered by exact wire and
+ownership tests, interceptor nesting, a 500-case property over both repeated
+argument lists, and a CLI-devserver create-then-attach test. The live proof ran
+against CLI 1.5.1 / Server 1.29.1 with
+`frontend.enableExecuteMultiOperation=true`; current Temporal guidance
+recommends Server 1.28 or newer for Update-With-Start.
+
 The same generic RPC boundary now implements four read APIs without adding C
 symbols:
 
@@ -2052,7 +2091,7 @@ a connection-mutation input and remain direct Core ABI calls at the terminal;
 all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks twenty-one nested operation families and arbitrary
+A 500-case property checks twenty-two nested operation families and arbitrary
 short-circuit depth, including all six standalone Nexus lifecycle/Visibility
 interceptor groups. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
@@ -2878,6 +2917,11 @@ Workflows are enabled.
    create and reuse paths, including its single Signal-header map and response
    `started` bit. The absence of separate start headers and eager dispatch is a
    protocol constraint, not an Odin wrapper omission.
+   Update-With-Start is wire-, property-, interceptor-, and
+   CLI-devserver-tested for both atomic creation and attachment to a running
+   execution. It depends only on Core's generic RPC bridge and the pinned
+   `ExecuteMultiOperation` protobufs; the public API enforces every current
+   operation-specific Service restriction before transport.
    The pinned standalone-Activity client API is
    newer than CLI Server 1.29.1. Feature availability must be tested against
    the supported server matrix rather than inferred from generated APIs.
@@ -2934,9 +2978,13 @@ called out explicitly. Ordinary `UpdateWorkflowExecutionOptions` now reuses the
 same validated model, is intercepted, and is live-proven through canonical
 response plus Describe. The supported-server inventory identified experimental
 Workflow Pause as a coherent control gap; Pause/Unpause is now intercepted and
-live-proven with deferred Signal delivery. The next smallest stable Client
-parity gap is Workflow deletion, including explicit chain/run targeting and
-clear safety semantics before exposing the destructive call.
+live-proven with deferred Signal delivery. Atomic Update-With-Start is now also
+implemented and live-proven on both create and attach paths. Workflow deletion
+is intentionally deprioritized: current language SDK handles generally treat
+it as an operator/CLI concern, and exposing a destructive call needs explicit
+chain/run targeting and safety semantics. The next higher-value hardening slice
+is process-isolated Activity panic containment, followed by a maintained
+client/server capability matrix for newer Schedule, Nexus, and Pause APIs.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 
@@ -2968,6 +3016,8 @@ round trips, 500 Signal-With-Start request round trips, 500 ordinary repeated
 Signal request/header round trips over 0–12 arguments, 500 paginated Visibility
 list/count round trips, 500 repeated Query request/header round trips over 0–12
 arguments, 500 repeated Update request/header round trips over 0–12 arguments,
+500 Update-With-Start request round trips over two independent 0–12 argument
+lists with exact operation order and deterministic bytes,
 500 Worker versioning mappings across every C-union strategy,
 500 global/per-type nondeterminism policy mappings,
 500 query response round trips, and

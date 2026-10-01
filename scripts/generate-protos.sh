@@ -50,6 +50,8 @@ cargo run --quiet \
   coresdk.workflow_completion.WorkflowActivationCompletion \
   temporal.api.workflowservice.v1.StartWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.StartWorkflowExecutionResponse \
+  temporal.api.workflowservice.v1.ExecuteMultiOperationRequest \
+  temporal.api.workflowservice.v1.ExecuteMultiOperationResponse \
   temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest \
   temporal.api.workflowservice.v1.StartNexusOperationExecutionResponse \
   temporal.api.workflowservice.v1.PollNexusOperationExecutionRequest \
