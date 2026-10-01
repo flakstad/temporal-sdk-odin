@@ -131,6 +131,13 @@ fi
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
+forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \
+  TEMPORAL_CORE_LOG_FILTER=trace \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-core-connect.sh")"
+echo "$forwarded_log_output"
+grep -q 'Core log forwarding delivered .* callback-scoped records.' <<<"$forwarded_log_output"
+
 nexus_core_output="$(TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-core-connect.sh")"

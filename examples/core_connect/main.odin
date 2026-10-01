@@ -2,9 +2,29 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:sync"
 import "core:time"
 import temporal_core "../../temporal/core"
 import proto "../../temporal/core/proto"
+
+Forwarded_Log_State :: struct {
+	mutex:       sync.Mutex,
+	count:       int,
+	well_formed: bool,
+}
+
+capture_core_log :: proc(user_data: rawptr, log: ^temporal_core.Runtime_Log) {
+	state := cast(^Forwarded_Log_State)user_data
+	if state == nil || log == nil {
+		return
+	}
+	sync.mutex_lock(&state.mutex)
+	defer sync.mutex_unlock(&state.mutex)
+	state.count += 1
+	if len(log.target) > 0 && len(log.message) > 0 && log.timestamp_millis > 0 {
+		state.well_formed = true
+	}
+}
 
 probe_standalone_nexus :: proc(client: ^temporal_core.Client) {
 	timeout := proto.Google_Protobuf_Duration{seconds = 5}
@@ -78,6 +98,8 @@ main :: proc() {
 	)
 	log_filter_buffer: [256]u8
 	log_filter := os.get_env(log_filter_buffer[:], "TEMPORAL_CORE_LOG_FILTER")
+	forward_logs_buffer: [64]u8
+	forward_logs := os.get_env(forward_logs_buffer[:], "TEMPORAL_CORE_FORWARD_LOGS")
 	standalone_nexus_probe_buffer: [64]u8
 	standalone_nexus_probe := os.get_env(
 		standalone_nexus_probe_buffer[:],
@@ -86,6 +108,7 @@ main :: proc() {
 	runtime_options := temporal_core.runtime_options_default()
 	prometheus_options := temporal_core.Runtime_Prometheus_Options{}
 	logging_options := temporal_core.Runtime_Logging_Options{}
+	forwarded_logs := Forwarded_Log_State{}
 	if len(prometheus_address) > 0 {
 		prometheus_options.bind_address = prometheus_address
 		prometheus_options.counters_total_suffix = true
@@ -95,8 +118,13 @@ main :: proc() {
 			{key = "sdk_language", value = "odin"},
 		}
 	}
-	if len(log_filter) > 0 {
+	if len(log_filter) > 0 || forward_logs == "1" {
 		logging_options.filter = log_filter
+		if len(logging_options.filter) == 0 do logging_options.filter = "info"
+		if forward_logs == "1" {
+			logging_options.forward_to = capture_core_log
+			logging_options.user_data = &forwarded_logs
+		}
 		runtime_options.logging = &logging_options
 	}
 	runtime, runtime_error := temporal_core.runtime_create_with_options(runtime_options)
@@ -162,6 +190,22 @@ main :: proc() {
 	defer delete(info.protobuf)
 
 	fmt.printf("Connected through Temporal SDK Core; GetSystemInfo returned %d protobuf bytes.\n", len(info.protobuf))
+	if forward_logs == "1" {
+		time.sleep(50 * time.Millisecond)
+		sync.mutex_lock(&forwarded_logs.mutex)
+		log_count := forwarded_logs.count
+		well_formed := forwarded_logs.well_formed
+		sync.mutex_unlock(&forwarded_logs.mutex)
+		if log_count == 0 || !well_formed {
+			fmt.eprintf(
+				"Core log forwarding did not deliver a well-formed record (count=%d, valid=%v).\n",
+				log_count,
+				well_formed,
+			)
+			os.exit(1)
+		}
+		fmt.printf("Core log forwarding delivered %d callback-scoped records.\n", log_count)
+	}
 	if len(prometheus_address) > 0 {
 		fmt.printf("Core Prometheus exporter is serving %s.\n", prometheus_address)
 		// The integration script scrapes while this process owns the runtime.

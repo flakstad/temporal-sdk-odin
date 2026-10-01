@@ -7044,9 +7044,18 @@ raw_byte_ref_string :: proc(value: raw.Byte_Array_Ref) -> string {
 	return string(([^]u8)(value.data)[:int(value.size)])
 }
 
+runtime_log_test_callback :: proc(user_data: rawptr, log: ^temporal_core.Runtime_Log) {
+	_ = user_data
+	_ = log
+}
+
 @(test)
 runtime_observability_options_bind_exactly_to_the_pinned_core_abi :: proc(t: ^testing.T) {
-	logging := temporal_core.Runtime_Logging_Options{filter = "temporalio_sdk_core=debug"}
+	logging := temporal_core.Runtime_Logging_Options{
+		filter = "temporalio_sdk_core=debug",
+		forward_to = runtime_log_test_callback,
+		user_data = cast(rawptr)(uintptr(42)),
+	}
 	prometheus := temporal_core.Runtime_Prometheus_Options{
 		bind_address = "127.0.0.1:9464",
 		counters_total_suffix = true,
@@ -7079,7 +7088,7 @@ runtime_observability_options_bind_exactly_to_the_pinned_core_abi :: proc(t: ^te
 	testing.expect(t, bindings.telemetry.logging == &bindings.logging)
 	testing.expect(t, bindings.telemetry.metrics == &bindings.metrics)
 	testing.expect_value(t, raw_byte_ref_string(bindings.logging.filter), "temporalio_sdk_core=debug")
-	testing.expect(t, bindings.logging.forward_to == nil)
+	testing.expect(t, bindings.logging.forward_to != nil)
 	testing.expect(t, bindings.metrics.prometheus == &bindings.prometheus)
 	testing.expect(t, bindings.metrics.opentelemetry == nil)
 	testing.expect_value(t, raw_byte_ref_string(bindings.prometheus.bind_address), "127.0.0.1:9464")
@@ -7100,6 +7109,34 @@ runtime_observability_options_bind_exactly_to_the_pinned_core_abi :: proc(t: ^te
 	testing.expect_value(t, bindings.runtime_info[0].runtime_type, raw.Runtime_Type.Native)
 	testing.expect_value(t, raw_byte_ref_string(bindings.runtime_info[0].version), "Odin test")
 	testing.expect(t, bindings.raw_options.disable_environment_info)
+}
+
+@(test)
+runtime_log_forwarding_route_is_exclusive_and_reusable_after_close :: proc(t: ^testing.T) {
+	logging := temporal_core.Runtime_Logging_Options{
+		filter = "temporalio_sdk_core=off",
+		forward_to = runtime_log_test_callback,
+	}
+	options := temporal_core.runtime_options_default()
+	options.logging = &logging
+
+	first, first_error := temporal_core.runtime_create_with_options(options)
+	testing.expectf(t, first_error.message == nil, "first forwarding Runtime failed: %s", string(first_error.message))
+	temporal_core.error_free(&first_error)
+
+	second, second_error := temporal_core.runtime_create_with_options(options)
+	testing.expect(t, second.handle == nil)
+	testing.expect(t, strings.contains(string(second_error.message), "only one Core log-forwarding Runtime"))
+	temporal_core.error_free(&second_error)
+	temporal_core.runtime_close(&second)
+
+	temporal_core.runtime_close(&first)
+	testing.expect(t, first.handle == nil)
+
+	third, third_error := temporal_core.runtime_create_with_options(options)
+	testing.expectf(t, third_error.message == nil, "reused forwarding route failed: %s", string(third_error.message))
+	temporal_core.error_free(&third_error)
+	temporal_core.runtime_close(&third)
 }
 
 @(test)
@@ -7155,6 +7192,16 @@ runtime_observability_options_reject_ambiguous_or_malformed_values :: proc(t: ^t
 	options = temporal_core.runtime_options_default()
 	prometheus.histogram_bucket_overrides = "metric-without-values"
 	options.prometheus = &prometheus
+	error = temporal_core.runtime_options_validate(options)
+	testing.expect(t, error.message != nil)
+	temporal_core.error_free(&error)
+
+	logging := temporal_core.Runtime_Logging_Options{
+		filter = "temporalio_sdk_core=debug",
+		user_data = cast(rawptr)(uintptr(42)),
+	}
+	options = temporal_core.runtime_options_default()
+	options.logging = &logging
 	error = temporal_core.runtime_options_validate(options)
 	testing.expect(t, error.message != nil)
 	temporal_core.error_free(&error)

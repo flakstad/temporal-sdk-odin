@@ -5,6 +5,7 @@ import "core:c"
 import "core:bytes"
 import "core:fmt"
 import "core:math"
+import allocator_runtime "base:runtime"
 import "core:strings"
 import "core:sync"
 import "core:time"
@@ -17,7 +18,8 @@ Error :: struct {
 }
 
 Runtime :: struct {
-	handle: ^raw.Runtime,
+	handle:            ^raw.Runtime,
+	forwards_core_logs: bool,
 }
 
 Client :: struct {
@@ -50,11 +52,29 @@ Runtime_Key_Value :: struct {
 	value: string,
 }
 
+Runtime_Log_Level :: raw.Forwarded_Log_Level
+
+// Runtime_Log owns its strings only for the duration of Runtime_Log_Callback.
+// Clone fields inside the callback if they must outlive it.
+Runtime_Log :: struct {
+	level:            Runtime_Log_Level,
+	target:           string,
+	message:          string,
+	timestamp_millis: u64,
+	fields_json:      string,
+}
+
+Runtime_Log_Callback :: #type proc(user_data: rawptr, log: ^Runtime_Log)
+
 Runtime_Logging_Options :: struct {
 	// Uses Core's tracing filter syntax, for example "temporalio_sdk_core=debug".
-	// Logs are written by Core because forward callbacks do not carry per-runtime
-	// user data and may arrive on arbitrary runtime threads.
-	filter: string,
+	filter:    string,
+	// The callback can run concurrently on arbitrary Core threads. It must not
+	// call runtime_create/runtime_close and must return before user_data is freed.
+	// Core's C ABI has no callback user-data slot, so only one forwarding Runtime
+	// may exist in a process at a time.
+	forward_to: Runtime_Log_Callback,
+	user_data:  rawptr,
 }
 
 Open_Telemetry_Metric_Temporality :: raw.Open_Telemetry_Metric_Temporality
@@ -126,7 +146,8 @@ runtime_opentelemetry_options_default :: proc(url: string) -> Runtime_Open_Telem
 
 // Runtime_Option_Bindings owns every temporary buffer and address-stable raw
 // record borrowed by temporal_core_runtime_new. The bridge copies all option
-// data synchronously except a logging callback, which this layer does not set.
+// data synchronously; a configured logging callback remains a process-global
+// function pointer for the Runtime lifetime.
 Runtime_Option_Bindings :: struct {
 	raw_options:       raw.Runtime_Options,
 	telemetry:         raw.Telemetry_Options,
@@ -138,6 +159,14 @@ Runtime_Option_Bindings :: struct {
 	global_tags:       [dynamic]u8,
 	opentelemetry_headers: [dynamic]u8,
 }
+
+Runtime_Log_Route :: struct {
+	callback:  Runtime_Log_Callback,
+	user_data: rawptr,
+}
+
+runtime_log_route_mutex: sync.Mutex
+runtime_log_route: Runtime_Log_Route
 
 Poller_Behavior_Kind :: enum {
 	Default,
@@ -336,6 +365,71 @@ copy_core_bytes :: proc(value: ^raw.Byte_Array) -> []u8 {
 	return result
 }
 
+runtime_log_ref_view :: proc(value: raw.Byte_Array_Ref) -> string {
+	if value.data == nil || value.size == 0 {
+		return ""
+	}
+	return string(([^]u8)(value.data)[:int(value.size)])
+}
+
+runtime_log_clone_ref :: proc(value: raw.Byte_Array_Ref) -> (owned: string, ok: bool) {
+	view := runtime_log_ref_view(value)
+	if len(view) == 0 {
+		return "", true
+	}
+	allocation_error: allocator_runtime.Allocator_Error
+	owned, allocation_error = strings.clone(view, allocator_runtime.heap_allocator())
+	return owned, allocation_error == nil
+}
+
+runtime_forwarded_log_callback :: proc "c" (level: raw.Forwarded_Log_Level, source: ^raw.Forwarded_Log) {
+	context = allocator_runtime.default_context()
+	if source == nil {
+		return
+	}
+	sync.mutex_lock(&runtime_log_route_mutex)
+	defer sync.mutex_unlock(&runtime_log_route_mutex)
+	if runtime_log_route.callback == nil {
+		return
+	}
+
+	heap := allocator_runtime.heap_allocator()
+	log := Runtime_Log{
+		level = level,
+		timestamp_millis = raw.forwarded_log_timestamp_millis(source),
+	}
+	ok := true
+	log.target, ok = runtime_log_clone_ref(raw.forwarded_log_target(source))
+	if ok do log.message, ok = runtime_log_clone_ref(raw.forwarded_log_message(source))
+	if ok do log.fields_json, ok = runtime_log_clone_ref(raw.forwarded_log_fields_json(source))
+	defer delete(log.target, heap)
+	defer delete(log.message, heap)
+	defer delete(log.fields_json, heap)
+	if !ok {
+		return
+	}
+	runtime_log_route.callback(runtime_log_route.user_data, &log)
+}
+
+runtime_log_route_install :: proc(options: ^Runtime_Logging_Options) -> (installed: bool, error: Error) {
+	if options == nil || options.forward_to == nil {
+		return false, {}
+	}
+	sync.mutex_lock(&runtime_log_route_mutex)
+	defer sync.mutex_unlock(&runtime_log_route_mutex)
+	if runtime_log_route.callback != nil {
+		return false, client_option_error("only one Core log-forwarding Runtime may exist in a process")
+	}
+	runtime_log_route = {callback = options.forward_to, user_data = options.user_data}
+	return true, {}
+}
+
+runtime_log_route_remove :: proc() {
+	sync.mutex_lock(&runtime_log_route_mutex)
+	defer sync.mutex_unlock(&runtime_log_route_mutex)
+	runtime_log_route = {}
+}
+
 error_free :: proc(error: ^Error) {
 	if error == nil {
 		return
@@ -394,6 +488,9 @@ runtime_options_validate :: proc(options: Runtime_Options) -> Error {
 	}
 	if options.logging != nil && len(options.logging.filter) == 0 {
 		return client_option_error("Core logging filter must not be empty")
+	}
+	if options.logging != nil && options.logging.forward_to == nil && options.logging.user_data != nil {
+		return client_option_error("Core logging user data requires a forwarding callback")
 	}
 	if options.prometheus != nil {
 		if len(options.prometheus.bind_address) == 0 {
@@ -480,8 +577,9 @@ runtime_option_bindings_init :: proc(
 	bindings.raw_options.telemetry = &bindings.telemetry
 	if options.logging != nil {
 		bindings.logging.filter = byte_ref(options.logging.filter)
-		// Nil selects Core's console logger. Forwarded callbacks remain raw-only
-		// until the SDK can provide a process-wide, thread-safe dispatcher.
+		if options.logging.forward_to != nil {
+			bindings.logging.forward_to = runtime_forwarded_log_callback
+		}
 		bindings.telemetry.logging = &bindings.logging
 	}
 	if options.prometheus == nil && options.opentelemetry == nil {
@@ -548,14 +646,20 @@ runtime_create_with_options :: proc(options: Runtime_Options) -> (runtime: Runti
 		return {}, bindings_error
 	}
 	defer runtime_option_bindings_free(&bindings)
+	forwarding_installed, forwarding_error := runtime_log_route_install(options.logging)
+	if forwarding_error.message != nil {
+		return {}, forwarding_error
+	}
 	result := raw.runtime_new(&bindings.raw_options)
 	if result.fail != nil {
 		error.message = copy_core_bytes(result.fail)
 		raw.byte_array_free(result.runtime, result.fail)
 		raw.runtime_free(result.runtime)
+		if forwarding_installed do runtime_log_route_remove()
 		return
 	}
 	runtime.handle = result.runtime
+	runtime.forwards_core_logs = forwarding_installed
 	return
 }
 
@@ -565,6 +669,10 @@ runtime_close :: proc(runtime: ^Runtime) {
 	}
 	raw.runtime_free(runtime.handle)
 	runtime.handle = nil
+	if runtime.forwards_core_logs {
+		runtime_log_route_remove()
+		runtime.forwards_core_logs = false
+	}
 }
 
 Connect_State :: struct {

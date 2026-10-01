@@ -286,10 +286,12 @@ runtime heartbeat metadata, and environment privacy controls. The
 CLI-devserver suite scrapes a live Prometheus endpoint and requires the tagged
 `GetSystemInfo` request counter. Runtime option strings and typed key/value maps
 are borrowed only for synchronous construction and copied by Core. Structured
-log forwarding remains raw-only: the pinned callback has no `user_data`, may
-run on arbitrary Core threads, and lends each log record only for the callback
-duration, so a safe per-runtime Odin callback facade needs a deliberate
-process-wide dispatcher.
+log forwarding is exposed through a callback-scoped owned `Runtime_Log`: Odin
+copies target, message, timestamp, and JSON fields before the raw Core record
+expires. The pinned callback has no `user_data`, so the SDK provides one
+synchronized process-wide route and rejects a second simultaneous forwarding
+Runtime. The live suite receives real records from arbitrary Core threads and
+the unit suite proves the route is reusable after shutdown.
 
 `activity.info(ctx)`
 now exposes the Core-delivered execution

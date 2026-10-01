@@ -1108,16 +1108,23 @@ The public Client accepts the same configuration while retaining sole
 ownership of the created runtime.
 
 Logging is deliberately asymmetric. A nil `forward_to` makes Core write to its
-console subscriber and is now public. A non-nil callback is expected to live
-for the runtime lifetime, receives no user-data pointer, may be invoked from
-any Core thread, and can access the opaque record only until callback return.
-The raw binding exposes the callback type and the four borrowed accessors
-(`target`, `message`, `timestamp_millis`, `fields_json`), but the idiomatic
-layer does not yet expose callbacks. A correct Odin implementation needs a
-process-wide synchronized registry and must copy every field inside the C
-callback; storing the opaque log pointer would be a use-after-free.
+console subscriber. A non-nil callback may be invoked from any Core thread and
+the raw ABI provides no user-data pointer. Odin therefore installs one
+synchronized process-wide route, rejects a second simultaneous forwarding
+Runtime, and associates the public callback/user-data pair with the one active
+route. The C trampoline calls all four borrowed accessors (`target`, `message`,
+`timestamp_millis`, `fields_json`) and heap-copies every string before invoking
+the Odin callback. `Runtime_Log` is callback-scoped and its fields must be
+cloned again if retained. `runtime_close` first frees Core—which deactivates its
+forwarder—then takes the route lock, thereby waiting for any callback already
+inside the Odin dispatcher before clearing user data. Callbacks may originate
+on concurrent Core threads but are serialized by that lock; they must not call
+Runtime create/close or panic across the C boundary.
 
-The live acceptance test configures the Prometheus exporter on loopback,
+The live acceptance test first configures forwarding at trace level, performs
+`GetSystemInfo`, and requires at least one record with non-empty target/message
+and a positive timestamp. A lifecycle unit test proves exclusivity and route
+reuse after close. A separate live path configures the Prometheus exporter on loopback,
 performs `GetSystemInfo`, scrapes `/metrics` while the runtime remains alive,
 and observes `temporal_request_total` with Core's service tag and an Odin global
 tag. This proves Core's listener, instrumentation, option ownership, and
@@ -2877,11 +2884,12 @@ The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core,
 live-proven, and covered by typed Client outbound interceptors. Its typed
 Start/Describe data surface is also implemented; the Server 1.32 persistence
-and terminal-token limitations above remain explicit. The next smallest
-vertical milestone is exposing Core log forwarding in the idiomatic Runtime/
-Client options. The raw callback/accessors already exist, but the language
-layer must copy borrowed log fields inside the callback, safely route callbacks
-from arbitrary Core threads, and prove shutdown removes the process-wide route.
+and terminal-token limitations above remain explicit. Core log forwarding is
+now exposed with copied callback-scoped records and a lifecycle-tested
+process-wide route. The next smallest Client completeness milestone is exposing
+the pinned `PostResetOperation` union in Workflow reset options, then proving
+the supported post-reset operation through the CLI dev server without changing
+the existing reset defaults.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 

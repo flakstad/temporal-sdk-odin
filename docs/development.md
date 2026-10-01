@@ -462,18 +462,36 @@ bucket overrides intentionally remain the bridge's compact
 `metric\n1,2.5,10` escape hatch for now.
 
 Setting `Runtime_Logging_Options.filter` with no forwarding callback selects
-Core's console subscriber. Although the raw package declares the forwarded-log
-callback and accessor ABI, it is not exposed as a high-level callback yet: the
-ABI supplies no per-runtime user pointer, callbacks can arrive on arbitrary
-runtime threads, and the log record is invalid immediately after return. A
-language facade must therefore copy records during the callback and coordinate
-a process-wide dispatcher. Runtime close deactivates Core's forwarder before
-the runtime is freed, but that alone does not solve callback routing.
+Core's console subscriber. Set `forward_to` and optional `user_data` to receive
+structured `Runtime_Log` records instead. The callback can arrive from an
+arbitrary Core thread; target, message, and JSON fields are owned only until it
+returns and must be cloned to retain. The C ABI supplies no per-runtime pointer,
+so only one forwarding Runtime may exist per process. The SDK serializes the
+route and rejects another until `runtime_close` has deactivated Core and removed
+the route. A callback must not call Runtime create/close or panic across C.
+
+```odin
+on_core_log :: proc(data: rawptr, log: ^core.Runtime_Log) {
+    // Synchronize application state here; this is a Core runtime thread.
+    fmt.printf("[%v] %s: %s\n", log.level, log.target, log.message)
+}
+
+logging := core.Runtime_Logging_Options{
+    filter = "temporalio_sdk_core=debug",
+    forward_to = on_core_log,
+    user_data = tracing_state,
+}
+runtime_options.logging = &logging
+```
 
 The integration suite starts `examples/core_connect` with a loopback
 Prometheus address, scrapes `/metrics` while the runtime is alive, and requires
 `temporal_request_total` for `GetSystemInfo` with both Core's `service_name` and
 the Odin global tag. This proves the exporter rather than only its C layout.
+It also runs `examples/core_connect` with
+`TEMPORAL_CORE_FORWARD_LOGS=1 TEMPORAL_CORE_LOG_FILTER=trace` and requires a
+well-formed callback record. The unit suite proves a second simultaneous route
+is rejected and that a fresh forwarding Runtime succeeds after close.
 
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.
