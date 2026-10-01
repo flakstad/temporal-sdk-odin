@@ -27,6 +27,13 @@ and requires the completion bytes to remain identical with logging disabled,
 suppressed, and explicitly enabled. This guards the stronger invariant that
 observability cannot change Workflow commands.
 
+The Workflow metric property generates another 500 combinations across all
+seven instrument kinds, fresh execution, history replay, query-only replay,
+invalid names/attributes, and negative histogram values. It requires exactly
+the non-history, valid records to reach the host emitter and checks that
+activation identity is attached without becoming visible to Workflow control
+flow.
+
 `native/Cargo.toml` is a wrapper workspace. SDK Core deliberately does not
 commit a workspace lockfile, while a language SDK needs reproducible native
 artifacts. The wrapper therefore owns `native/Cargo.lock`, following the same
@@ -476,6 +483,22 @@ defer core.metric_close(&counter)
 
 err = core.metric_counter_add(&counter, 1)
 ```
+
+Activity code obtains the same exporter with automatic execution scope:
+
+```odin
+meter := activity.metric_meter(ctx)
+counter, err := core.metric_counter_create(meter, "activity_items")
+defer core.metric_close(&counter)
+err = core.metric_counter_add(&counter, 1)
+```
+
+The meter pointer is valid only during the callback. It is a validating no-op
+when metrics are disabled, so the Activity does not need exporter conditionals.
+Workflow code must instead use `workflow.metric_counter_add` and its typed
+siblings. Those calls are replay-filtered and return no status; history replay
+cannot duplicate a record or branch on host observability state. The Worker
+owns their lazily cached Core instruments until `worker.close`.
 
 `Metric` clones a private Core meter and base-attribute handle, so it remains
 valid if its factory `Metric_Meter` closes first. It must still close before the

@@ -146,6 +146,124 @@ Workflow_Registration :: struct {
 	runtime: workflow.Fiber_Runtime,
 }
 
+Workflow_Metric_Instrument :: struct {
+	name:   string,
+	kind:   workflow.Metric_Kind,
+	metric: temporal_core.Metric,
+}
+
+Workflow_Metric_Backend :: struct {
+	meter:       temporal_core.Metric_Meter,
+	instruments: [dynamic]Workflow_Metric_Instrument,
+}
+
+workflow_metric_kind_core :: proc(kind: workflow.Metric_Kind) -> temporal_core.Metric_Kind {
+	switch kind {
+	case .Counter_Integer:         return .Counter_Integer
+	case .Histogram_Integer:       return .Histogram_Integer
+	case .Histogram_Float:         return .Histogram_Float
+	case .Histogram_Duration:      return .Histogram_Duration
+	case .Gauge_Integer:           return .Gauge_Integer
+	case .Gauge_Float:             return .Gauge_Float
+	case .Up_Down_Counter_Integer: return .Up_Down_Counter_Integer
+	}
+	return .Counter_Integer
+}
+
+workflow_metric_instrument_find :: proc(
+	backend: ^Workflow_Metric_Backend,
+	name: string,
+	kind: workflow.Metric_Kind,
+) -> ^Workflow_Metric_Instrument {
+	for &instrument in backend.instruments {
+		if instrument.kind == kind && instrument.name == name {
+			return &instrument
+		}
+	}
+	return nil
+}
+
+workflow_metric_instrument_get :: proc(
+	backend: ^Workflow_Metric_Backend,
+	record: ^workflow.Metric_Record,
+) -> ^Workflow_Metric_Instrument {
+	instrument := workflow_metric_instrument_find(backend, record.name, record.kind)
+	if instrument != nil do return instrument
+	metric, metric_error := temporal_core.metric_create(
+		&backend.meter,
+		record.name,
+		workflow_metric_kind_core(record.kind),
+		record.description,
+		record.unit,
+	)
+	if metric_error.message != nil {
+		temporal_core.error_free(&metric_error)
+		return nil
+	}
+	owned_name, allocation_error := strings.clone(record.name, allocator_runtime.heap_allocator())
+	if allocation_error != nil {
+		temporal_core.metric_close(&metric)
+		return nil
+	}
+	append(&backend.instruments, Workflow_Metric_Instrument{
+		name = owned_name,
+		kind = record.kind,
+		metric = metric,
+	})
+	return &backend.instruments[len(backend.instruments) - 1]
+}
+
+workflow_metric_emit_to_core :: proc(user_data: rawptr, record: ^workflow.Metric_Record) {
+	backend := cast(^Workflow_Metric_Backend)user_data
+	if backend == nil || record == nil do return
+	instrument := workflow_metric_instrument_get(backend, record)
+	if instrument == nil do return
+	attributes := make([]temporal_core.Metric_Attribute, len(record.attributes))
+	defer delete(attributes)
+	for attribute, index in record.attributes {
+		switch attribute.kind {
+		case .String:
+			attributes[index] = temporal_core.metric_attribute_string(attribute.key, attribute.string_value)
+		case .Integer:
+			attributes[index] = temporal_core.metric_attribute_i64(attribute.key, attribute.integer_value)
+		case .Float:
+			attributes[index] = temporal_core.metric_attribute_f64(attribute.key, attribute.float_value)
+		case .Boolean:
+			attributes[index] = temporal_core.metric_attribute_bool(attribute.key, attribute.boolean_value)
+		}
+	}
+	record_error: temporal_core.Error
+	switch record.kind {
+	case .Counter_Integer:
+		record_error = temporal_core.metric_counter_add(&instrument.metric, record.integer_value, attributes)
+	case .Histogram_Integer:
+		record_error = temporal_core.metric_histogram_record_integer(&instrument.metric, record.integer_value, attributes)
+	case .Histogram_Float:
+		record_error = temporal_core.metric_histogram_record_float(&instrument.metric, record.float_value, attributes)
+	case .Histogram_Duration:
+		record_error = temporal_core.metric_histogram_record_duration(&instrument.metric, record.duration_value, attributes)
+	case .Gauge_Integer:
+		record_error = temporal_core.metric_gauge_record_integer(&instrument.metric, record.integer_value, attributes)
+	case .Gauge_Float:
+		record_error = temporal_core.metric_gauge_record_float(&instrument.metric, record.float_value, attributes)
+	case .Up_Down_Counter_Integer:
+		record_error = temporal_core.metric_up_down_counter_add(&instrument.metric, record.signed_integer_value, attributes)
+	}
+	temporal_core.error_free(&record_error)
+}
+
+workflow_metric_backend_destroy :: proc(user_data: rawptr) {
+	backend := cast(^Workflow_Metric_Backend)user_data
+	if backend == nil do return
+	for &instrument in backend.instruments {
+		temporal_core.metric_close(&instrument.metric)
+		delete(instrument.name, allocator_runtime.heap_allocator())
+	}
+	delete(backend.instruments)
+	temporal_core.metric_meter_close(&backend.meter)
+	free(backend, allocator_runtime.heap_allocator())
+}
+
 Workflow_Run :: struct {
 	run_id:             string,
 	registration_index: int,
@@ -730,6 +848,46 @@ configure_workflow_runtime :: proc(worker: ^Worker, runtime: ^workflow.Fiber_Run
 	if logger_error.message != nil {
 		result := error_from_string(string(logger_error.message))
 		workflow.error_free(&logger_error)
+		return result
+	}
+	backend, backend_allocation_error := new(
+		Workflow_Metric_Backend,
+		allocator_runtime.heap_allocator(),
+	)
+	if backend_allocation_error != nil {
+		return error_from_string("could not allocate Workflow metric backend")
+	}
+	backend.meter = temporal_core.metric_meter_noop()
+	backend.instruments = make(
+		[dynamic]Workflow_Metric_Instrument,
+		allocator_runtime.heap_allocator(),
+	)
+	core_runtime := worker.replay_runtime
+	if worker.mode == .Online && worker.client != nil {
+		core_runtime = worker.client.runtime
+	}
+	if core_runtime != nil && core_runtime.metrics_enabled {
+		base_attributes := [3]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("namespace", runtime.namespace),
+			temporal_core.metric_attribute_string("task_queue", runtime.task_queue),
+			temporal_core.metric_attribute_string("workflow_type", runtime.workflow_type),
+		}
+		meter, meter_error := temporal_core.metric_meter_create(core_runtime, base_attributes[:])
+		if meter_error.message == nil {
+			backend.meter = meter
+		} else {
+			temporal_core.error_free(&meter_error)
+		}
+	}
+	emitter_error := workflow.fiber_runtime_set_metric_emitter(runtime, {
+		user_data = backend,
+		emit = workflow_metric_emit_to_core,
+		destroy = workflow_metric_backend_destroy,
+	})
+	if emitter_error.message != nil {
+		workflow_metric_backend_destroy(backend)
+		result := error_from_string(string(emitter_error.message))
+		workflow.error_free(&emitter_error)
 		return result
 	}
 	for interceptor in worker.workflow_inbound_interceptors {
@@ -1477,6 +1635,7 @@ Activity_Execution :: struct {
 	inputs:        [dynamic]codec.Payload,
 	input_views:   []codec.Payload_View,
 	info_owner:    Activity_Info_Owner,
+	metric_meter:  temporal_core.Metric_Meter,
 	ctx:           activity.Context,
 	error:         Error,
 }
@@ -1956,6 +2115,7 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 	delete(execution.inputs)
 	delete(execution.input_views)
 	activity_info_owner_destroy(&execution.info_owner)
+	temporal_core.metric_meter_close(&execution.metric_meter)
 	error_free(&execution.error)
 	free(execution)
 }
@@ -2004,11 +2164,27 @@ activity_execution_start :: proc(
 		activity_execution_destroy(execution)
 		return nil, info_error
 	}
+	execution.metric_meter = temporal_core.metric_meter_noop()
+	runtime := worker.client.runtime
+	if runtime != nil && runtime.metrics_enabled {
+		metric_attributes := [3]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("namespace", execution.info_owner.info.namespace),
+			temporal_core.metric_attribute_string("task_queue", execution.info_owner.info.task_queue),
+			temporal_core.metric_attribute_string("activity_type", execution.info_owner.info.activity_type),
+		}
+		meter, meter_error := temporal_core.metric_meter_create(runtime, metric_attributes[:])
+		if meter_error.message == nil {
+			execution.metric_meter = meter
+		} else {
+			temporal_core.error_free(&meter_error)
+		}
+	}
 	activity.context_init_info(
 		&execution.ctx,
 		execution.info_owner.info,
 		cast(rawptr)execution,
 		activity_heartbeat_recorder,
+		&execution.metric_meter,
 	)
 	thread.pool_add_task(pool, context.allocator, activity_execution_task, execution)
 	return execution, {}

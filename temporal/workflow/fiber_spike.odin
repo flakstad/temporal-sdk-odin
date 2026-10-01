@@ -85,6 +85,80 @@ Logger :: struct {
 	log_replay_history_events: bool,
 }
 
+Metric_Kind :: enum {
+	Counter_Integer,
+	Histogram_Integer,
+	Histogram_Float,
+	Histogram_Duration,
+	Gauge_Integer,
+	Gauge_Float,
+	Up_Down_Counter_Integer,
+}
+
+Metric_Attribute_Kind :: enum {
+	String,
+	Integer,
+	Float,
+	Boolean,
+}
+
+// Metric attributes and all strings are borrowed for the synchronous emitter
+// call. Workflow code cannot observe whether the host exporter accepted them.
+Metric_Attribute :: struct {
+	key:           string,
+	kind:          Metric_Attribute_Kind,
+	string_value:  string,
+	integer_value: i64,
+	float_value:   f64,
+	boolean_value: bool,
+}
+
+metric_attribute_string :: proc(key, value: string) -> Metric_Attribute {
+	return {key = key, kind = .String, string_value = value}
+}
+
+metric_attribute_i64 :: proc(key: string, value: i64) -> Metric_Attribute {
+	return {key = key, kind = .Integer, integer_value = value}
+}
+
+metric_attribute_f64 :: proc(key: string, value: f64) -> Metric_Attribute {
+	return {key = key, kind = .Float, float_value = value}
+}
+
+metric_attribute_bool :: proc(key: string, value: bool) -> Metric_Attribute {
+	return {key = key, kind = .Boolean, boolean_value = value}
+}
+
+Metric_Record :: struct {
+	name:                     string,
+	kind:                     Metric_Kind,
+	description:              string,
+	unit:                     string,
+	integer_value:            u64,
+	signed_integer_value:     i64,
+	float_value:              f64,
+	duration_value:           time.Duration,
+	attributes:               []Metric_Attribute,
+	namespace:                string,
+	workflow_id:              string,
+	run_id:                   string,
+	workflow_type:            string,
+	task_queue:               string,
+	replaying:                bool,
+	replaying_history_events: bool,
+}
+
+Metric_Emit_Proc :: #type proc(user_data: rawptr, record: ^Metric_Record)
+Metric_Destroy_Proc :: #type proc(user_data: rawptr)
+
+// Metric_Emitter is owned by a Fiber_Runtime. emit is synchronous. destroy is
+// called exactly once by fiber_runtime_close when user_data is non-nil.
+Metric_Emitter :: struct {
+	user_data: rawptr,
+	emit:      Metric_Emit_Proc,
+	destroy:   Metric_Destroy_Proc,
+}
+
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
 // operations, not a general worker/client handle. This remains an experiment.
 Fiber_Context :: struct {
@@ -1386,6 +1460,7 @@ Fiber_Runtime :: struct {
 	evictions:              int,
 	stack_options:          Stack_Options,
 	logger:                 Logger,
+	metric_emitter:         Metric_Emitter,
 }
 
 fiber_runtime_set_logger :: proc(runtime: ^Fiber_Runtime, logger: Logger) -> Error {
@@ -1396,6 +1471,23 @@ fiber_runtime_set_logger :: proc(runtime: ^Fiber_Runtime, logger: Logger) -> Err
 		return error_from_string("Workflow logger cannot be changed after execution starts")
 	}
 	runtime.logger = logger
+	return {}
+}
+
+fiber_runtime_set_metric_emitter :: proc(
+	runtime: ^Fiber_Runtime,
+	emitter: Metric_Emitter,
+) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow runtime is not initialized")
+	}
+	if len(runtime.instances) != 0 {
+		return error_from_string("Workflow metric emitter cannot be changed after execution starts")
+	}
+	if runtime.metric_emitter.user_data != nil && runtime.metric_emitter.destroy != nil {
+		runtime.metric_emitter.destroy(runtime.metric_emitter.user_data)
+	}
+	runtime.metric_emitter = emitter
 	return {}
 }
 
@@ -2072,6 +2164,9 @@ fiber_runtime_close :: proc(runtime: ^Fiber_Runtime) {
 	delete(runtime.task_queue)
 	if runtime.callback_data != nil && runtime.callback_destroy != nil {
 		runtime.callback_destroy(runtime.callback_data)
+	}
+	if runtime.metric_emitter.user_data != nil && runtime.metric_emitter.destroy != nil {
+		runtime.metric_emitter.destroy(runtime.metric_emitter.user_data)
 	}
 	runtime^ = {}
 }
@@ -4297,6 +4392,254 @@ is_replaying :: proc(ctx: ^Fiber_Context) -> bool {
 is_replaying_history_events :: proc(ctx: ^Fiber_Context) -> bool {
 	return ctx != nil && ctx.instance != nil &&
 	       ctx.instance.activation_is_replaying_history_events
+}
+
+workflow_metric_attributes_valid :: proc(attributes: []Metric_Attribute) -> bool {
+	for attribute in attributes {
+		if len(attribute.key) == 0 {
+			return false
+		}
+		if attribute.kind == .Float &&
+		   (math.is_nan(attribute.float_value) || math.is_inf(attribute.float_value)) {
+			return false
+		}
+	}
+	return true
+}
+
+workflow_metric_emit :: proc(instance: ^Fiber_Instance, record: Metric_Record) {
+	if instance == nil || instance.runtime == nil || len(record.name) == 0 ||
+	   !workflow_metric_attributes_valid(record.attributes) {
+		return
+	}
+	// History replay must never duplicate application metrics. Query-only
+	// replay remains observable because it does not replay history events.
+	if instance.activation_is_replaying_history_events {
+		return
+	}
+	emitter := &instance.runtime.metric_emitter
+	if emitter.emit == nil {
+		return
+	}
+	emitted_record := record
+	emitted_record.namespace = instance.namespace
+	emitted_record.workflow_id = instance.workflow_id
+	emitted_record.run_id = instance.run_id
+	emitted_record.workflow_type = instance.workflow_type
+	emitted_record.task_queue = instance.task_queue
+	emitted_record.replaying = instance.activation_is_replaying
+	emitted_record.replaying_history_events = instance.activation_is_replaying_history_events
+	emitter.emit(emitter.user_data, &emitted_record)
+}
+
+metric_counter_add :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Counter_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_histogram_record_integer :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Histogram_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_histogram_record_float :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: f64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil || math.is_nan(value) || math.is_inf(value) || value < 0 do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Histogram_Float, float_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_histogram_record_duration :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: time.Duration,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "duration",
+) {
+	if ctx == nil || value < 0 do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Histogram_Duration, duration_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_gauge_record_integer :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Gauge_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_gauge_record_float :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: f64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil || math.is_nan(value) || math.is_inf(value) do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Gauge_Float, float_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+metric_up_down_counter_add :: proc(
+	ctx: ^Fiber_Context,
+	name: string,
+	value: i64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if ctx == nil do return
+	workflow_metric_emit(ctx.instance, {
+		name = name, kind = .Up_Down_Counter_Integer, signed_integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_counter_add :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Counter_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_histogram_record_integer :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Histogram_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_histogram_record_float :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: f64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil || math.is_nan(value) || math.is_inf(value) || value < 0 do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Histogram_Float, float_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_histogram_record_duration :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: time.Duration,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "duration",
+) {
+	if query == nil || value < 0 do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Histogram_Duration, duration_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_gauge_record_integer :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: u64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Gauge_Integer, integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_gauge_record_float :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: f64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil || math.is_nan(value) || math.is_inf(value) do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Gauge_Float, float_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
+}
+
+query_metric_up_down_counter_add :: proc(
+	query: ^Query_Context,
+	name: string,
+	value: i64,
+	attributes: []Metric_Attribute = nil,
+	description := "",
+	unit := "",
+) {
+	if query == nil do return
+	workflow_metric_emit(query.instance, {
+		name = name, kind = .Up_Down_Counter_Integer, signed_integer_value = value,
+		attributes = attributes, description = description, unit = unit,
+	})
 }
 
 workflow_log_emit :: proc(

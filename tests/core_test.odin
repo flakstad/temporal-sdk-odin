@@ -2482,6 +2482,70 @@ workflow_time_random_and_uuid_replay_identically :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_application_metrics_are_typed_and_replay_aware :: proc(t: ^testing.T) {
+	capture := Workflow_Metric_Capture{}
+	runtime := workflow.Fiber_Runtime{
+		metric_emitter = {user_data = &capture, emit = workflow_metric_capture},
+	}
+	instance := workflow.Fiber_Instance{
+		runtime = &runtime,
+		namespace = "payments",
+		workflow_id = "workflow-id",
+		run_id = "run-id",
+		workflow_type = "order_workflow",
+		task_queue = "orders",
+	}
+	ctx := workflow.Fiber_Context{instance = &instance}
+	attributes := []workflow.Metric_Attribute{
+		workflow.metric_attribute_string("outcome", "ok"),
+	}
+	workflow.metric_counter_add(&ctx, "workflow_events", 3, attributes)
+	workflow.metric_histogram_record_integer(&ctx, "items", 4)
+	workflow.metric_histogram_record_float(&ctx, "ratio", 0.5)
+	workflow.metric_histogram_record_duration(&ctx, "latency", 1500 * time.Millisecond)
+	workflow.metric_gauge_record_integer(&ctx, "queue_depth", 2)
+	workflow.metric_gauge_record_float(&ctx, "load", -0.25)
+	workflow.metric_up_down_counter_add(&ctx, "in_flight", -1)
+	testing.expect_value(t, capture.calls, 7)
+	testing.expect(t, capture.structured_valid)
+	expected_kinds := [?]workflow.Metric_Kind{
+		.Counter_Integer,
+		.Histogram_Integer,
+		.Histogram_Float,
+		.Histogram_Duration,
+		.Gauge_Integer,
+		.Gauge_Float,
+		.Up_Down_Counter_Integer,
+	}
+	for kind, index in expected_kinds {
+		testing.expect_value(t, capture.kinds[index], kind)
+	}
+
+	instance.activation_is_replaying = true
+	instance.activation_is_replaying_history_events = true
+	workflow.metric_counter_add(&ctx, "suppressed_replay", 1)
+	testing.expect_value(t, capture.calls, 7)
+
+	instance.activation_is_replaying_history_events = false
+	query := workflow.Query_Context{instance = &instance}
+	workflow.query_metric_counter_add(&query, "query_observed", 1)
+	testing.expect_value(t, capture.calls, 8)
+	testing.expect_value(t, capture.query_replay_calls, 1)
+
+	workflow.metric_counter_add(&ctx, "", 1)
+	workflow.metric_histogram_record_float(&ctx, "negative", -1)
+	workflow.metric_counter_add(
+		&ctx,
+		"bad_attribute",
+		1,
+		[]workflow.Metric_Attribute{workflow.metric_attribute_string("", "invalid")},
+	)
+	workflow.metric_counter_add(nil, "invalid_context", 1)
+	workflow.query_metric_counter_add(nil, "invalid_query", 1)
+	testing.expect_value(t, capture.calls, 8)
+}
+
+@(test)
 workflow_application_logging_is_structured_and_replay_aware :: proc(t: ^testing.T) {
 	capture := Workflow_Log_Capture{}
 	runtime := workflow.Fiber_Runtime{}
@@ -5914,6 +5978,36 @@ Workflow_Log_Capture :: struct {
 	levels:                   [8]workflow.Log_Level,
 }
 
+Workflow_Metric_Capture :: struct {
+	calls:            int,
+	query_replay_calls: int,
+	structured_valid: bool,
+	kinds:            [8]workflow.Metric_Kind,
+}
+
+workflow_metric_capture :: proc(user_data: rawptr, record: ^workflow.Metric_Record) {
+	state := cast(^Workflow_Metric_Capture)user_data
+	if state == nil || record == nil do return
+	if state.calls < len(state.kinds) {
+		state.kinds[state.calls] = record.kind
+	}
+	state.calls += 1
+	if record.replaying && !record.replaying_history_events {
+		state.query_replay_calls += 1
+	}
+	if record.name == "workflow_events" {
+		state.structured_valid = record.integer_value == 3 &&
+		                         record.namespace == "payments" &&
+		                         record.workflow_id == "workflow-id" &&
+		                         record.run_id == "run-id" &&
+		                         record.workflow_type == "order_workflow" &&
+		                         record.task_queue == "orders" &&
+		                         len(record.attributes) == 1 &&
+		                         record.attributes[0].key == "outcome" &&
+		                         record.attributes[0].string_value == "ok"
+	}
+}
+
 workflow_log_capture :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
 	state := cast(^Workflow_Log_Capture)user_data
 	if state == nil || record == nil {
@@ -7414,6 +7508,43 @@ core_metric_meter_requires_a_configured_exporter :: proc(t: ^testing.T) {
 }
 
 @(test)
+core_noop_metric_meter_preserves_validation_and_lifecycle :: proc(t: ^testing.T) {
+	meter := temporal_core.metric_meter_noop()
+	testing.expect(t, meter.noop)
+
+	counter, create_error := temporal_core.metric_counter_create(&meter, "activity_attempts")
+	testing.expect(t, create_error.message == nil)
+	testing.expect(t, counter.noop)
+	record_error := temporal_core.metric_counter_add(
+		&counter,
+		1,
+		[]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("outcome", "ok"),
+		},
+	)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	temporal_core.metric_close(&counter)
+	testing.expect(t, !counter.noop)
+
+	invalid, invalid_error := temporal_core.metric_counter_create(&meter, "")
+	testing.expect(t, invalid.noop == false)
+	testing.expect(t, strings.contains(string(invalid_error.message), "must not be empty"))
+	temporal_core.error_free(&invalid_error)
+
+	child, child_error := temporal_core.metric_meter_with_attributes(
+		&meter,
+		[]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("task_queue", "orders"),
+		},
+	)
+	testing.expect(t, child_error.message == nil)
+	testing.expect(t, child.noop)
+	temporal_core.metric_meter_close(&child)
+	temporal_core.metric_meter_close(&meter)
+}
+
+@(test)
 core_metric_meter_records_all_pinned_instrument_kinds_with_owned_attributes :: proc(t: ^testing.T) {
 	prometheus := temporal_core.Runtime_Prometheus_Options{
 		bind_address = "127.0.0.1:0",
@@ -8040,6 +8171,42 @@ language_worker_propagates_bounded_stack_policy_to_workflow_runtime :: proc(t: ^
 	testing.expect_value(t, options.workflow, 192 * 1024)
 	testing.expect_value(t, options.signal_handler, 96 * 1024)
 	testing.expect_value(t, options.update_handler, 160 * 1024)
+}
+
+@(test)
+language_worker_installs_scoped_workflow_metric_backend_and_caches_instruments :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	sdk_worker, create_error := worker.create(&client, "metric-policy-worker")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&sdk_worker,
+		"metric_policy_workflow",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	if len(sdk_worker.workflow_registrations) != 1 do return
+	workflow_runtime := &sdk_worker.workflow_registrations[0].runtime
+	testing.expect(t, workflow_runtime.metric_emitter.emit != nil)
+	backend := cast(^worker.Workflow_Metric_Backend)workflow_runtime.metric_emitter.user_data
+	testing.expect(t, backend != nil && backend.meter.noop)
+	if backend == nil do return
+	instance := workflow.Fiber_Instance{runtime = workflow_runtime}
+	ctx := workflow.Fiber_Context{instance = &instance}
+	workflow.metric_counter_add(&ctx, "cached_counter", 1)
+	workflow.metric_counter_add(&ctx, "cached_counter", 2)
+	testing.expect_value(t, len(backend.instruments), 1)
+	workflow.metric_histogram_record_duration(&ctx, "latency", time.Millisecond)
+	testing.expect_value(t, len(backend.instruments), 2)
 }
 
 @(test)
@@ -15787,11 +15954,15 @@ activity_application_failure_protobuf_preserves_retry_contract :: proc(t: ^testi
 activity_context_reports_heartbeat_and_cooperative_cancellation :: proc(t: ^testing.T) {
 	capture := Heartbeat_Capture{}
 	defer delete(capture.details)
+	meter := temporal_core.metric_meter_noop()
+	defer temporal_core.metric_meter_close(&meter)
 	ctx := activity.Context{}
-	activity.context_init(&ctx, "activity-id", 3, &capture, capture_heartbeat)
+	activity.context_init(&ctx, "activity-id", 3, &capture, capture_heartbeat, &meter)
 
 	testing.expect_value(t, activity.activity_id(&ctx), "activity-id")
 	testing.expect_value(t, activity.attempt(&ctx), u32(3))
+	testing.expect(t, activity.metric_meter(&ctx) == &meter)
+	testing.expect(t, activity.metric_meter(nil) == nil)
 	testing.expect(t, !activity.is_cancellation_requested(&ctx))
 	testing.expect(t, activity.heartbeat(&ctx, "halfway") == .Recorded)
 	testing.expect_value(t, capture.calls, 1)

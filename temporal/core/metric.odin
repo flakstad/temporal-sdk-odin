@@ -46,6 +46,7 @@ Metric_Meter :: struct {
 	runtime:    ^Runtime,
 	handle:     ^raw.Metric_Meter,
 	attributes: ^raw.Metric_Attributes,
+	noop:       bool,
 }
 
 // Metric owns an independent Core meter, attribute set, and instrument. It may
@@ -56,6 +57,14 @@ Metric :: struct {
 	handle:     ^raw.Metric,
 	attributes: ^raw.Metric_Attributes,
 	kind:       Metric_Kind,
+	noop:       bool,
+}
+
+// metric_meter_noop returns an initialized meter which validates instruments
+// and values but performs no host I/O. Language-level Activity and Workflow
+// contexts use this when their Runtime has no metrics exporter configured.
+metric_meter_noop :: proc() -> Metric_Meter {
+	return {noop = true}
 }
 
 metric_error :: proc(message: string) -> Error {
@@ -127,9 +136,9 @@ metric_meter_create :: proc(
 	if runtime == nil || runtime.handle == nil {
 		return {}, metric_error("runtime is not initialized")
 	}
-	raw_attributes, attributes_error := metric_raw_attributes(attributes)
-	if attributes_error.message != nil {
-		return {}, attributes_error
+	raw_attributes, raw_attributes_error := metric_raw_attributes(attributes)
+	if raw_attributes_error.message != nil {
+		return {}, raw_attributes_error
 	}
 	defer delete(raw_attributes)
 	handle := raw.metric_meter_new(runtime.handle)
@@ -153,13 +162,20 @@ metric_meter_with_attributes :: proc(
 	meter: ^Metric_Meter,
 	attributes: []Metric_Attribute,
 ) -> (child: Metric_Meter, error: Error) {
+	attributes_error := metric_attributes_validate(attributes)
+	if attributes_error.message != nil {
+		return {}, attributes_error
+	}
+	if meter != nil && meter.noop {
+		return metric_meter_noop(), {}
+	}
 	if meter == nil || meter.handle == nil || meter.attributes == nil ||
 	   meter.runtime == nil || meter.runtime.handle == nil {
 		return {}, metric_error("metric meter is not initialized")
 	}
-	raw_attributes, attributes_error := metric_raw_attributes(attributes)
-	if attributes_error.message != nil {
-		return {}, attributes_error
+	raw_attributes, raw_attributes_error := metric_raw_attributes(attributes)
+	if raw_attributes_error.message != nil {
+		return {}, raw_attributes_error
 	}
 	defer delete(raw_attributes)
 	handle := raw.metric_meter_new(meter.runtime.handle)
@@ -205,15 +221,18 @@ metric_create :: proc(
 	description := "",
 	unit := "",
 ) -> (metric: Metric, error: Error) {
-	if meter == nil || meter.handle == nil || meter.attributes == nil ||
-	   meter.runtime == nil || meter.runtime.handle == nil {
-		return {}, metric_error("metric meter is not initialized")
-	}
 	if len(name) == 0 {
 		return {}, metric_error("metric name must not be empty")
 	}
 	if !metric_kind_valid(kind) {
 		return {}, metric_error("metric kind is invalid")
+	}
+	if meter != nil && meter.noop {
+		return {kind = kind, noop = true}, {}
+	}
+	if meter == nil || meter.handle == nil || meter.attributes == nil ||
+	   meter.runtime == nil || meter.runtime.handle == nil {
+		return {}, metric_error("metric meter is not initialized")
 	}
 	owned_meter := raw.metric_meter_new(meter.runtime.handle)
 	if owned_meter == nil {
@@ -334,6 +353,10 @@ metric_record_attributes :: proc(
 	metric: ^Metric,
 	additional_attributes: []Metric_Attribute,
 ) -> (attributes: ^raw.Metric_Attributes, temporary: bool, error: Error) {
+	if metric != nil && metric.noop {
+		validation_error := metric_attributes_validate(additional_attributes)
+		return nil, false, validation_error
+	}
 	if metric == nil || metric.handle == nil || metric.meter == nil ||
 	   metric.attributes == nil || metric.runtime == nil || metric.runtime.handle == nil {
 		return nil, false, metric_error("metric is not initialized")
@@ -374,6 +397,7 @@ metric_counter_add :: proc(
 	if attributes_error.message != nil {
 		return attributes_error
 	}
+	if metric.noop do return {}
 	raw.metric_record_integer(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -389,6 +413,7 @@ metric_histogram_record_integer :: proc(
 	}
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_integer(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -407,6 +432,7 @@ metric_histogram_record_float :: proc(
 	}
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_float(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -427,6 +453,7 @@ metric_histogram_record_duration :: proc(
 	if value % time.Millisecond != 0 do millis += 1
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_duration(metric.handle, millis, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -442,6 +469,7 @@ metric_gauge_record_integer :: proc(
 	}
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_integer(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -460,6 +488,7 @@ metric_gauge_record_float :: proc(
 	}
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_float(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}
@@ -475,6 +504,7 @@ metric_up_down_counter_add :: proc(
 	}
 	attributes, temporary, attributes_error := metric_record_attributes(metric, additional_attributes)
 	if attributes_error.message != nil do return attributes_error
+	if metric.noop do return {}
 	raw.metric_record_integer_signed(metric.handle, value, attributes)
 	if temporary do raw.metric_attributes_free(attributes)
 	return {}

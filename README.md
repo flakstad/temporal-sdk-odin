@@ -337,9 +337,30 @@ float/duration histograms, integer/float gauges, and signed up-down counter.
 Meters can derive immutable attribute scopes with
 `metric_meter_with_attributes`; record calls can add temporary attributes.
 Metric handles own their cloned meter/attribute state and must close before the
-Runtime. This is a host/Activity primitive, not yet the replay-safe scoped
-Workflow meter offered by mature SDKs; do not call it directly from Workflow
-code.
+Runtime. An Activity callback receives a callback-scoped meter through
+`activity.metric_meter(ctx)`. It automatically carries `namespace`,
+`task_queue`, and `activity_type`; when no exporter is configured it remains a
+valid, validating no-op meter.
+
+Workflow code uses replay-aware procedures instead of Core handles:
+
+```odin
+workflow.metric_counter_add(
+    ctx,
+    "orders_charged",
+    1,
+    []workflow.Metric_Attribute{
+        workflow.metric_attribute_string("currency", "NOK"),
+    },
+)
+```
+
+The Worker owns and caches the Core instruments with automatic `namespace`,
+`task_queue`, and `workflow_type` attributes. History-event replay is always
+suppressed; query-only replay remains observable. Workflow metric procedures
+return no status, so exporter state cannot influence deterministic control
+flow. Query handlers have corresponding `query_metric_*` procedures. Do not
+call the lower-level Core metric API directly from Workflow code.
 
 Server capability discovery uses the same public Client and generic Core RPC
 bridge:

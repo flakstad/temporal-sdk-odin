@@ -1237,11 +1237,23 @@ Core's `get_metric_meter` deliberately bypasses the Temporal-only metric-prefix
 wrapper, so application names are exported exactly as supplied while global
 tags and optional `service_name` still apply.
 
-These Runtime metrics are intended for normal host and Activity code. Calling
-them directly from Workflow code would be a replaying side effect. A scoped
-Workflow meter with replay suppression and automatic namespace/task-queue/
-Workflow-type attributes remains a distinct language-runtime layer rather than
-being silently made available through this Core handle.
+Activities receive an execution-owned `Metric_Meter` through their callback
+Context. The Worker creates it with namespace, task queue, and Activity type
+base attributes after decoding Core's Activity task, and closes it only after
+the callback result has been handed off. A Runtime without an exporter supplies
+a validating no-op meter, keeping application code independent of deployment
+observability settings.
+
+Workflow code never receives the Core handle. Its `metric_*` procedures build a
+borrowed synchronous record and return no status. The language runtime drops
+records for activations replaying history events, while allowing query-only
+replay diagnostics. The Worker-owned backend adds namespace, task queue, and
+Workflow type attributes, lazily caches typed Core instruments, and destroys
+the cache with the registered Workflow runtime. Consequently a native handle
+never lives on a fiber stack that Core eviction can discard without running an
+Odin `defer`, and exporter state cannot be used for deterministic branching.
+Calling the lower-level Runtime meter directly from Workflow code remains an
+unsupported replaying side effect.
 
 Logging is deliberately asymmetric. A nil `forward_to` makes Core write to its
 console subscriber. A non-nil callback may be invoked from any Core thread and

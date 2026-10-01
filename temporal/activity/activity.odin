@@ -4,6 +4,7 @@ package activity
 import "core:sync"
 import "core:time"
 import codec "../codec"
+import temporal_core "../core"
 
 Cancel_Reason :: enum u32 {
 	None,
@@ -316,6 +317,7 @@ payload_fail :: proc(
 
 Context :: struct {
 	info_value: Info,
+	metric_meter_value: ^temporal_core.Metric_Meter,
 	cancel_requested: bool,
 	cancel_reason:    Cancel_Reason,
 	cancel_details:   u32,
@@ -329,9 +331,11 @@ context_init :: proc(
 	attempt: u32,
 	heartbeat_user_data: rawptr,
 	heartbeat_recorder: Heartbeat_Recorder,
+	metric_meter: ^temporal_core.Metric_Meter = nil,
 ) {
 	ctx^ = Context{
 		info_value = Info{activity_id = activity_id, attempt = attempt},
+		metric_meter_value = metric_meter,
 		heartbeat_user_data = heartbeat_user_data,
 		heartbeat_recorder = heartbeat_recorder,
 	}
@@ -342,15 +346,27 @@ context_init_info :: proc(
 	activity_info: Info,
 	heartbeat_user_data: rawptr,
 	heartbeat_recorder: Heartbeat_Recorder,
+	metric_meter: ^temporal_core.Metric_Meter = nil,
 ) {
 	if ctx == nil {
 		return
 	}
 	ctx^ = Context{
 		info_value = activity_info,
+		metric_meter_value = metric_meter,
 		heartbeat_user_data = heartbeat_user_data,
 		heartbeat_recorder = heartbeat_recorder,
 	}
+}
+
+// metric_meter returns the callback-scoped application meter. Instruments
+// created from it must be closed before the callback returns. A no-op meter is
+// supplied when the Core Runtime has no exporter.
+metric_meter :: proc(ctx: ^Context) -> ^temporal_core.Metric_Meter {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.metric_meter_value
 }
 
 context_request_cancellation :: proc(

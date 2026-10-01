@@ -20,6 +20,7 @@ Error :: struct {
 Runtime :: struct {
 	handle:            ^raw.Runtime,
 	forwards_core_logs: bool,
+	metrics_enabled:   bool,
 }
 
 Client :: struct {
@@ -660,6 +661,7 @@ runtime_create_with_options :: proc(options: Runtime_Options) -> (runtime: Runti
 	}
 	runtime.handle = result.runtime
 	runtime.forwards_core_logs = forwarding_installed
+	runtime.metrics_enabled = options.prometheus != nil || options.opentelemetry != nil
 	return
 }
 
@@ -669,6 +671,7 @@ runtime_close :: proc(runtime: ^Runtime) {
 	}
 	raw.runtime_free(runtime.handle)
 	runtime.handle = nil
+	runtime.metrics_enabled = false
 	if runtime.forwards_core_logs {
 		runtime_log_route_remove()
 		runtime.forwards_core_logs = false
