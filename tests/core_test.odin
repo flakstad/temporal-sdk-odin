@@ -28091,6 +28091,21 @@ client_connection_options_validate_security_and_metadata_contracts :: proc(t: ^t
 	temporal_core.error_free(&api_key_error)
 	temporal_core.client_connection_bindings_free(&bindings)
 
+	explicit_plaintext := api_key_options
+	explicit_plaintext.tls_disabled = true
+	plaintext_error := temporal_core.client_connection_bindings_init(&bindings, explicit_plaintext)
+	testing.expect(t, plaintext_error.message == nil)
+	testing.expect(t, bindings.raw_options.tls_options == nil)
+	temporal_core.error_free(&plaintext_error)
+	temporal_core.client_connection_bindings_free(&bindings)
+
+	invalid_tls_combination := api_key_options
+	invalid_tls_combination.tls = &temporal_core.Client_TLS_Options{}
+	invalid_tls_combination.tls_disabled = true
+	invalid_tls_error := temporal_core.client_connection_options_validate(invalid_tls_combination)
+	testing.expect(t, invalid_tls_error.message != nil)
+	temporal_core.error_free(&invalid_tls_error)
+
 	invalid_metadata := [?]temporal_core.Client_Metadata_Entry{{
 		key = "Uppercase-Key",
 		value = transmute([]u8)string("value"),
@@ -28158,6 +28173,173 @@ client_connection_options_validate_security_and_metadata_contracts :: proc(t: ^t
 	testing.expect(t, public_error.message != nil)
 	temporal_client.error_free(&public_error)
 	temporal_client.close(&invalid_client)
+}
+
+@(test)
+client_configuration_profiles_are_loaded_by_pinned_core_and_owned_by_odin :: proc(
+	t: ^testing.T,
+) {
+	toml_source := string(`
+[profile.default]
+address = "localhost:7233"
+namespace = "orders"
+api_key = "file-api-key"
+
+[profile.default.tls]
+disabled = false
+server_name = "temporal.example.test"
+server_ca_cert_data = "ca-data"
+client_cert_data = "cert-data"
+client_key_data = "key-data"
+
+[profile.default.codec]
+endpoint = "http://codec.example.test:8080"
+auth = "Bearer codec-token"
+
+[profile.default.grpc_meta]
+X_ODIN_TRACE = "file-trace"
+
+[profile.secondary]
+address = "https://secondary.example.test:7233"
+namespace = "secondary"
+`)
+	owned_source := bytes.clone(transmute([]u8)toml_source)
+	config, config_error := temporal_client.load_config({
+		source = {data = owned_source},
+		config_file_strict = true,
+		use_environment_override = true,
+	})
+	delete(owned_source)
+	defer temporal_client.config_free(&config)
+	defer temporal_client.error_free(&config_error)
+	testing.expectf(t, config_error.message == nil, "config load failed: %s", string(config_error.message))
+	testing.expect_value(t, len(config.profiles), 2)
+	profile, found := temporal_client.config_find_profile(&config, "default")
+	testing.expect(t, found && profile != nil)
+	if !found || profile == nil {
+		return
+	}
+	testing.expect_value(t, profile.address, "localhost:7233")
+	testing.expect_value(t, profile.namespace, "orders")
+	testing.expect_value(t, profile.api_key, "file-api-key")
+	testing.expect(t, profile.tls.present && !profile.tls.disabled)
+	testing.expect_value(t, profile.tls.server_name, "temporal.example.test")
+	testing.expect_value(t, profile.tls.server_ca_cert.kind, temporal_client.Config_Data_Source_Kind.Data)
+	testing.expect_value(t, string(profile.tls.server_ca_cert.data), "ca-data")
+	testing.expect_value(t, string(profile.tls.client_cert.data), "cert-data")
+	testing.expect_value(t, string(profile.tls.client_key.data), "key-data")
+	testing.expect(t, profile.codec.present)
+	testing.expect_value(t, profile.codec.endpoint, "http://codec.example.test:8080")
+	testing.expect_value(t, profile.codec.auth, "Bearer codec-token")
+	testing.expect_value(t, len(profile.grpc_metadata), 1)
+	if len(profile.grpc_metadata) == 1 {
+		testing.expect_value(t, profile.grpc_metadata[0].key, "x-odin-trace")
+		testing.expect_value(t, string(profile.grpc_metadata[0].value), "file-trace")
+	}
+	secondary, secondary_found := temporal_client.config_find_profile(&config, "secondary")
+	testing.expect(t, secondary_found && secondary != nil)
+	if secondary_found && secondary != nil {
+		testing.expect_value(t, secondary.namespace, "secondary")
+		testing.expect(t, !secondary.tls.present)
+	}
+
+	override_environment := [?]temporal_client.Config_Environment_Entry{
+		{key = "TEMPORAL_ADDRESS", value = "127.0.0.1:8233"},
+		{key = "TEMPORAL_NAMESPACE", value = "environment-namespace"},
+		{key = "TEMPORAL_API_KEY", value = "environment-api-key"},
+		{key = "TEMPORAL_TLS", value = "false"},
+		{key = "TEMPORAL_GRPC_META_X_ODIN_TRACE", value = "environment-trace"},
+	}
+	loaded, loaded_error := temporal_client.load_config_profile({
+		profile = "default",
+		source = {data = transmute([]u8)toml_source},
+		config_file_strict = true,
+		use_environment_override = true,
+		environment = override_environment[:],
+	})
+	defer temporal_client.config_profile_free(&loaded)
+	defer temporal_client.error_free(&loaded_error)
+	testing.expectf(t, loaded_error.message == nil, "profile load failed: %s", string(loaded_error.message))
+	testing.expect_value(t, loaded.address, "127.0.0.1:8233")
+	testing.expect_value(t, loaded.namespace, "environment-namespace")
+	testing.expect_value(t, loaded.api_key, "environment-api-key")
+	testing.expect(t, loaded.tls.present && loaded.tls.disabled)
+	testing.expect_value(t, len(loaded.grpc_metadata), 1)
+	if len(loaded.grpc_metadata) == 1 {
+		testing.expect_value(t, loaded.grpc_metadata[0].key, "x-odin-trace")
+		testing.expect_value(t, string(loaded.grpc_metadata[0].value), "environment-trace")
+	}
+}
+
+@(test)
+client_configuration_rejects_ambiguous_sources_and_environment_controls :: proc(
+	t: ^testing.T,
+) {
+	_, source_error := temporal_client.load_config_profile({
+		source = {path = "temporal.toml", data = transmute([]u8)string("invalid")},
+		disable_environment = true,
+	})
+	testing.expect_value(t, source_error.kind, temporal_client.Error_Kind.Configuration)
+	testing.expect(t, source_error.message != nil)
+	temporal_client.error_free(&source_error)
+
+	_, disabled_error := temporal_client.load_config_profile({
+		disable_file = true,
+		disable_environment = true,
+	})
+	testing.expect_value(t, disabled_error.kind, temporal_client.Error_Kind.Configuration)
+	testing.expect(t, disabled_error.message != nil)
+	temporal_client.error_free(&disabled_error)
+
+	duplicate_environment := [?]temporal_client.Config_Environment_Entry{
+		{key = "TEMPORAL_NAMESPACE", value = "first"},
+		{key = "TEMPORAL_NAMESPACE", value = "second"},
+	}
+	_, duplicate_error := temporal_client.load_config_profile({
+		disable_file = true,
+		use_environment_override = true,
+		environment = duplicate_environment[:],
+	})
+	testing.expect_value(t, duplicate_error.kind, temporal_client.Error_Kind.Configuration)
+	testing.expect(t, duplicate_error.message != nil)
+	temporal_client.error_free(&duplicate_error)
+
+	_, strict_error := temporal_client.load_config_profile({
+		source = {data = transmute([]u8)string("[profile.default]\nunknown = true\n")},
+		disable_environment = true,
+		config_file_strict = true,
+	})
+	testing.expect_value(t, strict_error.kind, temporal_client.Error_Kind.Configuration)
+	testing.expect(t, strict_error.message != nil)
+	temporal_client.error_free(&strict_error)
+
+	incomplete_mtls := temporal_client.Config_Profile{
+		address = "localhost:7233",
+		tls = {
+			present = true,
+			client_cert = {
+				kind = .Data,
+				data = transmute([]u8)string("client-cert"),
+			},
+		},
+	}
+	_, mtls_error := temporal_client.connect_with_config_profile(&incomplete_mtls)
+	testing.expect_value(t, mtls_error.kind, temporal_client.Error_Kind.Configuration)
+	testing.expect(t, mtls_error.message != nil)
+	temporal_client.error_free(&mtls_error)
+
+	raw_profile, raw_profile_error := temporal_core.client_env_config_profile_load_json({
+		disable_file = true,
+		env_vars_json = `{
+			"TEMPORAL_TLS":"true",
+			"TEMPORAL_TLS_DISABLE_HOST_VERIFICATION":"true"
+		}`,
+	})
+	defer delete(raw_profile)
+	defer temporal_core.error_free(&raw_profile_error)
+	testing.expect(t, raw_profile_error.message == nil)
+	// Pinned Core reads this setting, but its C bridge JSON adapter omits it.
+	testing.expect(t, !strings.contains(string(raw_profile), "disable_host_verification"))
 }
 
 @(test)

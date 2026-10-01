@@ -2474,8 +2474,41 @@ option against the CLI dev server and calls the live metadata/API-key update
 symbols (the smoke API key is immediately cleared before a Workflow RPC).
 Cloud and mTLS credentials are not stored in this repository, so certificate
 verification and Temporal Cloud authentication still require an external
-credentialed acceptance environment. Temporal TOML/environment configuration
-profiles are not exposed yet.
+credentialed acceptance environment.
+
+The public Client can also use Core's Temporal TOML/environment profile loader:
+
+```odin
+profile, load_error := client.load_config_profile({profile = "dev"})
+defer client.error_free(&load_error)
+assert(load_error.message == nil)
+defer client.config_profile_free(&profile)
+
+temporal_client, connect_error := client.connect_with_config_profile(&profile)
+defer client.error_free(&connect_error)
+assert(connect_error.message == nil)
+defer client.close(&temporal_client)
+```
+
+With no explicit source, Core checks `TEMPORAL_CONFIG_FILE` and its default
+`temporal.toml` location; `TEMPORAL_PROFILE` selects a profile and other
+`TEMPORAL_*` values override it. Tests can pass inline bytes and an exact
+environment map instead. `Config_Profile` owns its decoded strings, TLS source
+data, codec settings, and gRPC metadata until `config_profile_free`.
+
+For the focused live proof, start the CLI dev server and run:
+
+```bash
+temporal server start-dev --headless
+./scripts/config-profile-integration-test.sh
+```
+
+The script loads `examples/config_connect/temporal.toml` through the pinned C
+bridge, connects through the public Client, and requires a non-empty
+`GetSystemInfo` server version. Remote codec endpoint/auth values are currently
+configuration data only. The pinned bridge also omits Core's
+`disable_host_verification` field from its result JSON, so that setting cannot
+yet be applied by Odin.
 
 ### Local Activity live path
 

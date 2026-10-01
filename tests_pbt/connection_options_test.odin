@@ -4,6 +4,7 @@ import "core:bytes"
 import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
+import temporal_client "../temporal/client"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 
@@ -108,6 +109,107 @@ client_connection_options_preserve_generated_transport_values :: proc(t: ^testin
 		"Client connection options preserve transport values",
 		client_connection_options_property,
 		{num_tests = 500, seed = 0x434f_4e4e_4543_544f},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+client_configuration_profile_property :: proc(t: ^pbt.T) -> pbt.Result {
+	select_beta := pbt.draw(t, pbt.boolean())
+	override_address := pbt.draw(t, pbt.boolean())
+	override_namespace := pbt.draw(t, pbt.boolean())
+	override_api_key := pbt.draw(t, pbt.boolean())
+	tls_enabled := pbt.draw(t, pbt.boolean())
+	pbt.cover(t, select_beta, 30.0, "non-default profile")
+	pbt.cover(t, override_address, 30.0, "environment address override")
+	pbt.cover(t, override_namespace, 30.0, "environment namespace override")
+	pbt.cover(t, override_api_key, 30.0, "environment API-key override")
+	pbt.cover(t, !tls_enabled, 30.0, "environment disables TLS")
+
+	toml_source := string(`
+[profile.alpha]
+address = "alpha.example.test:7233"
+namespace = "alpha-namespace"
+api_key = "alpha-key"
+
+[profile.beta]
+address = "beta.example.test:7233"
+namespace = "beta-namespace"
+api_key = "beta-key"
+`)
+	profile_name := "alpha"
+	expected_address := "alpha.example.test:7233"
+	expected_namespace := "alpha-namespace"
+	expected_api_key := "alpha-key"
+	if select_beta {
+		profile_name = "beta"
+		expected_address = "beta.example.test:7233"
+		expected_namespace = "beta-namespace"
+		expected_api_key = "beta-key"
+	}
+	environment_storage: [4]temporal_client.Config_Environment_Entry
+	environment_count := 0
+	if override_address {
+		environment_storage[environment_count] = {
+			key = "TEMPORAL_ADDRESS",
+			value = "environment.example.test:8233",
+		}
+		environment_count += 1
+		expected_address = "environment.example.test:8233"
+	}
+	if override_namespace {
+		environment_storage[environment_count] = {
+			key = "TEMPORAL_NAMESPACE",
+			value = "environment-namespace",
+		}
+		environment_count += 1
+		expected_namespace = "environment-namespace"
+	}
+	if override_api_key {
+		environment_storage[environment_count] = {
+			key = "TEMPORAL_API_KEY",
+			value = "environment-key",
+		}
+		environment_count += 1
+		expected_api_key = "environment-key"
+	}
+	environment_storage[environment_count] = {
+		key = "TEMPORAL_TLS",
+		value = tls_enabled ? "true" : "false",
+	}
+	environment_count += 1
+
+	owned_source := bytes.clone(transmute([]u8)toml_source)
+	profile, profile_error := temporal_client.load_config_profile({
+		profile = profile_name,
+		source = {data = owned_source},
+		config_file_strict = true,
+		use_environment_override = true,
+		environment = environment_storage[:environment_count],
+	})
+	delete(owned_source)
+	defer temporal_client.config_profile_free(&profile)
+	defer temporal_client.error_free(&profile_error)
+	if profile_error.message != nil {
+		return pbt.fail("Core rejected a generated valid configuration profile")
+	}
+	if profile.address != expected_address ||
+	   profile.namespace != expected_namespace ||
+	   profile.api_key != expected_api_key {
+		return pbt.fail("file/profile/environment precedence changed")
+	}
+	if !profile.tls.present || profile.tls.disabled == tls_enabled {
+		return pbt.fail("generated TEMPORAL_TLS override changed")
+	}
+	return pbt.pass()
+}
+
+@(test)
+client_configuration_profiles_preserve_core_resolution_precedence :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Client configuration profiles preserve Core resolution precedence",
+		client_configuration_profile_property,
+		{num_tests = 250, seed = 0x434f_4e46_4947_5552},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

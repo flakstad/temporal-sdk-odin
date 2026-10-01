@@ -6,8 +6,8 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
-Activity/Workflow/Nexus worker registry and poll loop, updated 2026-09-30. The Activity slice now also has a
-generic Temporal Payload boundary, typed JSON Activity registration, and
+Activity/Workflow/Nexus worker registry and poll loop, updated 2026-10-01. The
+Activity slice now also has a generic Temporal Payload boundary, typed JSON Activity registration, and
 structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
 commands/results, completion, eviction, and replay, with typed JSON adapters
@@ -534,6 +534,67 @@ no Nexus URL mapping for them. The current Python SDK's generated common API at 
 [`5bb4612`](https://github.com/temporalio/sdk-python/blob/5bb461265e6c1af29c5f25dbb871a7e67448c61e/temporalio/api/common/v1/message_pb2.pyi)
 and the pinned Core schema are the source for the `Callback` shape; the Odin
 SDK does not invent a URL form that the upstream converter does not define.
+
+#### Client configuration profiles
+
+The pinned C bridge exposes Core's official configuration loader directly:
+
+```text
+temporal_core_client_env_config_load
+temporal_core_client_env_config_profile_load
+```
+
+Both calls are synchronous. Inputs are borrowed `ByteArrayRef` values. The
+source can be a TOML path, inline TOML bytes, or absent. The profile call also
+accepts an explicit profile name, file/environment disable flags, strict TOML
+parsing, and an optional JSON object that replaces the process environment for
+deterministic tests. Core, rather than Odin, implements the resolution order:
+
+1. explicit source, `TEMPORAL_CONFIG_FILE`, then Core's platform default;
+2. explicit profile, `TEMPORAL_PROFILE`, then `default`;
+3. `TEMPORAL_*` environment values over the selected file profile.
+
+The all-profile call parses the file but does not apply connection-setting
+environment overrides to every profile. Its injected environment is relevant
+to file discovery. Call the single-profile loader for the fully resolved
+connection configuration.
+
+Success is JSON and failure is UTF-8, each returned as exactly one
+Core-allocated `TemporalCoreByteArray*`. The bridge JSON carries address,
+namespace, API key, TLS data sources, remote-codec settings, and normalized
+gRPC metadata. A data source is either `{ "path": ... }` or
+`{ "data": [byte, ...] }`. Odin copies and frees the returned Core array,
+decodes in a temporary arena, and deep-clones the public `Config_Profile` into
+the caller's allocator. The TOML/env/source buffers can therefore be destroyed
+immediately after `load_config_profile`; the result must be released once with
+`config_profile_free`. `Config` and all of its named profiles are a single
+owned graph released with `config_free` and must not be value-copied.
+
+`client.connect_with_config_profile` resolves certificate paths only when TLS
+is enabled, adds `http://` or `https://` to a bare address using Core's TLS
+rule, and applies address, namespace, API key, TLS, and ASCII gRPC metadata.
+Identity, runtime telemetry, retry/keepalive, proxy, DNS, compression, warning
+limits, and interceptors remain explicit caller options. An API key enables TLS
+unless the profile explicitly says `tls.disabled = true`; this required an
+explicit `tls_disabled` bit in the Odin connection options because a null TLS
+pointer alone cannot distinguish those cases.
+
+Two upstream limitations are preserved rather than hidden:
+
+- Core's common configuration model reads
+  `TEMPORAL_TLS_DISABLE_HOST_VERIFICATION`, but the pinned C bridge's JSON
+  wrapper omits `disable_host_verification`. The Odin SDK cannot observe or
+  apply it through this ABI. Host verification therefore remains enabled.
+- The bridge returns the profile's codec endpoint/auth, but neither the pinned
+  Rust `ClientConfigProfile -> ConnectionOptions` conversion nor this Odin
+  slice installs remote codec transport. Odin exposes the values for
+  inspection and does not claim that they are active.
+
+This is evidence in favor of the C bridge foundation: configuration policy and
+environment compatibility remain in upstream Core instead of being
+reimplemented in Odin. It also reinforces that the bridge is not a complete
+language SDK surface; omissions in its JSON adapter need pin-specific tests and
+occasionally an upstream change.
 
 ### Worker and activity tasks
 
@@ -1076,6 +1137,10 @@ as ABI requirements:
   but caller-managed. Copy or consume it, then call
   `temporal_core_byte_array_free(runtime, bytes)` exactly once. Do not call
   Odin `free` on it.
+- Configuration-loader success/failure arrays follow the same ownership rule,
+  but do not belong to a runtime. The bridge implementation accepts a null
+  runtime in `temporal_core_byte_array_free`; Odin copies the JSON/error and
+  frees the array exactly once before returning from its synchronous wrapper.
 - Runtime creation failure is special: `RuntimeOrFail` still contains a runtime
   used to free the error. Free the error with that runtime, then free the
   runtime; never otherwise use the failed runtime.
@@ -1213,6 +1278,8 @@ temporal_core_client_free
 temporal_core_client_update_metadata
 temporal_core_client_update_binary_metadata
 temporal_core_client_update_api_key
+temporal_core_client_env_config_load
+temporal_core_client_env_config_profile_load
 temporal_core_cancellation_token_new
 temporal_core_cancellation_token_cancel
 temporal_core_cancellation_token_free
@@ -1246,6 +1313,18 @@ Odin client_get_system_info
   <- 32-byte serialized response
 copy + temporal_core_byte_array_free
 client_free -> runtime_free
+```
+
+The configuration-profile acceptance path, also executed against that direct
+CLI dev server, is:
+
+```text
+temporal.toml path
+  -> temporal_core_client_env_config_profile_load(profile = "dev")
+  <- Core-owned JSON -> owned Odin Config_Profile
+  -> connect_with_config_profile
+  -> temporal_core_client_connect(http://localhost:7233)
+  -> GetSystemInfo -> Temporal Server 1.29.1
 ```
 
 Original live-server verification environment:

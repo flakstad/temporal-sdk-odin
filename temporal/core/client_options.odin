@@ -56,6 +56,7 @@ Client_Connection_Options :: struct {
 	binary_metadata:            []Client_Metadata_Entry,
 	api_key:                    string,
 	tls:                        ^Client_TLS_Options,
+	tls_disabled:               bool,
 	retry:                      ^Client_Retry_Options,
 	keep_alive:                 ^Client_Keep_Alive_Options,
 	http_connect_proxy:         ^Client_HTTP_Connect_Proxy_Options,
@@ -153,6 +154,9 @@ client_connection_options_validate :: proc(options: Client_Connection_Options) -
 		return client_option_error("Temporal API key is not valid ASCII metadata")
 	}
 	if options.tls != nil {
+		if options.tls_disabled {
+			return client_option_error("Temporal TLS options cannot be combined with explicit TLS disablement")
+		}
 		has_cert := len(options.tls.client_cert) > 0
 		has_key := len(options.tls.client_private_key) > 0
 		if has_cert != has_key {
@@ -273,7 +277,7 @@ client_connection_bindings_init :: proc(
 		payloads_warn_size = options.payloads_warn_size,
 		memo_warn_size = options.memo_warn_size,
 	}
-	if options.tls != nil || len(options.api_key) > 0 {
+	if options.tls != nil || (len(options.api_key) > 0 && !options.tls_disabled) {
 		if options.tls != nil {
 			bindings.tls = {
 				server_root_ca_cert = bytes_ref(options.tls.server_root_ca_cert),

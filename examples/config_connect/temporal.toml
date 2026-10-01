@@ -1,0 +1,6 @@
+[profile.dev]
+address = "localhost:7233"
+namespace = "default"
+
+[profile.dev.tls]
+disabled = true

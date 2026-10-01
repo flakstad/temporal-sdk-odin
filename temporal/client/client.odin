@@ -19,6 +19,7 @@ import temporal_headers "../headers"
 Error_Kind :: enum {
 	None,
 	Invalid_Argument,
+	Configuration,
 	Connection,
 	Rpc,
 	Malformed_Response,
@@ -183,6 +184,7 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 		binary_metadata = options.binary_metadata,
 		api_key = options.api_key,
 		tls = options.tls,
+		tls_disabled = options.tls_disabled,
 		retry = options.retry,
 		keep_alive = options.keep_alive,
 		http_connect_proxy = options.http_connect_proxy,

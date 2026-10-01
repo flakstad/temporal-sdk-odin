@@ -21,6 +21,7 @@ Connect_Options :: struct {
 	metadata:               []RPC_Metadata_Entry,
 	binary_metadata:        []RPC_Metadata_Entry,
 	tls:                    ^TLS_Options,
+	tls_disabled:           bool,
 	retry:                  ^Client_Retry_Options,
 	keep_alive:             ^Keep_Alive_Options,
 	http_connect_proxy:     ^HTTP_Connect_Proxy_Options,

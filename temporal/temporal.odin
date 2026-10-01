@@ -13,6 +13,10 @@ Client :: temporal_client.Client
 Client_Connect_Options :: temporal_client.Connect_Options
 Client_Error :: temporal_client.Error
 Client_Error_Kind :: temporal_client.Error_Kind
+Client_Config :: temporal_client.Config
+Client_Config_Profile :: temporal_client.Config_Profile
+Client_Config_Load_Options :: temporal_client.Config_Load_Options
+Client_Config_Profile_Load_Options :: temporal_client.Config_Profile_Load_Options
 
 Worker :: temporal_worker.Worker
 Worker_Options :: temporal_worker.Options
@@ -22,6 +26,12 @@ Worker_Error :: temporal_worker.Error
 
 connect :: temporal_client.connect
 connect_with_options :: temporal_client.connect_with_options
+connect_with_config_profile :: temporal_client.connect_with_config_profile
+client_config_load :: temporal_client.load_config
+client_config_profile_load :: temporal_client.load_config_profile
+client_config_find_profile :: temporal_client.config_find_profile
+client_config_free :: temporal_client.config_free
+client_config_profile_free :: temporal_client.config_profile_free
 client_close :: temporal_client.close
 client_error_free :: temporal_client.error_free
 

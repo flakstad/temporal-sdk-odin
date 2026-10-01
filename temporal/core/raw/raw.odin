@@ -252,6 +252,33 @@ Rpc_Call_Options :: struct {
 	cancellation_token: ^Cancellation_Token,
 }
 
+Client_Env_Config_Or_Fail :: struct {
+	success: ^Byte_Array,
+	fail:    ^Byte_Array,
+}
+
+Client_Env_Config_Profile_Or_Fail :: struct {
+	success: ^Byte_Array,
+	fail:    ^Byte_Array,
+}
+
+Client_Env_Config_Load_Options :: struct {
+	path:               Byte_Array_Ref,
+	data:               Byte_Array_Ref,
+	config_file_strict: bool,
+	env_vars:           Byte_Array_Ref,
+}
+
+Client_Env_Config_Profile_Load_Options :: struct {
+	profile:            Byte_Array_Ref,
+	path:               Byte_Array_Ref,
+	data:               Byte_Array_Ref,
+	disable_file:       bool,
+	disable_env:        bool,
+	config_file_strict: bool,
+	env_vars:           Byte_Array_Ref,
+}
+
 Client_Rpc_Call_Callback :: #type proc "c" (
 	user_data:       rawptr,
 	success:         ^Byte_Array,
@@ -457,6 +484,14 @@ when size_of(uintptr) == 8 {
 	#assert(size_of(Client_HTTP_Connect_Proxy_Options) == 48)
 	#assert(size_of(Client_DNS_Load_Balancing_Options) == 8)
 	#assert(size_of(Rpc_Call_Options) == 96)
+	#assert(size_of(Client_Env_Config_Or_Fail) == 16)
+	#assert(size_of(Client_Env_Config_Profile_Or_Fail) == 16)
+	#assert(size_of(Client_Env_Config_Load_Options) == 56)
+	#assert(offset_of(Client_Env_Config_Load_Options, config_file_strict) == 32)
+	#assert(offset_of(Client_Env_Config_Load_Options, env_vars) == 40)
+	#assert(size_of(Client_Env_Config_Profile_Load_Options) == 72)
+	#assert(offset_of(Client_Env_Config_Profile_Load_Options, disable_file) == 48)
+	#assert(offset_of(Client_Env_Config_Profile_Load_Options, env_vars) == 56)
 	#assert(size_of(Worker_Replayer_Or_Fail) == 24)
 	#assert(size_of(Worker_Replay_Push_Result) == 8)
 	#assert(offset_of(Rpc_Call_Options, retry) == 40)
@@ -553,6 +588,12 @@ foreign temporal_core {
 		user_data: rawptr,
 		callback: Client_Rpc_Call_Callback,
 	) ---
+	client_env_config_load :: proc(
+		options: ^Client_Env_Config_Load_Options,
+	) -> Client_Env_Config_Or_Fail ---
+	client_env_config_profile_load :: proc(
+		options: ^Client_Env_Config_Profile_Load_Options,
+	) -> Client_Env_Config_Profile_Or_Fail ---
 	worker_new :: proc(connection: ^Connection, options: ^Worker_Options) -> Worker_Or_Fail ---
 	worker_replayer_new :: proc(
 		runtime: ^Runtime,

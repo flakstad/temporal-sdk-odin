@@ -68,8 +68,15 @@ options now expose Core's TLS/mTLS,
 API-key, ASCII/binary RPC metadata, retry, keepalive, HTTP CONNECT proxy, DNS
 load-balancing, compression, identity, and payload-warning controls. API-key
 connections enable TLS automatically, and metadata/API keys can be replaced on
-a live connection. The public Client now exposes `get_system_info`, returning
-an allocator-owned Server version plus all thirteen capability bits in the
+a live connection. Core's official TOML/environment profile loader is now
+bound through the C ABI. `client.load_config_profile` returns an owned Odin
+profile and `client.connect_with_config_profile` applies its address,
+namespace, API key, TLS/mTLS sources, and gRPC metadata. Bare addresses receive
+the same HTTP/HTTPS choice as upstream Core, including explicit TLS disablement
+for local development. Codec settings are exposed but remote codec transport
+is not implemented; the pinned bridge also omits Core's host-verification
+disable flag from its JSON result. The public Client now exposes
+`get_system_info`, returning an allocator-owned Server version plus all thirteen capability bits in the
 pinned Temporal API. This gives applications an authoritative baseline for
 Schedules, Nexus, eager Workflow start, SDK metadata, Build-ID versioning, and
 related features; experimental RPCs without a capability bit still require a
@@ -2362,6 +2369,7 @@ temporal/client/          owned Client and Workflow handle/control APIs
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof
+examples/config_connect/  Core TOML profile -> public Client proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/update_with_start/ atomic create-or-attach Update proof
