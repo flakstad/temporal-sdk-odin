@@ -96,7 +96,23 @@ run :: proc() -> int {
 	}
 
 	worker_options := worker.options_default(task_queue)
-	worker_options.max_cached_workflows = 0
+	cache_mode_buffer: [64]u8
+	cache_mode := os.get_env(
+		cache_mode_buffer[:],
+		"TEMPORAL_ODIN_ISOLATE_CACHE_MODE",
+	)
+	if len(cache_mode) == 0 {
+		cache_mode = "zero"
+	}
+	switch cache_mode {
+	case "zero":
+		worker_options.max_cached_workflows = 0
+	case "sticky":
+		worker_options.max_cached_workflows = 100
+	case:
+		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_CACHE_MODE: %s\n", cache_mode)
+		return 1
+	}
 	worker_options.workflow_task_poller_behavior = worker.poller_simple_maximum(2)
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
@@ -230,13 +246,25 @@ run :: proc() -> int {
 		return 1
 	}
 	manager_stats := workflow_isolate.manager_stats(&executor_manager)
+	expected_generations := 5
+	if cache_mode == "sticky" {
+		expected_generations = 3
+	}
+	if first_mode == "normal" {
+		expected_generations -= 1
+	}
+	expected_graceful_shutdowns := expected_generations - expected_activation_failures + 1
+	expected_incremental_activations := 2
 	if greeting_result != "Hello from an isolated Workflow, Odin" ||
 	   farewell_result.message != "Goodbye from the shared registry, Odin" ||
 	   farewell_result.code != 42 || run_stats.workflow_executions_completed != 2 ||
 	   run_stats.workflow_activation_failures != expected_activation_failures ||
 	   manager_stats.child_exits != expected_child_exits ||
 	   manager_stats.activation_timeouts != expected_timeouts ||
-	   manager_stats.generations_started < 4 || manager_stats.graceful_shutdowns < 5 ||
+	   manager_stats.generations_started != expected_generations ||
+	   manager_stats.evictions != expected_generations ||
+	   manager_stats.graceful_shutdowns != expected_graceful_shutdowns ||
+	   manager_stats.incremental_activations != expected_incremental_activations ||
 	   manager_stats.manifest_handshakes != manager_stats.generations_started + 1 ||
 	   manager_stats.manifest_mismatches != 0 ||
 	   manager_stats.shutdown_timeouts != 0 ||
@@ -244,7 +272,8 @@ run :: proc() -> int {
 	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			cache_mode,
 			greeting_result,
 			farewell_result.message,
 			farewell_result.code,
@@ -253,8 +282,12 @@ run :: proc() -> int {
 			manager_stats.child_exits,
 			manager_stats.activation_timeouts,
 			manager_stats.generations_started,
+			expected_generations,
 			manager_stats.evictions,
 			manager_stats.graceful_shutdowns,
+			expected_graceful_shutdowns,
+			manager_stats.incremental_activations,
+			expected_incremental_activations,
 			manager_stats.manifest_handshakes,
 			manager_stats.manifest_mismatches,
 			manager_stats.shutdown_timeouts,
@@ -266,19 +299,21 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
 		farewell_result.message,
 		farewell_result.code,
 		workflow.registry_count(&registry),
+		cache_mode,
 		first_mode,
 		manager_stats.generations_started,
 		manager_stats.child_exits,
 		manager_stats.activation_timeouts,
 		manager_stats.evictions,
 		run_stats.workflow_replay_activations,
+		manager_stats.incremental_activations,
 		manager_stats.graceful_shutdowns,
 		manager_stats.manifest_handshakes,
 		manager_stats.manifest_mismatches,

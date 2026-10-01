@@ -53,11 +53,13 @@ fi
 
 unique_suffix="${RANDOM}-$(date +%s)"
 first_mode="${TEMPORAL_ODIN_ISOLATE_FIRST_MODE:-crash}"
+cache_mode="${TEMPORAL_ODIN_ISOLATE_CACHE_MODE:-zero}"
 output="$(
   TEMPORAL_ODIN_TASK_QUEUE="odin-isolate-$unique_suffix" \
   TEMPORAL_ODIN_WORKFLOW_ID="odin-isolate-$unique_suffix" \
   TEMPORAL_ODIN_ISOLATE_CHILD_COMMAND="$child_binary" \
   TEMPORAL_ODIN_ISOLATE_FIRST_MODE="$first_mode" \
+  TEMPORAL_ODIN_ISOLATE_CACHE_MODE="$cache_mode" \
   "$parent_binary" 2>&1
 )"
 echo "$output"
@@ -66,8 +68,20 @@ grep -q 'registry_types=2' <<<"$output"
 grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"
 grep -q 'farewell="Goodbye from the shared registry, Odin"' <<<"$output"
 grep -q "first_mode=$first_mode" <<<"$output"
-grep -q 'graceful_shutdowns=5' <<<"$output"
-grep -q 'manifest_handshakes=6' <<<"$output"
+grep -q "cache_mode=$cache_mode" <<<"$output"
+if [[ "$cache_mode" == "sticky" ]]; then
+  grep -q 'generations=3' <<<"$output"
+  grep -q 'evictions=3' <<<"$output"
+  grep -q 'graceful_shutdowns=3' <<<"$output"
+  grep -q 'manifest_handshakes=4' <<<"$output"
+  grep -q 'incremental_activations=2' <<<"$output"
+else
+  grep -q 'generations=5' <<<"$output"
+  grep -q 'evictions=5' <<<"$output"
+  grep -q 'graceful_shutdowns=5' <<<"$output"
+  grep -q 'manifest_handshakes=6' <<<"$output"
+  grep -q 'incremental_activations=2' <<<"$output"
+fi
 grep -q 'manifest_mismatches=0' <<<"$output"
 grep -q 'shutdown_timeouts=0' <<<"$output"
 grep -q 'crash_loop_rejections=0' <<<"$output"

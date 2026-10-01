@@ -3274,7 +3274,7 @@ supervisor itself, including readiness, bounded crash-loop backoff, thread-safe
 stop, TERM/grace/KILL, lifecycle events, unit tests, and a live abrupt-crash/
 replay proof. The fine-grained IPC path now carries opaque
 activation/completion protobufs through bounded, versioned, correlated frames
-and is connected to Core through a reusable bounded zero-cache manager. Child
+and is connected to Core through a reusable bounded per-run manager. Child
 death is live-proven as activation failure, eviction, and fresh-process replay;
 generated statechart traces check failed-generation fencing and multi-route
 capacity. A positive activation deadline now kills and reaps an unresponsive
@@ -3285,9 +3285,12 @@ a typed-JSON result. A canonical registry handshake is now checked once before
 polling and again for each child generation. Shutdown response and process exit
 are now bounded independently from activation execution; capacity admission is
 immediate rather than deadlocking the serial poll thread; and a cooldown circuit
-breaker bounds consecutive executor failures. The next step is sticky per-run
-child routing with a non-zero Core cache. Production hardening remains
-process-boundary work. The
+breaker bounds consecutive executor failures. Sticky per-run routing with a
+non-zero Core cache is now live-proven: two
+successful children retain two timer Workflows across incremental activations,
+while an initial crash or timeout still evicts and recovers. The next step is
+executor-host observability and complete result metadata. Production hardening
+remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3920,17 +3923,25 @@ initial attempt and four successful zero-cache tasks across scheduling and
 replay/timer resolution. Exact batching and generation counts are diagnostic,
 not an SDK contract.
 
+The second verified mode sets `max_cached_workflows = 100`. After one initial
+crash or timeout, the two Workflow runs each retain one successful child across
+timer suspension and resolution. Core delivers two incremental activations to
+those existing run routes. The live path therefore uses three generations and
+three evictions rather than zero-cache's five, with three graceful shutdowns
+including preflight. Both exact results and all failure-containment assertions
+remain unchanged.
+
 The cache/language-lifetime invariant is strict:
 
 ```text
 Core cache entry exists  <=>  exactly one live Odin executor generation owns it
 ```
 
-Zero-cache satisfies this with one process per successful Workflow Task.
-Future sticky mode must instead retain a run-routed child until Core eviction.
-Starting a new child for an incremental activation while Core still considers
-the old language cache entry live is invalid because the new process lacks the
-suspended fiber.
+Zero-cache satisfies this with one process per successful Workflow Task. Sticky
+mode retains a run-routed child until Core eviction and is now live-proven with
+non-zero caching. Starting a new child for an incremental activation while Core
+still considers the old language cache entry live remains invalid because the
+new process lacks the suspended fiber.
 
 The external processor itself is an Odin-only API seam and is still marked
 experimental. A reusable manager now provides bounded admission, owned run-ID

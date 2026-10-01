@@ -266,13 +266,18 @@ length-prefixed manifest. A manager configured with `expected_registry` can call
 the manifest exchange before its first activation. Registry ownership remains
 local to each process throughout the handshake.
 
-The zero-cache manager accepts independent `activation_timeout` and
+The per-run isolation manager accepts independent `activation_timeout` and
 `shutdown_timeout` values. A positive shutdown deadline covers both the
 acknowledgement and final process exit and always reaps the child. Capacity
 exhaustion rejects immediately; it never waits on the serial Core activation
 thread. `Crash_Loop_Policy` can bound consecutive child/session failures and
 opens for a monotonic cooldown before one trial is admitted. A successful
 activation resets this global streak.
+
+With a non-zero Core Workflow cache, the same route and child remain alive for
+incremental activations until `RemoveFromCache`. The live sticky test keeps two
+timer Workflows on two successful generations across suspension/resolution;
+zero-cache uses four successful generations for the same work.
 
 Once initialized, `Executor_Host` owns its runtimes independently of the source
 Registry. Per-run instances remain routed to the selected runtime until Core

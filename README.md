@@ -499,11 +499,12 @@ supervisor contract is documented in
 [`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow or
 per-Activity production subprocess pools are not implemented. The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
-to online Core polling in zero-cache mode. Its live test deliberately crashes
+to online Core polling in zero-cache and sticky-cache modes. Its live test
+deliberately crashes
 the first per-Workflow executor, submits a failed activation completion,
 acknowledges Core eviction, replays in fresh children, and obtains the durable
 timer Workflow result from the CLI dev server. The current implementation is a
-reusable bounded zero-cache manager with owned run-ID/generation routes,
+reusable bounded per-run manager with owned run-ID/generation routes,
 failed-until-eviction fencing, correlated private pipes, and generated
 statechart/PBT lifecycle coverage. A live hung-child test proves the optional
 activation deadline kills/reaps the executor and recovers through Core replay.
@@ -516,8 +517,10 @@ now verifies a canonical type manifest in a pre-poll child and again in every
 executor generation. Shutdown acknowledgement and process exit have an optional
 deadline, full capacity rejects without blocking the serial Core poll thread,
 and an optional cooldown circuit breaker bounds consecutive executor failures.
-It still lacks executor-host log/metric/interceptor configuration and
-sticky-cache execution.
+With a non-zero Core cache, the two live timer Workflows retain one successful
+child generation each across suspension and incremental resolution; crash and
+timeout recovery still evict and replay safely. It still lacks executor-host
+log/metric/interceptor configuration and production pool hardening.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 
@@ -2251,7 +2254,7 @@ examples/replay_history/  offline binary-history compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/workflow_isolate/ persistent per-run Workflow process spike
 examples/workflow_isolate_app/ shared parent/child Workflow registry
-examples/workflow_isolate_core/ Core-polled zero-cache crash/replay proof
+examples/workflow_isolate_core/ Core-polled zero/sticky crash/replay proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker

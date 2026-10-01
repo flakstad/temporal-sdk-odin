@@ -1,8 +1,8 @@
 # Workflow process isolation
 
-Status: experimental zero-cache process boundary, connected to `worker.run`
-and live-proven against the Temporal CLI dev server. It is not yet a production
-executor pool.
+Status: experimental per-run process boundary, connected to `worker.run` and
+live-proven in both zero-cache and sticky-cache modes against the Temporal CLI
+dev server. It is not yet a production executor pool.
 
 ## Decision and evidence
 
@@ -19,7 +19,8 @@ Starting a fresh process for an arbitrary incremental activation without first
 coordinating Core eviction is invalid: the new child does not own the suspended
 Workflow fiber expected by that activation. Zero-cache execution is a correct,
 simple first implementation at the cost of replaying history for every task.
-Sticky per-run children are the later performance mode.
+Both modes now use the same manager and protocol; Core cache configuration
+selects the lifetime.
 
 The pinned Core implementation gives the parent a recovery path. A failed
 `WorkflowActivationCompletion` is handled as a Workflow Task failure and a
@@ -142,7 +143,7 @@ Every per-task child repeats the correlated handshake before receiving its first
 activation, covering a replaced or inconsistent executable after preflight.
 Malformed or mismatched manifests are protocol failures and the child is reaped.
 
-## Core-integrated zero-cache proof
+## Core-integrated cache proofs
 
 The online Worker now has an experimental `workflow_activation_processor`
 callback. It replaces only language-side activation dispatch: Core still owns
@@ -152,8 +153,8 @@ serial invocation and returns an ordinarily owned `workflow.Process_Result`.
 The existing in-process dispatcher remains the default, and offline replay
 deliberately remains in-process.
 
-`temporal/workflow/isolate.Manager` is the reusable zero-cache implementation
-of that callback. Initialization copies both child command vectors, requires a
+`temporal/workflow/isolate.Manager` is the reusable per-run implementation of
+that callback. Initialization copies both child command vectors, requires a
 positive route capacity, and owns a dynamic run-ID table. Each accepted route
 gets a monotonically increasing generation and its own process and pipe pair.
 Capacity counts both live routes and failed routes awaiting eviction, so a
@@ -226,6 +227,16 @@ path observes exactly one timeout, kills and reaps the child, submits the failed
 completion, consumes eviction, replays in later generations, and returns the
 same durable result. No pipe-reader thread remains at shutdown.
 
+Set `TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky` to use
+`max_cached_workflows=100`. After one deliberately failed generation, the two
+Workflow runs each keep one child across timer suspension and resolution. The
+live path observes three generations and three evictions instead of the
+zero-cache path's five, while still processing both timer resolutions as
+incremental activations and returning the same exact results. The crash and hang
+variants both pass. This proves the invariant in the non-zero-cache direction:
+incremental activations remain routed to the generation that owns the suspended
+fiber until Core explicitly evicts it.
+
 This is evidence for the central recovery contract: the parent can survive a
 language executor crash, fail only that Workflow Task, and let Core/Server
 history drive a fresh Odin runtime. Temporal remains the durable state owner.
@@ -290,8 +301,8 @@ still required:
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is sticky per-run routing with a non-zero
-Core cache. It can reuse the manager, registry handshake, bounded shutdown, and
-wire protocol, but must prove that every incremental activation stays on the
-same generation until Core eviction. Executor-host observability should follow
-without changing command determinism.
+The next discriminating vertical slice is executor-host observability and
+configuration: replay-aware logging, metrics, and interceptor installation must
+run in the child while observations cross back without affecting deterministic
+commands. Complete `Process_Result` observation metadata and malformed/late
+completion tests remain part of that hardening.

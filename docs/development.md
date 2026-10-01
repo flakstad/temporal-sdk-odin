@@ -784,7 +784,7 @@ domain, and exactly saturated at the configured maximum.
 
 ### Per-run Workflow process boundary
 
-The fine-grained executor transport and its zero-cache Core integration are
+The fine-grained executor transport and its zero/sticky-cache Core integration are
 documented in [`workflow-isolation.md`](workflow-isolation.md). The transport
 can be run without a Temporal Server:
 
@@ -837,15 +837,28 @@ the pipe. The live test completes both a string Workflow and a typed-JSON
 Workflow through the same executor binary, after either a deliberate first
 child crash or timeout.
 
+Run the non-zero-cache path with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+After one failed generation, two timer Workflows use exactly two successful
+children across suspension and resolution: three generations/evictions total,
+versus five in zero-cache mode. Both timer resolutions are incremental
+activations routed to the already-owned generation. The hang variant passes
+with the same counts.
+
 External and in-process Workflow registrations cannot be mixed on one Worker.
 Workflow loggers and interceptors for external registrations must be configured
 inside the executor host; the parent rejects them rather than silently applying
 them to runtimes that will never execute. Protocol version 2 encodes the ordered
 type-name manifest with explicit lengths. `manager_verify_host` verifies the
 ordinary child before `worker.run`, and every task child repeats the handshake
-before its first activation. The live crash and hang paths each require six
-successful handshakes and zero mismatches. Executor-host hook configuration,
-and sticky-cache routing remain outstanding.
+before its first activation. The zero-cache crash and hang paths each require
+six successful handshakes; sticky mode requires four. All require zero
+mismatches. Executor-host hook configuration remains outstanding.
 
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity

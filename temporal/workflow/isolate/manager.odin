@@ -176,6 +176,7 @@ Manager_Stats :: struct {
 	start_failures:      int,
 	crash_loop_rejections: int,
 	crash_loop_recoveries: int,
+	incremental_activations: int,
 }
 
 Child_Session :: struct {
@@ -916,6 +917,7 @@ manager_process_activation :: proc(
 				"Workflow executor route was initialized more than once",
 			)
 		}
+		manager.stats.incremental_activations += 1
 	} else {
 		if !route_info.initializes {
 			return failure_result(
