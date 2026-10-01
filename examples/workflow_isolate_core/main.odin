@@ -604,5 +604,12 @@ run :: proc() -> int {
 }
 
 main :: proc() {
+	if len(os.args) >= 2 && os.args[1] == "--native-bundle-check" {
+		fmt.printf(
+			"Workflow isolation application bundle is loadable (protocol=%d)\n",
+			workflow_isolate.VERSION,
+		)
+		return
+	}
 	os.exit(run())
 }

@@ -842,6 +842,20 @@ can be run without a Temporal Server:
 TEMPORAL_ODIN_SKIP_BUILD=1 ./scripts/workflow-isolate-integration-test.sh
 ```
 
+Build and verify the relocatable, application-specific parent/executor bundle:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/package-workflow-isolate-example.sh dist
+./scripts/verify-workflow-isolate-example-package.sh \
+  dist/temporal-sdk-odin-workflow-isolate-example-<target>.tar.gz
+```
+
+Unlike the generic native runtime archive, this executor contains the example
+Workflow registry. The verifier moves the unpacked bundle, checks its relative
+loader paths and pinned Core/protocol versions, then runs the serverless
+process proof. CI repeats the same proof on all four supported targets.
+
 The parent sends two correlated binary Core activations over bounded versioned
 frames to one child process. The child suspends a sequential Odin Workflow on a
 timer after the first activation, retains its fiber, resumes it on `FireTimer`,

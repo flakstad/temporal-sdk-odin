@@ -89,6 +89,14 @@ jobs:
       - name: Install and consume packaged runtime
         run: ./scripts/native-package-integration-test.sh "dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz"
 
+      - name: Package portable Workflow isolation example
+        env:
+          TEMPORAL_ODIN_SKIP_BUILD: "1"
+        run: ./scripts/package-workflow-isolate-example.sh dist
+
+      - name: Verify relocated Workflow isolation bundle
+        run: ./scripts/workflow-isolate-package-integration-test.sh "dist/temporal-sdk-odin-workflow-isolate-example-${{ matrix.target }}.tar.gz"
+
       - name: Upload native package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -96,4 +104,13 @@ jobs:
           path: |
             dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz
             dist/temporal-sdk-odin-native-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload Workflow isolation example package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: temporal-sdk-odin-workflow-isolate-example-${{ matrix.target }}
+          path: |
+            dist/temporal-sdk-odin-workflow-isolate-example-${{ matrix.target }}.tar.gz
+            dist/temporal-sdk-odin-workflow-isolate-example-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error

@@ -847,6 +847,22 @@ Core install name/SONAME, embedded library search paths, unexpected shared
 dependencies, and a mismatched fiber object. The final executable supplies the
 runtime search path to the immutable package directory.
 
+The isolated Workflow executor is application-specific, so it is deliberately
+not included in that generic native archive. A relocatable parent/executor
+example bundle and its full loader/process verification can be built with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/package-workflow-isolate-example.sh dist
+./scripts/verify-workflow-isolate-example-package.sh \
+  dist/temporal-sdk-odin-workflow-isolate-example-<target>.tar.gz
+```
+
+CI performs this relocation proof on macOS and Linux for arm64 and x86_64. See
+[the application-bundle contract](docs/workflow-isolate-example-package.md)
+for why a real application must compile its own Workflow registry into the
+executor.
+
 In one terminal, start the recommended local development server:
 
 ```bash

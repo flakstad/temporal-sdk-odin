@@ -99,6 +99,24 @@ trailing data, limits, and invalid control frames. A 500-case property test
 generates binary run IDs, payloads up to 8 KiB, both data message kinds, and
 64-bit correlation IDs.
 
+The application-specific deployment boundary is also executable rather than
+only documented. Build and verify a relocatable example bundle with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/package-workflow-isolate-example.sh dist
+./scripts/verify-workflow-isolate-example-package.sh \
+  dist/temporal-sdk-odin-workflow-isolate-example-<target>.tar.gz
+```
+
+The archive contains separate Core-owning parent and registry-owning executor
+binaries plus the pinned Core dynamic library. Both binaries use only a
+bundle-relative loader path. Verification moves the unpacked directory before
+loading the parent and running the complete serverless pipe/process proof. The
+CI matrix performs this on macOS and Linux, arm64 and x86_64. This is kept
+separate from the generic native runtime archive because the executor must be
+compiled with the application's Workflow registry and callbacks.
+
 ## Shared registry and executor host
 
 Workflow procedure pointers cannot be serialized or transferred safely across
@@ -442,12 +460,9 @@ response could be read; a new generation never reuses those pipes.
 
 ## Not implemented yet
 
-This slice deliberately does not claim production isolation. The following are
-still required:
-
-- validate macOS/Linux arm64/x86_64 pipe and process behavior.
-
-The next discriminating vertical slice is cross-platform pipe/process
-validation and packaging of the executor binary on the four supported target
-triples. Production isolation still needs policy and classification coverage
-for additional fatal native child exits, resource budgets, and pool scheduling.
+This slice deliberately does not claim production isolation. The four-target
+CI matrix now builds, relocates, loads, and executes the application bundle,
+covering the basic pipe, process, architecture, and loader contracts.
+Production isolation still needs resource budgets, pool scheduling, release
+signing/notarization, and broader policy/classification coverage for fatal
+native child exits.
