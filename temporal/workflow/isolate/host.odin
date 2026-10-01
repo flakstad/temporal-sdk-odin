@@ -49,13 +49,22 @@ Executor_Host :: struct {
 
 // Executor_Host_Options are copied into every process-local Workflow runtime
 // before any execution starts. Logger/interceptor user_data remains owned by
-// the child application and must outlive executor_host_close.
+// the child application and must outlive executor_host_close. The factory and
+// its user_data are borrowed only during initialization; each successful
+// emitter transfers to one runtime and is destroyed by fiber_runtime_close.
+Executor_Host_Metric_Emitter_Factory_Proc :: #type proc(
+	user_data: rawptr,
+	workflow_type, task_queue, namespace: string,
+) -> (emitter: workflow.Metric_Emitter, ok: bool)
+
 Executor_Host_Options :: struct {
 	namespace:             string,
 	stack_options:         workflow.Stack_Options,
 	logger:                workflow.Logger,
 	inbound_interceptors:  []workflow.Inbound_Interceptor,
 	outbound_interceptors: []workflow.Outbound_Interceptor,
+	metric_emitter_factory_data: rawptr,
+	metric_emitter_factory: Executor_Host_Metric_Emitter_Factory_Proc,
 }
 
 executor_host_options_default :: proc(namespace := "default") -> Executor_Host_Options {
@@ -142,6 +151,36 @@ executor_host_init_with_options :: proc(
 			delete(owned_name)
 			executor_host_close(host)
 			return result
+		}
+		if options.metric_emitter_factory != nil {
+			emitter, emitter_ok := options.metric_emitter_factory(
+				options.metric_emitter_factory_data,
+				name,
+				task_queue,
+				namespace,
+			)
+			if !emitter_ok || emitter.emit == nil {
+				if emitter.user_data != nil && emitter.destroy != nil {
+					emitter.destroy(emitter.user_data)
+				}
+				workflow.fiber_runtime_close(&runtime)
+				delete(owned_name)
+				executor_host_close(host)
+				return host_error("Workflow executor metric-emitter factory failed")
+			}
+			emitter_error := workflow.fiber_runtime_set_metric_emitter(&runtime, emitter)
+			if emitter_error.message != nil {
+				message := string(emitter_error.message)
+				result := host_error(message)
+				workflow.error_free(&emitter_error)
+				if emitter.user_data != nil && emitter.destroy != nil {
+					emitter.destroy(emitter.user_data)
+				}
+				workflow.fiber_runtime_close(&runtime)
+				delete(owned_name)
+				executor_host_close(host)
+				return result
+			}
 		}
 		for interceptor in options.inbound_interceptors {
 			interceptor_error := workflow.fiber_runtime_add_inbound_interceptor(

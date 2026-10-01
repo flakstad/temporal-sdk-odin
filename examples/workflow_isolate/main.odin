@@ -29,6 +29,27 @@ executor_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
 	)
 }
 
+executor_metric_emit :: proc(_: rawptr, record: ^workflow.Metric_Record) {
+	if record == nil {
+		return
+	}
+	fmt.eprintf(
+		"isolated-executor workflow_metric name=%s value=%d type=%s replay=%v replaying_history=%v\n",
+		record.name,
+		record.integer_value,
+		record.workflow_type,
+		record.replaying,
+		record.replaying_history_events,
+	)
+}
+
+executor_metric_emitter_factory :: proc(
+	_: rawptr,
+	_, _, _: string,
+) -> (workflow.Metric_Emitter, bool) {
+	return workflow.Metric_Emitter{emit = executor_metric_emit}, true
+}
+
 executor_execute_workflow_interceptor :: proc(
 	_: rawptr,
 	input: ^workflow.Inbound_Execute_Workflow_Input,
@@ -38,6 +59,7 @@ executor_execute_workflow_interceptor :: proc(
 		workflow.log_field_string("hook", "executor-host-inbound"),
 	}
 	workflow.log_info(input.ctx, "workflow_started", fields[:])
+	workflow.metric_counter_add(input.ctx, "workflow_started", 1)
 	return next.invoke(next.data, input)
 }
 
@@ -74,6 +96,7 @@ run_child :: proc(
 	host_options := workflow_isolate.executor_host_options_default()
 	host_options.logger = {emit = executor_log}
 	host_options.inbound_interceptors = inbound_interceptors[:]
+	host_options.metric_emitter_factory = executor_metric_emitter_factory
 	host_init_error := workflow_isolate.executor_host_init_with_options(
 		&host,
 		&registry,

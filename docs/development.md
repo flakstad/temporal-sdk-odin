@@ -857,9 +857,12 @@ them to runtimes that will never execute. Pass `Executor_Host_Options` to
 `executor_host_init_with_options` to install one replay-aware logger and ordered
 inbound/outbound interceptor lists in every child runtime before execution. The
 example logger uses inherited stderr because stdout is the binary isolation
-protocol. Protocol version 2 encodes the ordered
-type-name manifest with explicit lengths. Protocol version 3 adds a correlated
-JSON `Completion_Metadata` frame before the opaque protobuf completion. It
+protocol. The optional metric-emitter factory receives Workflow type, task
+queue, and namespace once per registered runtime; a successful returned emitter
+is owned and destroyed by exactly that runtime. Protocol version 2 encodes the
+ordered type-name manifest with explicit lengths. Protocol version 3 adds a
+correlated JSON `Completion_Metadata` frame before the opaque protobuf
+completion. It
 preserves the complete child `Process_Result` for Worker statistics and
 observers; the parent validates terminal flags against the authoritative
 completion and uses activation routing as the source of replay/history/eviction
@@ -870,7 +873,8 @@ six successful handshakes; sticky mode requires four. All require zero
 mismatches. The live observer requires four non-zero child timer sequences in
 zero-cache replay and two in sticky mode. Both paths also require exactly two
 inbound-interceptor log records; zero-cache replay records are suppressed.
-Runtime-owned metric-emitter creation remains outstanding.
+They require exactly two counter records as well; zero-cache replay metrics are
+also suppressed.
 
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity

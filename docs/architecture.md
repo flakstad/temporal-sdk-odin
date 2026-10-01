@@ -3293,8 +3293,10 @@ carries the complete language `Process_Result` separately from the authoritative
 opaque Core completion, with live observer evidence for timer sequence fields.
 Child runtimes can now receive a replay-aware logger plus ordered inbound and
 outbound interceptors through explicit host options; the live proof requires
-replay-suppressed interceptor logs on child stderr. The next step is a
-per-runtime metric-emitter factory and structured diagnostics. Production
+replay-suppressed interceptor logs on child stderr. A factory now creates and
+transfers one runtime-owned metric emitter per registered Workflow type, and the
+live proof requires the same replay-suppressed metric count. The next step is
+structured diagnostics. Production
 hardening remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
@@ -3975,8 +3977,8 @@ through the process manager and fed to ordinary Worker statistics/observers;
 the live proof checks child-only timer sequence values in zero- and sticky-cache
 modes. Executor-host log, metric, and interceptor hooks remain language-runtime
 work, not additional Temporal protocol work. Logger and interceptor
-configuration is implemented; per-runtime metric-emitter creation and optional
-structured event transport remain. See
+configuration and per-runtime metric-emitter creation are implemented; optional
+structured event transport remains. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

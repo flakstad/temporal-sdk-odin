@@ -296,5 +296,9 @@ inbound/outbound interceptors into every child runtime before execution. Option
 slices are borrowed during initialization, hook records are copied, and
 `user_data` remains owned by the child application until host close. Child
 stdout is reserved for isolation frames; the example logger deliberately uses
-stderr. A per-runtime metric-emitter factory remains outstanding because each
-`Fiber_Runtime` owns and destroys its emitter independently.
+stderr. The metric-emitter factory is invoked once per registered runtime with
+its Workflow type, task queue, and namespace because each `Fiber_Runtime` owns
+and destroys its emitter independently. A successful emitter transfers to that
+runtime and its `destroy` callback runs exactly once at host close.
+Replay-history metrics are suppressed by the Workflow runtime before reaching
+the emitter.

@@ -529,6 +529,14 @@ Workflow_Host_Hook_Test_State :: struct {
 	logs:                int,
 	workflow_executions: int,
 	saw_expected_record: bool,
+	metric_factories:    int,
+	metrics:             int,
+	metric_destroys:     int,
+	saw_expected_metric: bool,
+}
+
+Workflow_Host_Metric_Test_Backend :: struct {
+	state: ^Workflow_Host_Hook_Test_State,
 }
 
 workflow_host_hook_test_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
@@ -544,6 +552,54 @@ workflow_host_hook_test_log :: proc(user_data: rawptr, record: ^workflow.Log_Rec
 	                            !record.replaying_history_events
 }
 
+workflow_host_hook_test_metric_emit :: proc(user_data: rawptr, record: ^workflow.Metric_Record) {
+	backend := cast(^Workflow_Host_Metric_Test_Backend)user_data
+	if backend == nil || backend.state == nil || record == nil {
+		return
+	}
+	backend.state.metrics += 1
+	backend.state.saw_expected_metric = record.name == "host_metric" &&
+	                                    record.kind == .Counter_Integer &&
+	                                    record.integer_value == 1 &&
+	                                    record.workflow_type == "registry-first" &&
+	                                    !record.replaying_history_events
+}
+
+workflow_host_hook_test_metric_destroy :: proc(user_data: rawptr) {
+	backend := cast(^Workflow_Host_Metric_Test_Backend)user_data
+	if backend == nil {
+		return
+	}
+	if backend.state != nil {
+		backend.state.metric_destroys += 1
+	}
+	free(backend, allocator_runtime.heap_allocator())
+}
+
+workflow_host_hook_test_metric_factory :: proc(
+	user_data: rawptr,
+	_, _, _: string,
+) -> (workflow.Metric_Emitter, bool) {
+	state := cast(^Workflow_Host_Hook_Test_State)user_data
+	if state == nil {
+		return {}, false
+	}
+	backend, allocation_error := new(
+		Workflow_Host_Metric_Test_Backend,
+		allocator_runtime.heap_allocator(),
+	)
+	if allocation_error != nil {
+		return {}, false
+	}
+	backend.state = state
+	state.metric_factories += 1
+	return {
+		user_data = backend,
+		emit = workflow_host_hook_test_metric_emit,
+		destroy = workflow_host_hook_test_metric_destroy,
+	}, true
+}
+
 workflow_host_hook_test_execute :: proc(
 	user_data: rawptr,
 	input: ^workflow.Inbound_Execute_Workflow_Input,
@@ -552,6 +608,7 @@ workflow_host_hook_test_execute :: proc(
 	state := cast(^Workflow_Host_Hook_Test_State)user_data
 	state.workflow_executions += 1
 	workflow.log_info(input.ctx, "host-interceptor")
+	workflow.metric_counter_add(input.ctx, "host_metric", 1)
 	return next.invoke(next.data, input)
 }
 
@@ -604,6 +661,8 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 		emit = workflow_host_hook_test_log,
 	}
 	host_options.inbound_interceptors = inbound_interceptors[:]
+	host_options.metric_emitter_factory_data = &hook_state
+	host_options.metric_emitter_factory = workflow_host_hook_test_metric_factory
 	host_init_error := workflow_isolate.executor_host_init_with_options(
 		&host,
 		&registry,
@@ -731,6 +790,9 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	testing.expect_value(t, hook_state.workflow_executions, 1)
 	testing.expect_value(t, hook_state.logs, 1)
 	testing.expect(t, hook_state.saw_expected_record)
+	testing.expect_value(t, hook_state.metric_factories, 2)
+	testing.expect_value(t, hook_state.metrics, 1)
+	testing.expect(t, hook_state.saw_expected_metric)
 	workflow_isolate.host_error_free(&process_error)
 	workflow.error_free(&processed.error)
 	delete(processed.completion)
@@ -756,6 +818,8 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	workflow_isolate.host_error_free(&process_error)
 	workflow.error_free(&processed.error)
 	delete(processed.completion)
+	workflow_isolate.executor_host_close(&host)
+	testing.expect_value(t, hook_state.metric_destroys, 2)
 }
 
 Workflow_Processor_Test_State :: struct {

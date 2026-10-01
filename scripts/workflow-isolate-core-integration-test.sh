@@ -68,6 +68,11 @@ if [[ "$workflow_log_count" != "2" ]]; then
   echo "Expected exactly two replay-suppressed executor Workflow logs; got $workflow_log_count" >&2
   exit 1
 fi
+workflow_metric_count="$(grep -c 'isolated-executor workflow_metric name=workflow_started value=1' <<<"$output" || true)"
+if [[ "$workflow_metric_count" != "2" ]]; then
+  echo "Expected exactly two replay-suppressed executor Workflow metrics; got $workflow_metric_count" >&2
+  exit 1
+fi
 grep -q 'Core registry isolation completed' <<<"$output"
 grep -q 'registry_types=2' <<<"$output"
 grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"
