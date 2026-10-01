@@ -1,0 +1,336 @@
+package main
+
+import "core:bytes"
+import "core:fmt"
+import "core:mem/virtual"
+import "core:os"
+import "core:time"
+import codec "../../temporal/codec"
+import proto "../../temporal/core/proto"
+import workflow "../../temporal/workflow"
+import workflow_isolate "../../temporal/workflow/isolate"
+
+WORKFLOW_TYPE :: "odin_isolated_workflow_spike"
+TASK_QUEUE :: "odin-isolated-workflow-spike"
+RUN_ID :: "isolated-workflow-run"
+
+isolated_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	workflow.sleep(ctx, time.Second)
+	return fmt.aprintf("Hello from an isolated Workflow, %s", name)
+}
+
+write_executor_error :: proc(request_id: u64, run_id: []u8, message: string) {
+	_ = workflow_isolate.write(os.stdout, {
+		kind = .Executor_Error,
+		request_id = request_id,
+		run_id = run_id,
+		payload = transmute([]u8)message,
+	})
+}
+
+run_child :: proc() -> int {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		WORKFLOW_TYPE,
+		TASK_QUEUE,
+		isolated_workflow,
+	)
+	if init_error.message != nil {
+		fmt.eprintf("Could not initialize isolated Workflow runtime: %s\n", string(init_error.message))
+		workflow.error_free(&init_error)
+		return 1
+	}
+	defer workflow.fiber_runtime_close(&runtime)
+
+	for {
+		request, read_error := workflow_isolate.read(os.stdin)
+		if read_error.kind == .End_Of_Stream {
+			return 0
+		}
+		if read_error.kind != .None {
+			fmt.eprintf("Could not read isolation frame: %v\n", read_error.kind)
+			return 1
+		}
+		defer workflow_isolate.owned_frame_free(&request)
+
+		#partial switch request.frame.kind {
+		case .Activation:
+			processed := workflow.process_fiber_activation(&runtime, request.frame.payload)
+			if processed.completion == nil {
+				message := "Workflow activation produced no completion"
+				if processed.error.message != nil {
+					message = string(processed.error.message)
+				}
+				write_executor_error(request.frame.request_id, request.frame.run_id, message)
+				workflow.error_free(&processed.error)
+				return 1
+			}
+			response_run_id := transmute([]u8)processed.run_id
+			if !bytes.equal(response_run_id, request.frame.run_id) {
+				write_executor_error(
+					request.frame.request_id,
+					request.frame.run_id,
+					"Workflow activation run ID did not match its isolation route",
+				)
+				delete(processed.completion)
+				workflow.error_free(&processed.error)
+				return 1
+			}
+			write_error := workflow_isolate.write(os.stdout, {
+				kind = .Completion,
+				request_id = request.frame.request_id,
+				run_id = response_run_id,
+				payload = processed.completion[:],
+			})
+			delete(processed.completion)
+			workflow.error_free(&processed.error)
+			if write_error.kind != .None {
+				fmt.eprintf("Could not write isolation completion: %v\n", write_error.kind)
+				return 1
+			}
+		case .Shutdown:
+			write_error := workflow_isolate.write(os.stdout, {
+				kind = .Shutdown_Acknowledged,
+				request_id = request.frame.request_id,
+			})
+			if write_error.kind != .None {
+				return 1
+			}
+			return 0
+		case:
+			write_executor_error(
+				request.frame.request_id,
+				request.frame.run_id,
+				"Workflow executor received an invalid request kind",
+			)
+			return 1
+		}
+	}
+}
+
+Completion_Kind :: enum {
+	Invalid,
+	Timer_Started,
+	Workflow_Completed,
+}
+
+inspect_completion :: proc(data: []u8) -> (kind: Completion_Kind, result: string) {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	if !decoded || completion.run_id != RUN_ID {
+		return
+	}
+	#partial switch status in completion.status {
+	case proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion_Status_Successful:
+		if status.value == nil || len(status.value.commands) != 1 {
+			return
+		}
+		#partial switch variant in status.value.commands[0].variant {
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Timer:
+			if variant.value != nil && variant.value.seq == 1 {
+				kind = .Timer_Started
+			}
+		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Complete_Workflow_Execution:
+			if variant.value == nil || variant.value.result == nil {
+				return
+			}
+			metadata := make(
+				[]codec.Metadata_Entry,
+				len(variant.value.result.metadata),
+			)
+			for entry, index in variant.value.result.metadata {
+				metadata[index] = {key = entry.key, value = entry.value}
+			}
+			payload_view := codec.Payload_View{
+				metadata = metadata,
+				data = variant.value.result.data,
+			}
+			decode_error := codec.decode_json(payload_view, &result)
+			delete(metadata)
+			if decode_error == .None {
+				kind = .Workflow_Completed
+			}
+		}
+	}
+	return
+}
+
+exchange :: proc(
+	input: ^os.File,
+	output: ^os.File,
+	request_id: u64,
+	payload: []u8,
+) -> (response: workflow_isolate.Owned_Frame, ok: bool) {
+	write_error := workflow_isolate.write(input, {
+		kind = .Activation,
+		request_id = request_id,
+		run_id = transmute([]u8)string(RUN_ID),
+		payload = payload,
+	})
+	if write_error.kind != .None {
+		fmt.eprintf("Could not send activation %d: %v\n", request_id, write_error.kind)
+		return
+	}
+	read_error: workflow_isolate.Error
+	response, read_error = workflow_isolate.read(output)
+	if read_error.kind != .None {
+		fmt.eprintf("Could not read completion %d: %v\n", request_id, read_error.kind)
+		return
+	}
+	if response.frame.kind == .Executor_Error {
+		fmt.eprintf("Executor rejected activation %d: %s\n", request_id, string(response.frame.payload))
+		return response, false
+	}
+	if response.frame.kind != .Completion || response.frame.request_id != request_id ||
+	   !bytes.equal(response.frame.run_id, transmute([]u8)string(RUN_ID)) {
+		fmt.eprintf("Executor returned a mismatched completion for activation %d\n", request_id)
+		return response, false
+	}
+	return response, true
+}
+
+run_parent :: proc() -> int {
+	child_input, parent_input, input_pipe_error := os.pipe()
+	if input_pipe_error != nil {
+		fmt.eprintf("Could not create executor input pipe: %s\n", os.error_string(input_pipe_error))
+		return 1
+	}
+	parent_output, child_output, output_pipe_error := os.pipe()
+	if output_pipe_error != nil {
+		os.close(child_input)
+		os.close(parent_input)
+		fmt.eprintf("Could not create executor output pipe: %s\n", os.error_string(output_pipe_error))
+		return 1
+	}
+
+	command := [?]string{os.args[0], "--child"}
+	process, start_error := os.process_start({
+		command = command[:],
+		stdin = child_input,
+		stdout = child_output,
+		stderr = os.stderr,
+	})
+	os.close(child_input)
+	os.close(child_output)
+	if start_error != nil {
+		os.close(parent_input)
+		os.close(parent_output)
+		fmt.eprintf("Could not start Workflow executor child: %s\n", os.error_string(start_error))
+		return 1
+	}
+	defer os.close(parent_input)
+	defer os.close(parent_output)
+	child_reaped := false
+	defer if !child_reaped {
+		_ = os.process_kill(process)
+		_, _ = os.process_wait(process)
+	}
+
+	input, input_error := codec.encode_json("Odin")
+	if input_error != .None {
+		return 1
+	}
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = WORKFLOW_TYPE,
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	initial_activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = RUN_ID,
+		history_length = 3,
+	}
+	defer delete(initial_activation.jobs)
+	append(&initial_activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+			value = &initialize,
+		},
+	})
+	initial_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&initial_activation)
+	defer delete(initial_bytes)
+	initial_response, initial_ok := exchange(parent_input, parent_output, 1, initial_bytes[:])
+	defer workflow_isolate.owned_frame_free(&initial_response)
+	if !initial_ok {
+		return 1
+	}
+	initial_kind, _ := inspect_completion(initial_response.frame.payload)
+	if initial_kind != .Timer_Started {
+		fmt.eprintln("Isolated Workflow did not suspend on its timer")
+		return 1
+	}
+
+	fire_timer := proto.Coresdk_Workflow_Activation_FireTimer{seq = 1}
+	resume_activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = RUN_ID,
+		history_length = 7,
+	}
+	defer delete(resume_activation.jobs)
+	append(&resume_activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Fire_Timer{
+			value = &fire_timer,
+		},
+	})
+	resume_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&resume_activation)
+	defer delete(resume_bytes)
+	resume_response, resume_ok := exchange(parent_input, parent_output, 2, resume_bytes[:])
+	defer workflow_isolate.owned_frame_free(&resume_response)
+	if !resume_ok {
+		return 1
+	}
+	resume_kind, result := inspect_completion(resume_response.frame.payload)
+	defer delete(result)
+	if resume_kind != .Workflow_Completed ||
+	   result != "Hello from an isolated Workflow, Odin" {
+		fmt.eprintf("Isolated Workflow returned an unexpected result: %s\n", result)
+		return 1
+	}
+
+	shutdown_error := workflow_isolate.write(parent_input, {
+		kind = .Shutdown,
+		request_id = 3,
+	})
+	if shutdown_error.kind != .None {
+		return 1
+	}
+	shutdown_response, shutdown_read_error := workflow_isolate.read(parent_output)
+	defer workflow_isolate.owned_frame_free(&shutdown_response)
+	if shutdown_read_error.kind != .None ||
+	   shutdown_response.frame.kind != .Shutdown_Acknowledged ||
+	   shutdown_response.frame.request_id != 3 {
+		return 1
+	}
+	state, wait_error := os.process_wait(process)
+	child_reaped = true
+	if wait_error != nil || !state.success {
+		fmt.eprintln("Workflow executor child did not exit cleanly")
+		return 1
+	}
+
+	fmt.printf(
+		"Workflow process isolation proved two correlated activations, suspension, resumption, and completion for run %s.\n",
+		RUN_ID,
+	)
+	return 0
+}
+
+main :: proc() {
+	if len(os.args) == 2 && os.args[1] == "--child" {
+		os.exit(run_child())
+	}
+	os.exit(run_parent())
+}

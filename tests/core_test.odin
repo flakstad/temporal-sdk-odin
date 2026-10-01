@@ -6,6 +6,7 @@ import "core:testing"
 import "core:bytes"
 import "core:fmt"
 import "core:mem/virtual"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -23,6 +24,7 @@ import supervisor "../temporal/supervisor"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
+import workflow_isolate "../temporal/workflow/isolate"
 
 fiber_guard_test_entry :: proc "c" (user_data: rawptr) {
 	called := cast(^bool)user_data
@@ -133,6 +135,88 @@ supervisor_enforces_readiness_and_clean_exit_lifecycle :: proc(t: ^testing.T) {
 	testing.expect_value(t, timeout_stats.readiness_timeouts, 1)
 	testing.expect_value(t, timeout_stats.termination_requests, 1)
 	testing.expect_value(t, timeout_stats.failed_exits, 1)
+}
+
+@(test)
+workflow_isolation_protocol_roundtrips_binary_frames_and_pipes :: proc(t: ^testing.T) {
+	run_id := [?]u8{'r', 'u', 'n', 0, 'i', 'd'}
+	payload := [?]u8{0, 1, 2, 0xff, 0, 9}
+	frame := workflow_isolate.Frame{
+		kind = .Activation,
+		request_id = 42,
+		run_id = run_id[:],
+		payload = payload[:],
+	}
+	encoded, encode_error := workflow_isolate.encode(frame)
+	defer delete(encoded)
+	testing.expect_value(t, encode_error.kind, workflow_isolate.Error_Kind.None)
+	testing.expect_value(t, len(encoded), workflow_isolate.HEADER_SIZE + len(run_id) + len(payload))
+
+	decoded, decode_error := workflow_isolate.decode(encoded)
+	defer workflow_isolate.owned_frame_free(&decoded)
+	testing.expect_value(t, decode_error.kind, workflow_isolate.Error_Kind.None)
+	testing.expect_value(t, decoded.frame.kind, workflow_isolate.Kind.Activation)
+	testing.expect_value(t, decoded.frame.request_id, u64(42))
+	testing.expect(t, bytes.equal(decoded.frame.run_id, run_id[:]))
+	testing.expect(t, bytes.equal(decoded.frame.payload, payload[:]))
+
+	read_end, write_end, pipe_error := os.pipe()
+	testing.expect(t, pipe_error == nil)
+	if pipe_error != nil {
+		return
+	}
+	defer os.close(read_end)
+	defer os.close(write_end)
+	write_error := workflow_isolate.write(write_end, frame)
+	testing.expect_value(t, write_error.kind, workflow_isolate.Error_Kind.None)
+	from_pipe, read_error := workflow_isolate.read(read_end)
+	defer workflow_isolate.owned_frame_free(&from_pipe)
+	testing.expect_value(t, read_error.kind, workflow_isolate.Error_Kind.None)
+	testing.expect(t, bytes.equal(from_pipe.frame.run_id, run_id[:]))
+	testing.expect(t, bytes.equal(from_pipe.frame.payload, payload[:]))
+}
+
+@(test)
+workflow_isolation_protocol_rejects_corruption_limits_and_invalid_contracts :: proc(
+	t: ^testing.T,
+) {
+	valid := workflow_isolate.Frame{
+		kind = .Completion,
+		request_id = 7,
+		run_id = transmute([]u8)string("run"),
+		payload = transmute([]u8)string("completion"),
+	}
+	encoded, encode_error := workflow_isolate.encode(valid)
+	defer delete(encoded)
+	testing.expect_value(t, encode_error.kind, workflow_isolate.Error_Kind.None)
+
+	encoded[0] = encoded[0] ~ 0xff
+	_, corrupt_error := workflow_isolate.decode(encoded)
+	testing.expect_value(t, corrupt_error.kind, workflow_isolate.Error_Kind.Invalid_Magic)
+	encoded[0] = encoded[0] ~ 0xff
+
+	_, truncated_error := workflow_isolate.decode(encoded[:len(encoded) - 1])
+	testing.expect_value(t, truncated_error.kind, workflow_isolate.Error_Kind.Truncated)
+
+	with_trailing := make([]u8, len(encoded) + 1)
+	defer delete(with_trailing)
+	copy(with_trailing, encoded)
+	_, trailing_error := workflow_isolate.decode(with_trailing)
+	testing.expect_value(t, trailing_error.kind, workflow_isolate.Error_Kind.Trailing_Data)
+
+	tiny_limits := workflow_isolate.Limits{
+		maximum_run_id_bytes = 2,
+		maximum_payload_bytes = 4,
+	}
+	_, limit_error := workflow_isolate.encode(valid, tiny_limits)
+	testing.expect_value(t, limit_error.kind, workflow_isolate.Error_Kind.Too_Large)
+
+	invalid_shutdown := workflow_isolate.Frame{
+		kind = .Shutdown,
+		payload = transmute([]u8)string("unexpected"),
+	}
+	validation_error := workflow_isolate.frame_validate(invalid_shutdown)
+	testing.expect_value(t, validation_error.kind, workflow_isolate.Error_Kind.Invalid_Argument)
 }
 
 Callback_Drain_Test_State :: struct {

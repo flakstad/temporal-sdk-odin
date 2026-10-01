@@ -497,9 +497,12 @@ Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
 fresh-stack history replay, and Signal-driven completion. The whole-Worker
 supervisor contract is documented in
 [`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow or
-per-Activity subprocess pools are not implemented. Canceling a Client wait does
-not cancel an already accepted durable Update; the current Temporal Service
-exposes no such operation.
+per-Activity subprocess pools are not implemented. A first
+[`docs/workflow-isolation.md`](docs/workflow-isolation.md) spike does prove a
+persistent child retaining one Workflow fiber across two versioned binary
+activation/completion exchanges; it is not connected to Core polling yet.
+Canceling a Client wait does not cancel an already accepted durable Update; the
+current Temporal Service exposes no such operation.
 
 Activity and Nexus executor shutdown now has an explicit uncooperative-callback
 policy. The zero value keeps the safe default—wait without a watchdog. A Worker
@@ -2218,6 +2221,7 @@ temporal/supervisor/      whole-Worker child process lifecycle and restart polic
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
 temporal/workflow/        explicit-state and stackful-fiber experiments
+temporal/workflow/isolate versioned activation/completion process framing
 temporal/client/          owned Client and Workflow handle/control APIs
 temporal/failure/         owned recursive Temporal Failure model
 examples/core_connect/    Odin -> Core -> Temporal proof
@@ -2228,6 +2232,7 @@ examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
+examples/workflow_isolate/ persistent per-run Workflow process spike
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker

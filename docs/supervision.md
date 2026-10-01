@@ -10,6 +10,9 @@ or another service manager should still supervise that top-level process.
 This is whole-Worker isolation. It is not yet a per-Workflow subprocess pool:
 one fatal callback can still terminate every registration in that child, after
 which Temporal retries unfinished tasks in the replacement process.
+The separate [`workflow-isolation.md`](workflow-isolation.md) spike now proves
+that a child can retain one suspended Workflow fiber across multiple framed
+Core activations, but that transport is not yet wired into `worker.run`.
 
 ## SDK supervisor
 

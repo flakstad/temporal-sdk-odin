@@ -782,6 +782,24 @@ property generates initial/maximum backoff, multipliers, and transition counts,
 requiring every delay to remain monotonic, overflow-safe in the generated
 domain, and exactly saturated at the configured maximum.
 
+### Per-run Workflow process boundary spike
+
+The first fine-grained executor transport is documented in
+[`workflow-isolation.md`](workflow-isolation.md). It can be run without a
+Temporal Server:
+
+```bash
+./scripts/build-examples.sh
+TEMPORAL_ODIN_SKIP_BUILD=1 ./scripts/workflow-isolate-integration-test.sh
+```
+
+The parent sends two correlated binary Core activations over bounded versioned
+frames to one child process. The child suspends a sequential Odin Workflow on a
+timer after the first activation, retains its fiber, resumes it on `FireTimer`,
+and returns the terminal Core completion. This proves the required per-run
+state lifetime, not integration with the Worker's Core poll loop. Unit and PBT
+coverage validates framing independently of the process example.
+
 Workflows have the corresponding registration levels:
 
 ```odin

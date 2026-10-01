@@ -28,6 +28,7 @@ build_example hello_nexus temporal-odin-hello-nexus
 build_example standalone_nexus_client temporal-odin-standalone-nexus-client
 build_example hello_nexus_workflow temporal-odin-hello-nexus-workflow
 build_example worker_supervisor temporal-odin-worker-supervisor
+build_example workflow_isolate temporal-odin-workflow-isolate
 build_example hello_workflow temporal-odin-hello-workflow
 build_example eager_workflow temporal-odin-eager-workflow
 build_example eager_activity temporal-odin-eager-activity

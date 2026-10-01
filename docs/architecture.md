@@ -3133,7 +3133,7 @@ Workflows are enabled.
    timers, Signal waits, main/Signal/Update fibers, propagated durable
    deadlines, and replay. Client Update result waits are now bounded and locally
    cancellable without implying durable Update cancellation. It does not yet prove
-   per-execution panic containment, replay-history JSON import,
+   integrated per-execution panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, growable stacks, recoverable stack
    overflow, or
    a production deterministic scheduler.
@@ -3165,7 +3165,9 @@ Workflows are enabled.
    details, next-retry delay, deadline/execution metadata, effective Retry
    Policy, and prior heartbeat details. Its Activity-only process-isolation
    policy is now live-proven. The SDK now manages optional whole-Worker child
-   restart/readiness/backoff, while a per-Activity subprocess executor remains
+   restart/readiness/backoff. A versioned bounded pipe protocol and a persistent
+   two-activation Workflow executor child are proven independently, while
+   Worker/Core routing and a per-Activity subprocess executor remain
    unimplemented. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
@@ -3270,12 +3272,16 @@ panicking Workflow execution at a process boundary while preserving Core's
 task/completion lifecycle. The SDK now provides the smaller whole-Worker
 supervisor itself, including readiness, bounded crash-loop backoff, thread-safe
 stop, TERM/grace/KILL, lifecycle events, unit tests, and a live abrupt-crash/
-replay proof. A fine-grained process pool should follow only if this evidence
-justifies the added IPC runtime. Infinite Workflow detection and per-execution
-subprocess dispatch remain process-boundary work. The capability
-inventory is now a
-public, tested runtime model plus the maintained evidence table below; it must
-grow whenever a new protocol surface is added.
+replay proof. The first fine-grained IPC experiment now carries opaque
+activation/completion protobufs through bounded, versioned, correlated frames;
+one child demonstrably retains a suspended fiber across two activations. The
+next step is a real zero-cache Core path: one child per Workflow Task, explicit
+eviction acknowledgement, and child death translated into activation failure,
+eviction, and fresh-process replay. Sticky per-run child routing is the later
+performance mode. Infinite Workflow detection and the production process pool
+remain process-boundary work. The
+capability inventory is now a public, tested runtime model plus the maintained
+evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 
