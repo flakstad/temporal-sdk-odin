@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:time"
 import nexus "../../temporal/nexus"
 import temporal_core "../../temporal/core"
 import worker "../../temporal/worker"
@@ -53,10 +54,21 @@ main :: proc() {
 	}
 	defer temporal_core.client_close(&client)
 
+	resource_tuner_buffer: [64]u8
+	resource_tuner_enabled :=
+		os.get_env(resource_tuner_buffer[:], "TEMPORAL_NEXUS_RESOURCE_TUNER") == "1"
 	options := worker.options_default("odin-hello-nexus")
 	options.identity_override = "temporal-sdk-odin-hello-nexus"
 	options.max_concurrent_nexus_tasks = 2
 	options.nexus_task_poller_behavior = worker.poller_simple_maximum(1)
+	if resource_tuner_enabled {
+		options.max_concurrent_nexus_tasks = 0
+		options.resource_based_nexus_tuner = worker.resource_based_nexus_tuner_with_options(
+			0.8,
+			0.9,
+			{minimum_slots = 1, maximum_slots = 2, ramp_throttle = 50 * time.Millisecond},
+		)
+	}
 	nexus_worker, create_error := worker.create_with_options(&client, options)
 	if create_error.message != nil {
 		fmt.eprintf("Nexus Worker creation failed: %s\n", string(create_error.message))
@@ -122,7 +134,11 @@ main :: proc() {
 		}
 	}
 
-	fmt.println("Odin Nexus Worker is polling task queue odin-hello-nexus")
+	if resource_tuner_enabled {
+		fmt.println("Odin Nexus Worker is polling with resource-based Nexus capacity")
+	} else {
+		fmt.println("Odin Nexus Worker is polling task queue odin-hello-nexus")
+	}
 	stats, run_error := worker.run(&nexus_worker, {max_nexus_tasks = max_tasks})
 	close_error := worker.close(&nexus_worker)
 	if run_error.message != nil {

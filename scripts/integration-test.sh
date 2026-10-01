@@ -163,6 +163,7 @@ nexus_metrics_port=$((18000 + $$ % 1000))
 nexus_metrics_address="127.0.0.1:${nexus_metrics_port}"
 NEXUS_ENDPOINT="$nexus_endpoint_name" \
   TEMPORAL_NEXUS_WORKFLOW_ID="odin-nexus-workflow-${RANDOM}-$(date +%s)" \
+  TEMPORAL_NEXUS_RESOURCE_TUNER=1 \
   TEMPORAL_ODIN_PROMETHEUS_BIND_ADDRESS="$nexus_metrics_address" \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-nexus-workflow.sh" >"$workflow_output_file" 2>&1 &
@@ -220,6 +221,7 @@ grep -q 'Nexus async start token reached the registered cancel handler' <<<"$nex
 grep -q 'All four Nexus cancellation policies completed their distinct live paths' <<<"$nexus_workflow_output"
 grep -q 'Nexus async result completed through a Temporal Workflow callback' <<<"$nexus_workflow_output"
 grep -q 'Nexus caller Workflow event link was attached to the async completer' <<<"$nexus_workflow_output"
+grep -q 'Nexus tasks completed through Core resource-based capacity' <<<"$nexus_workflow_output"
 grep -q 'Nexus Workflow history replayed offline through Core activations=' <<<"$nexus_workflow_output"
 temporal operator nexus endpoint delete \
   --name "$nexus_endpoint_name" \

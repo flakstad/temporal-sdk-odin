@@ -10287,6 +10287,58 @@ resource_based_activity_tuner_binds_to_the_pinned_core_c_abi :: proc(t: ^testing
 }
 
 @(test)
+resource_based_nexus_tuner_binds_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
+	options := temporal_core.worker_options_default()
+	// The resource supplier supersedes the otherwise-required fixed capacity.
+	options.max_nexus_task_slots = 0
+	options.resource_based_nexus_tuner =
+		temporal_core.resource_based_nexus_tuner_with_options(
+			0.72,
+			0.83,
+			{
+				minimum_slots = 3,
+				maximum_slots = 19,
+				ramp_throttle = 1250 * time.Millisecond + time.Nanosecond,
+			},
+		)
+
+	bindings := temporal_core.Worker_Option_Bindings{}
+	bindings_error := temporal_core.worker_option_bindings_init(&bindings, options)
+	testing.expectf(t, bindings_error.message == nil, "binding failed: %s", string(bindings_error.message))
+	temporal_core.error_free(&bindings_error)
+	tuner := &bindings.raw_options.tuner
+	testing.expect_value(t, tuner.nexus_task_slot_supplier.tag, raw.Slot_Supplier_Tag.Resource_Based)
+	testing.expect_value(
+		t,
+		tuner.nexus_task_slot_supplier.resource_based.minimum_slots,
+		uintptr(3),
+	)
+	testing.expect_value(
+		t,
+		tuner.nexus_task_slot_supplier.resource_based.maximum_slots,
+		uintptr(19),
+	)
+	testing.expect_value(
+		t,
+		tuner.nexus_task_slot_supplier.resource_based.ramp_throttle_ms,
+		u64(1251),
+	)
+	testing.expect_value(
+		t,
+		tuner.nexus_task_slot_supplier.resource_based.tuner_options.target_memory_usage,
+		0.72,
+	)
+	testing.expect_value(
+		t,
+		tuner.nexus_task_slot_supplier.resource_based.tuner_options.target_cpu_usage,
+		0.83,
+	)
+	// Suppliers that were not opted into the shared controller remain fixed.
+	testing.expect_value(t, tuner.activity_slot_supplier.tag, raw.Slot_Supplier_Tag.Fixed_Size)
+	testing.expect_value(t, tuner.local_activity_slot_supplier.tag, raw.Slot_Supplier_Tag.Fixed_Size)
+}
+
+@(test)
 nexus_task_and_completion_round_trip_the_pinned_core_contract :: proc(t: ^testing.T) {
 	input_payload := proto.Temporal_Api_Common_V1_Payload{
 		data = transmute([]u8)string(`{"name":"Odin"}`),
@@ -10960,6 +11012,26 @@ worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) 
 	invalid_ramp_error := temporal_core.worker_options_validate(invalid_ramp)
 	testing.expect(t, invalid_ramp_error.message != nil)
 	temporal_core.error_free(&invalid_ramp_error)
+
+	invalid_nexus_range := temporal_core.worker_options_default()
+	invalid_nexus_range.resource_based_nexus_tuner =
+		temporal_core.resource_based_nexus_tuner_with_options(
+			0.8,
+			0.9,
+			{minimum_slots = 3, maximum_slots = 2},
+		)
+	invalid_nexus_range_error := temporal_core.worker_options_validate(invalid_nexus_range)
+	testing.expect(t, invalid_nexus_range_error.message != nil)
+	temporal_core.error_free(&invalid_nexus_range_error)
+
+	mismatched_targets := temporal_core.worker_options_default()
+	mismatched_targets.resource_based_activity_tuner =
+		temporal_core.resource_based_activity_tuner(0.8, 0.9)
+	mismatched_targets.resource_based_nexus_tuner =
+		temporal_core.resource_based_nexus_tuner(0.7, 0.9)
+	mismatched_targets_error := temporal_core.worker_options_validate(mismatched_targets)
+	testing.expect(t, mismatched_targets_error.message != nil)
+	temporal_core.error_free(&mismatched_targets_error)
 }
 
 @(test)
@@ -10989,6 +11061,11 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 		{minimum_slots = 2, maximum_slots = 11, ramp_throttle = 10 * time.Millisecond},
 		{minimum_slots = 1, maximum_slots = 7, ramp_throttle = 20 * time.Millisecond},
 	)
+	options.resource_based_nexus_tuner = worker.resource_based_nexus_tuner_with_options(
+		0.75,
+		0.85,
+		{minimum_slots = 2, maximum_slots = 13, ramp_throttle = 30 * time.Millisecond},
+	)
 	options.max_worker_activities_per_second = 7.5
 
 	sdk_worker, create_error := worker.create_with_options(&client, options)
@@ -11005,6 +11082,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, sdk_worker.max_concurrent_activities, 11)
 	testing.expect_value(t, sdk_worker.max_concurrent_local_activities, 7)
+	testing.expect_value(t, sdk_worker.max_concurrent_nexus_tasks, 13)
 	testing.expect_value(t, sdk_worker.core_options.max_cached_workflows, u32(8))
 	testing.expect_value(t, sdk_worker.core_options.max_worker_activities_per_second, 7.5)
 	testing.expect_value(

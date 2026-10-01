@@ -462,6 +462,9 @@ run :: proc() -> int {
 		fmt.eprintln("NEXUS_ENDPOINT must name a Temporal Nexus endpoint")
 		return 1
 	}
+	resource_tuner_buffer: [64]u8
+	resource_tuner_enabled :=
+		os.get_env(resource_tuner_buffer[:], "TEMPORAL_NEXUS_RESOURCE_TUNER") == "1"
 
 	prometheus_address_buffer: [128]u8
 	prometheus_address := os.get_env(
@@ -498,6 +501,14 @@ run :: proc() -> int {
 	options.identity_override = "temporal-sdk-odin-hello-nexus-workflow"
 	options.max_concurrent_nexus_tasks = 2
 	options.nexus_task_poller_behavior = worker.poller_simple_maximum(1)
+	if resource_tuner_enabled {
+		options.max_concurrent_nexus_tasks = 0
+		options.resource_based_nexus_tuner = worker.resource_based_nexus_tuner_with_options(
+			0.8,
+			0.9,
+			{minimum_slots = 1, maximum_slots = 2, ramp_throttle = 50 * time.Millisecond},
+		)
+	}
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
 		options,
@@ -809,6 +820,9 @@ run :: proc() -> int {
 	fmt.println("All four Nexus cancellation policies completed their distinct live paths")
 	fmt.println("Nexus async result completed through a Temporal Workflow callback")
 	fmt.println("Nexus caller Workflow event link was attached to the async completer")
+	if resource_tuner_enabled {
+		fmt.println("Nexus tasks completed through Core resource-based capacity")
+	}
 	fmt.printf(
 		"Nexus Workflow history replayed offline through Core activations=%d\n",
 		replay_result.activations_processed,

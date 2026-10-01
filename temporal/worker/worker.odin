@@ -402,11 +402,14 @@ Poller_Behavior_Kind :: temporal_core.Poller_Behavior_Kind
 Poller_Behavior :: temporal_core.Poller_Behavior
 Resource_Based_Slot_Options :: temporal_core.Resource_Based_Slot_Options
 Resource_Based_Activity_Tuner_Options :: temporal_core.Resource_Based_Activity_Tuner_Options
+Resource_Based_Nexus_Tuner_Options :: temporal_core.Resource_Based_Nexus_Tuner_Options
 
 poller_simple_maximum :: temporal_core.poller_simple_maximum
 poller_autoscaling :: temporal_core.poller_autoscaling
 resource_based_activity_tuner :: temporal_core.resource_based_activity_tuner
 resource_based_activity_tuner_with_options :: temporal_core.resource_based_activity_tuner_with_options
+resource_based_nexus_tuner :: temporal_core.resource_based_nexus_tuner
+resource_based_nexus_tuner_with_options :: temporal_core.resource_based_nexus_tuner_with_options
 
 Options :: struct {
 	task_queue:                                      string,
@@ -427,6 +430,7 @@ Options :: struct {
 	nonsticky_to_sticky_poll_ratio:                   f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                    Resource_Based_Activity_Tuner_Options,
+	resource_based_nexus_tuner:                       Resource_Based_Nexus_Tuner_Options,
 	versioning:                                      Worker_Versioning_Options,
 	nondeterminism_policy:                           Nondeterminism_Policy,
 	workflow_stacks:                                 workflow.Stack_Options,
@@ -457,6 +461,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		max_eager_activity_reservations_per_workflow_task =
 			core_options.max_eager_activity_reservations_per_workflow_task,
 		resource_based_activity_tuner = core_options.resource_based_activity_tuner,
+		resource_based_nexus_tuner = core_options.resource_based_nexus_tuner,
 	}
 }
 
@@ -652,6 +657,7 @@ create_with_options :: proc(
 		max_eager_activity_reservations_per_workflow_task =
 			options.max_eager_activity_reservations_per_workflow_task,
 		resource_based_activity_tuner = options.resource_based_activity_tuner,
+		resource_based_nexus_tuner = options.resource_based_nexus_tuner,
 	}
 	core_options_error := temporal_core.worker_options_validate(core_options)
 	if core_options_error.message != nil {
@@ -726,6 +732,10 @@ create_with_options :: proc(
 			options.resource_based_activity_tuner.activity_slots.maximum_slots
 		worker.max_concurrent_local_activities =
 			options.resource_based_activity_tuner.local_activity_slots.maximum_slots
+	}
+	if options.resource_based_nexus_tuner.enabled {
+		worker.max_concurrent_nexus_tasks =
+			options.resource_based_nexus_tuner.nexus_task_slots.maximum_slots
 	}
 	worker.graceful_shutdown_period = options.graceful_shutdown_period
 	worker.core_options = core_options

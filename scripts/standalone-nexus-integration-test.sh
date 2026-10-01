@@ -57,13 +57,16 @@ run_worker() {
   : >"$worker_log"
   if [[ "$mode" == "cancel" ]]; then
     TEMPORAL_NEXUS_STANDALONE_CANCEL=1 \
+      TEMPORAL_NEXUS_RESOURCE_TUNER=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-nexus.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == "lifecycle" ]]; then
     TEMPORAL_NEXUS_STANDALONE_LIFECYCLE=1 \
+      TEMPORAL_NEXUS_RESOURCE_TUNER=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-nexus.sh" >"$worker_log" 2>&1 &
   else
+    TEMPORAL_NEXUS_RESOURCE_TUNER=1 \
     TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-nexus.sh" >"$worker_log" 2>&1 &
   fi
@@ -93,6 +96,7 @@ cat "$worker_log"
 cat "$client_log"
 grep -q 'returned "Hello Odin" through the Odin Client' "$client_log"
 grep -q 'one synchronous Nexus operation completed' "$worker_log"
+grep -q 'polling with resource-based Nexus capacity' "$worker_log"
 
 run_worker cancel
 NEXUS_ENDPOINT="$endpoint_name" \

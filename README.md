@@ -300,6 +300,10 @@ options.resource_based_activity_tuner = worker.resource_based_activity_tuner(
 	0.8, // target memory utilization
 	0.9, // target CPU utilization
 )
+options.resource_based_nexus_tuner = worker.resource_based_nexus_tuner(
+	0.8, // must match the Activity tuner when both are enabled
+	0.9,
+)
 
 sdk_worker, err := worker.create_with_options(&core_client, options)
 ```
@@ -309,13 +313,14 @@ null so SDK Core can use its default and accept server-directed poller
 autoscaling. Durations are rounded upward to whole milliseconds at the C ABI;
 invalid rates, poller ranges, cache/poller combinations, resource targets/slot
 ranges, and negative durations are rejected before `worker_new`. A
-resource-based tuner supersedes `max_concurrent_activities` for Activity
-capacity and uses conservative default maxima of ten remote and ten local
-Activities; use `resource_based_activity_tuner_with_options` to set exact
-minimum, maximum, and ramp-throttle values. Workflow and Nexus suppliers remain
-fixed; the Nexus executor honors `max_concurrent_nexus_tasks`, but is not yet
-integrated with Core's resource-based supplier. The identity and all other referenced strings are owned by the
-Odin Worker until `worker.close`.
+resource-based Activity tuner supersedes `max_concurrent_activities` and uses
+conservative default maxima of ten remote and ten local Activities; use its
+`_with_options` form to set exact minimum, maximum, and ramp-throttle values.
+The corresponding Nexus tuner supersedes `max_concurrent_nexus_tasks` and
+defaults to one-to-ten tasks. Core uses one resource controller per Worker, so
+the CPU and memory targets must match when both tuners are enabled. Workflow
+slots remain fixed. The identity and all other referenced strings are owned by
+the Odin Worker until `worker.close`.
 
 The dev-server suite proves both cache modes: cache-disabled execution rebuilds
 the Workflow from history, while a cached sticky execution resumes the same

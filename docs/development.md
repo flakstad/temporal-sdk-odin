@@ -482,19 +482,22 @@ options.resource_based_activity_tuner = worker.resource_based_activity_tuner(
     0.8, // target memory utilization
     0.9, // target CPU utilization
 )
+options.resource_based_nexus_tuner = worker.resource_based_nexus_tuner(
+    0.8, // shared controller: use the same targets
+    0.9,
+)
 ```
 
 The convenience constructor uses one-to-ten slots and a 50 ms ramp throttle
 for both remote and local Activities. The `_with_options` form exposes their
-independent slot ranges. Both suppliers must carry identical CPU/memory targets
-because the C bridge creates one shared resource controller and rejects mixed
-resource options. The Odin callback pool is sized from the enabled suppliers'
+independent slot ranges. Nexus capacity has a matching tuner and `_with_options`
+constructor. Every enabled resource supplier must carry identical CPU/memory
+targets because the C bridge creates one shared resource controller and rejects
+mixed resource options. The Odin callback pools are sized from the suppliers'
 maximums so Core never grants work without matching executor capacity. Workflow
-and Nexus remain fixed-size, and custom suppliers are not exposed yet. The
-public Nexus executor sizes its callback pool from
-`max_concurrent_nexus_tasks`; it enables polling only when an operation is
-registered and uses the configured Nexus poller behavior. Resource-based Nexus
-capacity is not exposed yet.
+slots remain fixed-size, and custom suppliers are not exposed yet. The public
+Nexus executor enables polling only when an operation is registered and uses
+the configured Nexus poller behavior.
 Prefer fixed slots for ordinary Workers; Temporal recommends resource-based
 tuning when resource protection or workload-specific scaling warrants it.
 Pairing it with `worker.poller_autoscaling` avoids excessive pollers at low
@@ -526,6 +529,13 @@ forgets to populate the C rate field completes in well under that bound.
 remote/Local Activity suppliers and autoscaling Activity pollers. The
 integration harness completes a real task through the CLI dev server, proving
 that Core accepts the tuner and that Odin's executor returns its completion.
+
+`TEMPORAL_NEXUS_RESOURCE_TUNER=1` similarly configures both Nexus examples with
+a resource-based supplier. The Workflow-to-Nexus suite exercises it on the
+baseline CLI dev server; the standalone suite also enables it for synchronous,
+cancellation, and lifecycle operations on servers that expose the newer RPCs.
+Together they prove that Core accepts the supplier and that the bounded Odin
+Nexus executor returns every completion.
 
 ### Runtime observability
 

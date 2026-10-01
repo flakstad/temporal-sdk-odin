@@ -194,6 +194,7 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	slots := pbt.draw(t, pbt.int_range(1, 64))
 	nexus_slots := pbt.draw(t, pbt.int_range(1, 64))
 	resource_tuned := pbt.draw(t, pbt.boolean())
+	nexus_resource_tuned := pbt.draw(t, pbt.boolean())
 	activity_minimum := pbt.draw(t, pbt.int_range(1, 8))
 	activity_maximum := pbt.draw(t, pbt.int_range(activity_minimum, 64))
 	local_minimum := pbt.draw(t, pbt.int_range(1, 8))
@@ -202,6 +203,10 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	activity_ramp_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
 	local_ramp_millis := pbt.draw(t, pbt.int_range(0, 1_000))
 	local_ramp_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
+	nexus_minimum := pbt.draw(t, pbt.int_range(1, 8))
+	nexus_maximum := pbt.draw(t, pbt.int_range(nexus_minimum, 64))
+	nexus_ramp_millis := pbt.draw(t, pbt.int_range(0, 1_000))
+	nexus_ramp_fraction := pbt.draw(t, pbt.int_range(0, 999_999))
 	target_memory_hundredths := pbt.draw(t, pbt.int_range(1, 100))
 	target_cpu_hundredths := pbt.draw(t, pbt.int_range(1, 100))
 	sticky_millis := pbt.draw(t, pbt.int_range(0, 60_000))
@@ -223,11 +228,22 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, sticky_fraction > 0, 40.0, "fractional duration rounds upward")
 	pbt.cover(t, worker_rate_unset, 30.0, "unset worker rate")
 	pbt.cover(t, resource_tuned, 30.0, "resource-based Activity suppliers")
+	pbt.cover(t, nexus_resource_tuned, 30.0, "resource-based Nexus supplier")
+	pbt.cover(
+		t,
+		resource_tuned && nexus_resource_tuned,
+		15.0,
+		"shared Activity and Nexus resource controller",
+	)
 
 	options := temporal_core.worker_options_default()
 	options.identity_override = "generated-worker"
 	options.max_activity_slots = slots
 	options.max_nexus_task_slots = nexus_slots
+	if nexus_resource_tuned {
+		// Prove the fixed capacity is not required when the resource supplier is enabled.
+		options.max_nexus_task_slots = 0
+	}
 	if cache_enabled {
 		options.max_cached_workflows = u32(pbt.draw(t, pbt.int_range(1, 500)))
 	}
@@ -268,6 +284,19 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 					maximum_slots = local_maximum,
 					ramp_throttle = time.Duration(local_ramp_millis) * time.Millisecond +
 						time.Duration(local_ramp_fraction) * time.Nanosecond,
+				},
+			)
+	}
+	if nexus_resource_tuned {
+		options.resource_based_nexus_tuner =
+			temporal_core.resource_based_nexus_tuner_with_options(
+				f64(target_memory_hundredths) / 100,
+				f64(target_cpu_hundredths) / 100,
+				{
+					minimum_slots = nexus_minimum,
+					maximum_slots = nexus_maximum,
+					ramp_throttle = time.Duration(nexus_ramp_millis) * time.Millisecond +
+						time.Duration(nexus_ramp_fraction) * time.Nanosecond,
 				},
 			)
 	}
@@ -320,8 +349,26 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots != expected_workflow_slots {
 		return pbt.fail("Workflow cache did not select a safe Workflow slot count")
 	}
-	if raw_options.tuner.nexus_task_slot_supplier.tag != .Fixed_Size ||
-	   raw_options.tuner.nexus_task_slot_supplier.fixed_size.num_slots != uintptr(nexus_slots) {
+	nexus_supplier := &raw_options.tuner.nexus_task_slot_supplier
+	if nexus_resource_tuned {
+		if nexus_supplier.tag != .Resource_Based {
+			return pbt.fail("resource-based Nexus supplier used the wrong C union arm")
+		}
+		expected_nexus_ramp := u64(nexus_ramp_millis)
+		if nexus_ramp_fraction > 0 {
+			expected_nexus_ramp += 1
+		}
+		if nexus_supplier.resource_based.minimum_slots != uintptr(nexus_minimum) ||
+		   nexus_supplier.resource_based.maximum_slots != uintptr(nexus_maximum) ||
+		   nexus_supplier.resource_based.ramp_throttle_ms != expected_nexus_ramp ||
+		   nexus_supplier.resource_based.tuner_options.target_memory_usage !=
+		     f64(target_memory_hundredths) / 100 ||
+		   nexus_supplier.resource_based.tuner_options.target_cpu_usage !=
+		     f64(target_cpu_hundredths) / 100 {
+			return pbt.fail("resource-based generated Nexus configuration changed during binding")
+		}
+	} else if nexus_supplier.tag != .Fixed_Size ||
+	          nexus_supplier.fixed_size.num_slots != uintptr(nexus_slots) {
 		return pbt.fail("generated fixed Nexus slot count changed during binding")
 	}
 	expected_sticky_millis := u64(sticky_millis)

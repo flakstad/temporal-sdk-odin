@@ -204,6 +204,16 @@ Resource_Based_Activity_Tuner_Options :: struct {
 	local_activity_slots: Resource_Based_Slot_Options,
 }
 
+// Resource_Based_Nexus_Tuner_Options controls the Nexus task supplier. When
+// combined with the Activity tuner, both options must use identical targets
+// because Core constructs one resource controller for the whole Worker.
+Resource_Based_Nexus_Tuner_Options :: struct {
+	enabled:             bool,
+	target_memory_usage: f64,
+	target_cpu_usage:    f64,
+	nexus_task_slots:    Resource_Based_Slot_Options,
+}
+
 resource_based_activity_tuner_with_options :: proc(
 	target_memory_usage: f64,
 	target_cpu_usage: f64,
@@ -241,6 +251,35 @@ resource_based_activity_tuner :: proc(
 	)
 }
 
+resource_based_nexus_tuner_with_options :: proc(
+	target_memory_usage: f64,
+	target_cpu_usage: f64,
+	nexus_task_slots: Resource_Based_Slot_Options,
+) -> Resource_Based_Nexus_Tuner_Options {
+	return {
+		enabled = true,
+		target_memory_usage = target_memory_usage,
+		target_cpu_usage = target_cpu_usage,
+		nexus_task_slots = nexus_task_slots,
+	}
+}
+
+resource_based_nexus_tuner :: proc(
+	target_memory_usage: f64,
+	target_cpu_usage: f64,
+	maximum_nexus_task_slots := 10,
+) -> Resource_Based_Nexus_Tuner_Options {
+	return resource_based_nexus_tuner_with_options(
+		target_memory_usage,
+		target_cpu_usage,
+		{
+			minimum_slots = 1,
+			maximum_slots = maximum_nexus_task_slots,
+			ramp_throttle = 50 * time.Millisecond,
+		},
+	)
+}
+
 poller_simple_maximum :: proc(maximum: int) -> Poller_Behavior {
 	return {kind = .Simple_Maximum, simple_maximum = maximum}
 }
@@ -273,6 +312,7 @@ Worker_Options :: struct {
 	nonsticky_to_sticky_poll_ratio:                  f32,
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                   Resource_Based_Activity_Tuner_Options,
+	resource_based_nexus_tuner:                      Resource_Based_Nexus_Tuner_Options,
 }
 
 worker_options_default :: proc() -> Worker_Options {
@@ -996,11 +1036,36 @@ resource_based_activity_tuner_validate :: proc(
 	)
 }
 
+resource_based_nexus_tuner_validate :: proc(
+	options: Resource_Based_Nexus_Tuner_Options,
+) -> Error {
+	if !options.enabled {
+		return {}
+	}
+	if math.is_nan(options.target_memory_usage) ||
+	   math.is_inf(options.target_memory_usage) ||
+	   options.target_memory_usage <= 0 || options.target_memory_usage > 1 {
+		return client_option_error(
+			"resource-based Nexus target memory usage must be finite and between zero (exclusive) and one",
+		)
+	}
+	if math.is_nan(options.target_cpu_usage) || math.is_inf(options.target_cpu_usage) ||
+	   options.target_cpu_usage <= 0 || options.target_cpu_usage > 1 {
+		return client_option_error(
+			"resource-based Nexus target CPU usage must be finite and between zero (exclusive) and one",
+		)
+	}
+	return resource_based_slot_options_validate(
+		options.nexus_task_slots,
+		"resource-based Nexus task supplier",
+	)
+}
+
 worker_options_validate :: proc(options: Worker_Options) -> Error {
 	if !options.resource_based_activity_tuner.enabled && options.max_activity_slots <= 0 {
 		return client_option_error("max activity slots must be positive")
 	}
-	if options.max_nexus_task_slots <= 0 {
+	if !options.resource_based_nexus_tuner.enabled && options.max_nexus_task_slots <= 0 {
 		return client_option_error("max Nexus task slots must be positive")
 	}
 	_, sticky_error := worker_duration_millis(
@@ -1069,7 +1134,26 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	   options.workflow_task_poller_behavior.simple_maximum < 2 {
 		return client_option_error("Workflow task simple poller must be at least two when Workflow caching is enabled")
 	}
-	return resource_based_activity_tuner_validate(options.resource_based_activity_tuner)
+	activity_tuner_error :=
+		resource_based_activity_tuner_validate(options.resource_based_activity_tuner)
+	if activity_tuner_error.message != nil {
+		return activity_tuner_error
+	}
+	nexus_tuner_error := resource_based_nexus_tuner_validate(options.resource_based_nexus_tuner)
+	if nexus_tuner_error.message != nil {
+		return nexus_tuner_error
+	}
+	if options.resource_based_activity_tuner.enabled &&
+	   options.resource_based_nexus_tuner.enabled &&
+	   (options.resource_based_activity_tuner.target_memory_usage !=
+	      options.resource_based_nexus_tuner.target_memory_usage ||
+	    options.resource_based_activity_tuner.target_cpu_usage !=
+	      options.resource_based_nexus_tuner.target_cpu_usage) {
+		return client_option_error(
+			"all resource-based slot suppliers must use identical memory and CPU targets",
+		)
+	}
+	return {}
 }
 
 resource_based_slot_supplier :: proc(
@@ -1181,6 +1265,21 @@ worker_option_bindings_init :: proc(
 		}
 		bindings.raw_options.tuner.activity_slot_supplier = activity_supplier
 		bindings.raw_options.tuner.local_activity_slot_supplier = local_activity_supplier
+	}
+	if options.resource_based_nexus_tuner.enabled {
+		tuner := options.resource_based_nexus_tuner
+		raw_tuner_options := raw.Resource_Based_Tuner_Options{
+			target_memory_usage = tuner.target_memory_usage,
+			target_cpu_usage = tuner.target_cpu_usage,
+		}
+		nexus_supplier, nexus_supplier_error := resource_based_slot_supplier(
+			tuner.nexus_task_slots,
+			raw_tuner_options,
+		)
+		if nexus_supplier_error.message != nil {
+			return nexus_supplier_error
+		}
+		bindings.raw_options.tuner.nexus_task_slot_supplier = nexus_supplier
 	}
 	bindings.raw_options.sticky_queue_schedule_to_start_timeout_ms = sticky_ms
 	bindings.raw_options.max_heartbeat_throttle_interval_ms = max_heartbeat_ms

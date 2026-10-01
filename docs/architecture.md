@@ -643,8 +643,8 @@ preserves Core's raw Nexus links, parses all four upstream URL/type forms into
 the generic pinned Link model, and attaches those values to callbacks and
 ordinary Workflow starts. All six pinned protobuf variants encode; `BatchJob`
 and `Callback` are encoding-only because upstream has no Nexus URL converter
-for them. Outbound metrics are not implemented. The
-outbound interceptor and selector/join integration are implemented.
+for them. Callback-scoped Nexus metric meters and the outbound interceptor and
+selector/join integration are implemented.
 
 ### Standalone Nexus operation Client boundary
 
@@ -2967,16 +2967,16 @@ process under a supervisor.
 
 `worker.create_with_options` now exposes the subset of the pinned Core worker
 builder that the Odin executor can honor without introducing another runtime:
-worker identity override, fixed or resource-based Activity capacity, Workflow
-cache size and sticky timeout, heartbeat throttling, worker-local and task-queue
-Activity rate limits, graceful shutdown, Workflow/Activity poller behavior,
+worker identity override, fixed or resource-based Activity/Nexus capacity,
+Workflow cache size and sticky timeout, heartbeat throttling, worker-local and
+task-queue Activity rate limits, graceful shutdown, Workflow/Activity poller behavior,
 sticky/nonsticky poll ratio, and eager Activity reservation count. The original
 `worker.create` is a compatibility convenience that fills the same
 `worker.Options` defaults.
-Resource-based Workflow/Nexus suppliers, custom slot suppliers, async Nexus
-operations, plugins, storage drivers, and the experimental payload-error limit
-remain deliberately unexposed. Fixed Nexus slots and poller behavior configure
-the public synchronous executor and its raw poll/completion lifecycle.
+Resource-based Workflow suppliers, custom slot suppliers, plugins, storage
+drivers, and the experimental payload-error limit remain deliberately
+unexposed. Fixed or resource-based Nexus slots and poller behavior configure
+the public synchronous/async executor and its raw poll/completion lifecycle.
 
 The public `Poller_Behavior` is an owned tagged Odin value. Immediately before
 `temporal_core_worker_new`, `Worker_Option_Bindings` translates it to the C
@@ -2997,18 +2997,18 @@ bridge converts its borrowed `ByteArrayRef` to an owned Rust `String` during
 
 The C bridge accepts four independent supplier union values but constructs one
 shared resource controller; consequently every resource-based arm must repeat
-the same CPU and memory targets. Odin exposes this invariant as one
-`Resource_Based_Activity_Tuner_Options` containing independent remote and Local
-Activity slot ranges. Targets must be finite in `(0, 1]`, slot minima must be
-positive, maxima cannot be below minima, and ramp durations are non-negative.
-The convenience constructor deliberately defaults both maxima to ten because
-the current Odin executor uses one OS thread per possible callback. When the
-tuner is enabled it supersedes `max_concurrent_activities`; `worker.run` sums
-the maximums of only the enabled remote/Local suppliers to size the shared
-callback pool. Workflow activation execution remains serial. The Nexus executor
-is concurrent but currently honors only the fixed supplier; resource-based
-Nexus tuning stays unexposed until the callback pool can follow dynamic slot
-capacity safely.
+the same CPU and memory targets. Odin exposes Activity/Local Activity and Nexus
+options separately so either executor can opt in, and rejects mismatched
+targets when both are enabled. Targets must be finite in `(0, 1]`, slot minima
+must be positive, maxima cannot be below minima, and ramp durations are
+non-negative. The convenience constructors deliberately default maxima to ten
+because the current Odin executors use one OS thread per possible callback.
+The Activity tuner supersedes `max_concurrent_activities`; `worker.run` sums
+the remote/Local maxima to size their shared callback pool. The Nexus tuner
+supersedes `max_concurrent_nexus_tasks` and sizes its separate callback pool
+from the configured maximum. This safely permits Core to vary granted slots
+between the minimum and maximum without outgrowing the Odin executor. Workflow
+activation execution remains serial, so its supplier remains fixed.
 
 The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
 rejects negative, NaN, and infinite values; positive values cross unchanged.
