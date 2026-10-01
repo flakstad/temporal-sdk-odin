@@ -7399,6 +7399,188 @@ runtime_init_and_shutdown :: proc(t: ^testing.T) {
 	temporal_core.runtime_close(&runtime)
 }
 
+@(test)
+core_metric_meter_requires_a_configured_exporter :: proc(t: ^testing.T) {
+	runtime, runtime_error := temporal_core.runtime_create()
+	testing.expectf(t, runtime_error.message == nil, "runtime_create failed: %s", string(runtime_error.message))
+	temporal_core.error_free(&runtime_error)
+	defer temporal_core.runtime_close(&runtime)
+
+	meter, meter_error := temporal_core.metric_meter_create(&runtime)
+	testing.expect(t, meter.handle == nil)
+	testing.expect(t, strings.contains(string(meter_error.message), "metrics are not configured"))
+	temporal_core.error_free(&meter_error)
+	temporal_core.metric_meter_close(&meter)
+}
+
+@(test)
+core_metric_meter_records_all_pinned_instrument_kinds_with_owned_attributes :: proc(t: ^testing.T) {
+	prometheus := temporal_core.Runtime_Prometheus_Options{
+		bind_address = "127.0.0.1:0",
+		counters_total_suffix = true,
+	}
+	options := temporal_core.runtime_options_default()
+	options.prometheus = &prometheus
+	runtime, runtime_error := temporal_core.runtime_create_with_options(options)
+	testing.expectf(t, runtime_error.message == nil, "metrics Runtime failed: %s", string(runtime_error.message))
+	temporal_core.error_free(&runtime_error)
+	if runtime.handle == nil do return
+	defer temporal_core.runtime_close(&runtime)
+
+	base_attributes := [?]temporal_core.Metric_Attribute{
+		temporal_core.metric_attribute_string("component", "unit-test"),
+		temporal_core.metric_attribute_i64("shard", 7),
+		temporal_core.metric_attribute_f64("ratio", 0.5),
+		temporal_core.metric_attribute_bool("ready", true),
+	}
+	meter, meter_error := temporal_core.metric_meter_create(&runtime, base_attributes[:])
+	testing.expectf(t, meter_error.message == nil, "metric meter failed: %s", string(meter_error.message))
+	temporal_core.error_free(&meter_error)
+	if meter.handle == nil do return
+
+	child_attributes := [?]temporal_core.Metric_Attribute{
+		temporal_core.metric_attribute_string("scope", "child"),
+	}
+	child, child_error := temporal_core.metric_meter_with_attributes(&meter, child_attributes[:])
+	testing.expectf(t, child_error.message == nil, "child metric meter failed: %s", string(child_error.message))
+	temporal_core.error_free(&child_error)
+	temporal_core.metric_meter_close(&meter)
+	if child.handle == nil do return
+
+	counter, counter_error := temporal_core.metric_create(
+		&child,
+		"odin_test_counter",
+		.Counter_Integer,
+		description = "Odin test counter",
+		unit = "event",
+	)
+	testing.expect(t, counter_error.message == nil)
+	temporal_core.error_free(&counter_error)
+	defer temporal_core.metric_close(&counter)
+
+	integer_histogram, integer_histogram_error := temporal_core.metric_create(
+		&child,
+		"odin_test_integer_histogram",
+		.Histogram_Integer,
+	)
+	testing.expect(t, integer_histogram_error.message == nil)
+	temporal_core.error_free(&integer_histogram_error)
+	defer temporal_core.metric_close(&integer_histogram)
+
+	float_histogram, float_histogram_error := temporal_core.metric_create(
+		&child,
+		"odin_test_float_histogram",
+		.Histogram_Float,
+	)
+	testing.expect(t, float_histogram_error.message == nil)
+	temporal_core.error_free(&float_histogram_error)
+	defer temporal_core.metric_close(&float_histogram)
+
+	duration_histogram, duration_histogram_error := temporal_core.metric_create(
+		&child,
+		"odin_test_duration_histogram",
+		.Histogram_Duration,
+	)
+	testing.expect(t, duration_histogram_error.message == nil)
+	temporal_core.error_free(&duration_histogram_error)
+	defer temporal_core.metric_close(&duration_histogram)
+
+	integer_gauge, integer_gauge_error := temporal_core.metric_create(
+		&child,
+		"odin_test_integer_gauge",
+		.Gauge_Integer,
+	)
+	testing.expect(t, integer_gauge_error.message == nil)
+	temporal_core.error_free(&integer_gauge_error)
+	defer temporal_core.metric_close(&integer_gauge)
+
+	float_gauge, float_gauge_error := temporal_core.metric_create(
+		&child,
+		"odin_test_float_gauge",
+		.Gauge_Float,
+	)
+	testing.expect(t, float_gauge_error.message == nil)
+	temporal_core.error_free(&float_gauge_error)
+	defer temporal_core.metric_close(&float_gauge)
+
+	up_down_counter, up_down_counter_error := temporal_core.metric_create(
+		&child,
+		"odin_test_up_down_counter",
+		.Up_Down_Counter_Integer,
+	)
+	testing.expect(t, up_down_counter_error.message == nil)
+	temporal_core.error_free(&up_down_counter_error)
+	defer temporal_core.metric_close(&up_down_counter)
+
+	// Every instrument cloned its own meter and attributes, so the factory may
+	// close before any records are emitted.
+	temporal_core.metric_meter_close(&child)
+	record_attributes := [?]temporal_core.Metric_Attribute{
+		temporal_core.metric_attribute_string("outcome", "ok"),
+	}
+	record_error := temporal_core.metric_counter_add(&counter, 3, record_attributes[:])
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_histogram_record_integer(&integer_histogram, 42)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_histogram_record_float(&float_histogram, 0.75)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_histogram_record_duration(
+		&duration_histogram,
+		1500 * time.Microsecond,
+	)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_gauge_record_integer(&integer_gauge, 5)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_gauge_record_float(&float_gauge, -1.25)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_up_down_counter_add(&up_down_counter, 2)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+	record_error = temporal_core.metric_up_down_counter_add(&up_down_counter, -1)
+	testing.expect(t, record_error.message == nil)
+	temporal_core.error_free(&record_error)
+
+	wrong_kind_error := temporal_core.metric_gauge_record_integer(&counter, 1)
+	testing.expect(t, strings.contains(string(wrong_kind_error.message), "not an integer gauge"))
+	temporal_core.error_free(&wrong_kind_error)
+	invalid_value_error := temporal_core.metric_histogram_record_float(&float_histogram, -0.5)
+	testing.expect(t, strings.contains(string(invalid_value_error.message), "non-negative"))
+	temporal_core.error_free(&invalid_value_error)
+	invalid_duration_error := temporal_core.metric_histogram_record_duration(
+		&duration_histogram,
+		-time.Nanosecond,
+	)
+	testing.expect(t, strings.contains(string(invalid_duration_error.message), "must not be negative"))
+	temporal_core.error_free(&invalid_duration_error)
+	invalid_attributes := [?]temporal_core.Metric_Attribute{
+		temporal_core.metric_attribute_string("", "invalid"),
+	}
+	invalid_attribute_error := temporal_core.metric_counter_add(
+		&counter,
+		1,
+		invalid_attributes[:],
+	)
+	testing.expect(t, strings.contains(string(invalid_attribute_error.message), "key must not be empty"))
+	temporal_core.error_free(&invalid_attribute_error)
+	invalid_kind_attributes := [?]temporal_core.Metric_Attribute{{
+		key = "invalid-kind",
+		kind = temporal_core.Metric_Attribute_Kind(99),
+	}}
+	invalid_kind_error := temporal_core.metric_counter_add(
+		&counter,
+		1,
+		invalid_kind_attributes[:],
+	)
+	testing.expect(t, strings.contains(string(invalid_kind_error.message), "kind is invalid"))
+	temporal_core.error_free(&invalid_kind_error)
+}
+
 raw_byte_ref_string :: proc(value: raw.Byte_Array_Ref) -> string {
 	if value.data == nil || value.size == 0 {
 		return ""

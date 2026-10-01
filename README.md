@@ -309,6 +309,38 @@ synchronized process-wide route and rejects a second simultaneous forwarding
 Runtime. The live suite receives real records from arbitrary Core threads and
 the unit suite proves the route is reusable after shutdown.
 
+The Runtime also exposes Core's application metric meter rather than requiring
+a second metrics stack:
+
+```odin
+base := [?]core.Metric_Attribute{
+    core.metric_attribute_string("component", "payments"),
+}
+meter, err := core.metric_meter_create(&runtime, base[:])
+defer core.metric_meter_close(&meter)
+
+charged, err := core.metric_counter_create(
+    &meter,
+    "orders_charged",
+    description = "Successfully charged orders",
+)
+defer core.metric_close(&charged)
+
+record_attributes := [?]core.Metric_Attribute{
+    core.metric_attribute_string("currency", "NOK"),
+}
+err = core.metric_counter_add(&charged, 1, record_attributes[:])
+```
+
+All seven C-bridge instrument kinds are available: integer counter, integer/
+float/duration histograms, integer/float gauges, and signed up-down counter.
+Meters can derive immutable attribute scopes with
+`metric_meter_with_attributes`; record calls can add temporary attributes.
+Metric handles own their cloned meter/attribute state and must close before the
+Runtime. This is a host/Activity primitive, not yet the replay-safe scoped
+Workflow meter offered by mature SDKs; do not call it directly from Workflow
+code.
+
 Server capability discovery uses the same public Client and generic Core RPC
 bridge:
 

@@ -461,6 +461,31 @@ runtime_options.metrics.global_tags = []core.Runtime_Key_Value{
 runtime, err := core.runtime_create_with_options(runtime_options)
 ```
 
+Once metrics are configured, application code can use the same Core exporter:
+
+```odin
+base := [?]core.Metric_Attribute{
+    core.metric_attribute_string("component", "billing"),
+    core.metric_attribute_i64("shard", 7),
+}
+meter, err := core.metric_meter_create(&runtime, base[:])
+defer core.metric_meter_close(&meter)
+
+counter, err := core.metric_counter_create(&meter, "billing_requests")
+defer core.metric_close(&counter)
+
+err = core.metric_counter_add(&counter, 1)
+```
+
+`Metric` clones a private Core meter and base-attribute handle, so it remains
+valid if its factory `Metric_Meter` closes first. It must still close before the
+Runtime. Do not copy owning meter/instrument records. The wrapper validates the
+instrument kind before calling Core because the raw ABI treats a mismatch as a
+panic. Per-record attributes allocate one short-lived Core attribute handle;
+derive a child meter with `metric_meter_with_attributes` when a label set will
+be reused. Positive sub-millisecond duration observations round upward to one
+millisecond.
+
 Prometheus and OpenTelemetry are mutually exclusive because the Core C bridge
 accepts exactly one exporter. OTLP supports gRPC/HTTP, headers, cumulative or
 delta temporality, and a configurable export period. Durations round positive
@@ -496,7 +521,13 @@ runtime_options.logging = &logging
 The integration suite starts `examples/core_connect` with a loopback
 Prometheus address, scrapes `/metrics` while the runtime is alive, and requires
 `temporal_request_total` for `GetSystemInfo` with both Core's `service_name` and
-the Odin global tag. This proves the exporter rather than only its C layout.
+the Odin global tag. It also creates `odin_application_events` through the raw
+meter ABI and requires value `3` plus base/per-record string, integer, float,
+and boolean labels. This proves the exporter and application record path rather
+than only their C layouts. Two lifecycle tests create every pinned instrument
+kind against a real Core Runtime on an ephemeral port, validate failure without
+an exporter, close factory meters before recording, and reject kind/value/
+attribute misuse before FFI.
 It also runs `examples/core_connect` with
 `TEMPORAL_CORE_FORWARD_LOGS=1 TEMPORAL_CORE_LOG_FILTER=trace` and requires a
 well-formed callback record. The unit suite proves a second simultaneous route

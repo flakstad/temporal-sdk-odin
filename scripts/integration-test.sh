@@ -211,8 +211,10 @@ metrics_pid=$!
 metrics_scraped=false
 for _ in {1..30}; do
   if curl -fsS "http://${metrics_address}/metrics" >"$workflow_control_output_file" 2>/dev/null; then
-    metrics_scraped=true
-    break
+    if grep -q 'odin_application_events_total{' "$workflow_control_output_file"; then
+      metrics_scraped=true
+      break
+    fi
   fi
   if ! kill -0 "$metrics_pid" 2>/dev/null; then
     echo "Core Prometheus example exited before its endpoint could be scraped" >&2
@@ -232,7 +234,15 @@ grep -q 'temporal_request_total{' "$workflow_control_output_file"
 grep -q 'operation="GetSystemInfo"' "$workflow_control_output_file"
 grep -q 'service_name="temporal-core-sdk"' "$workflow_control_output_file"
 grep -q 'sdk_language="odin"' "$workflow_control_output_file"
-echo "Core Prometheus exporter exposed tagged GetSystemInfo metrics"
+grep -q 'odin_application_events_total{' "$workflow_control_output_file"
+grep -q 'component="core-connect"' "$workflow_control_output_file"
+grep -q 'outcome="ok"' "$workflow_control_output_file"
+grep -q 'ratio="0.5"' "$workflow_control_output_file"
+grep -q 'ready="true"' "$workflow_control_output_file"
+grep -q 'shard="7"' "$workflow_control_output_file"
+grep -q 'odin_application_events_total{.*} 3' "$workflow_control_output_file"
+grep -q 'Core application metric recorded through the C bridge.' "$workflow_output_file"
+echo "Core Prometheus exporter exposed tagged SDK and Odin application metrics"
 
 eager_workflow_id="odin-sdk-eager-$$-$(date +%s)"
 TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \

@@ -171,6 +171,7 @@ The bridge exposes opaque handles plus C-layout options and callback APIs:
 | Replay construction | `temporal_core_worker_replayer_new` | worker options, without a Client connection |
 | Replay history input | `temporal_core_worker_replay_push` | binary `temporal.api.history.v1.History` plus Workflow ID |
 | Replay input close | `temporal_core_worker_replay_pusher_free` | closes Core's history stream |
+| Application metric meter | `temporal_core_metric_*` | opaque meters, instruments, typed attributes, and scalar records |
 | Errors | `TemporalCoreByteArray*` | UTF-8 message, with gRPC status/details where applicable |
 
 The asynchronous functions return through callbacks invoked by Core-managed
@@ -1207,6 +1208,41 @@ owns exporter tasks and listener state until `temporal_core_runtime_free`.
 The public Client accepts the same configuration while retaining sole
 ownership of the created runtime.
 
+The bridge also exposes a separate application-metric API over the exporter
+owned by the Runtime. Odin now binds all eleven functions:
+`temporal_core_metric_meter_new/free`,
+`temporal_core_metric_attributes_new/new_append/free`,
+`temporal_core_metric_new/free`, and the four integer, float, signed-integer,
+and duration record calls. The three C option/attribute records and both enums
+are mirrored with compile-time size/offset assertions against the generated
+header. This path is not protobuf-serialized and never reaches Temporal Server.
+
+`Metric_Meter` owns one Core meter and immutable base-attribute handle. A
+`Metric` clones both into independent Core handles when it is created, so the
+factory meter can close before recording. Per-record attributes create one
+temporary Core-owned attribute handle, record synchronously, and free it only
+after the C call returns. Input names, descriptions, units, keys, and string
+values are borrowed for construction; Rust copies them immediately. Instruments
+and meters must close before their Runtime. Since Odin records are copyable,
+their owning handle values must be moved by convention rather than duplicated.
+
+The C record functions panic on a mismatched instrument kind. The high-level
+wrapper retains the kind and rejects every wrong record operation before FFI;
+it also rejects invalid kinds, empty attribute keys, non-finite floats,
+negative float-histogram values, and negative durations. Duration values use
+the bridge's integer-millisecond contract and round a positive fraction upward.
+Counters and integer histograms/gauges accept `u64`; up-down counters accept
+`i64`. Typed attributes carry string, integer, float, or boolean values.
+Core's `get_metric_meter` deliberately bypasses the Temporal-only metric-prefix
+wrapper, so application names are exported exactly as supplied while global
+tags and optional `service_name` still apply.
+
+These Runtime metrics are intended for normal host and Activity code. Calling
+them directly from Workflow code would be a replaying side effect. A scoped
+Workflow meter with replay suppression and automatic namespace/task-queue/
+Workflow-type attributes remains a distinct language-runtime layer rather than
+being silently made available through this Core handle.
+
 Logging is deliberately asymmetric. A nil `forward_to` makes Core write to its
 console subscriber. A non-nil callback may be invoked from any Core thread and
 the raw ABI provides no user-data pointer. Odin therefore installs one
@@ -1227,7 +1263,9 @@ and a positive timestamp. A lifecycle unit test proves exclusivity and route
 reuse after close. A separate live path configures the Prometheus exporter on loopback,
 performs `GetSystemInfo`, scrapes `/metrics` while the runtime remains alive,
 and observes `temporal_request_total` with Core's service tag and an Odin global
-tag. This proves Core's listener, instrumentation, option ownership, and
+tag. The same scrape requires an Odin-created counter with base and per-record
+string/integer/float/boolean attributes and the exact value three. This proves
+Core's listener, application-meter ABI, instrumentation, option ownership, and
 shutdown path together. OTLP has ABI/unit coverage but awaits a collector-backed
 integration test.
 

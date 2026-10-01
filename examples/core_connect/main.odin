@@ -135,6 +135,53 @@ main :: proc() {
 	}
 	defer temporal_core.runtime_close(&runtime)
 
+	application_meter := temporal_core.Metric_Meter{}
+	application_counter := temporal_core.Metric{}
+	if len(prometheus_address) > 0 {
+		meter_attributes := [?]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("component", "core-connect"),
+			temporal_core.metric_attribute_i64("shard", 7),
+			temporal_core.metric_attribute_f64("ratio", 0.5),
+			temporal_core.metric_attribute_bool("ready", true),
+		}
+		meter_error: temporal_core.Error
+		application_meter, meter_error = temporal_core.metric_meter_create(
+			&runtime,
+			meter_attributes[:],
+		)
+		if meter_error.message != nil {
+			fmt.eprintf("Core application metric meter failed: %s\n", string(meter_error.message))
+			temporal_core.error_free(&meter_error)
+			os.exit(1)
+		}
+		counter_error: temporal_core.Error
+		application_counter, counter_error = temporal_core.metric_counter_create(
+			&application_meter,
+			"odin_application_events",
+			description = "Application events emitted by the Odin Core example",
+		)
+		if counter_error.message != nil {
+			fmt.eprintf("Core application counter failed: %s\n", string(counter_error.message))
+			temporal_core.error_free(&counter_error)
+			os.exit(1)
+		}
+		record_attributes := [?]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("outcome", "ok"),
+		}
+		record_error := temporal_core.metric_counter_add(
+			&application_counter,
+			3,
+			record_attributes[:],
+		)
+		if record_error.message != nil {
+			fmt.eprintf("Core application metric record failed: %s\n", string(record_error.message))
+			temporal_core.error_free(&record_error)
+			os.exit(1)
+		}
+		temporal_core.error_free(&record_error)
+		fmt.println("Core application metric recorded through the C bridge.")
+	}
+
 	client, connect_error := temporal_core.client_connect(&runtime)
 	if connect_error.message != nil {
 		fmt.eprintf("Temporal connection failed: %s\n", string(connect_error.message))
@@ -211,4 +258,6 @@ main :: proc() {
 		// The integration script scrapes while this process owns the runtime.
 		time.sleep(3 * time.Second)
 	}
+	temporal_core.metric_close(&application_counter)
+	temporal_core.metric_meter_close(&application_meter)
 }

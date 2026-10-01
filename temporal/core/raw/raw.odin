@@ -16,6 +16,9 @@ Worker     :: struct { _opaque: u8 }
 Worker_Replay_Pusher :: struct { _opaque: u8 }
 Cancellation_Token :: struct { _opaque: u8 }
 Forwarded_Log :: struct { _opaque: u8 }
+Metric_Meter :: struct { _opaque: u8 }
+Metric_Attributes :: struct { _opaque: u8 }
+Metric :: struct { _opaque: u8 }
 
 Byte_Array_Ref :: struct {
 	data: ^u8,
@@ -110,6 +113,43 @@ Metrics_Options :: struct {
 	attach_service_name: bool,
 	global_tags:         Byte_Array_Ref,
 	metric_prefix:       Byte_Array_Ref,
+}
+
+Metric_Attribute_Value_Type :: enum c.int {
+	String = 1,
+	Int,
+	Float,
+	Bool,
+}
+
+Metric_Kind :: enum c.int {
+	Counter_Integer = 1,
+	Histogram_Integer,
+	Histogram_Float,
+	Histogram_Duration,
+	Gauge_Integer,
+	Gauge_Float,
+	Up_Down_Counter_Integer,
+}
+
+Metric_Attribute_Value :: struct #raw_union {
+	string_value: Byte_Array_Ref,
+	int_value:    i64,
+	float_value:  f64,
+	bool_value:   bool,
+}
+
+Metric_Attribute :: struct {
+	key:        Byte_Array_Ref,
+	value:      Metric_Attribute_Value,
+	value_type: Metric_Attribute_Value_Type,
+}
+
+Metric_Options :: struct {
+	name:        Byte_Array_Ref,
+	description: Byte_Array_Ref,
+	unit:        Byte_Array_Ref,
+	kind:        Metric_Kind,
 }
 
 Telemetry_Options :: struct {
@@ -370,6 +410,8 @@ Worker_Poll_Callback :: #type proc "c" (
 #assert(size_of(bool) == 1)
 #assert(size_of(Runtime_Type) == size_of(c.int))
 #assert(size_of(Rpc_Service) == size_of(c.int))
+#assert(size_of(Metric_Attribute_Value_Type) == size_of(c.int))
+#assert(size_of(Metric_Kind) == size_of(c.int))
 #assert(size_of(Worker_Versioning_Strategy_Tag) == size_of(c.int))
 #assert(size_of(Slot_Supplier_Tag) == size_of(c.int))
 when size_of(uintptr) == 8 {
@@ -397,6 +439,12 @@ when size_of(uintptr) == 8 {
 	#assert(offset_of(Metrics_Options, metric_prefix) == 48)
 	#assert(size_of(Telemetry_Options) == 16)
 	#assert(offset_of(Telemetry_Options, metrics) == 8)
+	#assert(size_of(Metric_Attribute_Value) == 16)
+	#assert(size_of(Metric_Attribute) == 40)
+	#assert(offset_of(Metric_Attribute, value) == 16)
+	#assert(offset_of(Metric_Attribute, value_type) == 32)
+	#assert(size_of(Metric_Options) == 56)
+	#assert(offset_of(Metric_Options, kind) == 48)
 	#assert(size_of(Connection_Options) == 192)
 	#assert(offset_of(Connection_Options, tls_options) == 112)
 	#assert(offset_of(Connection_Options, grpc_compression) == 168)
@@ -450,6 +498,42 @@ foreign temporal_core {
 	forwarded_log_message :: proc(log: ^Forwarded_Log) -> Byte_Array_Ref ---
 	forwarded_log_timestamp_millis :: proc(log: ^Forwarded_Log) -> u64 ---
 	forwarded_log_fields_json :: proc(log: ^Forwarded_Log) -> Byte_Array_Ref ---
+	metric_meter_new :: proc(runtime: ^Runtime) -> ^Metric_Meter ---
+	metric_meter_free :: proc(meter: ^Metric_Meter) ---
+	metric_attributes_new :: proc(
+		meter: ^Metric_Meter,
+		attributes: ^Metric_Attribute,
+		size: c.size_t,
+	) -> ^Metric_Attributes ---
+	metric_attributes_new_append :: proc(
+		meter: ^Metric_Meter,
+		original: ^Metric_Attributes,
+		attributes: ^Metric_Attribute,
+		size: c.size_t,
+	) -> ^Metric_Attributes ---
+	metric_attributes_free :: proc(attributes: ^Metric_Attributes) ---
+	metric_new :: proc(meter: ^Metric_Meter, options: ^Metric_Options) -> ^Metric ---
+	metric_free :: proc(metric: ^Metric) ---
+	metric_record_integer :: proc(
+		metric: ^Metric,
+		value: u64,
+		attributes: ^Metric_Attributes,
+	) ---
+	metric_record_float :: proc(
+		metric: ^Metric,
+		value: f64,
+		attributes: ^Metric_Attributes,
+	) ---
+	metric_record_integer_signed :: proc(
+		metric: ^Metric,
+		value: i64,
+		attributes: ^Metric_Attributes,
+	) ---
+	metric_record_duration :: proc(
+		metric: ^Metric,
+		value_millis: u64,
+		attributes: ^Metric_Attributes,
+	) ---
 	client_connect    :: proc(
 		runtime: ^Runtime,
 		options: ^Connection_Options,
