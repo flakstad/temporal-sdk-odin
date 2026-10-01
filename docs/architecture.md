@@ -3413,7 +3413,8 @@ messages:
   inherited parent cancellation reaches a commanded child. Core applies the
   cancellation type carried by the original start command.
 - Odin emits `SignalExternalWorkflowExecution` with the child Workflow ID as
-  its target and an ordered repeated argument field. Core later emits
+  its target and an ordered repeated argument field. An optional UI summary is
+  encoded on the enclosing `WorkflowCommand.user_metadata`. Core later emits
   `ResolveSignalExternalWorkflow(seq, failure,
   cause)`, which Odin maps back to the waiting fiber.
 
@@ -3480,9 +3481,10 @@ Failure tree.
 `Child_Workflow_Future` is also the Workflow-local operation handle. Explicit
 `cancel_child_workflow` suppresses a still-local start or, once the start was
 commanded, uses Core's child-specific cancel command and preserves the caller's
-reason. Typed JSON or raw Payload signals are copied into the Workflow arena, assigned an
-independent external-signal sequence, and suspended until Core acknowledges the
-command. Signal failures expose Core's not-found, namespace-not-found, and
+reason. Typed JSON or raw Payload signals and their optional summary metadata
+are copied into the Workflow arena, assigned an independent external-signal
+sequence, and suspended until Core acknowledges the command. Signal failures
+expose Core's not-found, namespace-not-found, and
 signal-count-limit causes. Both signal command bytes and their generated input
 Payloads are covered by eviction/fresh-stack replay properties. The
 codec-neutral child/external signal APIs clone zero or more Payloads—including
@@ -3515,8 +3517,9 @@ They use the existing activation/completion protobuf channel:
 
 - `SignalExternalWorkflowExecution` targets a
   `NamespacedWorkflowExecution { namespace, workflow_id, run_id }`, carries one
-  language-assigned signal sequence and generic Payload arguments, and resolves
-  through `ResolveSignalExternalWorkflow`.
+  language-assigned signal sequence and generic Payload arguments, may carry a
+  UI summary on the enclosing command metadata, and resolves through
+  `ResolveSignalExternalWorkflow`.
 - `RequestCancelExternalWorkflowExecution` targets the same identity, uses its
   own language-assigned cancellation sequence and optional reason, and resolves
   through `ResolveRequestCancelExternalWorkflow`.
@@ -3525,13 +3528,14 @@ They use the existing activation/completion protobuf channel:
 - Signals and cancellation requests have independent sequence spaces because
   Core resolves them through different activation job types.
 
-The execution identity, signal name, reason, ordered Payloads, failure text, and encoded
-failure bytes are copied into the Workflow instance arena before the user fiber
-can suspend. `signal_external_workflow_payloads` clones its borrowed Payload
-slice; the singular Payload and JSON helpers delegate with one element, while
-`signal_external_workflow_owned` consumes one owned Payload. Returned strings are
-Workflow-owned views and must not escape the execution. Eviction destroys this
-state; deterministic replay recreates it from Workflow code and history.
+The execution identity, signal name, optional encoded summary, reason, ordered
+Payloads, failure text, and encoded failure bytes are copied into the Workflow
+instance arena before the user fiber can suspend.
+`signal_external_workflow_payloads` clones its borrowed Payload slice; the
+singular Payload and JSON helpers delegate with one element, while
+`signal_external_workflow_owned` consumes one owned Payload. Returned strings
+are Workflow-owned views and must not escape the execution. Eviction destroys
+this state; deterministic replay recreates it from Workflow code and history.
 
 Core owns server delivery and maps history events back to the matching `seq`.
 Odin owns validation, sequence allocation, ordered argument cloning, command construction, suspension,
@@ -3545,9 +3549,11 @@ resolves it rather than being canceled locally.
 The acceptance test starts two independent Odin Workflow executions. The caller
 signals the target, waits for acknowledgement, requests target cancellation,
 waits for that acknowledgement, and completes. The target observes the signal
-and then closes as canceled. Unit and 500-case property tests additionally
-require both outbound command completions to be byte-identical after eviction
-and fresh-stack replay.
+and then closes as canceled. The test reads both child- and external-target
+signal summaries from real
+`EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED` history events. Unit
+and 500-case property tests additionally require both outbound command
+completions to be byte-identical after eviction and fresh-stack replay.
 
 ### Continue-As-New boundary
 

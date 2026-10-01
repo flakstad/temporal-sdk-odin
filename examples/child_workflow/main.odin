@@ -259,7 +259,13 @@ signal_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> st
 		codec.payload_view(&count),
 		codec.payload_view(&enabled),
 	}
-	signal := workflow.signal_child_workflow_payloads(ctx, future, "approve", inputs[:])
+	signal := workflow.signal_child_workflow_payloads_with_options(
+		ctx,
+		future,
+		"approve",
+		inputs[:],
+		{summary = "Approve Odin Child Workflow"},
+	)
 	if signal.status != .Succeeded {
 		return "Child Workflow signal failed"
 	}
@@ -384,11 +390,12 @@ external_caller_workflow :: proc(ctx: ^workflow.Fiber_Context, target_workflow_i
 		codec.payload_view(&count),
 		codec.payload_view(&enabled),
 	}
-	signal := workflow.signal_external_workflow_payloads(
+	signal := workflow.signal_external_workflow_payloads_with_options(
 		ctx,
 		execution,
 		"external-approve",
 		inputs[:],
+		{summary = "Approve external Odin Workflow"},
 	)
 	if signal.status != .Succeeded {
 		return "External Workflow signal failed"

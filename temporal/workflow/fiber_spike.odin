@@ -612,8 +612,12 @@ payload_map_add_search_attribute_json :: proc(
 	return temporal_headers.put_owned(payloads, key, payload) == .None
 }
 
+// Signal_Options borrows headers and summary only for the signal call. The
+// runtime copies them into the Workflow run arena before the signal suspends.
+// Empty summary omits the UI-facing command metadata.
 Signal_Options :: struct {
 	headers: ^Headers,
+	summary: string,
 }
 
 // Timer_Options borrows summary only for the start call. A zero-value
@@ -1294,6 +1298,8 @@ Fiber_External_Signal_Operation :: struct {
 	signal_name:        string,
 	inputs:             [dynamic]codec.Payload,
 	headers:            [dynamic]Fiber_Named_Payload,
+	summary:            codec.Payload,
+	has_summary:        bool,
 	failure_message:    string,
 	failure:            ^temporal_failure.Failure,
 	cause:              Workflow_Signal_Failure_Cause,
@@ -7107,12 +7113,27 @@ signal_child_workflow_payloads_owned :: proc(
 		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "could not preserve Child Workflow signal name or headers"}
 	}
+	owned_summary := codec.Payload{}
+	has_summary := len(options.summary) > 0
+	if has_summary {
+		encode_error: codec.Error
+		owned_summary, encode_error = codec.encode_json(
+			options.summary,
+			instance.odin_context.allocator,
+		)
+		if encode_error != .None {
+			activity_inputs_free(&owned_inputs)
+			return {status = .Failed, failure_message = "could not preserve Child Workflow signal summary"}
+		}
+	}
 	operation := Fiber_External_Signal_Operation{
 		child_workflow_seq = future.seq,
 		child_workflow_id = child.workflow_id,
 		signal_name = owned_name,
 		inputs = owned_inputs,
 		headers = owned_headers,
+		summary = owned_summary,
+		has_summary = has_summary,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
@@ -7268,6 +7289,19 @@ signal_external_workflow_payloads_owned :: proc(
 		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "could not preserve external Workflow signal"}
 	}
+	owned_summary := codec.Payload{}
+	has_summary := len(options.summary) > 0
+	if has_summary {
+		encode_error: codec.Error
+		owned_summary, encode_error = codec.encode_json(
+			options.summary,
+			instance.odin_context.allocator,
+		)
+		if encode_error != .None {
+			activity_inputs_free(&owned_inputs)
+			return {status = .Failed, failure_message = "could not preserve external Workflow signal summary"}
+		}
+	}
 	operation := Fiber_External_Signal_Operation{
 		namespace = owned_namespace,
 		child_workflow_id = owned_workflow_id,
@@ -7275,6 +7309,8 @@ signal_external_workflow_payloads_owned :: proc(
 		signal_name = owned_name,
 		inputs = owned_inputs,
 		headers = owned_headers,
+		summary = owned_summary,
+		has_summary = has_summary,
 	}
 	return schedule_external_signal_and_await(ctx, operation)
 }
@@ -10119,14 +10155,15 @@ append_fiber_signal_external_workflow_command :: proc(
 	for &input in operation.inputs {
 		append(&request.args, proto.encode_payload(codec.payload_view(&input)))
 	}
-	append(
-		commands,
-		proto.Coresdk_Workflow_Commands_WorkflowCommand{
-			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution{
-				value = request,
-			},
+	command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+		variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Signal_External_Workflow_Execution{
+			value = request,
 		},
-	)
+	}
+	if operation.has_summary {
+		workflow_command_set_summary(&command, &operation.summary)
+	}
+	append(commands, command)
 	operation.state = .Commanded
 	if operation.child_workflow_seq != 0 {
 		result.signaled_child_workflow = true

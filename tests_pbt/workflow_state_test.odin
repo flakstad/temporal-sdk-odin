@@ -2633,6 +2633,7 @@ Generated_Child_Options_Input :: struct {
 	static_details:       string,
 	signal_name:          string,
 	signal_value:         string,
+	signal_summary:       string,
 }
 
 generated_child_options_workflow :: proc(
@@ -2771,7 +2772,7 @@ generated_child_options_workflow :: proc(
 		future,
 		input.signal_name,
 		argument_views[:],
-		{headers = &headers},
+		{headers = &headers, summary = input.signal_summary},
 	)
 	if result.status != .Succeeded {
 		return "signal failed"
@@ -3000,7 +3001,9 @@ generated_child_signal_match :: proc(
 			   variant.value.signal_name != expected.signal_name ||
 			   len(variant.value.headers) != 1 ||
 			   variant.value.headers[0].key != "property-header" ||
-			   variant.value.headers[0].value == nil {
+			   variant.value.headers[0].value == nil ||
+			   status.value.commands[0].user_metadata == nil ||
+			   status.value.commands[0].user_metadata.summary == nil {
 				return false
 			}
 			owned_header, clone_error := proto.clone_payload(variant.value.headers[0].value)
@@ -3015,6 +3018,20 @@ generated_child_signal_match :: proc(
 				return false
 			}
 			delete(decoded_header)
+			owned_summary, summary_clone_error := proto.clone_payload(
+				status.value.commands[0].user_metadata.summary,
+			)
+			if summary_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			decoded_summary: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None ||
+			   decoded_summary != expected.signal_summary {
+				delete(decoded_summary)
+				return false
+			}
+			delete(decoded_summary)
 			#partial switch target in variant.value.target {
 			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Child_Workflow_Id:
 				if target.value != expected.workflow_id {
@@ -3065,6 +3082,7 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		static_details = pbt.draw(t, pbt.string_ascii(1, 256)),
 		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		signal_summary = pbt.draw(t, pbt.string_ascii(1, 80)),
 	}
 	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero Child Workflow arguments")
 	pbt.cover(t, input_value.argument_count == 1, 3.0, "one Child Workflow argument")
@@ -3242,6 +3260,7 @@ Generated_External_Workflow_Input :: struct {
 	signal_value: string,
 	argument_count: int,
 	header_value: string,
+	signal_summary: string,
 	cancel_reason: string,
 }
 
@@ -3300,7 +3319,7 @@ generated_external_workflow_operations :: proc(
 		execution,
 		input.signal_name,
 		argument_views[:],
-		{headers = &headers},
+		{headers = &headers, summary = input.signal_summary},
 	)
 	if signal.status != .Succeeded {
 		return "signal failed"
@@ -3340,7 +3359,9 @@ generated_external_signal_match :: proc(
 			   variant.value.signal_name != expected.signal_name ||
 			   len(variant.value.headers) != 1 ||
 			   variant.value.headers[0].key != "property-header" ||
-			   variant.value.headers[0].value == nil {
+			   variant.value.headers[0].value == nil ||
+			   status.value.commands[0].user_metadata == nil ||
+			   status.value.commands[0].user_metadata.summary == nil {
 				return false
 			}
 			owned_header, clone_error := proto.clone_payload(variant.value.headers[0].value)
@@ -3355,6 +3376,20 @@ generated_external_signal_match :: proc(
 				return false
 			}
 			delete(decoded_header)
+			owned_summary, summary_clone_error := proto.clone_payload(
+				status.value.commands[0].user_metadata.summary,
+			)
+			if summary_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			decoded_summary: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None ||
+			   decoded_summary != expected.signal_summary {
+				delete(decoded_summary)
+				return false
+			}
+			delete(decoded_summary)
 			#partial switch target in variant.value.target {
 			case proto.Coresdk_Workflow_Commands_SignalExternalWorkflowExecution_Target_Workflow_Execution:
 				if target.value == nil || target.value.namespace != expected.namespace ||
@@ -3418,6 +3453,7 @@ external_workflow_operations_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		argument_count = pbt.draw(t, pbt.int_range(0, 12)),
 		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		signal_summary = pbt.draw(t, pbt.string_ascii(1, 80)),
 		cancel_reason = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
 	pbt.cover(t, input_value.argument_count == 0, 3.0, "zero external Signal arguments")

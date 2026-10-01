@@ -2658,6 +2658,20 @@ child_signal_output="$(<"$workflow_output_file")"
 echo "$child_signal_output"
 grep -q '"status": "COMPLETED"' <<<"$child_signal_output"
 grep -q 'Odin received approval-from-parent:42:true' <<<"$child_signal_output"
+temporal workflow show \
+  --workflow-id "$child_signal_parent_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+jq -e '
+  [.events[]
+    | select(.eventType == "EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED")
+    | select(
+        .signalExternalWorkflowExecutionInitiatedEventAttributes.signalName == "approve" and
+        (.userMetadata.summary.data | @base64d | fromjson) ==
+          "Approve Odin Child Workflow"
+      )]
+  | length == 1
+' "$typed_history_file" >/dev/null
 
 wait "$worker_pid"
 worker_pid=""
@@ -2792,6 +2806,21 @@ external_caller_output="$(<"$workflow_output_file")"
 echo "$external_caller_output"
 grep -q '"status": "COMPLETED"' <<<"$external_caller_output"
 grep -q 'External Workflow signaled and cancellation requested' <<<"$external_caller_output"
+temporal workflow show \
+  --workflow-id "$external_caller_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+jq -e '
+  [.events[]
+    | select(.eventType == "EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED")
+    | select(
+        .signalExternalWorkflowExecutionInitiatedEventAttributes.signalName ==
+          "external-approve" and
+        (.userMetadata.summary.data | @base64d | fromjson) ==
+          "Approve external Odin Workflow"
+      )]
+  | length == 1
+' "$typed_history_file" >/dev/null
 
 external_target_cli_status=0
 wait "$workflow_cli_pid" || external_target_cli_status=$?

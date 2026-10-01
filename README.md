@@ -123,8 +123,9 @@ Odin emits Core's `StartChildWorkflowExecution`, awaits its separate start and c
 resolutions, decodes typed JSON results and structured Child Workflow failures,
 signals a started child through `SignalExternalWorkflowExecution`, and requests
 explicit or inherited cancellation through `CancelChildWorkflowExecution`. The
-signal APIs preserve Core's repeated argument field, wait for Core's resolution,
-and report server failure causes. Unhandled
+signal APIs preserve Core's repeated argument field, attach an optional
+UI-facing summary to the enclosing command metadata, wait for Core's
+resolution, and report server failure causes. Unhandled
 child failures preserve Core's original Temporal Failure wrapper and cause
 chain when the parent fails. `start_child_workflow_payloads` preserves Core's
 repeated input field, including order, metadata, and external payload details;
@@ -1534,11 +1535,12 @@ target := workflow.External_Workflow_Execution{
     workflow_id = order_workflow_id,
     // Empty run_id targets the current execution.
 }
-signal := workflow.signal_external_workflow_json(
+signal := workflow.signal_external_workflow_json_with_options(
     ctx,
     target,
     "approve",
     approval,
+    {summary = "Approve order"},
 )
 if signal.status == .Succeeded {
     cancel := workflow.request_cancel_external_workflow(
@@ -1549,11 +1551,13 @@ if signal.status == .Succeeded {
 }
 ```
 
-The identity and signal name are borrowed for the call and copied into the
-Workflow arena before suspension. `signal_external_workflow_payloads` and the
-Child Workflow equivalent clone every borrowed Payload in order; their
-singular Payload and JSON forms remain one-argument adapters. The singular
-`_owned` form consumes its Payload. Failure results map Core's not-found,
+The identity, signal name, and optional summary are borrowed for the call and
+copied into the Workflow arena before suspension. The summary is encoded as
+`WorkflowCommand.user_metadata.summary` for both child and external targets.
+`signal_external_workflow_payloads` and the Child Workflow equivalent clone
+every borrowed Payload in order; their singular Payload and JSON forms remain
+one-argument adapters. The singular `_owned` form consumes its Payload. Failure
+results map Core's not-found,
 namespace-not-found, and signal-count-limit causes. This remains a low-level
 execution reference rather than a general client-style handle.
 

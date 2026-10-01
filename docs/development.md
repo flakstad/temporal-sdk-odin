@@ -1773,12 +1773,14 @@ Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
 Parent Close Policy, ID-reuse, cron, versioning-intent, priority, memo, typed
 Search Attribute, static summary, and static details combinations, plus generated
-signal names and zero to twelve decorated JSON Payloads. It checks every encoded
-`StartChildWorkflowExecution` field, including the enclosing command metadata,
-and every `SignalExternalWorkflowExecution` field and requires both commands to be
-byte-identical after eviction and fresh-stack replay. The external Workflow
+signal names, signal summaries, and zero to twelve decorated JSON Payloads. It
+checks every encoded `StartChildWorkflowExecution` field, including the
+enclosing command metadata,
+and every `SignalExternalWorkflowExecution` field and metadata summary, and
+requires both commands to be byte-identical after eviction and fresh-stack
+replay. The external Workflow
 property generates 500 namespace/Workflow ID/optional Run ID identities,
-signal names, JSON payloads, and cancellation reasons. It checks exact
+signal names, summaries, JSON payloads, and cancellation reasons. It checks exact
 `NamespacedWorkflowExecution` targets for signal and cancellation commands and
 requires both completions to be byte-identical after eviction and fresh-stack
 replay. The Continue-As-New property generates 500 replacement Workflow types,
@@ -2003,7 +2005,8 @@ server-backed paths automatically:
   resolves the child as canceled;
 - signaling a child through its Workflow-local Future and waiting for Core's
   `ResolveSignalExternalWorkflow` acknowledgement, using three ordered Payloads
-  with custom metadata and external payload details;
+  with custom metadata and external payload details; the initiated event must
+  retain the command's UI summary;
 - explicit child cancellation through the Future while the parent remains live
   and completes normally after observing the canceled child result;
 - a second start with the same running child ID, producing Core's
@@ -2011,7 +2014,8 @@ server-backed paths automatically:
 - two independent Workflows where one sends an external signal, waits for
   `ResolveSignalExternalWorkflow`, requests target cancellation, waits for
   `ResolveRequestCancelExternalWorkflow`, and completes while the target closes
-  as canceled; the signal carries three ordered Payloads across both workers;
+  as canceled; the signal carries three ordered Payloads and its UI summary
+  across both workers;
 - a Workflow that emits `ContinueAsNewWorkflowExecution` with replacement
   input/timeouts/memo/typed Search Attribute, is evicted, starts a second run
   under the same Workflow ID, reads the replacements there, and returns the
@@ -2354,6 +2358,8 @@ map before invoking the chain. Every interceptor sees the same mutable working
 map, the terminal continuation persists it into the operation, and the original
 builder remains unchanged. External cancellation has no header field, but its
 identity and reason remain mutable semantic input. The record itself is copied;
+child/external signal records include their mutable summary, which the terminal
+continuation JSON-encodes into owned command metadata before suspension.
 `user_data` remains borrowed until `worker.close`. Inputs, header pointers, and
 `next` values are valid only during that call. Continue-As-New's temporary
 working map is reclaimed with the terminal run arena because the call cannot
