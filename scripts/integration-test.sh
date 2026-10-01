@@ -244,6 +244,9 @@ grep -q 'odin_application_events_total{.*} 3' "$workflow_control_output_file"
 grep -q 'Core application metric recorded through the C bridge.' "$workflow_output_file"
 echo "Core Prometheus exporter exposed tagged SDK and Odin application metrics"
 
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/scoped-metrics-integration-test.sh"
+
 eager_workflow_id="odin-sdk-eager-$$-$(date +%s)"
 TEMPORAL_EAGER_WORKFLOW_ID="$eager_workflow_id" \
   TEMPORAL_REPLAY_HISTORY_OUT="$replay_history_file" \

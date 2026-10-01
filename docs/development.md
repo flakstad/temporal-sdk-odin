@@ -556,6 +556,21 @@ It also runs `examples/core_connect` with
 well-formed callback record. The unit suite proves a second simultaneous route
 is rejected and that a fresh forwarding Runtime succeeds after close.
 
+Run the scoped language-metric proof independently with:
+
+```bash
+./scripts/scoped-metrics-integration-test.sh
+```
+
+It uses `temporal server start-dev` directly when no healthy local Service is
+already present. The hello Worker exports Prometheus on a unique loopback port,
+emits a Workflow counter and an Activity-context counter, and deliberately
+waits on a durable timer after Core has evicted and replayed the Workflow. The
+scrape requires automatic `namespace`, `task_queue`, and Workflow/Activity type
+labels, the per-record `scenario` label, and exactly one observation for each
+counter. `scripts/integration-test.sh` includes this focused proof in the full
+live matrix.
+
 Activity cancellation is cooperative. `activity.is_cancellation_requested`
 and `activity.cancellation_reason` expose the primary state Core delivered.
 `activity.cancellation_details` returns the associated snapshot of Core's six

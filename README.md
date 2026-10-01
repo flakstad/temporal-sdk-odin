@@ -362,6 +362,13 @@ return no status, so exporter state cannot influence deterministic control
 flow. Query handlers have corresponding `query_metric_*` procedures. Do not
 call the lower-level Core metric API directly from Workflow code.
 
+`./scripts/scoped-metrics-integration-test.sh` starts the CLI dev server when
+needed, runs a real Workflow and Activity through Core, forces cache eviction
+and fresh-stack replay, and scrapes the live Prometheus endpoint while the
+Workflow is suspended on a durable timer. It requires both scoped counters and
+their automatic attributes to be present with value exactly one; a replayed
+Workflow emission would make the test fail with value two or greater.
+
 Server capability discovery uses the same public Client and generic Core RPC
 bridge:
 

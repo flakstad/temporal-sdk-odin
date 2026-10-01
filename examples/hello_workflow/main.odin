@@ -273,6 +273,29 @@ set_greeting_name_from_signal :: proc(
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
+	if name == "scoped-metrics" {
+		meter := activity.metric_meter(ctx)
+		if meter != nil {
+			counter, create_error := temporal_core.metric_counter_create(
+				meter,
+				"odin_scoped_activity_executions",
+				"Activity executions observed through the scoped Odin meter",
+			)
+			if create_error.message == nil {
+				record_error := temporal_core.metric_counter_add(
+					&counter,
+					1,
+					[]temporal_core.Metric_Attribute{
+						temporal_core.metric_attribute_string("scenario", "live"),
+					},
+				)
+				temporal_core.error_free(&record_error)
+			}
+			temporal_core.error_free(&create_error)
+			temporal_core.metric_close(&counter)
+		}
+		time.sleep(750 * time.Millisecond)
+	}
 	if name == "activity-interceptor" {
 		workflow_header: string
 		found, decode_error := activity.header_json(
@@ -852,6 +875,22 @@ local_retry_activity :: proc(ctx: ^activity.Context, name: string) -> activity.R
 }
 
 hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	if name == "scoped-metrics" {
+		workflow.metric_counter_add(
+			ctx,
+			"odin_scoped_workflow_executions",
+			1,
+			[]workflow.Metric_Attribute{
+				workflow.metric_attribute_string("scenario", "live"),
+			},
+			"Workflow executions observed without replay duplication",
+		)
+		result := workflow.execute_activity(ctx, "hello", name)
+		// Keep the Runtime and Prometheus listener alive after the Activity
+		// resolution has forced a fresh-stack history replay.
+		workflow.sleep(ctx, 5 * time.Second)
+		return result
+	}
 	if name == "join-all" {
 		first := workflow.start_activity(ctx, "hello", "join-fast")
 		second := workflow.start_activity(ctx, "hello", "Temporal-slow")
@@ -1573,7 +1612,25 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 }
 
 main :: proc() {
-	runtime, runtime_error := temporal_core.runtime_create()
+	prometheus_address_buffer: [128]u8
+	prometheus_address := os.get_env(
+		prometheus_address_buffer[:],
+		"TEMPORAL_ODIN_PROMETHEUS_BIND_ADDRESS",
+	)
+	runtime_options := temporal_core.runtime_options_default()
+	prometheus_options := temporal_core.Runtime_Prometheus_Options{}
+	global_metric_tags := [1]temporal_core.Runtime_Key_Value{
+		{key = "sdk_language", value = "odin"},
+	}
+	if len(prometheus_address) > 0 {
+		prometheus_options = {
+			bind_address = prometheus_address,
+			counters_total_suffix = true,
+		}
+		runtime_options.prometheus = &prometheus_options
+		runtime_options.metrics.global_tags = global_metric_tags[:]
+	}
+	runtime, runtime_error := temporal_core.runtime_create_with_options(runtime_options)
 	if runtime_error.message != nil {
 		fmt.eprintf("Core runtime initialization failed: %s\n", string(runtime_error.message))
 		temporal_core.error_free(&runtime_error)
@@ -2038,6 +2095,7 @@ main :: proc() {
 	expect_condition := scenario == "condition" || expect_cached_condition
 	expect_selector := scenario == "selector"
 	expect_join := scenario == "join-all"
+	expect_scoped_metrics := scenario == "scoped-metrics"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
@@ -2179,6 +2237,14 @@ main :: proc() {
 				fmt.eprintln("Workflow selector stats did not match")
 				failed = true
 			}
+		} else if expect_scoped_metrics {
+			if run_stats.activity_tasks_completed != 1 ||
+			   run_stats.workflow_signals_received != 0 ||
+			   run_stats.timers_canceled != 0 ||
+			   run_stats.workflow_replay_activations < 2 {
+				fmt.eprintln("Scoped-metrics Workflow stats did not prove replay")
+				failed = true
+			}
 		} else if expect_typed_payload || expect_failure_details || expect_terminal_failure ||
 		           expect_local_activity || expect_activity_headers || expect_activity_interceptor ||
 		           expect_multiple_activity_arguments {
@@ -2279,6 +2345,8 @@ main :: proc() {
 		fmt.println("multiple Query arguments completed end-to-end through Core")
 	} else if expect_multiple_update_arguments {
 		fmt.println("multiple Update arguments completed end-to-end through Core")
+	} else if expect_scoped_metrics {
+		fmt.println("scoped Activity and replay-safe Workflow metrics completed end-to-end")
 	} else if expect_local_activity {
 		fmt.println("Local Activity completed through Core in the Workflow Worker")
 	} else if expect_local_activity_retry {

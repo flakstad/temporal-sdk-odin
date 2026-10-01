@@ -1255,6 +1255,16 @@ Odin `defer`, and exporter state cannot be used for deterministic branching.
 Calling the lower-level Runtime meter directly from Workflow code remains an
 unsupported replaying side effect.
 
+The focused live proof configures the hello Worker with Core's Prometheus
+exporter, emits one Workflow counter before scheduling an Activity, and emits
+one Activity counter through `activity.metric_meter`. Cache-disabled execution
+then evicts the first fiber, replays the Workflow on a fresh stack, resolves the
+Activity, and suspends on a durable timer. A scrape at that point observes both
+series with their namespace/task-queue/type scope and value exactly one. This
+joins replay classification, language suppression, backend instrument caching,
+Core export, Activity-context ownership, and shutdown in one server-backed
+test rather than inferring the language path from the lower-level meter test.
+
 Logging is deliberately asymmetric. A nil `forward_to` makes Core write to its
 console subscriber. A non-nil callback may be invoked from any Core thread and
 the raw ABI provides no user-data pointer. Odin therefore installs one
