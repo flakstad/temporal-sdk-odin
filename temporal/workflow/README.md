@@ -13,7 +13,9 @@ implements Core's `NotifyHasPatch`/`SetPatchMarker` replay protocol through
 `patched` and `deprecate_patch`. Workflow time, history length/size, replay and
 history-replay status, Continue-As-New suggestions, the current Worker
 Deployment Version, deterministic random values, and UUID v4 values come only
-from activation metadata and Core-provided seeds. `set_current_details` updates
+from activation metadata and Core-provided seeds. Independent `Random_Stream`
+values are seeded by exactly one parent draw and provide deterministic u64/f64,
+unbiased range/index, and UUID v4 operations. `set_current_details` updates
 the response to Temporal's reserved Workflow metadata Query without emitting a
 command. The
 current live Workflow includes:

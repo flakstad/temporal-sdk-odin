@@ -5171,16 +5171,20 @@ now :: proc(ctx: ^Fiber_Context) -> (value: time.Time, present: bool) {
 // random_u64 advances a deterministic per-run stream seeded by Core. The
 // SplitMix64 algorithm and constants are part of Odin Workflow replay
 // compatibility and must not change without versioning.
+random_state_next :: proc(state: ^u64) -> u64 {
+	if state == nil do return 0
+	state^ += 0x9e3779b97f4a7c15
+	value := state^
+	value = (value ~ (value >> 30)) * 0xbf58476d1ce4e5b9
+	value = (value ~ (value >> 27)) * 0x94d049bb133111eb
+	return value ~ (value >> 31)
+}
+
 random_u64 :: proc(ctx: ^Fiber_Context) -> u64 {
 	if ctx == nil || ctx.instance == nil || !ctx.instance.random_initialized {
 		return 0
 	}
-	instance := ctx.instance
-	instance.random_state += 0x9e3779b97f4a7c15
-	value := instance.random_state
-	value = (value ~ (value >> 30)) * 0xbf58476d1ce4e5b9
-	value = (value ~ (value >> 27)) * 0x94d049bb133111eb
-	return value ~ (value >> 31)
+	return random_state_next(&ctx.instance.random_state)
 }
 
 random_f64 :: proc(ctx: ^Fiber_Context) -> f64 {
@@ -5188,13 +5192,65 @@ random_f64 :: proc(ctx: ^Fiber_Context) -> f64 {
 	return f64(random_u64(ctx) >> 11) * (1.0 / 9007199254740992.0)
 }
 
-uuid_v4 :: proc(ctx: ^Fiber_Context) -> string {
+// Random_Stream is an independent deterministic generator created from the
+// Workflow's Core-provided random stream. Creating one consumes exactly one
+// draw from the parent stream. Copying the value intentionally snapshots it.
+// It is Workflow-fiber state and must not be shared with ordinary threads.
+Random_Stream :: struct {
+	state:       u64,
+	initialized: bool,
+	instance:    ^Fiber_Instance,
+}
+
+random_stream_create :: proc(ctx: ^Fiber_Context) -> Random_Stream {
 	if ctx == nil || ctx.instance == nil || !ctx.instance.random_initialized {
-		return ""
+		return {}
 	}
+	return {
+		state = random_u64(ctx),
+		initialized = true,
+		instance = ctx.instance,
+	}
+}
+
+random_stream_u64 :: proc(stream: ^Random_Stream) -> u64 {
+	if stream == nil || !stream.initialized do return 0
+	return random_state_next(&stream.state)
+}
+
+random_stream_f64 :: proc(stream: ^Random_Stream) -> f64 {
+	return f64(random_stream_u64(stream) >> 11) * (1.0 / 9007199254740992.0)
+}
+
+// random_stream_range returns an unbiased value in [minimum, maximum).
+random_stream_range :: proc(
+	stream: ^Random_Stream,
+	minimum, maximum: u64,
+) -> (value: u64, ok: bool) {
+	if stream == nil || !stream.initialized || minimum >= maximum do return 0, false
+	span := maximum - minimum
+	// Values below the threshold would make modulo reduction biased. Unsigned
+	// complement plus one is defined modulo 2^64 and avoids a wider integer.
+	threshold := ((~span) + 1) % span
+	for {
+		draw := random_stream_u64(stream)
+		if draw >= threshold do return minimum + draw % span, true
+	}
+}
+
+random_stream_index :: proc(stream: ^Random_Stream, count: int) -> (index: int, ok: bool) {
+	if count <= 0 do return 0, false
+	value, range_ok := random_stream_range(stream, 0, u64(count))
+	if !range_ok do return 0, false
+	return int(value), true
+}
+
+random_uuid_v4_from_values :: proc(
+	instance: ^Fiber_Instance,
+	first, second: u64,
+) -> string {
+	if instance == nil do return ""
 	id: uuid.Identifier
-	first := random_u64(ctx)
-	second := random_u64(ctx)
 	for index in 0..<8 {
 		id[index] = u8(first >> u64((7 - index) * 8))
 		id[index + 8] = u8(second >> u64((7 - index) * 8))
@@ -5205,15 +5261,31 @@ uuid_v4 :: proc(ctx: ^Fiber_Context) -> string {
 	id[uuid.VARIANT_BYTE_INDEX] |= 0x80
 	result, allocation_error := uuid.to_string_allocated(
 		id,
-		ctx.instance.odin_context.allocator,
+		instance.odin_context.allocator,
 	)
 	if allocation_error != nil {
-		ctx.instance.failure_message = "could not allocate deterministic Workflow UUID"
-		ctx.instance.failure_type = "OdinWorkflowRandomError"
-		ctx.instance.phase = .Failed
+		instance.failure_message = "could not allocate deterministic Workflow UUID"
+		instance.failure_type = "OdinWorkflowRandomError"
+		instance.phase = .Failed
 		return ""
 	}
 	return result
+}
+
+random_stream_uuid_v4 :: proc(stream: ^Random_Stream) -> string {
+	if stream == nil || !stream.initialized || stream.instance == nil do return ""
+	return random_uuid_v4_from_values(
+		stream.instance,
+		random_stream_u64(stream),
+		random_stream_u64(stream),
+	)
+}
+
+uuid_v4 :: proc(ctx: ^Fiber_Context) -> string {
+	if ctx == nil || ctx.instance == nil || !ctx.instance.random_initialized {
+		return ""
+	}
+	return random_uuid_v4_from_values(ctx.instance, random_u64(ctx), random_u64(ctx))
 }
 
 find_patch_decision :: proc(

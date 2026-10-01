@@ -3698,7 +3698,14 @@ including when `InitializeWorkflow` precedes the update job in the serialized
 activation. This keeps Signal/Update routines and the main fiber on one shared,
 deterministically ordered stream.
 
-The initial Odin API provides `random_u64`, `random_f64`, and `uuid_v4`.
+The Odin API provides `random_u64`, `random_f64`, and `uuid_v4` on the shared
+per-run stream. `random_stream_create` consumes exactly one shared draw and
+returns an independent value-state SplitMix64 generator. Its u64/f64 and UUID
+operations use the same pinned algorithm; range/index helpers use rejection
+sampling so arbitrary non-power-of-two bounds are unbiased. Copying a stream
+snapshots it intentionally. Existing stream values are not mutated by a later
+`UpdateRandomSeed`; because Core seed updates are pre-scanned, streams created
+after that activation context is applied derive from the new parent state.
 SplitMix64 was selected as a tiny, locally implemented generator so replay does
 not depend on an Odin standard-library algorithm changing. Its algorithm and
 constants are now compatibility state. `random_f64` uses the high 53 bits and
@@ -3709,13 +3716,13 @@ detected as mutation and rolled back.
 
 One unit test fixes a Core seed, timestamp, and history length, then requires an
 identical terminal completion after eviction and replay. A 500-case property
-varies all three plus optional `UpdateRandomSeed`, checks the exact SplitMix64
-oracle, and again requires byte-identical completion. The live patch example
-also reads Workflow time and produces a deterministic UUID/random value using
-the real CLI dev server. Named isolated streams and richer numeric/range helpers
-are still pending. All information fields in the pinned `InitializeWorkflow`
-schema are now preserved; its user argument surface remains intentionally
-single-Payload pending a separate API design.
+varies all three plus optional `UpdateRandomSeed`, non-power-of-two range and
+index bounds, checks every exact shared/independent SplitMix64 draw, and again
+requires byte-identical completion. The live patch example also reads Workflow
+time and produces shared and independent deterministic UUID/range/index values
+using the real CLI dev server. All information fields in the pinned
+`InitializeWorkflow` schema are preserved, including ordered repeated Payload
+arguments.
 
 ### Per-activation metadata and current details
 

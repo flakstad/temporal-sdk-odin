@@ -157,9 +157,11 @@ same activation-context layer now exposes `workflow.now`, `history_length`,
 `history_size_bytes`, `is_replaying`, `is_replaying_history_events`, the
 Continue-As-New suggestion and current Worker Deployment Version, plus
 deterministic `random_u64`/`random_f64` and `uuid_v4` without consulting host
-time or OS entropy. `set_current_details` feeds Temporal's reserved Workflow
-metadata Query without adding a history event. Core-provided start/reset seeds
-are applied before user code resumes. Local Activities now run through Core's dedicated
+time or OS entropy. Independent `Random_Stream` values add unbiased ranges,
+indexes, floating-point values, and UUID v4 generation while consuming only
+the history-derived parent stream. `set_current_details` feeds Temporal's
+reserved Workflow metadata Query without adding a history event. Core-provided
+start/reset seeds are applied before user code resumes. Local Activities now run through Core's dedicated
 local task path: Workflow code emits `ScheduleLocalActivity`, the same Odin
 Activity registry receives a callback with `activity.info(ctx).is_local`, and
 `ResolveActivity(is_local=true)` resumes the fiber. The API exposes typed JSON
@@ -1626,14 +1628,24 @@ current_time, available := workflow.now(ctx)
 choice := workflow.random_u64(ctx)
 ratio := workflow.random_f64(ctx)
 request_id := workflow.uuid_v4(ctx)
+
+random := workflow.random_stream_create(ctx)
+shard, ok := workflow.random_stream_range(&random, 0, 16)
+index, index_ok := workflow.random_stream_index(&random, len(candidates))
+correlation_id := workflow.random_stream_uuid_v4(&random)
 ```
 
 `now` is constant within an activation and returns Core's history-derived
 timestamp. The random stream is seeded by `InitializeWorkflow` and reset by a
 pre-scanned `UpdateRandomSeed`; its SplitMix64 sequence is replay compatibility
 state and is not cryptographically secure. `uuid_v4` consumes that stream and
-returns a lowercase RFC 4122 variant/version string. Named isolated random
-streams are not implemented yet.
+returns a lowercase RFC 4122 variant/version string. Creating a `Random_Stream`
+consumes exactly one draw from the parent and then advances independently.
+Copying it intentionally snapshots its state. Existing streams retain their
+state across later activations; a pre-scanned Core seed update affects parent
+draws and streams created after that update. Range reduction uses rejection
+sampling rather than biased modulo reduction. These values are Workflow-only
+and are not safe for sharing with ordinary threads.
 
 Per-activation introspection is also history-derived:
 

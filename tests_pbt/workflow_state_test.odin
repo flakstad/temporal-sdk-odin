@@ -4165,6 +4165,12 @@ workflow_patch_truth_table_for_generated_values :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+Generated_Determinism_Input :: struct {
+	range_minimum: u64,
+	range_width:   u64,
+	index_count:   int,
+}
+
 Generated_Determinism_Output :: struct {
 	time_nanoseconds: i64,
 	history_length:   u32,
@@ -4172,13 +4178,17 @@ Generated_Determinism_Output :: struct {
 	second:           i64,
 	fraction:         f64,
 	uuid:             string,
+	stream_first:     i64,
+	stream_fraction:  f64,
+	stream_range:     u64,
+	stream_index:     int,
+	stream_uuid:      string,
 }
 
 generated_determinism_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
-	input: string,
+	input: Generated_Determinism_Input,
 ) -> Generated_Determinism_Output {
-	_ = input
 	activation_time, present := workflow.now(ctx)
 	result := Generated_Determinism_Output{}
 	result.history_length = workflow.history_length(ctx)
@@ -4186,6 +4196,16 @@ generated_determinism_workflow :: proc(
 	result.second = i64(workflow.random_u64(ctx) & 0x7fff_ffff_ffff_ffff)
 	result.fraction = workflow.random_f64(ctx)
 	result.uuid = workflow.uuid_v4(ctx)
+	stream := workflow.random_stream_create(ctx)
+	result.stream_first = i64(workflow.random_stream_u64(&stream) & 0x7fff_ffff_ffff_ffff)
+	result.stream_fraction = workflow.random_stream_f64(&stream)
+	result.stream_range, _ = workflow.random_stream_range(
+		&stream,
+		input.range_minimum,
+		input.range_minimum + input.range_width,
+	)
+	result.stream_index, _ = workflow.random_stream_index(&stream, input.index_count)
+	result.stream_uuid = workflow.random_stream_uuid_v4(&stream)
 	if present {
 		result.time_nanoseconds = time.to_unix_nanoseconds(activation_time)
 	}
@@ -4198,6 +4218,15 @@ splitmix64_next :: proc(state: ^u64) -> u64 {
 	value = (value ~ (value >> 30)) * 0xbf58476d1ce4e5b9
 	value = (value ~ (value >> 27)) * 0x94d049bb133111eb
 	return value ~ (value >> 31)
+}
+
+splitmix64_range :: proc(state: ^u64, minimum, maximum: u64) -> u64 {
+	span := maximum - minimum
+	threshold := ((~span) + 1) % span
+	for {
+		draw := splitmix64_next(state)
+		if draw >= threshold do return minimum + draw % span
+	}
 }
 
 decode_determinism_completion :: proc(
@@ -4238,6 +4267,15 @@ decode_determinism_completion :: proc(
 				return {}, false
 			}
 			output.uuid = owned_uuid
+			owned_stream_uuid, stream_allocation_error := strings.clone(
+				output.stream_uuid,
+				previous_allocator,
+			)
+			if stream_allocation_error != nil {
+				delete(output.uuid)
+				return {}, false
+			}
+			output.stream_uuid = owned_stream_uuid
 			return output, true
 		}
 	}
@@ -4251,8 +4289,18 @@ workflow_deterministic_primitives_property :: proc(t: ^pbt.T) -> pbt.Result {
 	seconds := i64(pbt.draw(t, pbt.int_range(1_000_000_000, 2_000_000_000)))
 	nanos := i32(pbt.draw(t, pbt.int_range(0, 999_999_999)))
 	history := u32(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	wide_rejection_range := pbt.draw(t, pbt.boolean())
+	range_minimum := u64(0)
+	range_width := u64(0x8000_0000_0000_0001)
+	if !wide_rejection_range {
+		range_minimum = u64(pbt.draw(t, pbt.int_range(0, 1_000_000)))
+		range_width = u64(pbt.draw(t, pbt.int_range(1, 1_000_000)))
+	}
+	index_count := pbt.draw(t, pbt.int_range(1, 10_000))
 	pbt.cover(t, has_update, 30.0, "Core seed update")
 	pbt.cover(t, !has_update, 30.0, "initial seed")
+	pbt.cover(t, wide_rejection_range, 30.0, "range with frequent rejected draws")
+	pbt.cover(t, !wide_rejection_range, 30.0, "ordinary application range")
 
 	owned_queue, queue_error := strings.clone("pbt-determinism-queue")
 	if queue_error != nil {
@@ -4279,7 +4327,11 @@ workflow_deterministic_primitives_property :: proc(t: ^pbt.T) -> pbt.Result {
 	worker.error_free(&register_error)
 	runtime := &sdk_worker.workflow_registrations[0].runtime
 
-	input, encode_error := codec.encode_json("input")
+	input, encode_error := codec.encode_json(Generated_Determinism_Input{
+		range_minimum = range_minimum,
+		range_width = range_width,
+		index_count = index_count,
+	})
 	if encode_error != .None {
 		return pbt.error("could not encode determinism input")
 	}
@@ -4329,22 +4381,48 @@ workflow_deterministic_primitives_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	output, decoded := decode_determinism_completion(fresh.completion[:])
 	defer delete(output.uuid)
+	defer delete(output.stream_uuid)
 	effective_seed := has_update ? updated_seed : initial_seed
 	expected_state := effective_seed
 	expected_first := i64(splitmix64_next(&expected_state) & 0x7fff_ffff_ffff_ffff)
 	expected_second := i64(splitmix64_next(&expected_state) & 0x7fff_ffff_ffff_ffff)
 	expected_fraction := f64(splitmix64_next(&expected_state) >> 11) *
 		(1.0 / 9007199254740992.0)
+	// UUID v4 consumes two parent draws before stream creation consumes its seed.
+	_ = splitmix64_next(&expected_state)
+	_ = splitmix64_next(&expected_state)
+	stream_state := splitmix64_next(&expected_state)
+	expected_stream_first := i64(splitmix64_next(&stream_state) & 0x7fff_ffff_ffff_ffff)
+	expected_stream_fraction := f64(splitmix64_next(&stream_state) >> 11) *
+		(1.0 / 9007199254740992.0)
+	expected_stream_range := splitmix64_range(
+		&stream_state,
+		range_minimum,
+		range_minimum + range_width,
+	)
+	expected_stream_index := int(splitmix64_range(&stream_state, 0, u64(index_count)))
+	// The stream UUID consumes its next two draws.
+	_ = splitmix64_next(&stream_state)
+	_ = splitmix64_next(&stream_state)
 	fraction_difference := output.fraction - expected_fraction
 	if fraction_difference < 0 {
 		fraction_difference = -fraction_difference
 	}
+	stream_fraction_difference := output.stream_fraction - expected_stream_fraction
+	if stream_fraction_difference < 0 {
+		stream_fraction_difference = -stream_fraction_difference
+	}
 	if !decoded || output.time_nanoseconds != seconds * i64(time.Second) + i64(nanos) ||
 	   output.history_length != history || output.first != expected_first ||
 	   output.second != expected_second || fraction_difference > 1e-15 ||
-	   len(output.uuid) != 36 || output.uuid[14] != '4' {
+	   len(output.uuid) != 36 || output.uuid[14] != '4' ||
+	   output.stream_first != expected_stream_first ||
+	   stream_fraction_difference > 1e-15 ||
+	   output.stream_range != expected_stream_range ||
+	   output.stream_index != expected_stream_index ||
+	   len(output.stream_uuid) != 36 || output.stream_uuid[14] != '4' {
 		return pbt.fail(fmt.tprintf(
-			"deterministic mismatch decoded=%v time=%d/%d history=%d/%d first=%d/%d second=%d/%d fraction=%v/%v uuid=%q",
+			"deterministic mismatch decoded=%v time=%d/%d history=%d/%d first=%d/%d second=%d/%d fraction=%v/%v uuid=%q stream_first=%d/%d stream_fraction=%v/%v stream_range=%d/%d stream_index=%d/%d stream_uuid=%q",
 			decoded,
 			output.time_nanoseconds,
 			seconds * i64(time.Second) + i64(nanos),
@@ -4357,6 +4435,15 @@ workflow_deterministic_primitives_property :: proc(t: ^pbt.T) -> pbt.Result {
 			output.fraction,
 			expected_fraction,
 			output.uuid,
+			output.stream_first,
+			expected_stream_first,
+			output.stream_fraction,
+			expected_stream_fraction,
+			output.stream_range,
+			expected_stream_range,
+			output.stream_index,
+			expected_stream_index,
+			output.stream_uuid,
 		))
 	}
 

@@ -6208,7 +6208,22 @@ deterministic_primitives_test_workflow :: proc(
 	if first == second || fraction < 0 || fraction >= 1 {
 		return "invalid Workflow random stream"
 	}
-	return workflow.uuid_v4(ctx)
+	identifier := workflow.uuid_v4(ctx)
+	stream := workflow.random_stream_create(ctx)
+	stream_first := workflow.random_stream_u64(&stream)
+	stream_second := workflow.random_stream_u64(&stream)
+	stream_fraction := workflow.random_stream_f64(&stream)
+	ranged, range_ok := workflow.random_stream_range(&stream, 17, 53)
+	index, index_ok := workflow.random_stream_index(&stream, 7)
+	stream_identifier := workflow.random_stream_uuid_v4(&stream)
+	_, empty_range_ok := workflow.random_stream_range(&stream, 4, 4)
+	_, empty_index_ok := workflow.random_stream_index(&stream, 0)
+	if stream_first == stream_second || stream_fraction < 0 || stream_fraction >= 1 ||
+	   !range_ok || ranged < 17 || ranged >= 53 || !index_ok || index < 0 || index >= 7 ||
+	   len(stream_identifier) != 36 || empty_range_ok || empty_index_ok {
+		return "invalid independent Workflow random stream"
+	}
+	return identifier
 }
 
 Workflow_Log_Capture :: struct {

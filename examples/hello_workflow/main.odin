@@ -1383,8 +1383,14 @@ patch_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		_ = activation_time
 		identifier := workflow.uuid_v4(ctx)
 		random_fraction := workflow.random_f64(ctx)
+		random_stream := workflow.random_stream_create(ctx)
+		stream_choice, stream_choice_ok := workflow.random_stream_range(&random_stream, 10, 20)
+		stream_index, stream_index_ok := workflow.random_stream_index(&random_stream, 4)
+		stream_identifier := workflow.random_stream_uuid_v4(&random_stream)
 		if !has_time || workflow.history_length(ctx) == 0 || len(identifier) != 36 ||
-		   random_fraction < 0 || random_fraction >= 1 {
+		   random_fraction < 0 || random_fraction >= 1 || !stream_choice_ok ||
+		   stream_choice < 10 || stream_choice >= 20 || !stream_index_ok ||
+		   stream_index < 0 || stream_index >= 4 || len(stream_identifier) != 36 {
 			return "invalid deterministic Workflow context"
 		}
 		result, allocation_error := strings.concatenate({"Patched ", name, " ", identifier})

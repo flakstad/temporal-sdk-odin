@@ -221,8 +221,10 @@ preservation of deployment/build identity, routing intent, and default behavior
 across the Odin-to-C ABI mapping. Another 500 generate global and per-type
 nondeterminism policies containing zero to twelve Workflow types and require
 exact C-array preservation. Another
-500 activation contexts vary initial/reset seeds, timestamps, and history
-lengths, then require exact random values and byte-identical fresh-stack replay.
+500 activation contexts vary initial/reset seeds, timestamps, history lengths,
+and non-power-of-two range/index bounds. They require exact shared-stream and
+independent-stream SplitMix64 values, unbiased rejection-sampling results, UUID
+shape, and byte-identical fresh-stack replay.
 Another 500 generated stack policies cover default, minimum, aligned custom,
 below-minimum, and above-maximum sizes independently for Workflow, Signal, and
 Update fibers. Unit tests inspect the actual native coroutine sizes, not only
