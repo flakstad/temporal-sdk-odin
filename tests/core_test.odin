@@ -103,6 +103,13 @@ Client_Interceptor_Test_State :: struct {
 	nexus_describe_seen:     bool,
 	nexus_mutation_seen:     bool,
 	nexus_mutation_kind:     temporal_client.Nexus_Operation_Mutation_Kind,
+	activity_start_seen:     bool,
+	activity_poll_seen:      bool,
+	activity_describe_seen:  bool,
+	activity_mutation_seen:  bool,
+	activity_mutation_kind:  temporal_client.Standalone_Activity_Mutation_Kind,
+	activity_list_seen:      bool,
+	activity_count_seen:     bool,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -623,6 +630,158 @@ client_interceptor_test_nexus_operation_mutation :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result
+}
+
+client_interceptor_test_start_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Start_Standalone_Activity_Input,
+	next: temporal_client.Client_Start_Standalone_Activity_Next,
+) -> (temporal_client.Standalone_Activity_Handle, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.activity_type = "intercepted-activity"
+	} else {
+		node.state.activity_start_seen = input.options.activity_type == "intercepted-activity"
+	}
+	result: temporal_client.Standalone_Activity_Handle
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity start short circuit")
+	} else {
+		result, result_error = temporal_client.client_start_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_poll_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Poll_Standalone_Activity_Input,
+	next: temporal_client.Client_Poll_Standalone_Activity_Next,
+) -> (temporal_client.Standalone_Activity_Poll_Result, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.timeout = 3 * time.Second
+	} else {
+		node.state.activity_poll_seen = input.options.timeout == 3 * time.Second
+	}
+	result: temporal_client.Standalone_Activity_Poll_Result
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity poll short circuit")
+	} else {
+		result, result_error = temporal_client.client_poll_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_describe_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Describe_Standalone_Activity_Input,
+	next: temporal_client.Client_Describe_Standalone_Activity_Next,
+) -> (temporal_client.Standalone_Activity_Description, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.include_input = true
+	} else {
+		node.state.activity_describe_seen = input.options.include_input
+	}
+	result: temporal_client.Standalone_Activity_Description
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity Describe short circuit")
+	} else {
+		result, result_error = temporal_client.client_describe_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_standalone_activity_mutation :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Standalone_Activity_Mutation_Input,
+	next: temporal_client.Client_Standalone_Activity_Mutation_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.reason = "intercepted Activity mutation"
+	} else {
+		node.state.activity_mutation_seen = input.reason == "intercepted Activity mutation"
+		node.state.activity_mutation_kind = input.kind
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "standalone Activity mutation short circuit")
+	} else {
+		result = temporal_client.client_standalone_activity_mutation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
+client_interceptor_test_list_standalone_activities :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_List_Standalone_Activities_Input,
+	next: temporal_client.Client_List_Standalone_Activities_Next,
+) -> (temporal_client.Standalone_Activity_List_Page, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.query = `ActivityId = "intercepted"`
+		input.options.page_size = 23
+	} else {
+		node.state.activity_list_seen = input.options.query == `ActivityId = "intercepted"` &&
+		                                input.options.page_size == 23
+	}
+	result: temporal_client.Standalone_Activity_List_Page
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity list short circuit")
+	} else {
+		result, result_error = temporal_client.client_list_standalone_activities_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_count_standalone_activities :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Count_Standalone_Activities_Input,
+	next: temporal_client.Client_Count_Standalone_Activities_Next,
+) -> (temporal_client.Standalone_Activity_Count, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.query = `ActivityStatus = "Running"`
+	} else {
+		node.state.activity_count_seen = input.query == `ActivityStatus = "Running"`
+	}
+	result: temporal_client.Standalone_Activity_Count
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity count short circuit")
+	} else {
+		result, result_error = temporal_client.client_count_standalone_activities_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
 }
 
 @(test)
@@ -11023,6 +11182,108 @@ client_nexus_lifecycle_interceptors_nest_and_propagate_mutations :: proc(t: ^tes
 		testing.expect_value(t, state.nexus_mutation_kind, kind)
 		for event, index in expected do testing.expect_value(t, state.events[index], event)
 	}
+}
+
+@(test)
+client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		namespace = "default",
+		identity = "odin-interceptor-test",
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	nodes := [?]^Client_Interceptor_Test_Node{&first, &second}
+	for node in nodes {
+		append(&client.interceptors, temporal_client.Client_Interceptor{
+			user_data = node,
+			start_standalone_activity = client_interceptor_test_start_standalone_activity,
+			poll_standalone_activity = client_interceptor_test_poll_standalone_activity,
+			describe_standalone_activity = client_interceptor_test_describe_standalone_activity,
+			standalone_activity_mutation = client_interceptor_test_standalone_activity_mutation,
+			list_standalone_activities = client_interceptor_test_list_standalone_activities,
+			count_standalone_activities = client_interceptor_test_count_standalone_activities,
+		})
+	}
+	handle := temporal_client.Standalone_Activity_Handle{
+		client = &client,
+		id = "interceptor-activity",
+		run_id = "interceptor-run",
+	}
+	expected := [?]int{1, 2, -2, -1}
+
+	started, start_error := temporal_client.start_standalone_activity_payload(
+		&client,
+		{},
+		{
+			id = "interceptor-activity",
+			activity_type = "caller-activity",
+			task_queue = "queue",
+			start_to_close_timeout = time.Minute,
+		},
+	)
+	temporal_client.standalone_activity_handle_free(&started)
+	testing.expect_value(t, string(start_error.message), "standalone Activity start short circuit")
+	temporal_client.error_free(&start_error)
+	testing.expect(t, state.activity_start_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	state.count = 0
+	polled, poll_error := temporal_client.poll_standalone_activity(&handle)
+	temporal_client.standalone_activity_poll_result_free(&polled)
+	testing.expect_value(t, string(poll_error.message), "standalone Activity poll short circuit")
+	temporal_client.error_free(&poll_error)
+	testing.expect(t, state.activity_poll_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	state.count = 0
+	description, describe_error := temporal_client.describe_standalone_activity(&handle)
+	temporal_client.standalone_activity_description_free(&description)
+	testing.expect_value(t, string(describe_error.message), "standalone Activity Describe short circuit")
+	temporal_client.error_free(&describe_error)
+	testing.expect(t, state.activity_describe_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	for kind in temporal_client.Standalone_Activity_Mutation_Kind {
+		state.count = 0
+		state.activity_mutation_seen = false
+		mutation_error := temporal_client.standalone_activity_mutation(
+			&handle,
+			kind,
+			"caller reason",
+		)
+		testing.expect_value(t, string(mutation_error.message), "standalone Activity mutation short circuit")
+		temporal_client.error_free(&mutation_error)
+		testing.expect(t, state.activity_mutation_seen)
+		testing.expect_value(t, state.activity_mutation_kind, kind)
+		for event, index in expected do testing.expect_value(t, state.events[index], event)
+	}
+
+	state.count = 0
+	page, list_error := temporal_client.list_standalone_activities(
+		&client,
+		{page_size = 5, query = `ActivityId = "caller"`},
+	)
+	temporal_client.standalone_activity_list_page_free(&page)
+	testing.expect_value(t, string(list_error.message), "standalone Activity list short circuit")
+	temporal_client.error_free(&list_error)
+	testing.expect(t, state.activity_list_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	state.count = 0
+	count, count_error := temporal_client.count_standalone_activities(
+		&client,
+		`ActivityStatus = "Completed"`,
+	)
+	temporal_client.standalone_activity_count_free(&count)
+	testing.expect_value(t, string(count_error.message), "standalone Activity count short circuit")
+	temporal_client.error_free(&count_error)
+	testing.expect(t, state.activity_count_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
 }
 
 @(test)
@@ -25498,6 +25759,38 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 		non_retryable_error_types = []string{"BadOrder"},
 	}
 	priority := temporal_client.Priority{priority_key = 3, fairness_key = "customer-42", fairness_weight = 1.5}
+	start_metadata := temporal_client.Start_Metadata{}
+	start_metadata_error := temporal_client.start_metadata_init(&start_metadata)
+	testing.expect(t, start_metadata_error.message == nil)
+	temporal_client.error_free(&start_metadata_error)
+	defer temporal_client.start_metadata_free(&start_metadata)
+	header_error := temporal_client.start_metadata_add_header_json(&start_metadata, "trace-id", "trace-42")
+	testing.expect(t, header_error.message == nil)
+	temporal_client.error_free(&header_error)
+	search_error := temporal_client.start_metadata_add_search_attribute_json(
+		&start_metadata,
+		"OrderId",
+		.Keyword,
+		"order-42",
+	)
+	testing.expect(t, search_error.message == nil)
+	temporal_client.error_free(&search_error)
+	summary_error := temporal_client.start_metadata_set_static_summary(&start_metadata, "Charge order")
+	testing.expect(t, summary_error.message == nil)
+	temporal_client.error_free(&summary_error)
+	on_conflict := temporal_client.Standalone_Activity_On_Conflict_Options{
+		attach_request_id = true,
+		attach_completion_callbacks = true,
+		attach_links = true,
+	}
+	links := [?]temporal_client.Link{{
+		kind = .Workflow,
+		workflow = {namespace = "orders", workflow_id = "order-42", run_id = "workflow-run"},
+	}}
+	callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+		url = "https://callbacks.invalid/activity",
+		headers = []temporal_client.Nexus_Callback_Header{{key = "callback-key", value = "callback-value"}},
+	}}
 	request_bytes, request_error := temporal_client.encode_start_standalone_activity_request(
 		"orders",
 		"odin-client",
@@ -25516,6 +25809,10 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 			priority = &priority,
 			id_reuse_policy = .Reject_Duplicate,
 			id_conflict_policy = .Use_Existing,
+			on_conflict_options = &on_conflict,
+			metadata = &start_metadata,
+			links = links[:],
+			completion_callbacks = callbacks[:],
 		},
 	)
 	defer delete(request_bytes)
@@ -25552,6 +25849,17 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 			testing.expect_value(t, request.priority.priority_key, i32(3))
 			testing.expect_value(t, request.priority.fairness_key, "customer-42")
 		}
+		testing.expect(t, request.on_conflict_options != nil)
+		if request.on_conflict_options != nil {
+			testing.expect(t, request.on_conflict_options.attach_request_id)
+			testing.expect(t, request.on_conflict_options.attach_completion_callbacks)
+			testing.expect(t, request.on_conflict_options.attach_links)
+		}
+		testing.expect(t, request.header != nil && len(request.header.fields) == 1)
+		testing.expect(t, request.search_attributes != nil && len(request.search_attributes.indexed_fields) == 1)
+		testing.expect(t, request.user_metadata != nil && request.user_metadata.summary != nil)
+		testing.expect_value(t, len(request.links), 1)
+		testing.expect_value(t, len(request.completion_callbacks), 1)
 	}
 	virtual.arena_destroy(&decode_arena)
 

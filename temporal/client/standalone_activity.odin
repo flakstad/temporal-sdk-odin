@@ -25,6 +25,12 @@ Standalone_Activity_Id_Conflict_Policy :: enum {
 	Use_Existing,
 }
 
+Standalone_Activity_On_Conflict_Options :: struct {
+	attach_request_id:           bool,
+	attach_completion_callbacks: bool,
+	attach_links:                bool,
+}
+
 // Start_Standalone_Activity_Options borrows all values for the synchronous
 // call. At least one close timeout must be positive.
 Start_Standalone_Activity_Options :: struct {
@@ -41,6 +47,12 @@ Start_Standalone_Activity_Options :: struct {
 	priority:                  ^Priority,
 	id_reuse_policy:           Standalone_Activity_Id_Reuse_Policy,
 	id_conflict_policy:        Standalone_Activity_Id_Conflict_Policy,
+	on_conflict_options:       ^Standalone_Activity_On_Conflict_Options,
+	// Header Payloads, Search Attributes, and static summary/details apply.
+	// Start_Metadata.memo is ignored because standalone Activities have no Memo.
+	metadata:                  ^Start_Metadata,
+	links:                     []Link,
+	completion_callbacks:      []Nexus_Completion_Callback,
 }
 
 // Standalone_Activity_Handle owns its IDs and borrows the Client. Free the
@@ -299,6 +311,27 @@ start_standalone_activity_options_error :: proc(options: Start_Standalone_Activi
 	   i32(options.id_conflict_policy) > i32(Standalone_Activity_Id_Conflict_Policy.Use_Existing) {
 		return "standalone Activity ID conflict policy is invalid"
 	}
+	if options.on_conflict_options != nil && options.id_conflict_policy != .Use_Existing {
+		return "standalone Activity on-conflict options require Use Existing conflict policy"
+	}
+	if options.metadata != nil && options.metadata.allocator.procedure == nil {
+		return "standalone Activity start metadata is not initialized"
+	}
+	for link in options.links {
+		if message := link_error(link); len(message) > 0 do return message
+	}
+	for callback in options.completion_callbacks {
+		if len(callback.url) == 0 do return "standalone Activity completion callback URL must not be empty"
+		for header in callback.headers {
+			if len(header.key) == 0 do return "standalone Activity completion callback header keys must not be empty"
+		}
+		for link in callback.links {
+			if message := link_error(link); len(message) > 0 do return message
+		}
+		for link in callback.workflow_event_links {
+			if message := workflow_event_link_error(link); len(message) > 0 do return message
+		}
+	}
 	if options.retry_policy != nil {
 		policy := options.retry_policy
 		if policy.initial_interval < 0 || policy.maximum_interval < 0 || policy.maximum_attempts < 0 {
@@ -361,6 +394,15 @@ encode_start_standalone_activity_request :: proc(
 		id_reuse_policy = standalone_activity_id_reuse_policy_to_proto(options.id_reuse_policy),
 		id_conflict_policy = standalone_activity_id_conflict_policy_to_proto(options.id_conflict_policy),
 	}
+	on_conflict_options := proto.Temporal_Api_Common_V1_OnConflictOptions{}
+	if options.on_conflict_options != nil {
+		on_conflict_options = {
+			attach_request_id = options.on_conflict_options.attach_request_id,
+			attach_completion_callbacks = options.on_conflict_options.attach_completion_callbacks,
+			attach_links = options.on_conflict_options.attach_links,
+		}
+		request.on_conflict_options = &on_conflict_options
+	}
 	schedule_to_close := duration_proto(options.schedule_to_close_timeout)
 	schedule_to_start := duration_proto(options.schedule_to_start_timeout)
 	start_to_close := duration_proto(options.start_to_close_timeout)
@@ -401,14 +443,120 @@ encode_start_standalone_activity_request :: proc(
 		}
 		request.priority = &priority
 	}
+	header := proto.Temporal_Api_Common_V1_Header{}
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	user_metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{}
+	static_summary := proto.Temporal_Api_Common_V1_Payload{}
+	static_details := proto.Temporal_Api_Common_V1_Payload{}
+	header_payloads: []proto.Temporal_Api_Common_V1_Payload
+	search_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(header.fields)
+	defer delete(search_attributes.indexed_fields)
+	defer free_start_proto_payloads(header_payloads)
+	defer free_start_proto_payloads(search_payloads)
+	defer delete(static_summary.metadata)
+	defer delete(static_summary.external_payloads)
+	defer delete(static_details.metadata)
+	defer delete(static_details.external_payloads)
+	if options.metadata != nil {
+		metadata := options.metadata
+		if metadata.has_static_summary {
+			static_summary = proto.encode_payload(codec.payload_view(&metadata.static_summary))
+			user_metadata.summary = &static_summary
+		}
+		if metadata.has_static_details {
+			static_details = proto.encode_payload(codec.payload_view(&metadata.static_details))
+			user_metadata.details = &static_details
+		}
+		if metadata.has_static_summary || metadata.has_static_details {
+			request.user_metadata = &user_metadata
+		}
+		if len(metadata.headers) > 0 {
+			header_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.headers))
+			for &entry, index in metadata.headers {
+				header_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.headers {
+				append(&header.fields, proto.Temporal_Api_Common_V1_Header_FieldsEntry{
+					key = entry.key,
+					value = &header_payloads[index],
+				})
+			}
+			request.header = &header
+		}
+		if len(metadata.search_attributes) > 0 {
+			search_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.search_attributes))
+			for &entry, index in metadata.search_attributes {
+				search_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.search_attributes {
+				append(
+					&search_attributes.indexed_fields,
+					proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+						key = entry.key,
+						value = &search_payloads[index],
+					},
+				)
+			}
+			request.search_attributes = &search_attributes
+		}
+	}
+
+	total_link_count := len(options.links)
+	for callback in options.completion_callbacks {
+		total_link_count += len(callback.links) + len(callback.workflow_event_links)
+	}
+	link_storage := encoded_link_storage_make(total_link_count)
+	defer encoded_link_storage_free(&link_storage)
+	defer delete(request.links)
+	for link in options.links do append(&request.links, encode_link(link, &link_storage))
+
+	callback_values := make([]proto.Temporal_Api_Common_V1_Callback_Nexus, len(options.completion_callbacks))
+	callback_headers := make([][dynamic]proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry, len(options.completion_callbacks))
+	callback_links := make([][dynamic]proto.Temporal_Api_Common_V1_Link, len(options.completion_callbacks))
+	defer {
+		for headers in callback_headers do delete(headers)
+		for links in callback_links do delete(links)
+		delete(callback_links)
+		delete(callback_headers)
+		delete(callback_values)
+		delete(request.completion_callbacks)
+	}
+	for callback, index in options.completion_callbacks {
+		callback_values[index].url = callback.url
+		for callback_header in callback.headers {
+			append(
+				&callback_headers[index],
+				proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry{
+					key = callback_header.key,
+					value = callback_header.value,
+				},
+			)
+		}
+		callback_values[index].header = callback_headers[index]
+		for link in callback.links do append(&callback_links[index], encode_link(link, &link_storage))
+		for link in callback.workflow_event_links {
+			append(&callback_links[index], encode_link({kind = .Workflow_Event, workflow_event = link}, &link_storage))
+		}
+		append(&request.completion_callbacks, proto.Temporal_Api_Common_V1_Callback{
+			links = callback_links[index],
+			variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus{
+				value = &callback_values[index],
+			},
+		})
+	}
 	return proto.encode_Temporal_Api_Workflowservice_V1_StartActivityExecutionRequest(&request), {}
 }
 
-start_standalone_activity_payload :: proc(
-	client: ^Client,
-	input: codec.Payload_View,
-	options: Start_Standalone_Activity_Options,
+start_standalone_activity_payload_terminal :: proc(
+	interceptor_input: ^Client_Start_Standalone_Activity_Input,
 ) -> (Standalone_Activity_Handle, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity start interceptor input is missing")
+	}
+	client := interceptor_input.client
+	input := interceptor_input.input
+	options := interceptor_input.options
 	if client == nil || client.connection == nil || client.connection.handle == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -440,6 +588,23 @@ start_standalone_activity_payload :: proc(
 	if handle_error.message != nil do return {}, handle_error
 	handle.started_by_request = response.started
 	return handle, {}
+}
+
+start_standalone_activity_payload :: proc(
+	client: ^Client,
+	input: codec.Payload_View,
+	options: Start_Standalone_Activity_Options,
+) -> (Standalone_Activity_Handle, Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
+	}
+	interceptor_input := Client_Start_Standalone_Activity_Input{
+		client = client,
+		input = input,
+		options = options,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_start_standalone_activity_chain(&state, &interceptor_input)
 }
 
 start_standalone_activity_json :: proc(
@@ -873,11 +1038,15 @@ decode_standalone_activity_description :: proc(
 	return description, {}
 }
 
-describe_standalone_activity :: proc(
-	handle: ^Standalone_Activity_Handle,
-	options: Describe_Standalone_Activity_Options = {},
-	allocator := context.allocator,
+describe_standalone_activity_terminal :: proc(
+	interceptor_input: ^Client_Describe_Standalone_Activity_Input,
 ) -> (Standalone_Activity_Description, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity Describe interceptor input is missing")
+	}
+	handle := interceptor_input.handle
+	options := interceptor_input.options
+	allocator := interceptor_input.allocator
 	if !standalone_activity_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
 	}
@@ -942,10 +1111,31 @@ describe_standalone_activity :: proc(
 	return decode_standalone_activity_description(rpc_result.protobuf, allocator)
 }
 
-poll_standalone_activity :: proc(
+describe_standalone_activity :: proc(
 	handle: ^Standalone_Activity_Handle,
-	options: Standalone_Activity_Wait_Options = {},
+	options: Describe_Standalone_Activity_Options = {},
+	allocator := context.allocator,
+) -> (Standalone_Activity_Description, Error) {
+	if !standalone_activity_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
+	}
+	interceptor_input := Client_Describe_Standalone_Activity_Input{
+		handle = handle,
+		options = options,
+		allocator = allocator,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_describe_standalone_activity_chain(&state, &interceptor_input)
+}
+
+poll_standalone_activity_terminal :: proc(
+	interceptor_input: ^Client_Poll_Standalone_Activity_Input,
 ) -> (Standalone_Activity_Poll_Result, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity poll interceptor input is missing")
+	}
+	handle := interceptor_input.handle
+	options := interceptor_input.options
 	if !standalone_activity_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
 	}
@@ -1008,6 +1198,21 @@ poll_standalone_activity :: proc(
 	}
 }
 
+poll_standalone_activity :: proc(
+	handle: ^Standalone_Activity_Handle,
+	options: Standalone_Activity_Wait_Options = {},
+) -> (Standalone_Activity_Poll_Result, Error) {
+	if !standalone_activity_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
+	}
+	interceptor_input := Client_Poll_Standalone_Activity_Input{
+		handle = handle,
+		options = options,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_poll_standalone_activity_chain(&state, &interceptor_input)
+}
+
 get_standalone_activity_result_payload :: proc(
 	handle: ^Standalone_Activity_Handle,
 	options: Standalone_Activity_Wait_Options = {},
@@ -1044,7 +1249,7 @@ get_standalone_activity_result_json :: proc(
 	return {}
 }
 
-cancel_standalone_activity :: proc(
+cancel_standalone_activity_rpc :: proc(
 	handle: ^Standalone_Activity_Handle,
 	reason := "",
 	request_id := "",
@@ -1068,7 +1273,7 @@ cancel_standalone_activity :: proc(
 	return standalone_activity_empty_rpc(handle.client, "RequestCancelActivityExecution", request_bytes[:])
 }
 
-terminate_standalone_activity :: proc(
+terminate_standalone_activity_rpc :: proc(
 	handle: ^Standalone_Activity_Handle,
 	reason := "",
 	request_id := "",
@@ -1092,7 +1297,7 @@ terminate_standalone_activity :: proc(
 	return standalone_activity_empty_rpc(handle.client, "TerminateActivityExecution", request_bytes[:])
 }
 
-delete_standalone_activity :: proc(handle: ^Standalone_Activity_Handle) -> Error {
+delete_standalone_activity_rpc :: proc(handle: ^Standalone_Activity_Handle) -> Error {
 	if !standalone_activity_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
 	}
@@ -1104,6 +1309,66 @@ delete_standalone_activity :: proc(handle: ^Standalone_Activity_Handle) -> Error
 	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DeleteActivityExecutionRequest(&request)
 	defer delete(request_bytes)
 	return standalone_activity_empty_rpc(handle.client, "DeleteActivityExecution", request_bytes[:])
+}
+
+standalone_activity_mutation_terminal :: proc(
+	input: ^Client_Standalone_Activity_Mutation_Input,
+) -> Error {
+	if input == nil {
+		return error_from_string(.Invalid_Argument, "standalone Activity mutation interceptor input is missing")
+	}
+	switch input.kind {
+	case .Cancel:
+		return cancel_standalone_activity_rpc(input.handle, input.reason, input.request_id)
+	case .Terminate:
+		return terminate_standalone_activity_rpc(input.handle, input.reason, input.request_id)
+	case .Delete:
+		return delete_standalone_activity_rpc(input.handle)
+	}
+	return error_from_string(.Invalid_Argument, "standalone Activity mutation kind is invalid")
+}
+
+standalone_activity_mutation :: proc(
+	handle: ^Standalone_Activity_Handle,
+	kind: Standalone_Activity_Mutation_Kind,
+	reason := "",
+	request_id := "",
+) -> Error {
+	if !standalone_activity_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "standalone Activity handle is not initialized")
+	}
+	if int(kind) < int(Standalone_Activity_Mutation_Kind.Cancel) ||
+	   int(kind) > int(Standalone_Activity_Mutation_Kind.Delete) {
+		return error_from_string(.Invalid_Argument, "standalone Activity mutation kind is invalid")
+	}
+	input := Client_Standalone_Activity_Mutation_Input{
+		handle = handle,
+		kind = kind,
+		reason = reason,
+		request_id = request_id,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_standalone_activity_mutation_chain(&state, &input)
+}
+
+cancel_standalone_activity :: proc(
+	handle: ^Standalone_Activity_Handle,
+	reason := "",
+	request_id := "",
+) -> Error {
+	return standalone_activity_mutation(handle, .Cancel, reason, request_id)
+}
+
+terminate_standalone_activity :: proc(
+	handle: ^Standalone_Activity_Handle,
+	reason := "",
+	request_id := "",
+) -> Error {
+	return standalone_activity_mutation(handle, .Terminate, reason, request_id)
+}
+
+delete_standalone_activity :: proc(handle: ^Standalone_Activity_Handle) -> Error {
+	return standalone_activity_mutation(handle, .Delete)
 }
 
 standalone_activity_empty_rpc :: proc(client: ^Client, method: string, request: []u8) -> Error {

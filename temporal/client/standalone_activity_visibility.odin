@@ -216,11 +216,14 @@ decode_standalone_activity_count :: proc(
 	return result, {}
 }
 
-list_standalone_activities :: proc(
-	client: ^Client,
-	options: List_Standalone_Activities_Options = {},
-	allocator := context.allocator,
+list_standalone_activities_terminal :: proc(
+	input: ^Client_List_Standalone_Activities_Input,
 ) -> (Standalone_Activity_List_Page, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity list interceptor input is missing")
+	}
+	client := input.client
+	options := input.options
 	if client == nil || client.connection == nil || client.connection.handle == nil ||
 	   len(client.namespace) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
@@ -244,21 +247,37 @@ list_standalone_activities :: proc(
 	)
 	defer delete(rpc_result.protobuf)
 	if rpc_result.error.message != nil do return {}, error_from_core(&rpc_result.error)
-	return decode_standalone_activity_list_page(rpc_result.protobuf, allocator)
+	return decode_standalone_activity_list_page(rpc_result.protobuf, input.allocator)
 }
 
-count_standalone_activities :: proc(
+list_standalone_activities :: proc(
 	client: ^Client,
-	query := "",
+	options: List_Standalone_Activities_Options = {},
 	allocator := context.allocator,
+) -> (Standalone_Activity_List_Page, Error) {
+	input := Client_List_Standalone_Activities_Input{
+		client = client,
+		options = options,
+		allocator = allocator,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_list_standalone_activities_chain(&state, &input)
+}
+
+count_standalone_activities_terminal :: proc(
+	input: ^Client_Count_Standalone_Activities_Input,
 ) -> (Standalone_Activity_Count, Error) {
+	if input == nil {
+		return {}, error_from_string(.Invalid_Argument, "standalone Activity count interceptor input is missing")
+	}
+	client := input.client
 	if client == nil || client.connection == nil || client.connection.handle == nil ||
 	   len(client.namespace) == 0 {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_CountActivityExecutionsRequest{
 		namespace = client.namespace,
-		query = query,
+		query = input.query,
 	}
 	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_CountActivityExecutionsRequest(&request)
 	defer delete(request_bytes)
@@ -270,5 +289,19 @@ count_standalone_activities :: proc(
 	)
 	defer delete(rpc_result.protobuf)
 	if rpc_result.error.message != nil do return {}, error_from_core(&rpc_result.error)
-	return decode_standalone_activity_count(rpc_result.protobuf, allocator)
+	return decode_standalone_activity_count(rpc_result.protobuf, input.allocator)
+}
+
+count_standalone_activities :: proc(
+	client: ^Client,
+	query := "",
+	allocator := context.allocator,
+) -> (Standalone_Activity_Count, Error) {
+	input := Client_Count_Standalone_Activities_Input{
+		client = client,
+		query = query,
+		allocator = allocator,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_count_standalone_activities_chain(&state, &input)
 }

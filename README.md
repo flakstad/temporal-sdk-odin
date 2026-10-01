@@ -34,8 +34,11 @@ List/Count. Describe covers execution state, timing, timeouts, Retry Policy,
 priority, input/outcome, heartbeat details, headers, Search Attributes, Links,
 UI metadata, and canonical Failure/callback bytes. Server 1.32 dispatches the
 resulting task through the unchanged Core Activity poll path to the existing
-Odin Worker. Server 1.29 returns gRPC 12/`UNIMPLEMENTED`. Start metadata and
-Client interceptors remain before this surface is called complete. The Client preserves terminal Workflow and Update Failure protobufs and decodes all ten
+Odin Worker. Server 1.29 returns gRPC 12/`UNIMPLEMENTED`. Start now supports
+Headers, Search Attributes, static summary/details, Links, completion callbacks,
+and `Use_Existing` attachment options, and the complete implemented slice runs
+through typed Client interceptors. Newer Pause/Unpause/Reset and execution-option
+update RPCs remain before this surface is called complete. The Client preserves terminal Workflow and Update Failure protobufs and decodes all ten
 current Temporal Failure variants into an allocator-owned recursive Odin tree.
 The live suite proves an unhandled `ActivityFailure -> ApplicationFailure`
 chain from Odin Activity through Server history and back to the Odin Client. It
@@ -414,8 +417,9 @@ returned to the caller. A false System Info bit is also `Unknown`, because the
 feature may merely be disabled. The default probes never mutate server state;
 Workflow Pause therefore remains unknown. Standalone Activity still reports
 `sdk_implemented=false`: Start/Poll/Describe/result, cancel/terminate/delete,
-and Visibility List/Count now exist, but Start metadata and Client interceptor
-coverage remain. No result is inferred from a parsed server version.
+Visibility List/Count, Start metadata, and Client interceptors now exist, but
+the newer Pause/Unpause/Reset and execution-option update RPCs remain. No
+result is inferred from a parsed server version.
 
 `activity.info(ctx)`
 now exposes the Core-delivered execution
@@ -593,7 +597,8 @@ Update-With-Start, Signal, Query, Workflow result waiting, Update start/result
 waiting, cancellation,
 termination, and Workflow
 Visibility list/count, standalone Nexus start/poll/describe, cancel/terminate/
-delete, list/count, plus Schedule
+delete and list/count, standalone Activity start/poll/describe,
+cancel/terminate/delete and list/count, plus Schedule
 Describe/List/Count/Matching-Times; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and

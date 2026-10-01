@@ -488,6 +488,144 @@ Client_Count_Nexus_Operations_Interceptor_Proc :: #type proc(
 	next: Client_Count_Nexus_Operations_Next,
 ) -> (Nexus_Operation_Count, Error)
 
+Client_Start_Standalone_Activity_Input :: struct {
+	client:  ^Client,
+	input:   activity_codec.Payload_View,
+	options: Start_Standalone_Activity_Options,
+}
+
+Client_Start_Standalone_Activity_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Start_Standalone_Activity_Input,
+) -> (Standalone_Activity_Handle, Error)
+
+Client_Start_Standalone_Activity_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Start_Standalone_Activity_Next_Proc,
+}
+
+Client_Start_Standalone_Activity_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Start_Standalone_Activity_Input,
+	next: Client_Start_Standalone_Activity_Next,
+) -> (Standalone_Activity_Handle, Error)
+
+Client_Poll_Standalone_Activity_Input :: struct {
+	handle:  ^Standalone_Activity_Handle,
+	options: Standalone_Activity_Wait_Options,
+}
+
+Client_Poll_Standalone_Activity_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Poll_Standalone_Activity_Input,
+) -> (Standalone_Activity_Poll_Result, Error)
+
+Client_Poll_Standalone_Activity_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Poll_Standalone_Activity_Next_Proc,
+}
+
+Client_Poll_Standalone_Activity_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Poll_Standalone_Activity_Input,
+	next: Client_Poll_Standalone_Activity_Next,
+) -> (Standalone_Activity_Poll_Result, Error)
+
+Client_Describe_Standalone_Activity_Input :: struct {
+	handle:    ^Standalone_Activity_Handle,
+	options:   Describe_Standalone_Activity_Options,
+	allocator: mem.Allocator,
+}
+
+Client_Describe_Standalone_Activity_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Describe_Standalone_Activity_Input,
+) -> (Standalone_Activity_Description, Error)
+
+Client_Describe_Standalone_Activity_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Describe_Standalone_Activity_Next_Proc,
+}
+
+Client_Describe_Standalone_Activity_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Describe_Standalone_Activity_Input,
+	next: Client_Describe_Standalone_Activity_Next,
+) -> (Standalone_Activity_Description, Error)
+
+Standalone_Activity_Mutation_Kind :: enum {
+	Cancel,
+	Terminate,
+	Delete,
+}
+
+Client_Standalone_Activity_Mutation_Input :: struct {
+	handle:     ^Standalone_Activity_Handle,
+	kind:       Standalone_Activity_Mutation_Kind,
+	reason:     string,
+	request_id: string,
+}
+
+Client_Standalone_Activity_Mutation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Standalone_Activity_Mutation_Input,
+) -> Error
+
+Client_Standalone_Activity_Mutation_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Standalone_Activity_Mutation_Next_Proc,
+}
+
+Client_Standalone_Activity_Mutation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Standalone_Activity_Mutation_Input,
+	next: Client_Standalone_Activity_Mutation_Next,
+) -> Error
+
+Client_List_Standalone_Activities_Input :: struct {
+	client:    ^Client,
+	options:   List_Standalone_Activities_Options,
+	allocator: mem.Allocator,
+}
+
+Client_List_Standalone_Activities_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_List_Standalone_Activities_Input,
+) -> (Standalone_Activity_List_Page, Error)
+
+Client_List_Standalone_Activities_Next :: struct {
+	data:   rawptr,
+	invoke: Client_List_Standalone_Activities_Next_Proc,
+}
+
+Client_List_Standalone_Activities_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_List_Standalone_Activities_Input,
+	next: Client_List_Standalone_Activities_Next,
+) -> (Standalone_Activity_List_Page, Error)
+
+Client_Count_Standalone_Activities_Input :: struct {
+	client:    ^Client,
+	query:     string,
+	allocator: mem.Allocator,
+}
+
+Client_Count_Standalone_Activities_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Count_Standalone_Activities_Input,
+) -> (Standalone_Activity_Count, Error)
+
+Client_Count_Standalone_Activities_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Count_Standalone_Activities_Next_Proc,
+}
+
+Client_Count_Standalone_Activities_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Count_Standalone_Activities_Input,
+	next: Client_Count_Standalone_Activities_Next,
+) -> (Standalone_Activity_Count, Error)
+
 Client_Describe_Schedule_Input :: struct {
 	handle:    ^Schedule_Handle,
 	allocator: mem.Allocator,
@@ -599,6 +737,12 @@ Client_Interceptor :: struct {
 	nexus_operation_mutation: Client_Nexus_Operation_Mutation_Interceptor_Proc,
 	list_nexus_operations:  Client_List_Nexus_Operations_Interceptor_Proc,
 	count_nexus_operations: Client_Count_Nexus_Operations_Interceptor_Proc,
+	start_standalone_activity:    Client_Start_Standalone_Activity_Interceptor_Proc,
+	poll_standalone_activity:     Client_Poll_Standalone_Activity_Interceptor_Proc,
+	describe_standalone_activity: Client_Describe_Standalone_Activity_Interceptor_Proc,
+	standalone_activity_mutation: Client_Standalone_Activity_Mutation_Interceptor_Proc,
+	list_standalone_activities:   Client_List_Standalone_Activities_Interceptor_Proc,
+	count_standalone_activities:  Client_Count_Standalone_Activities_Interceptor_Proc,
 	describe_schedule:  Client_Describe_Schedule_Interceptor_Proc,
 	list_schedules:     Client_List_Schedules_Interceptor_Proc,
 	count_schedules:    Client_Count_Schedules_Interceptor_Proc,
@@ -815,6 +959,66 @@ client_count_nexus_operations_next :: proc(
 ) -> (Nexus_Operation_Count, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation count interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_start_standalone_activity_next :: proc(
+	next: Client_Start_Standalone_Activity_Next,
+	input: ^Client_Start_Standalone_Activity_Input,
+) -> (Standalone_Activity_Handle, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity start interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_poll_standalone_activity_next :: proc(
+	next: Client_Poll_Standalone_Activity_Next,
+	input: ^Client_Poll_Standalone_Activity_Input,
+) -> (Standalone_Activity_Poll_Result, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity poll interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_describe_standalone_activity_next :: proc(
+	next: Client_Describe_Standalone_Activity_Next,
+	input: ^Client_Describe_Standalone_Activity_Input,
+) -> (Standalone_Activity_Description, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity Describe interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_standalone_activity_mutation_next :: proc(
+	next: Client_Standalone_Activity_Mutation_Next,
+	input: ^Client_Standalone_Activity_Mutation_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid standalone Activity mutation interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_list_standalone_activities_next :: proc(
+	next: Client_List_Standalone_Activities_Next,
+	input: ^Client_List_Standalone_Activities_Input,
+) -> (Standalone_Activity_List_Page, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity list interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_count_standalone_activities_next :: proc(
+	next: Client_Count_Standalone_Activities_Next,
+	input: ^Client_Count_Standalone_Activities_Input,
+) -> (Standalone_Activity_Count, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity count interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -1352,6 +1556,132 @@ client_count_nexus_operations_chain :: proc(
 		)
 	}
 	return count_nexus_operations_terminal(input)
+}
+
+client_start_standalone_activity_chain :: proc(
+	data: rawptr,
+	input: ^Client_Start_Standalone_Activity_Input,
+) -> (Standalone_Activity_Handle, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity start interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.start_standalone_activity == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.start_standalone_activity(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_start_standalone_activity_chain},
+		)
+	}
+	return start_standalone_activity_payload_terminal(input)
+}
+
+client_poll_standalone_activity_chain :: proc(
+	data: rawptr,
+	input: ^Client_Poll_Standalone_Activity_Input,
+) -> (Standalone_Activity_Poll_Result, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity poll interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.poll_standalone_activity == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.poll_standalone_activity(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_poll_standalone_activity_chain},
+		)
+	}
+	return poll_standalone_activity_terminal(input)
+}
+
+client_describe_standalone_activity_chain :: proc(
+	data: rawptr,
+	input: ^Client_Describe_Standalone_Activity_Input,
+) -> (Standalone_Activity_Description, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity Describe interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.describe_standalone_activity == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.describe_standalone_activity(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_describe_standalone_activity_chain},
+		)
+	}
+	return describe_standalone_activity_terminal(input)
+}
+
+client_standalone_activity_mutation_chain :: proc(
+	data: rawptr,
+	input: ^Client_Standalone_Activity_Mutation_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid standalone Activity mutation interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.standalone_activity_mutation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.standalone_activity_mutation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_standalone_activity_mutation_chain},
+		)
+	}
+	return standalone_activity_mutation_terminal(input)
+}
+
+client_list_standalone_activities_chain :: proc(
+	data: rawptr,
+	input: ^Client_List_Standalone_Activities_Input,
+) -> (Standalone_Activity_List_Page, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity list interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.list_standalone_activities == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.list_standalone_activities(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_list_standalone_activities_chain},
+		)
+	}
+	return list_standalone_activities_terminal(input)
+}
+
+client_count_standalone_activities_chain :: proc(
+	data: rawptr,
+	input: ^Client_Count_Standalone_Activities_Input,
+) -> (Standalone_Activity_Count, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid standalone Activity count interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.count_standalone_activities == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.count_standalone_activities(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_count_standalone_activities_chain},
+		)
+	}
+	return count_standalone_activities_terminal(input)
 }
 
 client_describe_schedule_chain :: proc(data: rawptr, input: ^Client_Describe_Schedule_Input) -> (Schedule_Description, Error) {
