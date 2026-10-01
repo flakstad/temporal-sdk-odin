@@ -426,7 +426,13 @@ cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
 independent sizes, shared by online execution and offline replay. It does
 **not** yet provide guard-page/growable stack protection, in-process panic
-containment, or a stable public API. Canceling a Client wait does not cancel an
+recovery, or a stable public API. Activity panic containment has a live-proven
+deployment boundary: run Activities in an Activity-only Odin worker process
+under a supervisor. `./scripts/activity-panic-integration-test.sh` deliberately
+traps that process on attempt 1, starts a replacement Odin worker, and requires
+Temporal to redeliver attempt 2 and complete the still-running Workflow. A
+mixed Workflow/Activity process is not protected by this pattern, and the SDK
+does not yet manage a subprocess executor itself. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
 Synchronous Nexus operation handling and Workflow-side calling are now a

@@ -251,6 +251,32 @@ impl AsyncActivityDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct ActivityPanicRecoveryDriverWorkflow;
+
+#[workflow_methods]
+impl ActivityPanicRecoveryDriverWorkflow {
+    #[run(name = "odin_activity_panic_recovery_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let result = ctx
+            .execute_activity(
+                HelloActivity,
+                "panic-recovery".to_string(),
+                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(1))
+                    .retry_policy(
+                        RetryPolicy::builder()
+                            .initial_interval(Duration::from_millis(100))
+                            .maximum_attempts(2)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .await?;
+        Ok(result)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -264,6 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_case = std::env::var_os("ACTIVITY_SHUTDOWN").is_some();
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
+    let panic_recovery = std::env::var_os("ACTIVITY_PANIC_RECOVERY").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
     let expected = if shutdown_case {
         "Workflow observed Worker shutdown Activity failure".to_string()
@@ -288,6 +315,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<TypedActivityDriverWorkflow>()?
         .register_workflow::<RetryActivityDriverWorkflow>()?
         .register_workflow::<AsyncActivityDriverWorkflow>()?
+        .register_workflow::<ActivityPanicRecoveryDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -385,6 +413,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
             println!("Workflow observed retried Odin Activity result: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
+
+        if panic_recovery {
+            let handle = client
+                .start_workflow(
+                    ActivityPanicRecoveryDriverWorkflow::run,
+                    (),
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != "Recovered on Activity attempt 2" {
+                return Err(format!("unexpected panic-recovery result: {result}").into());
+            }
+            println!("Workflow survived the Activity process crash: {result}");
             return Ok::<(), Box<dyn std::error::Error>>(());
         }
 

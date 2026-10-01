@@ -682,6 +682,23 @@ present it as containment. Until subprocess-isolated Activity executors or
 language/runtime support is designed, deploy workers under a process supervisor
 and return `activity.Result(T)` for expected failures.
 
+The supported containment pattern is now exercised end-to-end:
+
+```bash
+./scripts/activity-panic-integration-test.sh
+```
+
+The test starts an Activity-only Odin worker on a unique queue and a separate
+Rust Workflow worker. Attempt 1 prints a marker and invokes Odin `panic`, so the
+Activity worker terminates via `Trace/BPT trap` without returning a completion.
+The Service retains the durable Activity state; after the one-second
+Start-To-Close timeout and retry backoff, a newly started Odin Activity worker
+receives attempt 2. The callback returns its observed attempt number and the
+original Workflow completes with `Recovered on Activity attempt 2`. This proves
+the recommended supervisor/replacement process boundary, not in-process
+recovery. Co-locating Workflow and Activity registrations still makes an
+Activity panic fatal to that entire worker process.
+
 Workflows have the corresponding registration levels:
 
 ```odin

@@ -2762,6 +2762,17 @@ Odin `defer`s and allocator cleanup. Consequently an unexpected callback panic
 still terminates the worker process; honest containment requires a process
 boundary or future Odin runtime support, not a `longjmp` shim.
 
+That process boundary is now live-proven rather than merely recommended. The
+panic integration test runs an Activity-only Odin worker separately from the
+Workflow worker, deliberately traps attempt 1, verifies the process exits
+non-zero without an Activity completion, and starts a replacement Odin worker
+on the same task queue. Temporal's Start-To-Close timeout and Retry Policy
+redeliver the durable Activity as attempt 2; the replacement returns its
+observed attempt number and the unchanged Workflow completes. This is the
+minimum safe production policy under a process supervisor. It does not make a
+mixed Workflow/Activity process crash-safe and is not an SDK-managed
+per-Activity subprocess executor.
+
 `register_workflow(name, proc)` owns one `Fiber_Runtime` per Workflow type. A
 unit test initializes two types under different run IDs, verifies dispatch to
 the correct procedure, evicts one, and proves that the other route remains.
@@ -2970,8 +2981,9 @@ Workflows are enabled.
    bounds the completion-handoff route set to four, and drains cleanly. A live
    shutdown case also validates the configurable grace delay, concurrent
    heartbeats, exact Core cancellation flags, completion flush, and clean
-   finalization. The remaining concurrency risk is process-level panic and
-   uncooperative-callback containment.
+   finalization. Activity-only process crash/replacement is live-proven; the
+   remaining concurrency risks are mixed-process panic containment and
+   uncooperative callbacks.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -3015,8 +3027,9 @@ Workflows are enabled.
    deadline timers cancel their branch deterministically. The Activity API now
    models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
-   Policy, and prior heartbeat details, but still needs a process-isolation
-   policy for panics. Typed JSON decode/encode errors
+   Policy, and prior heartbeat details. Its Activity-only process-isolation
+   policy is now live-proven, while an SDK-managed subprocess executor remains
+   unimplemented. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
@@ -3100,9 +3113,12 @@ live-proven with deferred Signal delivery. Atomic Update-With-Start is now also
 implemented and live-proven on both create and attach paths. Workflow deletion
 is intentionally deprioritized: current language SDK handles generally treat
 it as an operator/CLI concern, and exposing a destructive call needs explicit
-chain/run targeting and safety semantics. The next higher-value hardening slice
-is process-isolated Activity panic containment, followed by a maintained
-client/server capability matrix for newer Schedule, Nexus, and Pause APIs.
+chain/run targeting and safety semantics. Activity-only process
+crash/replacement is now live-proven with a real panic, Start-To-Close timeout,
+retry, and replacement Odin worker. The next higher-value hardening slice is a
+maintained client/server capability matrix for newer Schedule, Nexus,
+standalone Activity, and Pause APIs, followed by guard-page/growable Workflow
+stacks and an explicit uncooperative-callback shutdown policy.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 
@@ -3231,9 +3247,11 @@ deliberately does not cancel an accepted Update. Any future policy for canceling
 the durable operation itself depends on a server protocol capability; the
 current Temporal protocol does not expose that as a language-token operation.
 
-Panic and uncooperative-callback containment should be designed as subprocess
-isolation unless Odin gains supported recovery. A statechart oracle can later
-expand the now-live graceful-shutdown path to retry/failure races.
+Activity panic containment is defined as an Activity-only supervised process
+and its crash/replacement retry path is live-proven. An SDK-managed subprocess
+executor and uncooperative-callback containment remain future work unless Odin
+gains supported recovery. A statechart oracle can later expand the now-live
+graceful-shutdown path to retry/failure races.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

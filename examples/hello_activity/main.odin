@@ -88,6 +88,14 @@ async_identity_free :: proc() {
 }
 
 hello :: proc(ctx: ^activity.Context, name: string) -> string {
+	if name == "panic-recovery" {
+		attempt := activity.attempt(ctx)
+		if attempt == 1 {
+			fmt.eprintln("intentional Activity panic on attempt 1")
+			panic("intentional Activity panic containment probe")
+		}
+		return fmt.aprintf("Recovered on Activity attempt %d", attempt)
+	}
 	if name == "shutdown-wait" {
 		sync.atomic_store_explicit(&shutdown_activity_started, true, .Release)
 		for !activity.is_cancellation_requested(ctx) {
@@ -315,7 +323,12 @@ main :: proc() {
 	resource_tuner_case := resource_tuner_value != ""
 	activity_slots := load_case ? 3 : 10
 	graceful_shutdown_period := shutdown_case ? 200 * time.Millisecond : temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD
-	worker_options := worker.options_default("odin-hello-activity")
+	task_queue_buffer: [128]u8
+	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
+	if len(task_queue) == 0 {
+		task_queue = "odin-hello-activity"
+	}
+	worker_options := worker.options_default(task_queue)
 	worker_options.identity_override = "temporal-sdk-odin-hello-activity"
 	worker_options.max_concurrent_activities = activity_slots
 	worker_options.graceful_shutdown_period = graceful_shutdown_period
@@ -381,7 +394,7 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	fmt.println("Odin Activity Worker is polling task queue odin-hello-activity")
+	fmt.printf("Odin Activity Worker is polling task queue %s\n", task_queue)
 	retry_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_RETRY")
 	retry_case := retry_value != ""
 	async_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_ASYNC")

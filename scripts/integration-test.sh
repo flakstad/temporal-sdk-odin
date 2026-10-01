@@ -990,6 +990,9 @@ run_activity_case async-id-complete
 run_activity_case async-token-failure
 run_activity_case async-id-cancel
 
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/activity-panic-integration-test.sh"
+
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
