@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import temporal_client "../../temporal/client"
+import temporal_core "../../temporal/core"
 import temporal_failure "../../temporal/failure"
 import nexus "../../temporal/nexus"
 import worker "../../temporal/worker"
@@ -17,6 +18,7 @@ ASYNC_COMPLETE_WORKFLOW_TYPE :: "odin_nexus_async_complete_workflow"
 ASYNC_WAIT_WORKFLOW_TYPE :: "odin_nexus_async_wait_workflow"
 
 nexus_client: ^temporal_client.Client
+nexus_metrics_probe_enabled: bool
 
 Start_State :: struct {
 	client:      ^temporal_client.Client,
@@ -26,6 +28,34 @@ Start_State :: struct {
 	error:       temporal_client.Error,
 }
 
+record_nexus_handler_metric :: proc(ctx: ^nexus.Context, name: string) -> bool {
+	meter := nexus.metric_meter(ctx)
+	if meter == nil {
+		return false
+	}
+	counter, counter_error := temporal_core.metric_counter_create(meter, name)
+	defer temporal_core.metric_close(&counter)
+	defer temporal_core.error_free(&counter_error)
+	if counter_error.message != nil {
+		return false
+	}
+	record_error := temporal_core.metric_counter_add(
+		&counter,
+		1,
+		[]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("scenario", "live"),
+		},
+	)
+	defer temporal_core.error_free(&record_error)
+	if record_error.message != nil {
+		return false
+	}
+	if nexus_metrics_probe_enabled {
+		time.sleep(250 * time.Millisecond)
+	}
+	return true
+}
+
 hello :: proc(ctx: ^nexus.Context, name: string) -> string {
 	operation_info := nexus.info(ctx)
 	if operation_info.service != NEXUS_SERVICE ||
@@ -33,6 +63,9 @@ hello :: proc(ctx: ^nexus.Context, name: string) -> string {
 	   len(operation_info.request_id) == 0 ||
 	   len(operation_info.task_token) == 0 {
 		return "invalid Nexus operation context"
+	}
+	if !record_nexus_handler_metric(ctx, "odin_nexus_handler_calls") {
+		return "could not record Nexus operation metric"
 	}
 	return fmt.aprintf("Hello %s", name)
 }
@@ -176,6 +209,13 @@ cancel_async_probe :: proc(
 			"unexpected Nexus cancellation-policy probe token",
 			"BAD_REQUEST",
 			.Non_Retryable,
+		)
+	}
+	if !record_nexus_handler_metric(ctx, "odin_nexus_cancel_handler_calls") {
+		return nexus.cancel_handler_error(
+			"could not record Nexus cancellation metric",
+			"INTERNAL",
+			.Retryable,
 		)
 	}
 	return nexus.cancel_complete()
@@ -423,7 +463,30 @@ run :: proc() -> int {
 		return 1
 	}
 
-	client, connect_error := temporal_client.connect()
+	prometheus_address_buffer: [128]u8
+	prometheus_address := os.get_env(
+		prometheus_address_buffer[:],
+		"TEMPORAL_ODIN_PROMETHEUS_BIND_ADDRESS",
+	)
+	runtime_options := temporal_core.runtime_options_default()
+	prometheus_options := temporal_core.Runtime_Prometheus_Options{}
+	global_metric_tags := [1]temporal_core.Runtime_Key_Value{
+		{key = "sdk_language", value = "odin"},
+	}
+	if len(prometheus_address) > 0 {
+		nexus_metrics_probe_enabled = true
+		prometheus_options = {
+			bind_address = prometheus_address,
+			counters_total_suffix = true,
+		}
+		runtime_options.prometheus = &prometheus_options
+		runtime_options.metrics.global_tags = global_metric_tags[:]
+	}
+	client, connect_error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		runtime_options = &runtime_options,
+	})
 	if connect_error.message != nil {
 		fmt.eprintf("Temporal Client connection failed: %s\n", string(connect_error.message))
 		temporal_client.error_free(&connect_error)

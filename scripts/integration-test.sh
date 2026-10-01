@@ -159,12 +159,60 @@ temporal operator nexus endpoint create \
   --description 'Temporal SDK for Odin Workflow-to-Nexus integration' \
   --command-timeout 10s \
   --output none
+nexus_metrics_port=$((18000 + $$ % 1000))
+nexus_metrics_address="127.0.0.1:${nexus_metrics_port}"
 NEXUS_ENDPOINT="$nexus_endpoint_name" \
   TEMPORAL_NEXUS_WORKFLOW_ID="odin-nexus-workflow-${RANDOM}-$(date +%s)" \
+  TEMPORAL_ODIN_PROMETHEUS_BIND_ADDRESS="$nexus_metrics_address" \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
-  "$repo_root/scripts/run-hello-nexus-workflow.sh" >"$workflow_output_file"
+  "$repo_root/scripts/run-hello-nexus-workflow.sh" >"$workflow_output_file" 2>&1 &
+worker_pid=$!
+nexus_metrics_scraped=false
+for _ in {1..100}; do
+  if curl -fsS "http://${nexus_metrics_address}/metrics" \
+    >"$workflow_control_output_file" 2>/dev/null; then
+    if grep -Eq '^odin_nexus_handler_calls_total\{.*\} 2(\.0)?$' \
+      "$workflow_control_output_file" && \
+      grep -Eq '^odin_nexus_cancel_handler_calls_total\{.*\} 1(\.0)?$' \
+      "$workflow_control_output_file"; then
+      nexus_metrics_scraped=true
+      break
+    fi
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Workflow-to-Nexus example exited before its application metric could be scraped" >&2
+    cat "$workflow_output_file" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+if [[ "$nexus_metrics_scraped" != true ]]; then
+  echo "Nexus application metric endpoint did not become ready at $nexus_metrics_address" >&2
+  exit 1
+fi
+nexus_metric_line="$(grep '^odin_nexus_handler_calls_total{' "$workflow_control_output_file")"
+nexus_cancel_metric_line="$(grep '^odin_nexus_cancel_handler_calls_total{' "$workflow_control_output_file")"
+grep -q 'namespace="default"' <<<"$nexus_metric_line"
+grep -q 'task_queue="odin-hello-nexus-workflow"' <<<"$nexus_metric_line"
+grep -q 'nexus_service="odin-greeting-service"' <<<"$nexus_metric_line"
+grep -q 'nexus_operation="hello"' <<<"$nexus_metric_line"
+grep -q 'scenario="live"' <<<"$nexus_metric_line"
+grep -q 'sdk_language="odin"' <<<"$nexus_metric_line"
+grep -Eq ' 2(\.0)?$' <<<"$nexus_metric_line"
+grep -q 'namespace="default"' <<<"$nexus_cancel_metric_line"
+grep -q 'task_queue="odin-hello-nexus-workflow"' <<<"$nexus_cancel_metric_line"
+grep -q 'nexus_service="odin-greeting-service"' <<<"$nexus_cancel_metric_line"
+grep -q 'nexus_operation="async-try-cancel"' <<<"$nexus_cancel_metric_line"
+grep -q 'scenario="live"' <<<"$nexus_cancel_metric_line"
+grep -q 'sdk_language="odin"' <<<"$nexus_cancel_metric_line"
+grep -Eq ' 1(\.0)?$' <<<"$nexus_cancel_metric_line"
+wait "$worker_pid"
+worker_pid=""
 nexus_workflow_output="$(<"$workflow_output_file")"
 echo "$nexus_workflow_output"
+echo "$nexus_metric_line"
+echo "$nexus_cancel_metric_line"
+echo 'Nexus handler application metric passed through the callback-scoped Core meter.'
 grep -q 'Odin Workflow called Odin Nexus operation through Temporal: Hello Odin' <<<"$nexus_workflow_output"
 grep -q 'Nexus handler failure and schedule-to-close timeout retained structured Failure trees' <<<"$nexus_workflow_output"
 grep -q 'Nexus selector and join composed two concurrent operations' <<<"$nexus_workflow_output"

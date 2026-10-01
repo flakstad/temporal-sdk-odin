@@ -9757,6 +9757,8 @@ nexus_typed_result_adapter_can_start_async_operations :: proc(t: ^testing.T) {
 nexus_context_exposes_headers_and_atomic_cancellation :: proc(t: ^testing.T) {
 	headers := [?]nexus.Header{{key = "traceparent", value = "00-test"}}
 	callback_headers := [?]nexus.Header{{key = "callback-key", value = "callback-value"}}
+	meter := temporal_core.metric_meter_noop()
+	defer temporal_core.metric_meter_close(&meter)
 	ctx := nexus.Context{}
 	nexus.context_init(
 		&ctx,
@@ -9766,7 +9768,26 @@ nexus_context_exposes_headers_and_atomic_cancellation :: proc(t: ^testing.T) {
 			headers = headers[:],
 			callback_headers = callback_headers[:],
 		},
+		&meter,
 	)
+	testing.expect(t, nexus.metric_meter(&ctx) == &meter)
+	testing.expect(t, nexus.metric_meter(nil) == nil)
+	counter, counter_error := temporal_core.metric_counter_create(
+		nexus.metric_meter(&ctx),
+		"nexus_handler_calls",
+	)
+	defer temporal_core.metric_close(&counter)
+	defer temporal_core.error_free(&counter_error)
+	testing.expect(t, counter_error.message == nil)
+	record_error := temporal_core.metric_counter_add(
+		&counter,
+		1,
+		[]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("outcome", "ok"),
+		},
+	)
+	defer temporal_core.error_free(&record_error)
+	testing.expect(t, record_error.message == nil)
 	value, found := nexus.header(&ctx, "traceparent")
 	testing.expect(t, found)
 	testing.expect_value(t, value, "00-test")

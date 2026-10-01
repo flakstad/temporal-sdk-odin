@@ -370,7 +370,9 @@ Metric handles own their cloned meter/attribute state and must close before the
 Runtime. An Activity callback receives a callback-scoped meter through
 `activity.metric_meter(ctx)`. It automatically carries `namespace`,
 `task_queue`, and `activity_type`; when no exporter is configured it remains a
-valid, validating no-op meter.
+valid, validating no-op meter. Nexus start and cancellation handlers receive
+the same lifecycle through `nexus.metric_meter(ctx)`, scoped with `namespace`,
+`task_queue`, `nexus_service`, and `nexus_operation`.
 
 Workflow code uses replay-aware procedures instead of Core handles:
 

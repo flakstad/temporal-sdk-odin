@@ -9,6 +9,7 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 import codec "../codec"
+import temporal_core "../core"
 
 Cancel_Reason :: enum u32 {
 	None,
@@ -52,16 +53,34 @@ Info :: struct {
 }
 
 Context :: struct {
-	info_value:       Info,
-	cancel_requested: bool,
-	cancel_reason:    Cancel_Reason,
+	info_value:        Info,
+	metric_meter_value: ^temporal_core.Metric_Meter,
+	cancel_requested:  bool,
+	cancel_reason:     Cancel_Reason,
 }
 
-context_init :: proc(ctx: ^Context, value: Info) {
+context_init :: proc(
+	ctx: ^Context,
+	value: Info,
+	metric_meter: ^temporal_core.Metric_Meter = nil,
+) {
 	if ctx == nil {
 		return
 	}
-	ctx^ = Context{info_value = value}
+	ctx^ = Context{
+		info_value = value,
+		metric_meter_value = metric_meter,
+	}
+}
+
+// metric_meter returns the callback-scoped application meter. Instruments
+// created from it must be closed before the handler returns. A no-op meter is
+// supplied when the Core Runtime has no exporter.
+metric_meter :: proc(ctx: ^Context) -> ^temporal_core.Metric_Meter {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.metric_meter_value
 }
 
 context_request_cancellation :: proc(ctx: ^Context, reason: Cancel_Reason) {

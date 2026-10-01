@@ -2803,6 +2803,7 @@ Nexus_Execution :: struct {
 	operation_token:      string,
 	input:                codec.Payload,
 	info_owner:           Nexus_Info_Owner,
+	metric_meter:         temporal_core.Metric_Meter,
 	ctx:                  nexus.Context,
 	error:                Error,
 }
@@ -2968,6 +2969,7 @@ nexus_execution_destroy :: proc(execution: ^Nexus_Execution) {
 	delete(execution.operation_token, allocator_runtime.heap_allocator())
 	codec.payload_free(&execution.input)
 	nexus_info_owner_destroy(&execution.info_owner)
+	temporal_core.metric_meter_close(&execution.metric_meter)
 	error_free(&execution.error)
 	free(execution)
 }
@@ -3060,7 +3062,27 @@ nexus_execution_start :: proc(
 		nexus_execution_destroy(execution)
 		return nil, info_error
 	}
-	nexus.context_init(&execution.ctx, execution.info_owner.info)
+	execution.metric_meter = temporal_core.metric_meter_noop()
+	runtime := worker.client.runtime
+	if runtime != nil && runtime.metrics_enabled {
+		metric_attributes := [4]temporal_core.Metric_Attribute{
+			temporal_core.metric_attribute_string("namespace", execution.info_owner.info.namespace),
+			temporal_core.metric_attribute_string("task_queue", execution.info_owner.info.task_queue),
+			temporal_core.metric_attribute_string("nexus_service", execution.info_owner.info.service),
+			temporal_core.metric_attribute_string("nexus_operation", execution.info_owner.info.operation),
+		}
+		meter, meter_error := temporal_core.metric_meter_create(runtime, metric_attributes[:])
+		if meter_error.message == nil {
+			execution.metric_meter = meter
+		} else {
+			temporal_core.error_free(&meter_error)
+		}
+	}
+	nexus.context_init(
+		&execution.ctx,
+		execution.info_owner.info,
+		&execution.metric_meter,
+	)
 	thread.pool_add_task(pool, context.allocator, nexus_execution_task, execution)
 	return execution, {}
 }

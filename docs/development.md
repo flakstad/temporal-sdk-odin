@@ -504,8 +504,12 @@ defer core.metric_close(&counter)
 err = core.metric_counter_add(&counter, 1)
 ```
 
-The meter pointer is valid only during the callback. It is a validating no-op
-when metrics are disabled, so the Activity does not need exporter conditionals.
+Nexus handlers use the same explicit pattern through
+`nexus.metric_meter(ctx)`. Their base attributes are `namespace`, `task_queue`,
+`nexus_service`, and `nexus_operation`; Activity meters use `activity_type`
+instead of the last two. The meter pointer is valid only during the callback.
+It is a validating no-op when metrics are disabled, so handler code does not
+need exporter conditionals.
 Workflow code must instead use `workflow.metric_counter_add` and its typed
 siblings. Those calls are replay-filtered and return no status; history replay
 cannot duplicate a record or branch on host observability state. The Worker
@@ -519,6 +523,14 @@ panic. Per-record attributes allocate one short-lived Core attribute handle;
 derive a child meter with `metric_meter_with_attributes` when a label set will
 be reused. Positive sub-millisecond duration observations round upward to one
 millisecond.
+
+The main CLI-devserver suite configures Prometheus on the Workflow-to-Nexus
+example and scrapes start- and cancellation-handler counters before shutdown.
+It requires the four automatic Nexus attributes, a record-specific attribute,
+the Runtime's global tag, value two for the example's two concurrent start
+operations, and value one for its registered cancel handler. This also tests
+that each execution-owned meter stays alive for the callback and is released
+during worker cleanup.
 
 Prometheus and OpenTelemetry are mutually exclusive because the Core C bridge
 accepts exactly one exporter. OTLP supports gRPC/HTTP, headers, cumulative or

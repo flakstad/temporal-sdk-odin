@@ -1299,6 +1299,15 @@ the callback result has been handed off. A Runtime without an exporter supplies
 a validating no-op meter, keeping application code independent of deployment
 observability settings.
 
+Nexus start and cancellation handlers now receive an execution-owned meter by
+the same rule. Its base attributes are namespace, task queue, Nexus service,
+and Nexus operation. The Worker constructs it only after the task's owned
+`Nexus_Info` has been built, passes a callback-scoped pointer through
+`nexus.Context`, and closes it when the routed execution is reaped. The no-op
+path is identical when the Runtime has no exporter. A live Prometheus scrape
+observes both start- and cancellation-handler counters with every automatic
+attribute before Worker shutdown.
+
 Workflow code never receives the Core handle. Its `metric_*` procedures build a
 borrowed synchronous record and return no status. The language runtime drops
 records for activations replaying history events, while allowing query-only
@@ -3197,7 +3206,8 @@ Workflows are enabled.
    completion and generic pinned-schema Link encoding are implemented; four
    upstream Nexus URL/type forms parse with explicit ownership. All six pinned
    variants encode, while `BatchJob` and `Callback` have no upstream URL
-   mapping. Outbound metrics remain. Async token
+   mapping. Handler application metrics are exposed through a callback-scoped
+   Core meter; automatic outbound operation metrics remain. Async token
    handoff, Workflow-backed callback
    completion, caller/completer linking, and every cancellation policy are
    live-proven. Runtime state transitions for those policies are also
