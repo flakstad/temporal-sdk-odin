@@ -2156,7 +2156,10 @@ Workflow start, or Child Workflow completion is ready. The ordinary typed
 consumed Payload/metadata views into a caller-provided `[]Join_Case_Result`.
 This keeps the join allocation-free and makes Signal ownership explicit; the
 views borrow the Workflow run. Exact duplicate cases are rejected. Cancellation
-returns `.Canceled` if all cases have not already become ready.
+returns `.Canceled` if all cases have not already become ready, clears the
+caller-provided result slots (`present=false`), and leaves partially ready Signals buffered.
+Signal cases can be mixed with durable operation cases; those Futures retain
+their typed `await_*` APIs after `.Ready`.
 
 A 300-trace property composes both APIs around three Child Workflows. It varies
 start and completion declaration order, Core job order, and the explicitly
@@ -2166,7 +2169,11 @@ as scheduler inputs rather than only testing their direct `await_*` paths.
 Another 180-trace property varies two Signal case orders, both Core delivery
 orders, and one/two-activation delivery. The CLI-devserver path sends `beta`
 before `alpha`, observes a partial joined wait, and completes with values in
-case-slot order after Core replay.
+case-slot order after Core replay. A third property does the same for a mixed
+Signal/Activity join. The live path delivers the Signal while a two-second Odin
+Activity is still running, remains suspended, and completes only after Core
+resolves the Activity. A focused deadline test proves cancellation does not
+consume a partially ready Signal and reproduces all three completions on replay.
 
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child

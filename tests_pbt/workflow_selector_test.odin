@@ -625,7 +625,7 @@ signal_join_property_workflow :: proc(ctx: ^workflow.Fiber_Context, flags: strin
 	}
 	values: [2]string
 	for &result, index in results {
-		if result.kind != .Signal || len(result.signal.values) != 1 ||
+		if !result.present || result.kind != .Signal || len(result.signal.values) != 1 ||
 		   result.signal.metadata.name != cases[index].signal_name {
 			return "wrong-result"
 		}
@@ -903,6 +903,321 @@ workflow_signal_join_is_deterministic_across_case_and_delivery_orders :: proc(t:
 		"Workflow Signal join is deterministic across case and delivery orders",
 		signal_join_property,
 		{num_tests = 180, seed = 0x5349_474e_414c_4a4f},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+mixed_join_property_workflow :: proc(ctx: ^workflow.Fiber_Context, flags: string) -> string {
+	reverse_cases := len(flags) > 0 && flags[0] == '1'
+	activity_future := workflow.start_activity(ctx, "mixed", "input")
+	cases := [2]workflow.Selector_Case{
+		workflow.selector_activity(activity_future),
+		workflow.selector_signal("approval"),
+	}
+	if reverse_cases {
+		cases = {
+			workflow.selector_signal("approval"),
+			workflow.selector_activity(activity_future),
+		}
+	}
+	results: [2]workflow.Join_Case_Result
+	if workflow.join_all_into(ctx, cases[:], results[:]) != .Ready {
+		return "canceled"
+	}
+	signal_index := reverse_cases ? 0 : 1
+	activity_index := reverse_cases ? 1 : 0
+	if !results[signal_index].present || !results[activity_index].present ||
+	   results[signal_index].kind != .Signal ||
+	   results[activity_index].kind != .Activity ||
+	   len(results[signal_index].signal.values) != 1 ||
+	   len(results[activity_index].signal.values) != 0 {
+		return "wrong-result-slots"
+	}
+	signal_value: string
+	if codec.decode_json(
+		results[signal_index].signal.values[0],
+		&signal_value,
+	) != .None {
+		return "signal-decode-failed"
+	}
+	activity_value := workflow.await_activity(ctx, activity_future)
+	return fmt.aprintf("%s/%s", activity_value, signal_value)
+}
+
+append_mixed_join_jobs :: proc(
+	jobs: ^[dynamic]proto.Coresdk_Workflow_Activation_WorkflowActivationJob,
+	signal_first: bool,
+	begin, end: int,
+	activity: ^proto.Coresdk_Workflow_Activation_ResolveActivity,
+	signal: ^proto.Coresdk_Workflow_Activation_SignalWorkflow,
+) {
+	for position in begin..<end {
+		use_signal := signal_first ? position == 0 : position == 1
+		if use_signal {
+			append(
+				jobs,
+				proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+					variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+						value = signal,
+					},
+				},
+			)
+		} else {
+			append(
+				jobs,
+				proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+					variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Resolve_Activity{
+						value = activity,
+					},
+				},
+			)
+		}
+	}
+}
+
+mixed_join_property :: proc(t: ^pbt.T) -> pbt.Result {
+	reverse_cases := pbt.draw(t, pbt.boolean())
+	signal_first := pbt.draw(t, pbt.boolean())
+	split_activations := pbt.draw(t, pbt.boolean())
+	pbt.cover(t, reverse_cases, 35.0, "reversed mixed join cases")
+	pbt.cover(t, signal_first, 35.0, "Signal before Activity resolution")
+	pbt.cover(t, split_activations, 35.0, "split mixed join activations")
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"pbt_mixed_join_workflow",
+		"test-queue",
+		mixed_join_property_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	if init_error.message != nil {
+		return pbt.error("could not initialize mixed join runtime")
+	}
+
+	flags := reverse_cases ? "1" : "0"
+	input, input_error := codec.encode_json(flags)
+	defer codec.payload_free(&input)
+	if input_error != .None {
+		return pbt.error("could not encode mixed join input")
+	}
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "pbt_mixed_join_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "pbt-mixed-join-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || initial.scheduled_activity_count != 1 ||
+	   !initial.waiting_join || initial.completed {
+		return pbt.fail("generated mixed join Workflow did not initialize")
+	}
+	initial_completion := bytes.clone(initial.completion[:])
+	defer delete(initial_completion)
+
+	activity_payload, activity_error := codec.encode_json("activity")
+	signal_payload, signal_error := codec.encode_json("signal")
+	defer codec.payload_free(&activity_payload)
+	defer codec.payload_free(&signal_payload)
+	if activity_error != .None || signal_error != .None {
+		return pbt.error("could not encode mixed join values")
+	}
+	activity_proto := proto.encode_payload(codec.payload_view(&activity_payload))
+	signal_proto := proto.encode_payload(codec.payload_view(&signal_payload))
+	defer delete(activity_proto.metadata)
+	defer delete(activity_proto.external_payloads)
+	defer delete(signal_proto.metadata)
+	defer delete(signal_proto.external_payloads)
+	activity_success := proto.Coresdk_Activity_Result_Success{result = &activity_proto}
+	activity_resolution := proto.Coresdk_Activity_Result_ActivityResolution{
+		status = proto.Coresdk_Activity_Result_ActivityResolution_Status_Completed{
+			value = &activity_success,
+		},
+	}
+	resolve_activity := proto.Coresdk_Workflow_Activation_ResolveActivity{
+		seq = 1,
+		result = &activity_resolution,
+	}
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "approval",
+		identity = "mixed-join-client",
+		originating_event_id = 47,
+	}
+	defer delete(signal.input)
+	append(&signal.input, signal_proto)
+
+	first_end := split_activations ? 1 : 2
+	partial_completion: []u8
+	defer delete(partial_completion)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append_mixed_join_jobs(
+		&activation.jobs,
+		signal_first,
+		0,
+		first_end,
+		&resolve_activity,
+		&signal,
+	)
+	first_delivery := process_activation(&runtime, &activation)
+	defer destroy_process_result(&first_delivery)
+	if first_delivery.error.message != nil {
+		return pbt.fail("generated mixed join delivery failed")
+	}
+	if split_activations {
+		if first_delivery.completed || !first_delivery.waiting_join {
+			return pbt.fail("mixed join resumed after only one case")
+		}
+		partial_completion = bytes.clone(first_delivery.completion[:])
+	} else if !first_delivery.completed || first_delivery.waiting_join {
+		return pbt.fail("mixed join did not resume after both cases")
+	}
+
+	terminal: workflow.Process_Result
+	if split_activations {
+		delete(activation.jobs)
+		activation.jobs = nil
+		activation.history_length = 11
+		append_mixed_join_jobs(
+			&activation.jobs,
+			signal_first,
+			1,
+			2,
+			&resolve_activity,
+			&signal,
+		)
+		terminal = process_activation(&runtime, &activation)
+		if terminal.error.message != nil || !terminal.completed || terminal.waiting_join {
+			return pbt.fail("split mixed join did not complete")
+		}
+	} else {
+		terminal = first_delivery
+	}
+	defer {
+		if split_activations {
+			destroy_process_result(&terminal)
+		}
+	}
+	terminal_completion := bytes.clone(terminal.completion[:])
+	defer delete(terminal_completion)
+	result_payload, found := clone_pbt_workflow_result(terminal.completion[:])
+	defer codec.payload_free(&result_payload)
+	if !found {
+		return pbt.fail("mixed join completion had no result")
+	}
+	result: string
+	if codec.decode_json(codec.payload_view(&result_payload), &result) != .None {
+		return pbt.fail("mixed join completion result did not decode")
+	}
+	defer delete(result)
+	if result != "activity/signal" {
+		return pbt.fail("mixed join results did not preserve typed slots")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(&runtime, &activation)
+	defer destroy_process_result(&evicted)
+	if evicted.error.message != nil || !evicted.evicted {
+		return pbt.fail("mixed join Workflow did not evict")
+	}
+
+	activation.is_replaying = true
+	activation.history_length = 3
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_initial)
+	if replayed_initial.error.message != nil ||
+	   !bytes.equal(initial_completion, replayed_initial.completion[:]) {
+		return pbt.fail("mixed join initialization changed on replay")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append_mixed_join_jobs(
+		&activation.jobs,
+		signal_first,
+		0,
+		first_end,
+		&resolve_activity,
+		&signal,
+	)
+	replayed_first := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_first)
+	if replayed_first.error.message != nil {
+		return pbt.fail("mixed join first replay delivery failed")
+	}
+	if split_activations {
+		if !bytes.equal(partial_completion, replayed_first.completion[:]) {
+			return pbt.fail("mixed join partial completion changed on replay")
+		}
+		delete(activation.jobs)
+		activation.jobs = nil
+		activation.history_length = 11
+		append_mixed_join_jobs(
+			&activation.jobs,
+			signal_first,
+			1,
+			2,
+			&resolve_activity,
+			&signal,
+		)
+		replayed_terminal := process_activation(&runtime, &activation)
+		defer destroy_process_result(&replayed_terminal)
+		if replayed_terminal.error.message != nil ||
+		   !bytes.equal(terminal_completion, replayed_terminal.completion[:]) {
+			return pbt.fail("mixed join terminal completion changed on replay")
+		}
+	} else if !bytes.equal(terminal_completion, replayed_first.completion[:]) {
+		return pbt.fail("same-activation mixed join changed on replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_mixed_join_is_deterministic_across_case_and_delivery_orders :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow mixed join is deterministic across case and delivery orders",
+		mixed_join_property,
+		{num_tests = 180, seed = 0x4d49_5845_445f_4a4f},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

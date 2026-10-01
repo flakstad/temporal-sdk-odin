@@ -2162,7 +2162,11 @@ metadata views borrow the Workflow run. This avoids both hidden allocation and
 ambiguous duplicate consumers. The case and result slices are borrowed across
 suspension. If the selected cancellation token is
 requested before every operation is ready, join returns `.Canceled` and leaves
-the operation handles under caller ownership. As with selector, this scheduler
+the operation handles under caller ownership, clears the supplied result slots
+with `present=false`,
+and does not consume any partially ready Signal. An outer non-canceled scope can
+therefore consume that buffered Signal afterward. Signal and durable-operation
+cases may be mixed; only Signal slots contain payload/metadata views. As with selector, this scheduler
 state never crosses the C ABI and adds no protobuf type or Core symbol.
 
 A focused unit trace resolves the second Activity first, verifies the join
@@ -2174,7 +2178,11 @@ observes a partial `waiting_join=true` activation, and completes in declaration
 order after Core eviction and replay. A second 180-trace property varies Signal
 case order, delivery order, and activation splitting; the live Signal case
 delivers `beta` before `alpha`, remains suspended after the first delivery, and
-returns the values in case-slot order after replay.
+returns the values in case-slot order after replay. A third 180-trace property
+mixes Signal and Activity cases across both orders and activation splits. Its
+live counterpart receives the Signal during a two-second Activity and completes
+only after Core resolves that Activity. A deadline-driven unit trace separately
+proves partial-Signal preservation on join cancellation and byte-identical replay.
 
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
@@ -3402,7 +3410,8 @@ implemented and live-proven. Two independent
 180-trace properties cover selector case/job order and join job/split order with
 fresh-stack replay; the selector property also carries generated Timer summaries
 through command metadata and replay. A third 180-trace property covers Signal
-join case/delivery order and activation splitting. Timer duration, summary, and explicit
+join case/delivery order and activation splitting; a fourth covers mixed
+Signal/Activity joins. Timer duration, summary, and explicit
 cancellation-token options are implemented. A 300-trace Child composition
 property now covers start/completion selectors, start/completion joins,
 explicit cancellation, partial readiness, and four byte-identical replay

@@ -215,10 +215,16 @@ if workflow.join_all_into(ctx, cases[:], results[:]) == .Ready {
 
 The result slice must match the case count and remains borrowed across
 suspension. On `.Ready`, each unique Signal is consumed into its corresponding
-slot; its Payload and metadata views borrow the Workflow run. Exact duplicate
+slot and `present` is set for every case; its Payload and metadata views borrow
+the Workflow run. On `.Canceled`, every slot remains zero with `present=false`.
+Exact duplicate
 cases—including duplicate Signal names—are invalid.
 Cancellation is checked after the all-ready condition, and unfinished
-operations remain owned by the Workflow when join returns `.Canceled`.
+operations remain owned by the Workflow when join returns `.Canceled`. Signal
+cases that were ready before a partial join was canceled remain buffered and
+can be consumed from a non-canceled outer scope. Signal and durable-operation
+cases may be mixed in the same result slice; non-Signal slots carry only their
+kind and retain their ordinary typed Future result API.
 Selector/join composition over Child start and completion futures, including an
 explicitly canceled child and partial readiness, is covered by a 300-trace
 fresh-stack replay property.

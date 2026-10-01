@@ -845,6 +845,7 @@ Join_Status :: enum {
 // Signal Payload views borrow the Workflow run; other case kinds keep using
 // their typed await APIs after the readiness barrier.
 Join_Case_Result :: struct {
+	present: bool,
 	kind:   Selector_Case_Kind,
 	signal: Payloads_Signal,
 }
@@ -9289,6 +9290,7 @@ join_all_into :: proc(
 		return status
 	}
 	for &join_case, index in cases {
+		results[index].present = true
 		results[index].kind = join_case.kind
 		if join_case.kind != .Signal {
 			continue

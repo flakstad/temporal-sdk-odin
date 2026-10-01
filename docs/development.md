@@ -293,6 +293,12 @@ plus one/two-activation delivery. `join_all_into` must consume each unique
 Signal into the matching caller-provided slot and reproduce every completion
 byte-for-byte after eviction. A focused negative test requires duplicate Signal
 names to fail as `OdinWorkflowJoinError`.
+A second 180-trace property mixes one Signal with one Activity and varies their
+case order, Core job order, and activation split. A deadline-driven unit trace
+proves a canceled partial join clears its output slots without consuming the
+already-buffered Signal (`present=false`), which an outer non-canceled scope
+then reads normally;
+initial, partial, and terminal completions are replay-identical.
 A 300-trace Child composition property then combines both primitives. Three
 children resolve start jobs in every generated order; a start selector and
 start join run before one generated child is explicitly canceled. Completion
@@ -320,6 +326,9 @@ result `Hello join-fast & Hello Temporal-slow`.
 The following `signal-join` case sends `beta` before `alpha`, requires the first
 Signal to leave `waiting_join=true`, then returns `A & B` from the declared
 case slots after Core-driven replay.
+The `mixed-join` case delivers `approval` while a two-second Activity is still
+running, requires the Workflow to remain joined, then returns
+`Hello Temporal-slow & approved` only after Core resolves the Activity.
 The activation-metadata unit test varies history size, Continue-As-New and
 target-version flags, deployment/build identity, full replay, and query-only
 replay. It queries `__temporal_workflow_metadata`, evicts the run, and requires

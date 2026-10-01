@@ -916,7 +916,8 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		}
 		alpha: string
 		beta: string
-		if results[0].kind != .Signal || results[1].kind != .Signal ||
+		if !results[0].present || !results[1].present ||
+		   results[0].kind != .Signal || results[1].kind != .Signal ||
 		   len(results[0].signal.values) != 1 || len(results[1].signal.values) != 1 ||
 		   results[0].signal.metadata.name != "alpha" ||
 		   results[1].signal.metadata.name != "beta" ||
@@ -925,6 +926,26 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 			return "Signal join result mismatch"
 		}
 		return fmt.aprintf("%s & %s", alpha, beta)
+	}
+	if name == "mixed-join" {
+		activity_future := workflow.start_activity(ctx, "hello", "Temporal-slow")
+		cases := [?]workflow.Selector_Case{
+			workflow.selector_signal("approval"),
+			workflow.selector_activity(activity_future),
+		}
+		results: [2]workflow.Join_Case_Result
+		if workflow.join_all_into(ctx, cases[:], results[:]) != .Ready ||
+		   !results[0].present || !results[1].present ||
+		   results[0].kind != .Signal || results[1].kind != .Activity ||
+		   len(results[0].signal.values) != 1 {
+			return "Mixed join result mismatch"
+		}
+		approval: string
+		if codec.decode_json(results[0].signal.values[0], &approval) != .None {
+			return "Mixed join Signal decode failed"
+		}
+		activity_result := workflow.await_activity(ctx, activity_future)
+		return fmt.aprintf("%s & %s", activity_result, approval)
 	}
 	if name == "selector" {
 		start_fields := [?]workflow.Log_Field{
@@ -2154,6 +2175,7 @@ main :: proc() {
 	expect_selector := scenario == "selector"
 	expect_join := scenario == "join-all"
 	expect_signal_join := scenario == "signal-join"
+	expect_mixed_join := scenario == "mixed-join"
 	expect_scoped_metrics := scenario == "scoped-metrics"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
@@ -2288,6 +2310,14 @@ main :: proc() {
 			   run_stats.timers_canceled != 0 ||
 			   run_stats.workflow_replay_activations < 1 {
 				fmt.eprintln("Workflow join stats did not match")
+				failed = true
+			}
+		} else if expect_mixed_join {
+			if run_stats.activity_tasks_completed != 1 ||
+			   run_stats.workflow_signals_received != 1 ||
+			   run_stats.timers_canceled != 0 ||
+			   run_stats.workflow_replay_activations < 1 {
+				fmt.eprintln("Workflow mixed join stats did not match")
 				failed = true
 			}
 		} else if expect_selector {
@@ -2448,6 +2478,8 @@ main :: proc() {
 		fmt.println("Workflow join waited for both concurrent Activities in declaration order")
 	} else if expect_signal_join {
 		fmt.println("Workflow join consumed two unique Signals in declaration slots")
+	} else if expect_mixed_join {
+		fmt.println("Workflow join combined a Signal and Activity across replay")
 	} else if expect_selector {
 		fmt.println("Workflow selector chose the ready Activity and canceled its losing timer")
 	} else {
