@@ -179,6 +179,7 @@ manager_options_default :: proc(command: []string) -> Manager_Options {
 Manager_Stats :: struct {
 	generations_started: int,
 	child_exits:         int,
+	last_child_exit_code: int,
 	protocol_failures:   int,
 	activation_timeouts: int,
 	capacity_rejections: int,
@@ -328,9 +329,13 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	return {}
 }
 
-session_abort :: proc(manager: ^Manager, session: ^Child_Session) {
+session_abort :: proc(
+	manager: ^Manager,
+	session: ^Child_Session,
+	exit_wait := time.Duration(0),
+) -> os.Process_State {
 	if session == nil || !session.active {
-		return
+		return {}
 	}
 	if session.input != nil {
 		os.close(session.input)
@@ -340,13 +345,14 @@ session_abort :: proc(manager: ^Manager, session: ^Child_Session) {
 		os.close(session.output)
 		session.output = nil
 	}
-	process_state, _ := os.process_wait(session.process, 0)
+	process_state, _ := os.process_wait(session.process, exit_wait)
 	if !process_state.exited {
 		_ = os.process_kill(session.process)
-		_, _ = os.process_wait(session.process)
+		process_state, _ = os.process_wait(session.process)
 	}
 	manager.stats.aborted_children += 1
 	session^ = {}
+	return process_state
 }
 
 session_shutdown :: proc(manager: ^Manager, session: ^Child_Session) -> bool {
@@ -374,7 +380,7 @@ session_shutdown :: proc(manager: ^Manager, session: ^Child_Session) -> bool {
 	if read_failure == .Timed_Out {
 		manager.stats.shutdown_timeouts += 1
 		manager_record_failure(manager)
-		session_abort(manager, session)
+		_ = session_abort(manager, session)
 		return false
 	}
 	if read_failure != .None || read_error.kind != .None ||
@@ -416,6 +422,7 @@ session_shutdown :: proc(manager: ^Manager, session: ^Child_Session) -> bool {
 			manager.stats.protocol_failures += 1
 		} else {
 			manager.stats.child_exits += 1
+			manager.stats.last_child_exit_code = process_state.exit_code
 		}
 		manager_record_failure(manager)
 		session^ = {}
@@ -431,7 +438,7 @@ manager_close :: proc(manager: ^Manager) {
 		return
 	}
 	for &route in manager.routes {
-		session_abort(manager, &route.session)
+		_ = session_abort(manager, &route.session)
 		delete(route.run_id)
 	}
 	delete(manager.routes)
@@ -586,7 +593,7 @@ start_route :: proc(
 	}
 	owned_run_id, clone_error := strings.clone(run_id)
 	if clone_error != nil {
-		session_abort(manager, &session)
+		_ = session_abort(manager, &session)
 		return 0, .Process
 	}
 	manager.next_generation += 1
@@ -988,7 +995,11 @@ record_session_failure :: proc(
 		manager.stats.protocol_failures += 1
 	}
 	manager_record_failure(manager)
-	session_abort(manager, session)
+	exit_wait := failure == .Child_Exit ? 100 * time.Millisecond : time.Duration(0)
+	process_state := session_abort(manager, session, exit_wait)
+	if failure == .Child_Exit && process_state.exited {
+		manager.stats.last_child_exit_code = process_state.exit_code
+	}
 }
 
 exchange_failure_message :: proc(failure: Exchange_Failure) -> string {
@@ -1056,7 +1067,7 @@ manager_process_activation :: proc(
 				} else {
 					manager.stats.protocol_failures += 1
 					manager_record_failure(manager)
-					session_abort(manager, &route.session)
+					_ = session_abort(manager, &route.session)
 					route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 				}
 			}
@@ -1083,7 +1094,7 @@ manager_process_activation :: proc(
 		if route_info.initializes {
 			route.state, _ = lifecycle_step(route.state, .Initialize)
 			manager.stats.protocol_failures += 1
-			session_abort(manager, &route.session)
+			_ = session_abort(manager, &route.session)
 			return failure_result(
 				manager,
 				route_info.run_id,
@@ -1126,7 +1137,7 @@ manager_process_activation :: proc(
 		process_result_metadata_free(&metadata)
 		manager.stats.protocol_failures += 1
 		manager_record_failure(manager)
-		session_abort(manager, &route.session)
+		_ = session_abort(manager, &route.session)
 		route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 		return failure_result(
 			manager,

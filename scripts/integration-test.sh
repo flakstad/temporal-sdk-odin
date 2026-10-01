@@ -1070,6 +1070,10 @@ TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/workflow-isolate-core-integration-test.sh"
 
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=stack-overflow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/workflow-isolate-core-integration-test.sh"
+
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/workflow-isolate-protocol-fault-integration-test.sh"
 

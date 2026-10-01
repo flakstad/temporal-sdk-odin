@@ -530,6 +530,10 @@ An additional sticky-cache proof records a durable Timer with the ordinary
 child, replays it with incompatible code behind the same type manifest, and
 requires both Core's `NONDETERMINISM` eviction and terminal `[TMPRL1100]`
 history from the CLI dev server.
+The same manager now survives a real guarded Workflow-stack overflow: it
+preserves the child's `SIGSEGV`/`SIGBUS` exit code, fails one Workflow Task,
+waits for Core eviction, and completes both executions through fresh-process
+replay.
 It still lacks production pool hardening.
 Replay-aware child logging, per-runtime metric-emitter creation, and
 inbound/outbound interceptor configuration are now explicit host options; the

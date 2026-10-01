@@ -14,6 +14,31 @@ Farewell_Result :: struct {
 	code:    int,
 }
 
+Registry_Revision :: enum {
+	Ordinary,
+	Incompatible_Nondeterminism,
+	Stack_Overflow,
+}
+
+stack_overflow_enabled := true
+
+consume_workflow_stack :: #force_no_inline proc(depth: u64) -> u64 {
+	frame: [1024]u8
+	for &item, index in frame {
+		item = u8((depth + u64(index)) & 0xff)
+	}
+	if stack_overflow_enabled {
+		nested := consume_workflow_stack(depth + u64(frame[depth % len(frame)]) + 1)
+		return nested + u64(frame[(depth + nested) % len(frame)])
+	}
+	return u64(frame[depth % len(frame)])
+}
+
+force_workflow_stack_overflow :: proc() {
+	fmt.eprintln("isolated-executor forcing guarded Workflow stack overflow")
+	_ = consume_workflow_stack(1)
+}
+
 greeting_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	workflow.sleep(ctx, time.Second)
 	return fmt.aprintf("Hello from an isolated Workflow, %s", name)
@@ -42,20 +67,42 @@ incompatible_nondeterminism_workflow :: proc(
 	return fmt.aprintf("Incompatible result for %s", name)
 }
 
-register :: proc(registry: ^workflow.Registry) -> workflow.Error {
-	return register_revision(registry, false)
+stack_overflow_string_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	force_workflow_stack_overflow()
+	return "unreachable"
 }
 
-// register_revision preserves the canonical type manifest while permitting the
-// integration proof to replay one type with deliberately incompatible code.
+stack_overflow_json_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	_: string,
+) -> Farewell_Result {
+	force_workflow_stack_overflow()
+	return {}
+}
+
+register :: proc(registry: ^workflow.Registry) -> workflow.Error {
+	return register_revision(registry, .Ordinary)
+}
+
+// register_revision preserves the canonical type manifest while integration
+// proofs deliberately replace callback implementations.
 register_revision :: proc(
 	registry: ^workflow.Registry,
-	incompatible_nondeterminism: bool,
+	revision: Registry_Revision,
 ) -> workflow.Error {
+	greeting_callback := greeting_workflow
+	farewell_callback := farewell_workflow
+	if revision == .Stack_Overflow {
+		greeting_callback = stack_overflow_string_workflow
+		farewell_callback = stack_overflow_json_workflow
+	}
 	greeting_error := workflow.registry_register_workflow(
 		registry,
 		GREETING_WORKFLOW_TYPE,
-		greeting_workflow,
+		greeting_callback,
 	)
 	if greeting_error.message != nil {
 		return greeting_error
@@ -63,16 +110,23 @@ register_revision :: proc(
 	farewell_error := workflow.registry_register_json_workflow(
 		registry,
 		FAREWELL_WORKFLOW_TYPE,
-		farewell_workflow,
+		farewell_callback,
 	)
 	if farewell_error.message != nil {
 		return farewell_error
 	}
-	if incompatible_nondeterminism {
+	if revision == .Incompatible_Nondeterminism {
 		return workflow.registry_register_workflow(
 			registry,
 			NONDETERMINISM_WORKFLOW_TYPE,
 			incompatible_nondeterminism_workflow,
+		)
+	}
+	if revision == .Stack_Overflow {
+		return workflow.registry_register_workflow(
+			registry,
+			NONDETERMINISM_WORKFLOW_TYPE,
+			stack_overflow_string_workflow,
 		)
 	}
 	return workflow.registry_register_workflow(

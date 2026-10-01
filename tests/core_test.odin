@@ -542,6 +542,7 @@ workflow_executor_crash_loop_breaker_stops_process_respawn_until_cooldown :: pro
 	testing.expect_value(t, manager.stats.generations_started, 2)
 	testing.expect_value(t, manager.consecutive_failures, 2)
 	testing.expect_value(t, manager.stats.child_exits, 2)
+	testing.expect_value(t, manager.stats.last_child_exit_code, 86)
 	testing.expect_value(t, manager.stats.protocol_failures, 0)
 	testing.expect_value(t, manager.stats.aborted_children, 2)
 	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)

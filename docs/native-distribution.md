@@ -32,7 +32,10 @@ to reserve each fixed Workflow stack lazily and place an inaccessible page at
 its overflow edge. This is part of the native shim ABI and is exercised by
 `scripts/fiber-guard-test.sh`; it is not supplied by SDK Core. Overflow remains
 a fatal process signal, so deployment supervision and explicit stack sizing are
-still required.
+still required when Workflows execute in-process. The experimental per-run
+executor manager now live-proves that the same signal can fail one Workflow
+Task and recover through Core eviction/replay without terminating the parent
+Worker.
 
 These are experimental CI artifacts, not final release bundles. Public binary
 distribution still needs an audited notice/SBOM for Core's transitive Rust

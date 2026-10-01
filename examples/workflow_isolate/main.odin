@@ -25,6 +25,7 @@ Child_Fault_Mode :: enum {
 	Malformed_Completion,
 	Metadata_Mismatch,
 	Nondeterministic,
+	Stack_Overflow,
 }
 
 executor_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
@@ -109,10 +110,13 @@ run_child :: proc(
 		return 1
 	}
 	defer workflow.registry_close(&registry)
-	registration_error := workflow_app.register_revision(
-		&registry,
-		fault_mode == .Nondeterministic,
-	)
+	registry_revision := workflow_app.Registry_Revision.Ordinary
+	if fault_mode == .Nondeterministic {
+		registry_revision = .Incompatible_Nondeterminism
+	} else if fault_mode == .Stack_Overflow {
+		registry_revision = .Stack_Overflow
+	}
+	registration_error := workflow_app.register_revision(&registry, registry_revision)
 	if registration_error.message != nil {
 		fmt.eprintf("Could not register executor Workflows: %s\n", string(registration_error.message))
 		workflow.error_free(&registration_error)
@@ -139,7 +143,8 @@ run_child :: proc(
 		return 1
 	}
 	defer workflow_isolate.executor_host_close(&host)
-	if fault_mode != .None && fault_mode != .Nondeterministic {
+	if fault_mode != .None && fault_mode != .Nondeterministic &&
+	   fault_mode != .Stack_Overflow {
 		manifest_request, read_error := workflow_isolate.read(os.stdin)
 		if read_error.kind != .None ||
 		   manifest_request.frame.kind != .Manifest_Request {
@@ -545,6 +550,10 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child-nondeterministic" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""
 		os.exit(run_child(.Nondeterministic, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-stack-overflow" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Stack_Overflow, task_queue))
 	}
 	os.exit(run_parent())
 }

@@ -3132,11 +3132,11 @@ Workflows are enabled.
    now proves downward-only nested cancellation-token trees across Activities,
    timers, Signal waits, main/Signal/Update fibers, propagated durable
    deadlines, and replay. Client Update result waits are now bounded and locally
-   cancellable without implying durable Update cancellation. It does not yet prove
-   integrated per-execution panic containment, replay-history JSON import,
-   richer nondeterminism diagnostics, growable stacks, recoverable stack
-   overflow, or
-   a production deterministic scheduler.
+   cancellable without implying durable Update cancellation. A real guard-page
+   overflow is now contained by the per-run executor, followed by Core eviction
+   and fresh-process replay. It does not yet prove Odin-panic containment,
+   replay-history JSON import, richer nondeterminism diagnostics, growable
+   stacks, or a production deterministic scheduler.
 5. **Cross-platform artifacts.** macOS arm64 and a clean Ubuntu 24.04 arm64
    container are locally executed through unit/property tests, all example
    builds, packaging, and packaged-runtime smoke. The repository defines the

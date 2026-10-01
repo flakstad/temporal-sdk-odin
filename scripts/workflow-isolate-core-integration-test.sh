@@ -64,13 +64,17 @@ output="$(
 )"
 echo "$output"
 workflow_log_count="$(grep -c 'isolated-executor workflow_log message="workflow_started"' <<<"$output" || true)"
-if [[ "$workflow_log_count" != "2" ]]; then
-  echo "Expected exactly two replay-suppressed executor Workflow logs; got $workflow_log_count" >&2
+expected_hook_count=2
+if [[ "$first_mode" == "stack-overflow" ]]; then
+  expected_hook_count=3
+fi
+if [[ "$workflow_log_count" != "$expected_hook_count" ]]; then
+  echo "Expected exactly $expected_hook_count replay-suppressed executor Workflow logs; got $workflow_log_count" >&2
   exit 1
 fi
 workflow_metric_count="$(grep -c 'isolated-executor workflow_metric name=workflow_started value=1' <<<"$output" || true)"
-if [[ "$workflow_metric_count" != "2" ]]; then
-  echo "Expected exactly two replay-suppressed executor Workflow metrics; got $workflow_metric_count" >&2
+if [[ "$workflow_metric_count" != "$expected_hook_count" ]]; then
+  echo "Expected exactly $expected_hook_count replay-suppressed executor Workflow metrics; got $workflow_metric_count" >&2
   exit 1
 fi
 grep -q 'Core registry isolation completed' <<<"$output"
@@ -108,9 +112,12 @@ grep -q 'missing_timer_sequences=0' <<<"$output"
 grep -q 'diagnostic_logs=2' <<<"$output"
 grep -q 'diagnostic_metrics=2' <<<"$output"
 grep -q 'diagnostics_received=4' <<<"$output"
-if [[ "$first_mode" == "crash" ]]; then
+if [[ "$first_mode" == "crash" || "$first_mode" == "stack-overflow" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"
+  if [[ "$first_mode" == "stack-overflow" ]]; then
+    grep -q 'isolated-executor forcing guarded Workflow stack overflow' <<<"$output"
+  fi
 elif [[ "$first_mode" == "hang" || "$first_mode" == "late" ]]; then
   grep -q 'child_exits=0' <<<"$output"
   grep -q 'activation_timeouts=1' <<<"$output"

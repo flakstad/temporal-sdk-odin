@@ -854,6 +854,20 @@ same type manifest. The sticky-cache replay must produce exactly one Core
 Workflow, and the CLI history must contain `[TMPRL1100]` or equivalent
 nondeterminism diagnostics.
 
+Exercise real guard-page stack-overflow recovery with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=stack-overflow \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+The first Workflow callback recursively exhausts the minicoro stack. The child
+must terminate with the platform's `SIGSEGV` or `SIGBUS` value, the manager must
+preserve that exit code, and Core eviction/replay must complete both executions
+in replacement children. This complements `scripts/fiber-guard-test.sh`, which
+proves the guard mapping and signal in a smaller native fork test.
+
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
 `register_external_workflow_registry` copies only the Workflow type-name

@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:sys/posix"
 import "core:time"
 import temporal_client "../../temporal/client"
 import worker "../../temporal/worker"
@@ -251,6 +252,7 @@ run :: proc() -> int {
 	expected_timeouts := 0
 	expected_protocol_failures := 0
 	expected_activation_failures := 1
+	expect_guard_signal := false
 	activation_timeout := 5 * time.Second
 	switch first_mode {
 	case "crash":
@@ -288,6 +290,10 @@ run :: proc() -> int {
 		first_argument = "--child-nondeterministic"
 		expected_child_exits = 0
 		expected_activation_failures = 0
+	case "stack-overflow":
+		first_argument = "--child-stack-overflow"
+		expected_child_exits = 1
+		expect_guard_signal = true
 	case:
 		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_FIRST_MODE: %s\n", first_mode)
 		return 1
@@ -477,6 +483,8 @@ run :: proc() -> int {
 		return 1
 	}
 	manager_stats := workflow_isolate.manager_stats(&executor_manager)
+	guard_signal_observed := manager_stats.last_child_exit_code == int(posix.SIGSEGV) ||
+		manager_stats.last_child_exit_code == int(posix.SIGBUS)
 	expected_generations := 5
 	if cache_mode == "sticky" {
 		expected_generations = 3
@@ -503,6 +511,7 @@ run :: proc() -> int {
 	   manager_stats.crash_loop_rejections != 0 ||
 	   manager_stats.capacity_rejections != 0 ||
 	   manager_stats.protocol_failures != expected_protocol_failures ||
+	   (expect_guard_signal && !guard_signal_observed) ||
 	   observations.timer_commands_with_sequence != expected_timer_sequences ||
 	   observations.timer_commands_without_sequence != 0 ||
 	   observations.diagnostic_logs != 2 || observations.diagnostic_metrics != 2 ||
@@ -510,7 +519,7 @@ run :: proc() -> int {
 	   manager_stats.diagnostics_received != 4 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d last_child_exit_code=%d expect_guard_signal=%v timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
@@ -518,6 +527,8 @@ run :: proc() -> int {
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			manager_stats.child_exits,
+			manager_stats.last_child_exit_code,
+			expect_guard_signal,
 			manager_stats.activation_timeouts,
 			manager_stats.generations_started,
 			expected_generations,
@@ -545,7 +556,7 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d diagnostics_received=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d last_child_exit_code=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d diagnostics_received=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
@@ -556,6 +567,7 @@ run :: proc() -> int {
 		first_mode,
 		manager_stats.generations_started,
 		manager_stats.child_exits,
+		manager_stats.last_child_exit_code,
 		manager_stats.activation_timeouts,
 		manager_stats.evictions,
 		run_stats.workflow_replay_activations,

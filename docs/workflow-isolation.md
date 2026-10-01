@@ -338,6 +338,28 @@ mismatch into a terminal Workflow failure. The test independently requires
 the server history. With a zero-sized cache, Core may emit the cache-lifecycle
 eviction first, so that mode is deliberately not used for this diagnostic.
 
+### Guard-page stack overflow containment
+
+Run an actual overflowing Workflow fiber through the same boundary with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=stack-overflow \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+The first child uses the ordinary registry manifest but a Workflow callback
+that recursively consumes its fixed minicoro stack. The native guard page
+terminates only that executor with `SIGSEGV` or `SIGBUS`. The manager retains
+the OS exit code, reports one failed activation, consumes Core's language-fail
+eviction, and starts no replacement until that eviction arrives. Ordinary code
+in fresh generations then replays the server history and both Workflows finish
+with their exact expected results. The preexisting native guard test separately
+requires the same signals, so this is not simulated with `exit(86)`.
+
+Child stderr contains the logger/metric hook emitted before the fatal signal,
+but its queued structured diagnostic frames cannot be delivered after the
+process dies. The live assertions intentionally distinguish those two paths.
+
 ### Ownership at the experimental callback
 
 - Core's poll result owns the activation bytes. `worker.run` borrows them to the
@@ -399,5 +421,5 @@ still required:
 
 The next discriminating vertical slice is cross-platform pipe/process
 validation and packaging of the executor binary on the four supported target
-triples. Production isolation also still needs a policy for fixed-stack
-overflow and other fatal child exits.
+triples. Production isolation still needs the same containment proof for Odin
+panics and other fatal native child exits.
