@@ -257,13 +257,25 @@ decode_update_standalone_activity_options_response :: proc(
 	if !decoded || response.activity_options == nil {
 		return {}, error_from_string(.Malformed_Response, "Temporal returned malformed standalone Activity options")
 	}
+	ok: bool
+	result, ok = clone_activity_options(response.activity_options, allocator)
+	if !ok {
+		return {}, error_from_string(.Malformed_Response, "could not copy standalone Activity options")
+	}
+	return result, {}
+}
+
+clone_activity_options :: proc(
+	options: ^proto.Temporal_Api_Activity_V1_ActivityOptions,
+	allocator: mem.Allocator,
+) -> (result: Standalone_Activity_Options, ok: bool) {
+	if options == nil || allocator.procedure == nil do return {}, false
 	result.allocator = allocator
-	options := response.activity_options
-	ok := true
+	ok = true
 	if options.task_queue != nil do result.task_queue, ok = description_clone_string(options.task_queue.name, allocator)
 	if !ok {
 		standalone_activity_options_free(&result)
-		return {}, error_from_string(.Malformed_Response, "could not copy standalone Activity task queue")
+		return {}, false
 	}
 	result.schedule_to_close_timeout = description_duration(options.schedule_to_close_timeout)
 	result.schedule_to_start_timeout = description_duration(options.schedule_to_start_timeout)
@@ -276,9 +288,9 @@ decode_update_standalone_activity_options_response :: proc(
 	if ok do result.priority, ok = description_priority(options.priority, allocator)
 	if !ok {
 		standalone_activity_options_free(&result)
-		return {}, error_from_string(.Malformed_Response, "could not copy standalone Activity options")
+		return {}, false
 	}
-	return result, {}
+	return result, true
 }
 
 update_standalone_activity_options_terminal :: proc(

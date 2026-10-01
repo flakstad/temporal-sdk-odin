@@ -3003,6 +3003,14 @@ temporal workflow describe \
   --output json >"$typed_history_file"
 grep -q "$deployment_name" "$typed_history_file"
 grep -q "$deployment_build_id" "$typed_history_file"
+TEMPORAL_CLIENT_ACTION=describe \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$deployment_workflow_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-control.sh" >"$client_control_log"
+cat "$client_control_log"
+grep -q 'versioning=true' "$client_control_log"
+grep -q "deployment_name=\"$deployment_name\"" "$client_control_log"
+grep -q "build_id=\"$deployment_build_id\"" "$client_control_log"
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

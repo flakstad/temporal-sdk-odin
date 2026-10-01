@@ -44,8 +44,9 @@ The live suite proves an unhandled `ActivityFailure -> ApplicationFailure`
 chain from Odin Activity through Server history and back to the Odin Client. It
 also
 owns and types `DescribeWorkflowExecution` results—including identity, status,
-timeouts, priority, memo/Search Attributes, Workflow pause metadata, pending
-Activity/child/Nexus summaries, and owned callback protobufs—and
+timeouts, priority, memo/Search Attributes, Workflow pause and deployment
+versioning metadata, effective pending-Activity options/routing, pending
+child/Nexus summaries, and owned callback protobufs—and
 iterates full Workflow history with explicit pagination tokens. Each history
 event includes stable metadata plus an owned canonical protobuf representation.
 The live suite requests one-event pages against the CLI dev server and follows

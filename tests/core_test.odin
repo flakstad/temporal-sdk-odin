@@ -24817,6 +24817,44 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	append(&heartbeats.payloads, heartbeat)
 	activity_type := proto.Temporal_Api_Common_V1_ActivityType{name = "charge_card"}
 	failure := proto.Temporal_Api_Failure_V1_Failure{message = "card declined"}
+	worker_stamp := proto.Temporal_Api_Common_V1_WorkerVersionStamp{
+		build_id = "legacy-build-v1",
+		use_versioning = true,
+	}
+	legacy_activity_deployment := proto.Temporal_Api_Deployment_V1_Deployment{
+		series_name = "payments-legacy",
+		build_id = "legacy-v2",
+	}
+	activity_deployment_version := proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion{
+		deployment_name = "payments",
+		build_id = "payments-v3",
+	}
+	activity_pause_rule := proto.Temporal_Api_Workflow_V1_PendingActivityInfo_PauseInfo_Rule{
+		rule_id = "maintenance-rule",
+		identity = "operator-1",
+		reason = "maintenance",
+	}
+	activity_pause_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_002}
+	activity_pause := proto.Temporal_Api_Workflow_V1_PendingActivityInfo_PauseInfo{
+		pause_time = &activity_pause_time,
+		paused_by = proto.Temporal_Api_Workflow_V1_PendingActivityInfo_PauseInfo_Paused_By_Rule{
+			value = &activity_pause_rule,
+		},
+	}
+	activity_task_queue := proto.Temporal_Api_Taskqueue_V1_TaskQueue{name = "payments-activity"}
+	activity_start_to_close := proto.Google_Protobuf_Duration{seconds = 30}
+	activity_retry_initial := proto.Google_Protobuf_Duration{seconds = 2}
+	activity_retry := proto.Temporal_Api_Common_V1_RetryPolicy{
+		initial_interval = &activity_retry_initial,
+		backoff_coefficient = 2,
+		maximum_attempts = 4,
+	}
+	activity_options := proto.Temporal_Api_Activity_V1_ActivityOptions{
+		task_queue = &activity_task_queue,
+		start_to_close_timeout = &activity_start_to_close,
+		retry_policy = &activity_retry,
+		priority = &priority,
+	}
 	pending_activity := proto.Temporal_Api_Workflow_V1_PendingActivityInfo{
 		activity_id = "activity-1",
 		activity_type = &activity_type,
@@ -24826,7 +24864,16 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		maximum_attempts = 5,
 		last_failure = &failure,
 		last_worker_identity = "worker-1",
+		last_worker_version_stamp = &worker_stamp,
+		assigned_build_id = proto.Temporal_Api_Workflow_V1_PendingActivityInfo_Assigned_Build_Id_Last_Independently_Assigned_Build_Id{
+			value = "activity-build-v2",
+		},
+		last_deployment = &legacy_activity_deployment,
+		last_worker_deployment_version = "payments:payments-v2",
+		last_deployment_version = &activity_deployment_version,
 		priority = &priority,
+		pause_info = &activity_pause,
+		activity_options = &activity_options,
 	}
 	pending_child := proto.Temporal_Api_Workflow_V1_PendingChildExecutionInfo{
 		workflow_id = "child-id",
@@ -24872,6 +24919,42 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		attempt = 1,
 		request_id = "callback-request",
 	}
+	legacy_workflow_deployment := proto.Temporal_Api_Deployment_V1_Deployment{
+		series_name = "orders-legacy",
+		build_id = "orders-legacy-v1",
+	}
+	workflow_deployment_version := proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion{
+		deployment_name = "orders",
+		build_id = "orders-v3",
+	}
+	target_deployment_version := proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion{
+		deployment_name = "orders",
+		build_id = "orders-v4",
+	}
+	one_time_override := proto.Temporal_Api_Workflow_V1_VersioningOverride_OneTimeOverride{
+		target_deployment_version = &target_deployment_version,
+	}
+	versioning_override := proto.Temporal_Api_Workflow_V1_VersioningOverride{
+		override = proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_One_Time{
+			value = &one_time_override,
+		},
+	}
+	legacy_transition := proto.Temporal_Api_Workflow_V1_DeploymentTransition{}
+	version_transition := proto.Temporal_Api_Workflow_V1_DeploymentVersionTransition{
+		version = "orders.orders-v4",
+		deployment_version = &target_deployment_version,
+	}
+	versioning_info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionVersioningInfo{
+		behavior = .VERSIONING_BEHAVIOR_AUTO_UPGRADE,
+		deployment = &legacy_workflow_deployment,
+		version = "orders-legacy-v1",
+		deployment_version = &workflow_deployment_version,
+		versioning_override = &versioning_override,
+		deployment_transition = &legacy_transition,
+		version_transition = &version_transition,
+		revision_number = 12,
+		continue_as_new_initial_versioning_behavior = .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION,
+	}
 	info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionInfo{
 		execution = &execution,
 		type = &workflow_type,
@@ -24884,7 +24967,12 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		state_transition_count = 8,
 		history_size_bytes = 4096,
 		execution_duration = &execution_duration,
+		most_recent_worker_version_stamp = &worker_stamp,
+		assigned_build_id = "workflow-build-v2",
+		inherited_build_id = "parent-build-v1",
 		first_run_id = "first-run",
+		versioning_info = &versioning_info,
+		worker_deployment_name = "orders",
 		priority = &priority,
 		external_payload_size_bytes = 99,
 		external_payload_count = 2,
@@ -24920,6 +25008,18 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	append(&response.callbacks, callback)
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse(&response)
 	description, decode_error := temporal_client.decode_workflow_description(encoded[:])
+	owned_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&owned_arena) == nil)
+	arena_description, arena_decode_error := temporal_client.decode_workflow_description(
+		encoded[:],
+		virtual.arena_allocator(&owned_arena),
+	)
+	testing.expect(t, arena_decode_error.message == nil)
+	testing.expect_value(t, arena_description.versioning_info.deployment_version.build_id, "orders-v3")
+	testing.expect_value(t, arena_description.pending_activities[0].activity_options.task_queue, "payments-activity")
+	temporal_client.workflow_description_free(&arena_description)
+	temporal_client.error_free(&arena_decode_error)
+	virtual.arena_destroy(&owned_arena)
 	delete(encoded)
 	defer temporal_client.workflow_description_free(&description)
 	defer temporal_client.error_free(&decode_error)
@@ -24935,6 +25035,36 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, description.history_size_bytes, i64(4096))
 	testing.expect(t, description.cancel_requested)
 	testing.expect_value(t, description.priority.fairness_key, "tenant-a")
+	testing.expect(t, description.most_recent_worker_version_stamp.present)
+	testing.expect_value(t, description.most_recent_worker_version_stamp.build_id, "legacy-build-v1")
+	testing.expect_value(t, description.assigned_build_id, "workflow-build-v2")
+	testing.expect_value(t, description.inherited_build_id, "parent-build-v1")
+	testing.expect_value(t, description.worker_deployment_name, "orders")
+	testing.expect(t, description.versioning_info.present)
+	testing.expect_value(
+		t,
+		description.versioning_info.behavior,
+		temporal_client.Workflow_Versioning_Behavior.Auto_Upgrade,
+	)
+	testing.expect_value(t, description.versioning_info.deployment_version.name, "orders")
+	testing.expect_value(t, description.versioning_info.deployment_version.build_id, "orders-v3")
+	testing.expect(t, description.versioning_info.has_versioning_override)
+	testing.expect_value(
+		t,
+		description.versioning_info.versioning_override.kind,
+		temporal_client.Workflow_Versioning_Override_Kind.One_Time,
+	)
+	testing.expect(t, description.versioning_info.legacy_transition.present)
+	testing.expect(t, !description.versioning_info.legacy_transition.target_present)
+	testing.expect(t, description.versioning_info.version_transition.target_present)
+	testing.expect_value(t, description.versioning_info.version_transition.legacy_version, "orders.orders-v4")
+	testing.expect_value(t, description.versioning_info.version_transition.target.build_id, "orders-v4")
+	testing.expect_value(t, description.versioning_info.revision_number, i64(12))
+	testing.expect_value(
+		t,
+		description.versioning_info.continue_as_new_behavior,
+		temporal_client.Continue_As_New_Versioning_Behavior.Use_Ramping_Version,
+	)
 	testing.expect(t, description.has_static_summary)
 	testing.expect_value(t, description.static_summary, "Order 42")
 	testing.expect(t, description.has_static_details)
@@ -24947,6 +25077,23 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, description.pending_activities[0].activity_type, "charge_card")
 	testing.expect_value(t, description.pending_activities[0].last_failure_message, "card declined")
 	testing.expect_value(t, len(description.pending_activities[0].heartbeat_details), 1)
+	described_activity := &description.pending_activities[0]
+	testing.expect(t, described_activity.last_worker_version_stamp.present)
+	testing.expect_value(
+		t,
+		described_activity.assigned_build_id_kind,
+		temporal_client.Activity_Assigned_Build_Id_Kind.Independent_Build_Id,
+	)
+	testing.expect_value(t, described_activity.assigned_build_id, "activity-build-v2")
+	testing.expect_value(t, described_activity.legacy_last_deployment.name, "payments-legacy")
+	testing.expect_value(t, described_activity.last_deployment_version.build_id, "payments-v3")
+	testing.expect(t, described_activity.pause_info.present)
+	testing.expect_value(t, described_activity.pause_info.kind, temporal_client.Activity_Pause_Kind.Rule)
+	testing.expect_value(t, described_activity.pause_info.rule_id, "maintenance-rule")
+	testing.expect(t, described_activity.has_activity_options)
+	testing.expect_value(t, described_activity.activity_options.task_queue, "payments-activity")
+	testing.expect_value(t, described_activity.activity_options.start_to_close_timeout.value, 30 * time.Second)
+	testing.expect(t, described_activity.activity_options.has_retry_policy)
 	testing.expect_value(t, len(description.pending_children), 1)
 	testing.expect_value(t, description.pending_children[0].parent_close_policy, temporal_client.Parent_Close_Policy.Request_Cancel)
 	testing.expect(t, description.pause_info.present)

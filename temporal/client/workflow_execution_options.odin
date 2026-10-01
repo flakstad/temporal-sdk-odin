@@ -31,12 +31,21 @@ Workflow_Execution_Options :: struct {
 	allocator:               mem.Allocator,
 }
 
+workflow_versioning_override_free :: proc(
+	override: ^Workflow_Versioning_Override,
+	allocator: mem.Allocator,
+) {
+	if override == nil || allocator.procedure == nil do return
+	delete(override.deployment_name, allocator)
+	delete(override.build_id, allocator)
+	override^ = {}
+}
+
 workflow_execution_options_free :: proc(options: ^Workflow_Execution_Options) {
 	if options == nil do return
 	allocator := options.allocator
 	if allocator.procedure != nil {
-		delete(options.versioning_override.deployment_name, allocator)
-		delete(options.versioning_override.build_id, allocator)
+		workflow_versioning_override_free(&options.versioning_override, allocator)
 		delete(options.priority.fairness_key, allocator)
 		delete(options.time_skipping_config.fast_forward.id, allocator)
 	}

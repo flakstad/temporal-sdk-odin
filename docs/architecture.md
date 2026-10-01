@@ -316,11 +316,12 @@ symbols:
   then copies the public snapshot into the caller's allocator. The current
   typed surface owns Workflow identity/type/task queue, status and timing,
   execution timeouts and counters, priority, memo/Search Attribute Payloads,
-  pending Activity/child/Nexus summaries, Workflow pause metadata, and the
-  pending Workflow Task. Callback schemas are preserved as allocator-owned
-  canonical protobufs; newer deployment/version-transition and detailed
-  pending-Activity routing fields remain in the generated raw schema until
-  their language-level shape is justified.
+  pending Activity/child/Nexus summaries, Workflow pause metadata, deployment
+  versioning/transition state, and the pending Workflow Task. Pending Activity
+  snapshots own legacy/new worker routing identity, manual/rule pause metadata,
+  and effective Activity options. Callback schemas are preserved as
+  allocator-owned canonical protobufs; auto-reset points and the remaining
+  extended execution metadata are still generated-only.
 - `GetWorkflowExecutionHistory` accepts the Service's opaque next-page token,
   page size, wait/filter, and archival flags. It returns owned event metadata
   and a canonical protobuf encoding of each decoded event. The re-encoding

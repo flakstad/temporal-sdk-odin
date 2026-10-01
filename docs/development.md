@@ -1772,7 +1772,11 @@ owned event plus its canonical protobuf encoding to remain readable. Focused
 unit tests perform the same arena-lifetime check for rich Describe results,
 including memo/Search Attribute Payloads, Workflow pause metadata, pending
 Activity/child/Nexus summaries, recursive Nexus failures, and owned canonical
-callback protobufs. The
+callback protobufs. The same ownership test covers legacy and current Worker
+Deployment identity, transitions (including a nil target meaning a transition
+to unversioned workers), execution overrides, Activity pause rules, and
+effective Activity options. The live deployment scenario additionally requires
+the Odin Describe path to return the Deployment name and Build ID. The
 Visibility property adds 500 pages with zero to sixteen execution summaries,
 all current Workflow status values, and opaque terminal/non-terminal tokens,
 plus zero to eight grouped count results with arbitrary ASCII Payload bytes.

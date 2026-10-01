@@ -43,6 +43,26 @@ Parent_Close_Policy :: enum i32 {
 	Request_Cancel = 3,
 }
 
+Workflow_Versioning_Behavior :: temporal_core.Worker_Versioning_Behavior
+
+Continue_As_New_Versioning_Behavior :: enum i32 {
+	Unspecified = 0,
+	Auto_Upgrade = 1,
+	Use_Ramping_Version = 2,
+}
+
+Activity_Assigned_Build_Id_Kind :: enum {
+	Unspecified,
+	Use_Workflow_Build_Id,
+	Independent_Build_Id,
+}
+
+Activity_Pause_Kind :: enum {
+	Unspecified,
+	Manual,
+	Rule,
+}
+
 Optional_Time :: struct {
 	value:   time.Time,
 	present: bool,
@@ -58,6 +78,39 @@ Workflow_Priority :: struct {
 	fairness_key:    string,
 	fairness_weight: f32,
 	present:         bool,
+}
+
+Deployment_Identity :: struct {
+	name:     string,
+	build_id: string,
+	present:  bool,
+}
+
+Worker_Version_Stamp :: struct {
+	build_id:       string,
+	use_versioning: bool,
+	present:        bool,
+}
+
+Workflow_Deployment_Transition :: struct {
+	present:        bool,
+	target_present: bool,
+	target:         Deployment_Identity,
+	legacy_version: string,
+}
+
+Workflow_Versioning_Info :: struct {
+	present:                  bool,
+	behavior:                 Workflow_Versioning_Behavior,
+	legacy_deployment:        Deployment_Identity,
+	legacy_version:           string,
+	deployment_version:       Deployment_Identity,
+	versioning_override:      Workflow_Versioning_Override,
+	has_versioning_override:  bool,
+	legacy_transition:        Workflow_Deployment_Transition,
+	version_transition:       Workflow_Deployment_Transition,
+	revision_number:          i64,
+	continue_as_new_behavior: Continue_As_New_Versioning_Behavior,
 }
 
 Named_Payload :: struct {
@@ -83,6 +136,24 @@ Pending_Activity :: struct {
 	priority:                   Workflow_Priority,
 	heartbeat_details:           [dynamic]codec.Payload,
 	last_failure_message:        string,
+	last_worker_version_stamp:   Worker_Version_Stamp,
+	assigned_build_id_kind:      Activity_Assigned_Build_Id_Kind,
+	assigned_build_id:           string,
+	legacy_last_deployment:      Deployment_Identity,
+	last_worker_deployment_version: string,
+	last_deployment_version:     Deployment_Identity,
+	pause_info:                  Pending_Activity_Pause_Info,
+	activity_options:            Standalone_Activity_Options,
+	has_activity_options:        bool,
+}
+
+Pending_Activity_Pause_Info :: struct {
+	present:    bool,
+	kind:       Activity_Pause_Kind,
+	pause_time: Optional_Time,
+	rule_id:    string,
+	identity:   string,
+	reason:     string,
 }
 
 Pending_Child_Workflow :: struct {
@@ -151,6 +222,11 @@ Workflow_Description :: struct {
 	external_payload_count:      i64,
 	cancel_requested:            bool,
 	priority:                    Workflow_Priority,
+	most_recent_worker_version_stamp: Worker_Version_Stamp,
+	assigned_build_id:           string,
+	inherited_build_id:          string,
+	worker_deployment_name:      string,
+	versioning_info:             Workflow_Versioning_Info,
 	static_summary:              string,
 	has_static_summary:          bool,
 	static_details:              string,
@@ -210,6 +286,137 @@ description_priority :: proc(
 		fairness_weight = value.fairness_weight,
 		present = true,
 	}, true
+}
+
+deployment_identity_free :: proc(value: ^Deployment_Identity, allocator: mem.Allocator) {
+	if value == nil || allocator.procedure == nil do return
+	delete(value.name, allocator)
+	delete(value.build_id, allocator)
+	value^ = {}
+}
+
+description_deployment_identity :: proc(
+	name, build_id: string,
+	present: bool,
+	allocator: mem.Allocator,
+) -> (result: Deployment_Identity, ok: bool) {
+	if !present do return {}, true
+	result.present = true
+	result.name, ok = description_clone_string(name, allocator)
+	if ok do result.build_id, ok = description_clone_string(build_id, allocator)
+	if !ok do deployment_identity_free(&result, allocator)
+	return result, ok
+}
+
+worker_version_stamp_free :: proc(value: ^Worker_Version_Stamp, allocator: mem.Allocator) {
+	if value == nil || allocator.procedure == nil do return
+	delete(value.build_id, allocator)
+	value^ = {}
+}
+
+description_worker_version_stamp :: proc(
+	source: ^proto.Temporal_Api_Common_V1_WorkerVersionStamp,
+	allocator: mem.Allocator,
+) -> (result: Worker_Version_Stamp, ok: bool) {
+	if source == nil do return {}, true
+	result.present = true
+	result.use_versioning = source.use_versioning
+	result.build_id, ok = description_clone_string(source.build_id, allocator)
+	return result, ok
+}
+
+workflow_deployment_transition_free :: proc(
+	transition: ^Workflow_Deployment_Transition,
+	allocator: mem.Allocator,
+) {
+	if transition == nil do return
+	deployment_identity_free(&transition.target, allocator)
+	delete(transition.legacy_version, allocator)
+	transition^ = {}
+}
+
+workflow_versioning_info_free :: proc(
+	info: ^Workflow_Versioning_Info,
+	allocator: mem.Allocator,
+) {
+	if info == nil do return
+	deployment_identity_free(&info.legacy_deployment, allocator)
+	delete(info.legacy_version, allocator)
+	deployment_identity_free(&info.deployment_version, allocator)
+	workflow_versioning_override_free(&info.versioning_override, allocator)
+	workflow_deployment_transition_free(&info.legacy_transition, allocator)
+	workflow_deployment_transition_free(&info.version_transition, allocator)
+	info^ = {}
+}
+
+description_workflow_versioning_info :: proc(
+	source: ^proto.Temporal_Api_Workflow_V1_WorkflowExecutionVersioningInfo,
+	allocator: mem.Allocator,
+) -> (result: Workflow_Versioning_Info, ok: bool) {
+	if source == nil do return {}, true
+	behavior := i32(source.behavior)
+	continue_behavior := i32(source.continue_as_new_initial_versioning_behavior)
+	if behavior < i32(Workflow_Versioning_Behavior.Unspecified) ||
+	   behavior > i32(Workflow_Versioning_Behavior.Auto_Upgrade) ||
+	   continue_behavior < i32(Continue_As_New_Versioning_Behavior.Unspecified) ||
+	   continue_behavior > i32(Continue_As_New_Versioning_Behavior.Use_Ramping_Version) {
+		return {}, false
+	}
+	result.present = true
+	result.behavior = Workflow_Versioning_Behavior(behavior)
+	result.revision_number = source.revision_number
+	result.continue_as_new_behavior = Continue_As_New_Versioning_Behavior(continue_behavior)
+	ok = true
+	if source.deployment != nil {
+		result.legacy_deployment, ok = description_deployment_identity(
+			source.deployment.series_name,
+			source.deployment.build_id,
+			true,
+			allocator,
+		)
+	}
+	if ok do result.legacy_version, ok = description_clone_string(source.version, allocator)
+	if ok && source.deployment_version != nil {
+		result.deployment_version, ok = description_deployment_identity(
+			source.deployment_version.deployment_name,
+			source.deployment_version.build_id,
+			true,
+			allocator,
+		)
+	}
+	if ok {
+		result.versioning_override,
+		result.has_versioning_override,
+		ok = decode_workflow_versioning_override(source.versioning_override, allocator)
+	}
+	if ok && source.deployment_transition != nil {
+		result.legacy_transition.present = true
+		if source.deployment_transition.deployment != nil {
+			result.legacy_transition.target_present = true
+			result.legacy_transition.target, ok = description_deployment_identity(
+				source.deployment_transition.deployment.series_name,
+				source.deployment_transition.deployment.build_id,
+				true,
+				allocator,
+			)
+		}
+	}
+	if ok && source.version_transition != nil {
+		result.version_transition.present = true
+		result.version_transition.legacy_version,
+		ok = description_clone_string(source.version_transition.version, allocator)
+		if ok && source.version_transition.deployment_version != nil {
+			result.version_transition.target_present = true
+			result.version_transition.target, ok = description_deployment_identity(
+				source.version_transition.deployment_version.deployment_name,
+				source.version_transition.deployment_version.build_id,
+				true,
+				allocator,
+			)
+		}
+	}
+	if !ok do workflow_versioning_info_free(&result, allocator)
+	return result, ok
 }
 
 description_clone_payload :: proc(
@@ -304,6 +511,11 @@ workflow_description_free :: proc(description: ^Workflow_Description) {
 	delete(description.static_summary, allocator)
 	delete(description.static_details, allocator)
 	delete(description.priority.fairness_key, allocator)
+	worker_version_stamp_free(&description.most_recent_worker_version_stamp, allocator)
+	delete(description.assigned_build_id, allocator)
+	delete(description.inherited_build_id, allocator)
+	delete(description.worker_deployment_name, allocator)
+	workflow_versioning_info_free(&description.versioning_info, allocator)
 	delete(description.pause_info.identity, allocator)
 	delete(description.pause_info.reason, allocator)
 	for &entry in description.memo {
@@ -344,6 +556,17 @@ pending_activity_free :: proc(activity: ^Pending_Activity, allocator: mem.Alloca
 	delete(activity.last_worker_identity, allocator)
 	delete(activity.priority.fairness_key, allocator)
 	delete(activity.last_failure_message, allocator)
+	worker_version_stamp_free(&activity.last_worker_version_stamp, allocator)
+	delete(activity.assigned_build_id, allocator)
+	deployment_identity_free(&activity.legacy_last_deployment, allocator)
+	delete(activity.last_worker_deployment_version, allocator)
+	deployment_identity_free(&activity.last_deployment_version, allocator)
+	delete(activity.pause_info.rule_id, allocator)
+	delete(activity.pause_info.identity, allocator)
+	delete(activity.pause_info.reason, allocator)
+	if activity.has_activity_options {
+		standalone_activity_options_free(&activity.activity_options)
+	}
 	for &payload in activity.heartbeat_details {
 		codec.payload_free(&payload)
 	}
@@ -414,6 +637,9 @@ decode_workflow_description :: proc(
 		{info.first_run_id, &description.first_run_id},
 		{info.type.name, &description.workflow_type},
 		{config.task_queue.name, &description.task_queue},
+		{info.assigned_build_id, &description.assigned_build_id},
+		{info.inherited_build_id, &description.inherited_build_id},
+		{info.worker_deployment_name, &description.worker_deployment_name},
 	}
 	for target in clone_targets {
 		ok: bool
@@ -459,6 +685,17 @@ decode_workflow_description :: proc(
 	if !priority_ok {
 		failed = true
 		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow priority")
+	}
+	version_ok: bool
+	description.most_recent_worker_version_stamp,
+	version_ok = description_worker_version_stamp(info.most_recent_worker_version_stamp, allocator)
+	if version_ok {
+		description.versioning_info,
+		version_ok = description_workflow_versioning_info(info.versioning_info, allocator)
+	}
+	if !version_ok {
+		failed = true
+		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow versioning info")
 	}
 	if config.user_metadata != nil {
 		metadata_ok: bool
@@ -527,11 +764,87 @@ decode_workflow_description :: proc(
 			activity.priority, ok = description_priority(source.priority, allocator)
 			failed = !ok
 		}
+		if !failed {
+			activity.last_worker_version_stamp,
+			ok = description_worker_version_stamp(source.last_worker_version_stamp, allocator)
+			failed = !ok
+		}
+		if !failed {
+			#partial switch assigned in source.assigned_build_id {
+			case proto.Temporal_Api_Workflow_V1_PendingActivityInfo_Assigned_Build_Id_Use_Workflow_Build_Id:
+				activity.assigned_build_id_kind = .Use_Workflow_Build_Id
+			case proto.Temporal_Api_Workflow_V1_PendingActivityInfo_Assigned_Build_Id_Last_Independently_Assigned_Build_Id:
+				activity.assigned_build_id_kind = .Independent_Build_Id
+				activity.assigned_build_id, ok = description_clone_string(assigned.value, allocator)
+			case:
+			}
+			failed = !ok
+		}
+		if !failed && source.last_deployment != nil {
+			activity.legacy_last_deployment, ok = description_deployment_identity(
+				source.last_deployment.series_name,
+				source.last_deployment.build_id,
+				true,
+				allocator,
+			)
+			failed = !ok
+		}
+		if !failed {
+			activity.last_worker_deployment_version,
+			ok = description_clone_string(source.last_worker_deployment_version, allocator)
+			failed = !ok
+		}
+		if !failed && source.last_deployment_version != nil {
+			activity.last_deployment_version, ok = description_deployment_identity(
+				source.last_deployment_version.deployment_name,
+				source.last_deployment_version.build_id,
+				true,
+				allocator,
+			)
+			failed = !ok
+		}
+		if !failed && source.pause_info != nil {
+			activity.pause_info.present = true
+			activity.pause_info.pause_time = description_time(source.pause_info.pause_time)
+			#partial switch paused_by in source.pause_info.paused_by {
+			case proto.Temporal_Api_Workflow_V1_PendingActivityInfo_PauseInfo_Paused_By_Manual:
+				activity.pause_info.kind = .Manual
+				if paused_by.value == nil {
+					ok = false
+				} else {
+					activity.pause_info.identity, ok = description_clone_string(paused_by.value.identity, allocator)
+					if ok do activity.pause_info.reason, ok = description_clone_string(paused_by.value.reason, allocator)
+				}
+			case proto.Temporal_Api_Workflow_V1_PendingActivityInfo_PauseInfo_Paused_By_Rule:
+				activity.pause_info.kind = .Rule
+				if paused_by.value == nil {
+					ok = false
+				} else {
+					activity.pause_info.rule_id, ok = description_clone_string(paused_by.value.rule_id, allocator)
+					if ok do activity.pause_info.identity, ok = description_clone_string(paused_by.value.identity, allocator)
+					if ok do activity.pause_info.reason, ok = description_clone_string(paused_by.value.reason, allocator)
+				}
+			case:
+			}
+			failed = !ok
+		}
+		if !failed && source.activity_options != nil {
+			activity.activity_options, ok = clone_activity_options(source.activity_options, allocator)
+			activity.has_activity_options = ok
+			failed = !ok
+		}
 		if failed {
 			pending_activity_free(&activity, allocator)
 			return {}, error_from_string(.Malformed_Response, "could not allocate pending Activity description")
 		}
-		activity.state = Pending_Activity_State(source.state)
+		state := i32(source.state)
+		if state < i32(Pending_Activity_State.Unspecified) ||
+		   state > i32(Pending_Activity_State.Pause_Requested) {
+			pending_activity_free(&activity, allocator)
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "Temporal returned an unknown pending Activity state")
+		}
+		activity.state = Pending_Activity_State(state)
 		activity.attempt = source.attempt
 		activity.maximum_attempts = source.maximum_attempts
 		activity.paused = source.paused
