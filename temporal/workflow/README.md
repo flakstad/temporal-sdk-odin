@@ -290,5 +290,11 @@ zero-cache uses four successful generations for the same work.
 Once initialized, `Executor_Host` owns its runtimes independently of the source
 Registry. Per-run instances remain routed to the selected runtime until Core
 sends `RemoveFromCache`. Parent-side Workflow loggers and interceptors do not
-apply to these child runtimes and are rejected by `worker.run`; executor-host
-configuration for those hooks is still outstanding.
+apply to these child runtimes and are rejected by `worker.run`.
+`Executor_Host_Options` instead installs a replay-aware logger and ordered
+inbound/outbound interceptors into every child runtime before execution. Option
+slices are borrowed during initialization, hook records are copied, and
+`user_data` remains owned by the child application until host close. Child
+stdout is reserved for isolation frames; the example logger deliberately uses
+stderr. A per-runtime metric-emitter factory remains outstanding because each
+`Fiber_Runtime` owns and destroys its emitter independently.

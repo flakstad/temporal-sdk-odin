@@ -524,8 +524,10 @@ complete language `Process_Result` in a separate diagnostic frame, validates
 terminal flags against the unchanged Core completion, and restores normal
 Worker statistics/observer visibility. The live proof checks timer sequence
 fields that the parent cannot infer from the completion. It still lacks
-executor-host log/metric/interceptor configuration and production pool
-hardening.
+per-runtime executor metric-emitter creation, optional structured diagnostic
+transport, and production pool hardening. Replay-aware child logging and
+inbound/outbound interceptor configuration are now explicit host options; the
+live proof requires exactly two non-replay interceptor logs in both cache modes.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 

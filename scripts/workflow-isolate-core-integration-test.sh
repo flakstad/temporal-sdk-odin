@@ -63,6 +63,11 @@ output="$(
   "$parent_binary" 2>&1
 )"
 echo "$output"
+workflow_log_count="$(grep -c 'isolated-executor workflow_log message="workflow_started"' <<<"$output" || true)"
+if [[ "$workflow_log_count" != "2" ]]; then
+  echo "Expected exactly two replay-suppressed executor Workflow logs; got $workflow_log_count" >&2
+  exit 1
+fi
 grep -q 'Core registry isolation completed' <<<"$output"
 grep -q 'registry_types=2' <<<"$output"
 grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"

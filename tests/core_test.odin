@@ -525,6 +525,36 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 	testing.expect_value(t, route.job_count, 1)
 }
 
+Workflow_Host_Hook_Test_State :: struct {
+	logs:                int,
+	workflow_executions: int,
+	saw_expected_record: bool,
+}
+
+workflow_host_hook_test_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
+	state := cast(^Workflow_Host_Hook_Test_State)user_data
+	if state == nil || record == nil {
+		return
+	}
+	state.logs += 1
+	state.saw_expected_record = record.message == "host-interceptor" &&
+	                            record.namespace == "registry-test-namespace" &&
+	                            record.workflow_type == "registry-first" &&
+	                            record.task_queue == "registry-test-queue" &&
+	                            !record.replaying_history_events
+}
+
+workflow_host_hook_test_execute :: proc(
+	user_data: rawptr,
+	input: ^workflow.Inbound_Execute_Workflow_Input,
+	next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+	state := cast(^Workflow_Host_Hook_Test_State)user_data
+	state.workflow_executions += 1
+	workflow.log_info(input.ctx, "host-interceptor")
+	return next.invoke(next.data, input)
+}
+
 @(test)
 workflow_registry_instantiates_executor_host_and_external_worker_manifest :: proc(
 	t: ^testing.T,
@@ -561,11 +591,24 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	defer delete(manifest)
 
 	host := workflow_isolate.Executor_Host{}
-	host_init_error := workflow_isolate.executor_host_init(
+	hook_state := Workflow_Host_Hook_Test_State{}
+	inbound_interceptors := [1]workflow.Inbound_Interceptor{{
+		user_data = &hook_state,
+		execute_workflow = workflow_host_hook_test_execute,
+	}}
+	host_options := workflow_isolate.executor_host_options_default(
+		"registry-test-namespace",
+	)
+	host_options.logger = {
+		user_data = &hook_state,
+		emit = workflow_host_hook_test_log,
+	}
+	host_options.inbound_interceptors = inbound_interceptors[:]
+	host_init_error := workflow_isolate.executor_host_init_with_options(
 		&host,
 		&registry,
 		"registry-test-queue",
-		"registry-test-namespace",
+		host_options,
 	)
 	testing.expectf(
 		t,
@@ -685,6 +728,9 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	testing.expect(t, processed.error.message == nil)
 	testing.expect(t, processed.completed)
 	testing.expect_value(t, len(host.runs), 1)
+	testing.expect_value(t, hook_state.workflow_executions, 1)
+	testing.expect_value(t, hook_state.logs, 1)
+	testing.expect(t, hook_state.saw_expected_record)
 	workflow_isolate.host_error_free(&process_error)
 	workflow.error_free(&processed.error)
 	delete(processed.completion)

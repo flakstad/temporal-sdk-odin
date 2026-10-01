@@ -122,7 +122,11 @@ the complete type-name manifest; those registrations contain no callback or
 fiber runtime. `worker.run` requires an external activation processor, rejects
 mixed in-process/external registrations, and rejects parent-side Workflow
 logging or interceptors because those hooks must execute in the child where the
-Workflow code runs.
+Workflow code runs. `Executor_Host_Options` installs a replay-aware logger and
+ordered inbound/outbound interceptors into every child runtime before execution.
+The option slices are borrowed only during initialization; hook records are
+copied, while their `user_data` remains child-application-owned through host
+close.
 
 The child initializes `workflow_isolate.Executor_Host` from its independently
 constructed Registry. On `InitializeWorkflow`, the host selects the registered
@@ -229,6 +233,15 @@ by the parent, so this is live evidence that v3 observation metadata crosses
 the process boundary. The zero-cache path observes four such commands because
 both timer schedules are replayed; sticky mode observes two.
 
+The example host also installs an inbound execution interceptor which emits one
+Workflow log through the host logger. The logger writes to inherited child
+`stderr`; framed protocol data has exclusive ownership of child `stdout`. Both
+zero-cache and sticky live paths require exactly two log records. The two replay
+initializations in zero-cache emit none because the Workflow logger suppresses
+history replay by default. This proves both that hooks run in the executor and
+that replay-aware logging survives the process boundary without changing
+commands.
+
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
 capacity, shutdown, crash-loop, or protocol failures. The observed
@@ -316,15 +329,14 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- configure replay-aware logs, metrics, interceptors, and diagnostics in the
-  executor host and carry observations back without letting them affect
+- add a per-runtime metric-emitter factory and, where stderr is insufficient,
+  structured diagnostic-event transport without letting observations affect
   commands;
 - prove nondeterminism and malformed/late child completions against
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is executor-host observability and
-configuration: replay-aware logging, metrics, and interceptor installation must
-run in the child, while their diagnostic events cross back independently of
-deterministic commands. Malformed/late completion tests remain part of that
-hardening.
+The next discriminating vertical slice is executor-host metrics and structured
+diagnostics. Metric emitters are runtime-owned, so the host needs a factory that
+creates one independently owned emitter per registered runtime. Malformed/late
+completion tests remain part of the process hardening.

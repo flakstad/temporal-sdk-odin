@@ -15,6 +15,32 @@ WORKFLOW_TYPE :: workflow_app.GREETING_WORKFLOW_TYPE
 TASK_QUEUE :: workflow_app.DEFAULT_TASK_QUEUE
 RUN_ID :: "isolated-workflow-run"
 
+executor_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
+	if record == nil {
+		return
+	}
+	fmt.eprintf(
+		"isolated-executor workflow_log message=%q type=%s replay=%v replaying_history=%v history=%d\n",
+		record.message,
+		record.workflow_type,
+		record.replaying,
+		record.replaying_history_events,
+		record.history_length,
+	)
+}
+
+executor_execute_workflow_interceptor :: proc(
+	_: rawptr,
+	input: ^workflow.Inbound_Execute_Workflow_Input,
+	next: workflow.Inbound_Execute_Workflow_Next,
+) -> workflow.Payload_Result {
+	fields := [1]workflow.Log_Field{
+		workflow.log_field_string("hook", "executor-host-inbound"),
+	}
+	workflow.log_info(input.ctx, "workflow_started", fields[:])
+	return next.invoke(next.data, input)
+}
+
 run_child :: proc(
 	crash_on_first_activation := false,
 	hang_on_first_activation := false,
@@ -42,7 +68,18 @@ run_child :: proc(
 		return 1
 	}
 	host := workflow_isolate.Executor_Host{}
-	host_init_error := workflow_isolate.executor_host_init(&host, &registry, task_queue)
+	inbound_interceptors := [1]workflow.Inbound_Interceptor{{
+		execute_workflow = executor_execute_workflow_interceptor,
+	}}
+	host_options := workflow_isolate.executor_host_options_default()
+	host_options.logger = {emit = executor_log}
+	host_options.inbound_interceptors = inbound_interceptors[:]
+	host_init_error := workflow_isolate.executor_host_init_with_options(
+		&host,
+		&registry,
+		task_queue,
+		host_options,
+	)
 	if host_init_error.message != nil {
 		fmt.eprintf("Could not initialize Workflow executor host: %s\n", string(host_init_error.message))
 		workflow_isolate.host_error_free(&host_init_error)

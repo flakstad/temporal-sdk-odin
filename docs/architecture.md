@@ -3291,7 +3291,10 @@ successful children retain two timer Workflows across incremental activations,
 while an initial crash or timeout still evicts and recovers. Protocol v3 now
 carries the complete language `Process_Result` separately from the authoritative
 opaque Core completion, with live observer evidence for timer sequence fields.
-The next step is executor-host log/metric/interceptor configuration. Production
+Child runtimes can now receive a replay-aware logger plus ordered inbound and
+outbound interceptors through explicit host options; the live proof requires
+replay-suppressed interceptor logs on child stderr. The next step is a
+per-runtime metric-emitter factory and structured diagnostics. Production
 hardening remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
@@ -3912,8 +3915,12 @@ types through one executor binary.
 External registrations are metadata-only in the parent and cannot be mixed
 with in-process registrations. An external activation processor is mandatory.
 Parent-side Workflow loggers and interceptors are rejected because the parent
-has no executing runtime; equivalent hooks must eventually be configured on the
-executor host. Protocol version 2 adds an ordered, length-prefixed type manifest;
+has no executing runtime. `Executor_Host_Options` now copies a replay-aware
+logger and ordered inbound/outbound interceptors into each child runtime before
+execution; hook `user_data` remains child-application-owned. The live host emits
+interceptor logs on inherited stderr, leaving framed stdout exclusive to the
+protocol, and zero-cache replay proves default log suppression. Protocol version
+2 adds an ordered, length-prefixed type manifest;
 version 3 adds the correlated observation-metadata frame.
 `manager_verify_host` compares it in a temporary child before polling, and every
 executor generation repeats the correlated handshake before activation. A
@@ -3967,7 +3974,9 @@ admits a trial after cooldown. Complete observation metadata is now preserved
 through the process manager and fed to ordinary Worker statistics/observers;
 the live proof checks child-only timer sequence values in zero- and sticky-cache
 modes. Executor-host log, metric, and interceptor hooks remain language-runtime
-work, not additional Temporal protocol work. See
+work, not additional Temporal protocol work. Logger and interceptor
+configuration is implemented; per-runtime metric-emitter creation and optional
+structured event transport remain. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

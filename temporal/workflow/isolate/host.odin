@@ -47,6 +47,21 @@ Executor_Host :: struct {
 	evictions:     int,
 }
 
+// Executor_Host_Options are copied into every process-local Workflow runtime
+// before any execution starts. Logger/interceptor user_data remains owned by
+// the child application and must outlive executor_host_close.
+Executor_Host_Options :: struct {
+	namespace:             string,
+	stack_options:         workflow.Stack_Options,
+	logger:                workflow.Logger,
+	inbound_interceptors:  []workflow.Inbound_Interceptor,
+	outbound_interceptors: []workflow.Outbound_Interceptor,
+}
+
+executor_host_options_default :: proc(namespace := "default") -> Executor_Host_Options {
+	return {namespace = namespace}
+}
+
 executor_host_init :: proc(
 	host: ^Executor_Host,
 	registry: ^workflow.Registry,
@@ -54,8 +69,24 @@ executor_host_init :: proc(
 	namespace := "default",
 	stack_options := workflow.Stack_Options{},
 ) -> Host_Error {
+	return executor_host_init_with_options(host, registry, task_queue, {
+		namespace = namespace,
+		stack_options = stack_options,
+	})
+}
+
+executor_host_init_with_options :: proc(
+	host: ^Executor_Host,
+	registry: ^workflow.Registry,
+	task_queue: string,
+	options: Executor_Host_Options,
+) -> Host_Error {
 	if host == nil || host.initialized {
 		return host_error("Workflow executor host is already initialized or missing")
+	}
+	namespace := options.namespace
+	if len(namespace) == 0 {
+		namespace = "default"
 	}
 	if registry == nil || !registry.initialized ||
 	   workflow.registry_count(registry) == 0 || len(task_queue) == 0 ||
@@ -92,7 +123,7 @@ executor_host_init :: proc(
 			&runtime,
 			task_queue,
 			namespace,
-			stack_options,
+			options.stack_options,
 		)
 		if instantiate_error.message != nil {
 			delete(owned_name)
@@ -101,6 +132,46 @@ executor_host_init :: proc(
 			workflow.error_free(&instantiate_error)
 			executor_host_close(host)
 			return result
+		}
+		logger_error := workflow.fiber_runtime_set_logger(&runtime, options.logger)
+		if logger_error.message != nil {
+			message := string(logger_error.message)
+			result := host_error(message)
+			workflow.error_free(&logger_error)
+			workflow.fiber_runtime_close(&runtime)
+			delete(owned_name)
+			executor_host_close(host)
+			return result
+		}
+		for interceptor in options.inbound_interceptors {
+			interceptor_error := workflow.fiber_runtime_add_inbound_interceptor(
+				&runtime,
+				interceptor,
+			)
+			if interceptor_error.message != nil {
+				message := string(interceptor_error.message)
+				result := host_error(message)
+				workflow.error_free(&interceptor_error)
+				workflow.fiber_runtime_close(&runtime)
+				delete(owned_name)
+				executor_host_close(host)
+				return result
+			}
+		}
+		for interceptor in options.outbound_interceptors {
+			interceptor_error := workflow.fiber_runtime_add_outbound_interceptor(
+				&runtime,
+				interceptor,
+			)
+			if interceptor_error.message != nil {
+				message := string(interceptor_error.message)
+				result := host_error(message)
+				workflow.error_free(&interceptor_error)
+				workflow.fiber_runtime_close(&runtime)
+				delete(owned_name)
+				executor_host_close(host)
+				return result
+			}
 		}
 		append(&host.registrations, Host_Registration{
 			name = owned_name,

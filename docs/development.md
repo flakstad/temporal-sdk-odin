@@ -853,7 +853,11 @@ with the same counts.
 External and in-process Workflow registrations cannot be mixed on one Worker.
 Workflow loggers and interceptors for external registrations must be configured
 inside the executor host; the parent rejects them rather than silently applying
-them to runtimes that will never execute. Protocol version 2 encodes the ordered
+them to runtimes that will never execute. Pass `Executor_Host_Options` to
+`executor_host_init_with_options` to install one replay-aware logger and ordered
+inbound/outbound interceptor lists in every child runtime before execution. The
+example logger uses inherited stderr because stdout is the binary isolation
+protocol. Protocol version 2 encodes the ordered
 type-name manifest with explicit lengths. Protocol version 3 adds a correlated
 JSON `Completion_Metadata` frame before the opaque protobuf completion. It
 preserves the complete child `Process_Result` for Worker statistics and
@@ -864,8 +868,9 @@ ordinary child before `worker.run`, and every task child repeats the handshake
 before its first activation. The zero-cache crash and hang paths each require
 six successful handshakes; sticky mode requires four. All require zero
 mismatches. The live observer requires four non-zero child timer sequences in
-zero-cache replay and two in sticky mode. Executor-host hook configuration
-remains outstanding.
+zero-cache replay and two in sticky mode. Both paths also require exactly two
+inbound-interceptor log records; zero-cache replay records are suppressed.
+Runtime-owned metric-emitter creation remains outstanding.
 
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity
