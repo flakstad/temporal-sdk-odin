@@ -1512,6 +1512,38 @@ Workflow state: Workflow code deterministically reconstructs it during replay,
 and the reserved `__temporal_workflow_metadata` Query returns it as Temporal's
 `{"currentDetails":"..."}` JSON payload.
 
+Workflow application logging is separate from Core runtime telemetry. Install
+one callback while the Worker is still configuring:
+
+```odin
+worker_options.workflow_logger = {
+    user_data = &log_sink,
+    emit = emit_workflow_log,
+}
+
+fields := [?]workflow.Log_Field{
+    workflow.log_field_string("order_id", order.id),
+    workflow.log_field_i64("attempt", 1),
+}
+workflow.log_info(ctx, "order started", fields[:])
+```
+
+`log_trace`, `log_debug`, `log_info`, `log_warn`, and `log_error` synchronously
+deliver a borrowed `Log_Record` containing Workflow identity, type, task queue,
+history length, activation timestamp, replay flags, and typed string/integer/
+float/boolean fields. Query handlers use the corresponding `query_log_*`
+procedures. The SDK performs no host I/O and logging emits no Workflow command.
+The callback must copy strings or fields it keeps after returning, and its
+`user_data` remains application-owned through `worker.close`.
+
+Logs from activations replaying history events are suppressed by default, so a
+normal log does not appear again merely because Core rebuilt a Workflow on a
+fresh stack. Query-only replay remains visible. Set
+`log_replay_history_events = true` only for replay diagnostics where duplicate
+records are intentional. Logging procedures deliberately return no value:
+whether a sink is configured or a replay record is suppressed cannot influence
+deterministic Workflow control flow.
+
 Workflow identity and mutable properties use the same activation-owned state:
 
 ```odin

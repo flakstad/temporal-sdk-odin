@@ -32,6 +32,23 @@ PATCH_ID :: "odin-sdk-live-patch-v1"
 // command sequence after a Worker process replacement.
 nondeterminism_revision_two: bool
 
+emit_workflow_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
+	if record == nil {
+		return
+	}
+	fmt.printf(
+		"workflow-log level=%v message=%q workflow_id=%s run_id=%s history=%d replay=%v replay_history=%v fields=%d\n",
+		record.level,
+		record.message,
+		record.workflow_id,
+		record.run_id,
+		record.history_length,
+		record.replaying,
+		record.replaying_history_events,
+		len(record.fields),
+	)
+}
+
 Typed_Greeting_Input :: struct {
 	name:       string,
 	salutation: string,
@@ -136,6 +153,13 @@ greeting_status_query :: proc(
 	state: Greeting_Query_State,
 	input: Greeting_Query_Input,
 ) -> Greeting_Query_Output {
+	workflow.query_log_debug(
+		query,
+		"greeting status queried",
+		[]workflow.Log_Field{
+			workflow.log_field_bool("include_name", input.include_name),
+		},
+	)
 	result := Greeting_Query_Output{phase = state.phase}
 	_, _ = workflow.query_header_json(query, "caller", &result.caller)
 	if input.include_name {
@@ -843,6 +867,11 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		return fmt.aprintf("%s & %s", first_result, second_result)
 	}
 	if name == "selector" {
+		start_fields := [?]workflow.Log_Field{
+			workflow.log_field_string("operation", "selector"),
+			workflow.log_field_i64("candidate_count", 2),
+		}
+		workflow.log_info(ctx, "selector started", start_fields[:])
 		activity_future := workflow.start_activity(ctx, "hello", name)
 		timer_future := workflow.start_timer_with_options(
 			ctx,
@@ -863,7 +892,13 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		if !workflow.cancel_timer(ctx, timer_future) {
 			return "could not cancel losing selector timer"
 		}
-		return workflow.await_activity(ctx, activity_future)
+		result := workflow.await_activity(ctx, activity_future)
+		workflow.log_info(
+			ctx,
+			"selector completed",
+			[]workflow.Log_Field{workflow.log_field_bool("activity_won", true)},
+		)
+		return result
 	}
 	if name == "multiple-activity-arguments" {
 		name_payload, name_error := codec.encode_json("Odin")
@@ -1591,6 +1626,7 @@ main :: proc() {
 	worker_options := worker.options_default(task_queue)
 	worker_options.versioning = versioning
 	worker_options.nondeterminism_policy = nondeterminism_policy
+	worker_options.workflow_logger = {emit = emit_workflow_log}
 	if create_scenario == "workflow-cache" {
 		worker_options.identity_override = "temporal-sdk-odin-cached-workflow"
 		worker_options.max_cached_workflows = 10

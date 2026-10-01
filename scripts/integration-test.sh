@@ -508,6 +508,15 @@ cat "$worker_log"
 grep -Eq "replay=false .*started_timer=true .*waiting_selector=true .*completed=false" "$worker_log"
 grep -Eq "resolved=1 .*canceled_timer=true .*waiting_selector=false .*completed=true" "$worker_log"
 grep -q "Workflow Timer interceptor entered before command" "$worker_log"
+selector_started_logs="$(grep -c 'workflow-log .*message="selector started"' "$worker_log")"
+selector_completed_logs="$(grep -c 'workflow-log .*message="selector completed"' "$worker_log")"
+if (( selector_started_logs != 1 || selector_completed_logs != 1 )); then
+  echo "Replay-aware Workflow logging emitted duplicates: started=$selector_started_logs completed=$selector_completed_logs" >&2
+  exit 1
+fi
+grep -Eq 'workflow-log .*message="selector started" .*workflow_id=odin-sdk-selector-.* replay=false replay_history=false fields=2' "$worker_log"
+grep -Eq 'workflow-log .*message="selector completed" .*workflow_id=odin-sdk-selector-.* replay=false replay_history=false fields=1' "$worker_log"
+echo "Workflow application logger emitted structured records once while replay stayed silent"
 grep -q "Workflow Timer interceptor exited after Future creation seq=1" "$worker_log"
 grep -q "Workflow selector chose the ready Activity and canceled its losing timer" "$worker_log"
 echo "Workflow selector raced an Activity and intercepted timer through Core and Temporal Server"
@@ -1596,6 +1605,8 @@ grep -q 'phase="waiting-for-approval" name="Temporal-slow"' <<<"$query_output"
 grep -q 'caller="odin-client-control"' <<<"$query_output"
 grep -q "Workflow Query interceptor entered before handler" "$worker_log"
 grep -q "Workflow Query interceptor exited after handler" "$worker_log"
+grep -q 'workflow-log level=Debug message="greeting status queried"' "$worker_log"
+grep -q 'message="greeting status queried" .*replay=true replay_history=false fields=1' "$worker_log"
 
 TEMPORAL_CLIENT_ACTION=signal \
   TEMPORAL_CLIENT_WORKFLOW_ID="$workflow_id" \

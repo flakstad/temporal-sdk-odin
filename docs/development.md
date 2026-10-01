@@ -18,6 +18,15 @@ They also pin `flakstad/statecharts` at
 `9e82885f0ae4669061aa5505b30db43537e83d19` as
 `test-deps/statecharts`. Both dependencies remain test-only.
 
+The Workflow logging property generates 500 combinations of Core replay state,
+history-event presence, explicit replay-log opt-in, all five log levels, and
+typed integer/float/boolean fields. It requires the suppression decision to
+match the activation classification and validates every callback-scoped field.
+The focused unit test additionally evicts the run, replays on a fresh fiber,
+and requires the completion bytes to remain identical with logging disabled,
+suppressed, and explicitly enabled. This guards the stronger invariant that
+observability cannot change Workflow commands.
+
 `native/Cargo.toml` is a wrapper workspace. SDK Core deliberately does not
 commit a workspace lockfile, while a language SDK needs reproducible native
 artifacts. The wrapper therefore owns `native/Cargo.lock`, following the same
@@ -2150,7 +2159,8 @@ These callbacks run on the Workflow fiber and execute again during history
 replay. They must be deterministic: use no network/filesystem access, wall
 clock, process randomness, or external mutable state that affects the result.
 Use Activities or Temporal-aware Workflow primitives for those operations.
-Logging is possible but will normally appear again on replay.
+Use the Worker-owned `workflow.Logger` for diagnostics; it suppresses replayed
+history events by default. Interceptors must not call host loggers directly.
 
 The unit suite verifies nested entry/unwind order, caller-header isolation,
 command headers, timer-duration and cancellation-reason replacement, delayed

@@ -15,6 +15,76 @@ import fiber_raw "fiber/raw"
 
 Condition_Predicate :: proc(data: rawptr) -> bool
 
+Log_Level :: enum {
+	Trace,
+	Debug,
+	Info,
+	Warn,
+	Error,
+}
+
+Log_Field_Kind :: enum {
+	String,
+	Integer,
+	Float,
+	Boolean,
+}
+
+// Log_Field values and strings are borrowed for the synchronous logger call.
+Log_Field :: struct {
+	key:           string,
+	kind:          Log_Field_Kind,
+	string_value:  string,
+	integer_value: i64,
+	float_value:   f64,
+	boolean_value: bool,
+}
+
+log_field_string :: proc(key, value: string) -> Log_Field {
+	return {key = key, kind = .String, string_value = value}
+}
+
+log_field_i64 :: proc(key: string, value: i64) -> Log_Field {
+	return {key = key, kind = .Integer, integer_value = value}
+}
+
+log_field_f64 :: proc(key: string, value: f64) -> Log_Field {
+	return {key = key, kind = .Float, float_value = value}
+}
+
+log_field_bool :: proc(key: string, value: bool) -> Log_Field {
+	return {key = key, kind = .Boolean, boolean_value = value}
+}
+
+// Log_Record is borrowed only for the synchronous Logger callback. Timestamp
+// and execution metadata come from Core's current activation, never host state.
+Log_Record :: struct {
+	level:                    Log_Level,
+	message:                  string,
+	fields:                   []Log_Field,
+	namespace:                string,
+	workflow_id:              string,
+	run_id:                   string,
+	workflow_type:            string,
+	task_queue:               string,
+	history_length:           u32,
+	timestamp:                time.Time,
+	has_timestamp:            bool,
+	replaying:                bool,
+	replaying_history_events: bool,
+}
+
+Log_Emit_Proc :: #type proc(user_data: rawptr, record: ^Log_Record)
+
+// Logger is copied into the Worker and each registered Workflow runtime.
+// user_data remains application-owned until worker.close. Replay of history
+// events is suppressed by default; query-only replay is not history replay.
+Logger :: struct {
+	user_data:                 rawptr,
+	emit:                      Log_Emit_Proc,
+	log_replay_history_events: bool,
+}
+
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
 // operations, not a general worker/client handle. This remains an experiment.
 Fiber_Context :: struct {
@@ -942,6 +1012,7 @@ Query_Context :: struct {
 	id:      string,
 	type:    string,
 	headers: [dynamic]Fiber_Named_Payload,
+	instance: ^Fiber_Instance,
 }
 
 // Update_Context is owned by the Workflow run arena. Header Payload views and
@@ -1314,6 +1385,18 @@ Fiber_Runtime :: struct {
 	replay_initializations: int,
 	evictions:              int,
 	stack_options:          Stack_Options,
+	logger:                 Logger,
+}
+
+fiber_runtime_set_logger :: proc(runtime: ^Fiber_Runtime, logger: Logger) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow runtime is not initialized")
+	}
+	if len(runtime.instances) != 0 {
+		return error_from_string("Workflow logger cannot be changed after execution starts")
+	}
+	runtime.logger = logger
+	return {}
 }
 
 // Minicoro's compiled minimum is 32 KiB. Keeping the same limit here avoids
@@ -4214,6 +4297,108 @@ is_replaying :: proc(ctx: ^Fiber_Context) -> bool {
 is_replaying_history_events :: proc(ctx: ^Fiber_Context) -> bool {
 	return ctx != nil && ctx.instance != nil &&
 	       ctx.instance.activation_is_replaying_history_events
+}
+
+workflow_log_emit :: proc(
+	instance: ^Fiber_Instance,
+	level: Log_Level,
+	message: string,
+	fields: []Log_Field = nil,
+) {
+	if instance == nil || instance.runtime == nil {
+		return
+	}
+	logger := &instance.runtime.logger
+	if logger.emit == nil {
+		return
+	}
+	if instance.activation_is_replaying_history_events &&
+	   !logger.log_replay_history_events {
+		return
+	}
+	record := Log_Record{
+		level = level,
+		message = message,
+		fields = fields,
+		namespace = instance.namespace,
+		workflow_id = instance.workflow_id,
+		run_id = instance.run_id,
+		workflow_type = instance.workflow_type,
+		task_queue = instance.task_queue,
+		history_length = instance.activation_history_length,
+		timestamp = instance.activation_time,
+		has_timestamp = instance.has_activation_time,
+		replaying = instance.activation_is_replaying,
+		replaying_history_events = instance.activation_is_replaying_history_events,
+	}
+	logger.emit(logger.user_data, &record)
+}
+
+// log synchronously emits one application record through the Worker-owned
+// logger. It performs no host I/O itself and emits no Workflow command. The
+// callback must copy anything it retains after returning.
+log :: proc(
+	ctx: ^Fiber_Context,
+	level: Log_Level,
+	message: string,
+	fields: []Log_Field = nil,
+) {
+	if ctx == nil {
+		return
+	}
+	workflow_log_emit(ctx.instance, level, message, fields)
+}
+
+log_trace :: proc(ctx: ^Fiber_Context, message: string, fields: []Log_Field = nil) {
+	log(ctx, .Trace, message, fields)
+}
+
+log_debug :: proc(ctx: ^Fiber_Context, message: string, fields: []Log_Field = nil) {
+	log(ctx, .Debug, message, fields)
+}
+
+log_info :: proc(ctx: ^Fiber_Context, message: string, fields: []Log_Field = nil) {
+	log(ctx, .Info, message, fields)
+}
+
+log_warn :: proc(ctx: ^Fiber_Context, message: string, fields: []Log_Field = nil) {
+	log(ctx, .Warn, message, fields)
+}
+
+log_error :: proc(ctx: ^Fiber_Context, message: string, fields: []Log_Field = nil) {
+	log(ctx, .Error, message, fields)
+}
+
+query_log :: proc(
+	query: ^Query_Context,
+	level: Log_Level,
+	message: string,
+	fields: []Log_Field = nil,
+) {
+	if query == nil {
+		return
+	}
+	workflow_log_emit(query.instance, level, message, fields)
+}
+
+query_log_trace :: proc(query: ^Query_Context, message: string, fields: []Log_Field = nil) {
+	query_log(query, .Trace, message, fields)
+}
+
+query_log_debug :: proc(query: ^Query_Context, message: string, fields: []Log_Field = nil) {
+	query_log(query, .Debug, message, fields)
+}
+
+query_log_info :: proc(query: ^Query_Context, message: string, fields: []Log_Field = nil) {
+	query_log(query, .Info, message, fields)
+}
+
+query_log_warn :: proc(query: ^Query_Context, message: string, fields: []Log_Field = nil) {
+	query_log(query, .Warn, message, fields)
+}
+
+query_log_error :: proc(query: ^Query_Context, message: string, fields: []Log_Field = nil) {
+	query_log(query, .Error, message, fields)
 }
 
 history_length :: proc(ctx: ^Fiber_Context) -> u32 {
@@ -9518,6 +9703,7 @@ invoke_workflow_query :: proc(
 		id = query.query_id,
 		type = query.query_type,
 		headers = make([dynamic]Fiber_Named_Payload),
+		instance = instance,
 	}
 	defer {
 		for &entry in query_context.headers {

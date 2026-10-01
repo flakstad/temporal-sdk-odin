@@ -1231,6 +1231,43 @@ tag. This proves Core's listener, instrumentation, option ownership, and
 shutdown path together. OTLP has ABI/unit coverage but awaits a collector-backed
 integration test.
 
+### Workflow application logging boundary
+
+Core runtime logs describe transport, polling, state-machine, and other native
+SDK behavior. Application logs emitted by Odin Workflow code are a language
+runtime concern: Core does not execute that code and the C bridge exposes no
+Workflow-application logger. The Odin Worker therefore copies a `Logger` record
+into every registered Workflow runtime. `worker.set_workflow_logger` may replace
+it only during configuration and updates already registered runtimes; the
+callback's `user_data` remains caller-owned until `worker.close`.
+
+Each call builds a stack-local, callback-scoped `Log_Record`. Message, field
+keys and string values remain borrowed from Workflow code. Namespace, Workflow
+ID, Run ID, Workflow type, and task queue borrow run-arena strings; history
+length, timestamp, and replay state come from the current Core activation. The
+callback is synchronous and must copy any data retained afterward. The SDK does
+not allocate for or perform host I/O on the Workflow fiber, emit a Workflow
+command, or feed callback state back into execution. Public logging procedures
+return no value, so sink presence and replay suppression cannot become a source
+of nondeterministic branching.
+
+The suppression predicate mirrors the pinned Rust runtime's activation
+classification: suppress only when `is_replaying` is true and the activation
+contains at least one non-Query job. A query-only replay activation is therefore
+observable, while history reconstruction does not duplicate ordinary
+application logs. `log_replay_history_events` is an explicit diagnostic opt-in
+that permits duplicates. This policy is implemented in the Odin layer because
+only it knows where user logging calls occur; Core still owns replay detection
+and supplies the authoritative activation flag/jobs.
+
+Unit coverage checks every typed field, activation metadata, all five levels,
+query-only replay, default suppression, opt-in replay emission, Worker
+propagation/replacement, and byte-identical activation completions. A 500-case
+property varies replay classification, opt-in policy, field values, and levels.
+The CLI-devserver selector path forces Core eviction and fresh-stack replay: it
+observes one start record rather than a duplicate and then one terminal record,
+while the Workflow result and command history remain unchanged.
+
 The Milestone 2 path, now using schema-generated bindings, also executed
 end-to-end on the same environment:
 

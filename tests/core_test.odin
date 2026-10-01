@@ -2482,6 +2482,162 @@ workflow_time_random_and_uuid_replay_identically :: proc(t: ^testing.T) {
 }
 
 @(test)
+workflow_application_logging_is_structured_and_replay_aware :: proc(t: ^testing.T) {
+	capture := Workflow_Log_Capture{}
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"workflow_logging_test_workflow",
+		"logging-task-queue",
+		workflow_logging_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	logger_error := workflow.fiber_runtime_set_logger(
+		&runtime,
+		{user_data = &capture, emit = workflow_log_capture},
+	)
+	testing.expect(t, logger_error.message == nil)
+	workflow.error_free(&logger_error)
+
+	input, input_error := codec.encode_json("logged-result")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "workflow_logging_test_workflow",
+		workflow_id = "logging-workflow-id",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	timestamp := proto.Google_Protobuf_Timestamp{
+		seconds = 1_700_000_123,
+		nanos = 456_789_000,
+	}
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "logging-run",
+		history_length = 9,
+		timestamp = &timestamp,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	fresh := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, fresh.error.message == nil, "Workflow logging failed: %s", string(fresh.error.message))
+	testing.expect(t, fresh.completed)
+	testing.expect_value(t, capture.calls, 5)
+	testing.expect(t, capture.structured_record_valid)
+	expected_levels := [?]workflow.Log_Level{.Info, .Trace, .Debug, .Warn, .Error}
+	for level, index in expected_levels {
+		testing.expect_value(t, capture.levels[index], level)
+	}
+	fresh_bytes := bytes.clone(fresh.completion[:])
+	delete(fresh.completion)
+	workflow.error_free(&fresh.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, replayed.error.message == nil, "Workflow logging replay failed: %s", string(replayed.error.message))
+	testing.expect(t, bytes.equal(fresh_bytes, replayed.completion[:]))
+	testing.expect_value(t, capture.calls, 5)
+	testing.expect_value(t, capture.replay_calls, 0)
+	delete(replayed.completion)
+	workflow.error_free(&replayed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+	logger_error = workflow.fiber_runtime_set_logger(
+		&runtime,
+		{
+			user_data = &capture,
+			emit = workflow_log_capture,
+			log_replay_history_events = true,
+		},
+	)
+	testing.expect(t, logger_error.message == nil)
+	workflow.error_free(&logger_error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_with_logs := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_with_logs.error.message == nil)
+	testing.expect(t, bytes.equal(fresh_bytes, replayed_with_logs.completion[:]))
+	testing.expect_value(t, capture.calls, 10)
+	testing.expect_value(t, capture.replay_calls, 5)
+	delete(fresh_bytes)
+	delete(replayed_with_logs.completion)
+	workflow.error_free(&replayed_with_logs.error)
+
+	query_runtime := workflow.Fiber_Runtime{logger = {user_data = &capture, emit = workflow_log_capture}}
+	query_instance := workflow.Fiber_Instance{
+		runtime = &query_runtime,
+		activation_is_replaying = true,
+		activation_is_replaying_history_events = false,
+	}
+	query_context := workflow.Query_Context{instance = &query_instance}
+	workflow.query_log_debug(&query_context, "query replay diagnostic")
+	testing.expect_value(t, capture.calls, 11)
+	testing.expect_value(t, capture.query_replay_calls, 1)
+	workflow.log_info(nil, "invalid context is ignored")
+	workflow.query_log_info(nil, "invalid Query context is ignored")
+}
+
+@(test)
 workflow_local_activity_command_resolution_and_replay :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -5750,6 +5906,76 @@ deterministic_primitives_test_workflow :: proc(
 	return workflow.uuid_v4(ctx)
 }
 
+Workflow_Log_Capture :: struct {
+	calls:                    int,
+	replay_calls:             int,
+	query_replay_calls:       int,
+	structured_record_valid:  bool,
+	levels:                   [8]workflow.Log_Level,
+}
+
+workflow_log_capture :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
+	state := cast(^Workflow_Log_Capture)user_data
+	if state == nil || record == nil {
+		return
+	}
+	if state.calls < len(state.levels) {
+		state.levels[state.calls] = record.level
+	}
+	state.calls += 1
+	if record.replaying_history_events {
+		state.replay_calls += 1
+	} else if record.replaying {
+		state.query_replay_calls += 1
+	}
+	if record.message != "workflow application log" {
+		return
+	}
+	fields_valid := len(record.fields) == 4
+	if fields_valid {
+		fields_valid = record.fields[0].key == "customer" &&
+		               record.fields[0].kind == .String &&
+		               record.fields[0].string_value == "odin" &&
+		               record.fields[1].key == "attempt" &&
+		               record.fields[1].kind == .Integer &&
+		               record.fields[1].integer_value == 7 &&
+		               record.fields[2].key == "ratio" &&
+		               record.fields[2].kind == .Float &&
+		               record.fields[2].float_value == 0.5 &&
+		               record.fields[3].key == "ready" &&
+		               record.fields[3].kind == .Boolean &&
+		               record.fields[3].boolean_value
+	}
+	state.structured_record_valid = fields_valid &&
+	                                record.namespace == "default" &&
+	                                record.workflow_id == "logging-workflow-id" &&
+	                                record.run_id == "logging-run" &&
+	                                record.workflow_type == "workflow_logging_test_workflow" &&
+	                                record.task_queue == "logging-task-queue" &&
+	                                record.history_length == 9 &&
+	                                record.has_timestamp &&
+	                                time.to_unix_nanoseconds(record.timestamp) ==
+	                                    1_700_000_123_456_789_000
+}
+
+workflow_logging_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	fields := [?]workflow.Log_Field{
+		workflow.log_field_string("customer", "odin"),
+		workflow.log_field_i64("attempt", 7),
+		workflow.log_field_f64("ratio", 0.5),
+		workflow.log_field_bool("ready", true),
+	}
+	workflow.log_info(ctx, "workflow application log", fields[:])
+	workflow.log_trace(ctx, "trace")
+	workflow.log_debug(ctx, "debug")
+	workflow.log_warn(ctx, "warn")
+	workflow.log_error(ctx, "error")
+	return input
+}
+
 local_activity_test_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: string,
@@ -7632,6 +7858,65 @@ language_worker_propagates_bounded_stack_policy_to_workflow_runtime :: proc(t: ^
 	testing.expect_value(t, options.workflow, 192 * 1024)
 	testing.expect_value(t, options.signal_handler, 96 * 1024)
 	testing.expect_value(t, options.update_handler, 160 * 1024)
+}
+
+@(test)
+language_worker_propagates_and_replaces_workflow_logger_before_run :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	first_capture := Workflow_Log_Capture{}
+	options := worker.options_default("logger-policy-worker")
+	options.workflow_logger = {
+		user_data = &first_capture,
+		emit = workflow_log_capture,
+	}
+	sdk_worker, create_error := worker.create_with_options(&client, options)
+	testing.expectf(t, create_error.message == nil, "worker.create failed: %s", string(create_error.message))
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+	register_error := worker.register_workflow(
+		&sdk_worker,
+		"logger_policy_workflow",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	testing.expect_value(t, len(sdk_worker.workflow_registrations), 1)
+	if len(sdk_worker.workflow_registrations) != 1 {
+		return
+	}
+	registered_logger := sdk_worker.workflow_registrations[0].runtime.logger
+	testing.expect(t, registered_logger.emit != nil)
+	testing.expect(t, registered_logger.user_data == &first_capture)
+	testing.expect(t, !registered_logger.log_replay_history_events)
+
+	second_capture := Workflow_Log_Capture{}
+	set_error := worker.set_workflow_logger(
+		&sdk_worker,
+		{
+			user_data = &second_capture,
+			emit = workflow_log_capture,
+			log_replay_history_events = true,
+		},
+	)
+	testing.expect(t, set_error.message == nil)
+	worker.error_free(&set_error)
+	replaced_logger := sdk_worker.workflow_registrations[0].runtime.logger
+	testing.expect(t, replaced_logger.emit != nil)
+	testing.expect(t, replaced_logger.user_data == &second_capture)
+	testing.expect(t, replaced_logger.log_replay_history_events)
+
+	sdk_worker.lifecycle = .Running
+	late_error := worker.set_workflow_logger(&sdk_worker, {})
+	testing.expect(t, late_error.message != nil)
+	worker.error_free(&late_error)
+	sdk_worker.lifecycle = .Configuring
 }
 
 @(test)

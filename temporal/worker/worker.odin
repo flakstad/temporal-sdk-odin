@@ -261,6 +261,7 @@ Options :: struct {
 	versioning:                                      Worker_Versioning_Options,
 	nondeterminism_policy:                           Nondeterminism_Policy,
 	workflow_stacks:                                 workflow.Stack_Options,
+	workflow_logger:                                 workflow.Logger,
 }
 
 options_default :: proc(task_queue: string, namespace := "default") -> Options {
@@ -312,6 +313,7 @@ Worker :: struct {
 	versioning:             Worker_Versioning_Options,
 	nondeterminism_policy:  Nondeterminism_Policy,
 	workflow_stacks:        workflow.Stack_Options,
+	workflow_logger:        workflow.Logger,
 	mode:                   Worker_Mode,
 	replay_runtime:         ^temporal_core.Runtime,
 }
@@ -429,6 +431,7 @@ create :: proc(
 	nondeterminism_policy := Nondeterminism_Policy{},
 	workflow_stacks := workflow.Stack_Options{},
 	graceful_shutdown_period := temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD,
+	workflow_logger := workflow.Logger{},
 ) -> (worker: Worker, error: Error) {
 	options := options_default(task_queue, namespace)
 	options.max_concurrent_activities = max_concurrent_activities
@@ -436,6 +439,7 @@ create :: proc(
 	options.nondeterminism_policy = nondeterminism_policy
 	options.workflow_stacks = workflow_stacks
 	options.graceful_shutdown_period = graceful_shutdown_period
+	options.workflow_logger = workflow_logger
 	return create_with_options(client, options)
 }
 
@@ -557,6 +561,7 @@ create_with_options :: proc(
 	worker.nondeterminism_policy = options.nondeterminism_policy
 	worker.nondeterminism_policy.fail_workflow_types = owned_failure_types
 	worker.workflow_stacks = resolved_stacks
+	worker.workflow_logger = options.workflow_logger
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.nexus_operation_registrations = make([dynamic]Nexus_Operation_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
@@ -574,6 +579,7 @@ create_replayer :: proc(
 	namespace := "default",
 	task_queue := "temporal-sdk-odin-replay",
 	workflow_stacks := workflow.Stack_Options{},
+	workflow_logger := workflow.Logger{},
 ) -> (worker: Worker, error: Error) {
 	if runtime == nil || runtime.handle == nil {
 		return {}, error_from_string("runtime is not initialized")
@@ -604,6 +610,7 @@ create_replayer :: proc(
 	worker.max_concurrent_local_activities = 1
 	worker.max_concurrent_nexus_tasks = 1
 	worker.workflow_stacks = resolved_stacks
+	worker.workflow_logger = workflow_logger
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
 	worker.activity_registrations = make([dynamic]Activity_Registration)
@@ -696,7 +703,35 @@ add_workflow_inbound_interceptor :: proc(
 	return {}
 }
 
+// set_workflow_logger replaces the replay-aware application logger while the
+// Worker is still configuring. The record is copied; user_data remains
+// application-owned and must outlive worker.close. A zero Logger disables it.
+set_workflow_logger :: proc(worker: ^Worker, logger: workflow.Logger) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("Workflow logger cannot be changed after worker.run starts")
+	}
+	for &registration in worker.workflow_registrations {
+		set_error := workflow.fiber_runtime_set_logger(&registration.runtime, logger)
+		if set_error.message != nil {
+			result := error_from_string(string(set_error.message))
+			workflow.error_free(&set_error)
+			return result
+		}
+	}
+	worker.workflow_logger = logger
+	return {}
+}
+
 configure_workflow_runtime :: proc(worker: ^Worker, runtime: ^workflow.Fiber_Runtime) -> Error {
+	logger_error := workflow.fiber_runtime_set_logger(runtime, worker.workflow_logger)
+	if logger_error.message != nil {
+		result := error_from_string(string(logger_error.message))
+		workflow.error_free(&logger_error)
+		return result
+	}
 	for interceptor in worker.workflow_inbound_interceptors {
 		add_error := workflow.fiber_runtime_add_inbound_interceptor(runtime, interceptor)
 		if add_error.message != nil {
