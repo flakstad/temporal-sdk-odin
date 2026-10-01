@@ -579,7 +579,7 @@ start_nexus_operation_payload_terminal :: proc(
 	}
 	request_bytes, encode_error := encode_start_nexus_operation_request(
 		client.namespace,
-		client.identity,
+		client_request_identity(client),
 		input,
 		options,
 	)
@@ -1239,7 +1239,7 @@ cancel_nexus_operation_rpc :: proc(
 		namespace = handle.client.namespace,
 		operation_id = handle.id,
 		run_id = handle.run_id,
-		identity = handle.client.identity,
+		identity = client_request_identity(handle.client),
 		request_id = actual_request_id,
 		reason = reason,
 	}
@@ -1363,7 +1363,7 @@ terminate_nexus_operation_rpc :: proc(
 		namespace = handle.client.namespace,
 		operation_id = handle.id,
 		run_id = handle.run_id,
-		identity = handle.client.identity,
+		identity = client_request_identity(handle.client),
 		request_id = actual_request_id,
 		reason = reason,
 	}

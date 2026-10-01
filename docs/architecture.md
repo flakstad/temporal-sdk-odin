@@ -210,6 +210,19 @@ DNS refresh, gzip selection, identity, and experimental payload/memo warning
 thresholds. It intentionally does not expose the bridge's custom gRPC transport
 override because that callback has a separate asynchronous lifetime contract.
 
+The configured identity crosses two related but distinct boundaries. Odin sends
+it to Core in `ClientOptions.identity`, where Core uses it as the connection's
+SDK identity, and heap-clones the same value into `client.Client`. Every typed
+Client request that has an identity field then copies that owned value into the
+request protobuf: Workflow start, Signal/Signal-With-Start, Update and polling,
+atomic Update-With-Start, cancel/reset/terminate, Workflow option and pause
+mutations, Schedules, asynchronous Activity completion, and Nexus operations.
+Low-level request encoders retain `temporal-sdk-odin@local` as a compatibility
+default when called directly without an identity; connected Clients always use
+their configured non-empty value. Exact-wire tests cover each request family,
+and the Update-With-Start live proof reads Server history and observes the
+configured example identity on start, both Updates, and the final Signal.
+
 The raw metadata ABI is an array where every element is `key + "\n" + value`.
 Odin validates lowercase gRPC key syntax, `-bin` placement, printable ASCII
 values, duplicate keys, certificate/key pairing, and millisecond duration
@@ -283,7 +296,9 @@ and both returned references must identify the same execution.
 This slice adds generated roots for `ExecuteMultiOperationRequest/Response`,
 but no raw C binding or new native symbol. It is covered by exact wire and
 ownership tests, interceptor nesting, a 500-case property over both repeated
-argument lists, and a CLI-devserver create-then-attach test. The live proof ran
+argument lists, and a CLI-devserver create-then-attach test. That live test also
+requires the configured Client identity to occur on at least four history
+events, proving it is not merely retained in the Odin handle. The live proof ran
 against CLI 1.5.1 / Server 1.29.1 with
 `frontend.enableExecuteMultiOperation=true`; current Temporal guidance
 recommends Server 1.28 or newer for Update-With-Start.

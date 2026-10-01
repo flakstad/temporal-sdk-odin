@@ -63,7 +63,7 @@ workflow_pause_mutation_terminal :: proc(
 	}
 	request_bytes, request_error := encode_workflow_pause_mutation_request(
 		input.handle.client.namespace,
-		input.handle.client.identity,
+		client_request_identity(input.handle.client),
 		input.handle.id,
 		input.handle.run_id,
 		input.kind,

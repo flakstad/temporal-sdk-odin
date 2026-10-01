@@ -20,7 +20,11 @@ print_error :: proc(operation: string, error: ^temporal_client.Error) {
 }
 
 run :: proc() -> int {
-	client, connect_error := temporal_client.connect()
+	client, connect_error := temporal_client.connect_with_options({
+		target_url = "http://localhost:7233",
+		namespace = "default",
+		identity = "temporal-sdk-odin-update-with-start-example",
+	})
 	if connect_error.message != nil {
 		print_error("connect", &connect_error)
 		temporal_client.error_free(&connect_error)

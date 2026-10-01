@@ -175,6 +175,11 @@ the Service's atomic `ExecuteMultiOperation` RPC. A missing Workflow is created
 and updated; a second call reuses the same run and applies another Update. The
 Odin API requires `.Use_Existing` and rejects cron, eager start, and start delay
 because those combinations are forbidden by the upstream wire contract.
+`client.Connect_Options.identity` is now propagated consistently into every
+supported Workflow, Update, Schedule, asynchronous Activity, and Nexus request
+that carries a client identity. The focused Update-With-Start integration test
+also verifies the configured identity in Server history for start, both Updates,
+and the completion Signal.
 The same owned `Headers` builder now drives ordinary Client Signals and
 Workflow-originated remote/Local Activities, Child Workflow starts, and
 child/external Workflow Signals. Incoming Signal metadata remains borrowed

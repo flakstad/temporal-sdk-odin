@@ -493,6 +493,7 @@ encode_create_schedule_request :: proc(
 	workflow_type: string,
 	input: codec.Payload_View,
 	options: Schedule_Create_Options,
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
@@ -667,7 +668,7 @@ encode_create_schedule_request :: proc(
 		namespace = namespace,
 		schedule_id = schedule_id,
 		schedule = &schedule,
-		identity = "temporal-sdk-odin@local",
+		identity = request_identity(identity),
 		request_id = request_id,
 	}
 	if options.trigger_immediately {
@@ -698,6 +699,7 @@ create_schedule_payload_terminal :: proc(interceptor_input: ^Client_Create_Sched
 		workflow_type,
 		input,
 		options,
+		client_request_identity(client),
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -768,6 +770,7 @@ encode_update_schedule_request :: proc(
 	input: codec.Payload_View,
 	options: Schedule_Create_Options,
 	conflict_token: []u8,
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if options.trigger_immediately {
 		return nil, error_from_string(.Invalid_Argument, "Schedule update cannot trigger an initial action")
@@ -778,6 +781,7 @@ encode_update_schedule_request :: proc(
 		workflow_type,
 		input,
 		options,
+		identity,
 	)
 	if create_error.message != nil { return nil, create_error }
 	defer delete(create_bytes)
@@ -806,7 +810,7 @@ encode_update_schedule_request :: proc(
 		schedule_id = schedule_id,
 		schedule = create_request.schedule,
 		conflict_token = conflict_token,
-		identity = "temporal-sdk-odin@local",
+		identity = create_request.identity,
 		request_id = create_request.request_id,
 	}
 	if options.metadata != nil {
@@ -835,6 +839,7 @@ update_schedule_payload_unintercepted :: proc(
 		input,
 		options,
 		conflict_token,
+		client_request_identity(handle.client),
 	)
 	if request_error.message != nil { return request_error }
 	defer delete(request_bytes)
@@ -1534,6 +1539,7 @@ encode_backfill_schedule_request :: proc(
 	namespace, schedule_id: string,
 	backfills: []Schedule_Backfill,
 	request_id := "",
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 || len(schedule_id) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Schedule backfill requires namespace and Schedule ID")
@@ -1572,7 +1578,7 @@ encode_backfill_schedule_request :: proc(
 		namespace = namespace,
 		schedule_id = schedule_id,
 		patch = &patch,
-		identity = "temporal-sdk-odin@local",
+		identity = request_identity(identity),
 		request_id = resolved_request_id,
 	}
 	return proto.encode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(&request), {}
@@ -1586,6 +1592,8 @@ backfill_schedule_unintercepted :: proc(handle: ^Schedule_Handle, backfills: []S
 		handle.client.namespace,
 		handle.id,
 		backfills,
+		"",
+		client_request_identity(handle.client),
 	)
 	if request_error.message != nil { return request_error }
 	defer delete(request_bytes)
@@ -1684,6 +1692,29 @@ list_schedule_matching_times :: proc(handle: ^Schedule_Handle, start_time, end_t
 	return client_list_schedule_matching_times_chain(&state, &input)
 }
 
+encode_schedule_patch_request :: proc(
+	namespace, schedule_id: string,
+	patch: ^proto.Temporal_Api_Schedule_V1_SchedulePatch,
+	request_id := "",
+	identity := DEFAULT_CLIENT_IDENTITY,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(schedule_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Schedule patch requires namespace and Schedule ID")
+	}
+	if patch == nil {
+		return nil, error_from_string(.Invalid_Argument, "Schedule patch must not be nil")
+	}
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_PatchScheduleRequest{
+		namespace = namespace,
+		schedule_id = schedule_id,
+		patch = patch,
+		identity = request_identity(identity),
+		request_id = resolve_request_id(request_id, request_id_buffer[:]),
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(&request), {}
+}
+
 schedule_patch_unintercepted :: proc(
 	handle: ^Schedule_Handle,
 	patch: ^proto.Temporal_Api_Schedule_V1_SchedulePatch,
@@ -1691,18 +1722,15 @@ schedule_patch_unintercepted :: proc(
 	if !schedule_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
-	if patch == nil {
-		return error_from_string(.Invalid_Argument, "Schedule patch must not be nil")
+	request_bytes, request_error := encode_schedule_patch_request(
+		handle.client.namespace,
+		handle.id,
+		patch,
+		identity = client_request_identity(handle.client),
+	)
+	if request_error.message != nil {
+		return request_error
 	}
-	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	request := proto.Temporal_Api_Workflowservice_V1_PatchScheduleRequest{
-		namespace = handle.client.namespace,
-		schedule_id = handle.id,
-		patch = patch,
-		identity = "temporal-sdk-odin@local",
-		request_id = uuid.to_string_buffer(uuid.generate_v4(), request_id_buffer[:]),
-	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(&request)
 	defer delete(request_bytes)
 	rpc_result := temporal_core.client_rpc_call(
 		handle.client.connection,
@@ -1738,16 +1766,33 @@ trigger_schedule :: proc(
 	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
 }
 
+encode_delete_schedule_request :: proc(
+	namespace, schedule_id: string,
+	identity := DEFAULT_CLIENT_IDENTITY,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(schedule_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Schedule deletion requires namespace and Schedule ID")
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_DeleteScheduleRequest{
+		namespace = namespace,
+		schedule_id = schedule_id,
+		identity = request_identity(identity),
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_DeleteScheduleRequest(&request), {}
+}
+
 delete_schedule_unintercepted :: proc(handle: ^Schedule_Handle) -> Error {
 	if !schedule_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Schedule handle is not initialized")
 	}
-	request := proto.Temporal_Api_Workflowservice_V1_DeleteScheduleRequest{
-		namespace = handle.client.namespace,
-		schedule_id = handle.id,
-		identity = "temporal-sdk-odin@local",
+	request_bytes, request_error := encode_delete_schedule_request(
+		handle.client.namespace,
+		handle.id,
+		client_request_identity(handle.client),
+	)
+	if request_error.message != nil {
+		return request_error
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DeleteScheduleRequest(&request)
 	defer delete(request_bytes)
 	rpc_result := temporal_core.client_rpc_call(
 		handle.client.connection,

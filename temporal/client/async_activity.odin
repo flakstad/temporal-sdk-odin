@@ -60,7 +60,7 @@ async_activity_identity :: proc(client: ^Client) -> string {
 	if client != nil && len(client.identity) > 0 {
 		return client.identity
 	}
-	return "temporal-sdk-odin@local"
+	return DEFAULT_CLIENT_IDENTITY
 }
 
 async_activity_payloads :: proc(

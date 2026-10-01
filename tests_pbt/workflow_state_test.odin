@@ -3548,6 +3548,8 @@ workflow_start_argument_property :: proc(t: ^pbt.T) -> pbt.Result {
 		"generated_workflow",
 		views,
 		options,
+		nil,
+		"property-client@test",
 	)
 	if first_error.message != nil {
 		temporal_client.error_free(&first_error)
@@ -3557,7 +3559,8 @@ workflow_start_argument_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if !proto.decode_Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest(
 		first_bytes[:],
 		&request,
-	) || request.input == nil || len(request.input.payloads) != argument_count {
+	) || request.input == nil || len(request.input.payloads) != argument_count ||
+	   request.identity != "property-client@test" {
 		return pbt.fail("generated Workflow start request changed argument count")
 	}
 	for &argument, index in request.input.payloads {
@@ -3570,6 +3573,8 @@ workflow_start_argument_property :: proc(t: ^pbt.T) -> pbt.Result {
 		"generated_workflow",
 		views,
 		options,
+		nil,
+		"property-client@test",
 	)
 	if second_error.message != nil {
 		temporal_client.error_free(&second_error)

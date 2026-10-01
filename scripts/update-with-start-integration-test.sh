@@ -6,6 +6,7 @@ workflow_id="odin-update-with-start-${RANDOM}-$(date +%s)"
 worker_pid=""
 worker_log="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-update-with-start-worker.XXXXXX")"
 output_log="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-update-with-start-output.XXXXXX")"
+history_log="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-update-with-start-history.XXXXXX")"
 
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
@@ -17,7 +18,7 @@ cleanup() {
     --reason 'Temporal Odin Update-With-Start integration cleanup' \
     --command-timeout 2s \
     --output none >/dev/null 2>&1 || true
-  rm -f "$worker_log" "$output_log"
+  rm -f "$worker_log" "$output_log" "$history_log"
 }
 trap cleanup EXIT INT TERM
 
@@ -51,6 +52,17 @@ TEMPORAL_UPDATE_WITH_START_WORKFLOW_ID="$workflow_id" \
 cat "$output_log"
 grep -q "Update-With-Start created then attached workflow_id=$workflow_id" "$output_log"
 grep -q 'result="Hello Odin"' "$output_log"
+
+temporal workflow show \
+  --workflow-id "$workflow_id" \
+  --command-timeout 10s \
+  --output json >"$history_log"
+grep -q 'temporal-sdk-odin-update-with-start-example' "$history_log"
+identity_count="$(grep -o 'temporal-sdk-odin-update-with-start-example' "$history_log" | wc -l | tr -d ' ')"
+if (( identity_count < 4 )); then
+  echo "Expected the configured Client identity on start, both Updates, and Signal; found $identity_count history occurrences" >&2
+  exit 1
+fi
 
 wait "$worker_pid"
 worker_pid=""

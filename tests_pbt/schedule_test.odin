@@ -54,6 +54,7 @@ schedule_create_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 			trigger_immediately = trigger,
 			request_id = "property-request",
 		},
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -72,7 +73,7 @@ schedule_create_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	context.allocator = previous_allocator
 	if !decoded || request.schedule == nil || request.schedule.spec == nil ||
 	   request.schedule.action == nil || request.schedule.policies == nil ||
-	   request.schedule.state == nil {
+	   request.schedule.state == nil || request.identity != "property-client@test" {
 		return pbt.fail("generated Schedule request did not decode")
 	}
 	if len(request.schedule.spec.interval) != 1 ||
@@ -125,6 +126,7 @@ schedule_update_calendar_property :: proc(t: ^pbt.T) -> pbt.Result {
 			request_id = "property-update-request",
 		},
 		conflict_token,
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -143,7 +145,7 @@ schedule_update_calendar_property :: proc(t: ^pbt.T) -> pbt.Result {
 	context.allocator = previous_allocator
 	if !decoded || request.schedule == nil || request.schedule.spec == nil ||
 	   len(request.schedule.spec.structured_calendar) != 1 || request.memo != nil ||
-	   request.search_attributes != nil {
+	   request.search_attributes != nil || request.identity != "property-client@test" {
 		return pbt.fail("generated Schedule calendar update did not decode")
 	}
 	calendar := request.schedule.spec.structured_calendar[0]

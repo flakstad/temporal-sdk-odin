@@ -9356,6 +9356,8 @@ client_start_request_preserves_repeated_workflow_arguments :: proc(t: ^testing.T
 		"repeated_workflow",
 		inputs[:],
 		{id = "repeated-workflow-id", task_queue = "repeated-workflow-queue", request_id = "repeated-request"},
+		nil,
+		"odin-custom-client@test",
 	)
 	defer delete(request_bytes)
 	defer temporal_client.error_free(&request_error)
@@ -9373,6 +9375,7 @@ client_start_request_preserves_repeated_workflow_arguments :: proc(t: ^testing.T
 	)
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect(t, request.input != nil)
 	if request.input == nil do return
 	testing.expect_value(t, len(request.input.payloads), 3)
@@ -9441,6 +9444,7 @@ client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^te
 			},
 			signal_headers = &headers,
 		},
+		"odin-custom-client@test",
 	)
 	defer delete(request_bytes)
 	defer temporal_client.error_free(&request_error)
@@ -9459,6 +9463,7 @@ client_signal_with_start_projects_start_fields_and_signal_headers :: proc(t: ^te
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
 	testing.expect_value(t, request.namespace, "default")
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect_value(t, request.workflow_id, "signal-start-id")
 	testing.expect_value(t, request.workflow_type.name, "signal_start_workflow")
 	testing.expect_value(t, request.task_queue.name, "signal-start-queue")
@@ -9810,6 +9815,7 @@ client_signal_request_preserves_repeated_arguments :: proc(t: ^testing.T) {
 		"repeated",
 		inputs[:],
 		{request_id = "repeated-signal-request"},
+		"odin-custom-client@test",
 	)
 	defer delete(request_bytes)
 	defer temporal_client.error_free(&request_error)
@@ -9827,6 +9833,7 @@ client_signal_request_preserves_repeated_arguments :: proc(t: ^testing.T) {
 	)
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect(t, request.input != nil)
 	if request.input == nil do return
 	testing.expect_value(t, len(request.input.payloads), 3)
@@ -10784,6 +10791,7 @@ client_update_projects_identity_and_headers :: proc(t: ^testing.T) {
 		codec.payload_view(&input),
 		{update_id = "update-id", headers = &headers},
 		"request-id",
+		"odin-custom-client@test",
 	)
 	defer delete(request_bytes)
 	defer temporal_client.error_free(&request_error)
@@ -10807,6 +10815,7 @@ client_update_projects_identity_and_headers :: proc(t: ^testing.T) {
 	testing.expect_value(t, request.first_execution_run_id, "first-run-id")
 	testing.expect(t, request.request != nil && request.request.input != nil)
 	if request.request != nil && request.request.input != nil {
+		testing.expect_value(t, request.request.meta.identity, "odin-custom-client@test")
 		testing.expect_value(t, request.request.meta.update_id, "update-id")
 		testing.expect_value(t, request.request.request_id, "request-id")
 		testing.expect_value(t, request.request.input.name, "rename")
@@ -10875,6 +10884,7 @@ client_update_with_start_encodes_atomic_operation_pair :: proc(t: ^testing.T) {
 		&start_headers,
 		&update_headers,
 		"update-request",
+		"odin-custom-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -10905,6 +10915,7 @@ client_update_with_start_encodes_atomic_operation_pair :: proc(t: ^testing.T) {
 	testing.expect_value(t, start.value.workflow_type.name, "order_workflow")
 	testing.expect_value(t, start.value.task_queue.name, "orders")
 	testing.expect_value(t, start.value.request_id, "start-request")
+	testing.expect_value(t, start.value.identity, "odin-custom-client@test")
 	testing.expect(
 		t,
 		start.value.workflow_id_conflict_policy == .WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
@@ -10919,6 +10930,7 @@ client_update_with_start_encodes_atomic_operation_pair :: proc(t: ^testing.T) {
 	testing.expect_value(t, update.value.first_execution_run_id, "")
 	testing.expect(t, update.value.wait_policy.lifecycle_stage == .UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_ACCEPTED)
 	testing.expect_value(t, update.value.request.meta.update_id, "update-42")
+	testing.expect_value(t, update.value.request.meta.identity, "odin-custom-client@test")
 	testing.expect_value(t, update.value.request.input.name, "set_reference")
 	testing.expect_value(t, len(update.value.request.input.args.payloads), 2)
 	testing.expect_value(t, string(update.value.request.input.args.payloads[0].data), `"update-first"`)
@@ -11306,6 +11318,7 @@ client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) 
 			metadata = &schedule_metadata,
 			request_id = "schedule-request",
 		},
+		"odin-custom-client@test",
 	)
 	defer delete(request_bytes)
 	defer temporal_client.error_free(&request_error)
@@ -11320,6 +11333,7 @@ client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) 
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
 	testing.expect_value(t, request.schedule_id, "daily-orders")
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect_value(t, request.request_id, "schedule-request")
 	testing.expect(t, request.schedule != nil && request.schedule.spec != nil)
 	testing.expect_value(t, len(request.schedule.spec.interval), 1)
@@ -11438,6 +11452,7 @@ client_schedule_update_is_full_replace_with_conflict_token :: proc(t: ^testing.T
 			request_id = "update-request",
 		},
 		conflict_token,
+		"odin-custom-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -11452,6 +11467,7 @@ client_schedule_update_is_full_replace_with_conflict_token :: proc(t: ^testing.T
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
 	testing.expect_value(t, request.schedule_id, "updated-schedule")
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect_value(t, request.request_id, "update-request")
 	testing.expect(t, bytes.equal(request.conflict_token, conflict_token))
 	testing.expect(t, request.schedule != nil && request.schedule.spec != nil)
@@ -11474,6 +11490,7 @@ client_schedule_backfill_encodes_all_ranges :: proc(t: ^testing.T) {
 		"backfill-schedule",
 		backfills[:],
 		"backfill-request",
+		"odin-custom-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -11487,6 +11504,7 @@ client_schedule_backfill_encodes_all_ranges :: proc(t: ^testing.T) {
 	decoded := proto.decode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(encoded[:], &request)
 	context.allocator = previous_allocator
 	testing.expect(t, decoded)
+	testing.expect_value(t, request.identity, "odin-custom-client@test")
 	testing.expect(t, request.patch != nil)
 	if request.patch != nil {
 		testing.expect_value(t, len(request.patch.backfill_request), 2)
@@ -11496,6 +11514,96 @@ client_schedule_backfill_encodes_all_ranges :: proc(t: ^testing.T) {
 		)
 		testing.expect_value(t, request.patch.backfill_request[1].start_time.seconds, i64(1_800_007_200))
 	}
+}
+
+@(test)
+client_control_and_schedule_mutation_requests_use_configured_identity :: proc(t: ^testing.T) {
+	identity := "odin-custom-client@test"
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+
+	cancel_encoded, cancel_error := temporal_client.encode_cancel_workflow_request(
+		"default",
+		identity,
+		"cancel-workflow",
+		"cancel-run",
+		"cancel-first-run",
+		"operator request",
+		"cancel-request",
+	)
+	defer delete(cancel_encoded)
+	defer temporal_client.error_free(&cancel_error)
+	testing.expectf(t, cancel_error.message == nil, "Workflow cancel encode failed: %s", string(cancel_error.message))
+	cancel_request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	testing.expect(t, proto.decode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(cancel_encoded[:], &cancel_request))
+	context.allocator = previous_allocator
+	testing.expect_value(t, cancel_request.identity, identity)
+	testing.expect_value(t, cancel_request.request_id, "cancel-request")
+	testing.expect_value(t, cancel_request.first_execution_run_id, "cancel-first-run")
+	testing.expect_value(t, cancel_request.workflow_execution.workflow_id, "cancel-workflow")
+
+	details := codec.payload_create(transmute([]u8)string(`{"source":"test"}`))
+	defer codec.payload_free(&details)
+	terminate_encoded, terminate_error := temporal_client.encode_terminate_workflow_request(
+		"default",
+		identity,
+		"terminate-workflow",
+		"terminate-run",
+		"terminate-first-run",
+		"operator request",
+		codec.payload_view(&details),
+		true,
+	)
+	defer delete(terminate_encoded)
+	defer temporal_client.error_free(&terminate_error)
+	testing.expectf(t, terminate_error.message == nil, "Workflow terminate encode failed: %s", string(terminate_error.message))
+	terminate_request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{}
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	testing.expect(t, proto.decode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(terminate_encoded[:], &terminate_request))
+	context.allocator = previous_allocator
+	testing.expect_value(t, terminate_request.identity, identity)
+	testing.expect_value(t, terminate_request.first_execution_run_id, "terminate-first-run")
+	testing.expect(t, terminate_request.details != nil && len(terminate_request.details.payloads) == 1)
+
+	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{}
+	patch_encoded, patch_error := temporal_client.encode_schedule_patch_request(
+		"default",
+		"patched-schedule",
+		&patch,
+		"patch-request",
+		identity,
+	)
+	defer delete(patch_encoded)
+	defer temporal_client.error_free(&patch_error)
+	testing.expectf(t, patch_error.message == nil, "Schedule patch encode failed: %s", string(patch_error.message))
+	patch_request := proto.Temporal_Api_Workflowservice_V1_PatchScheduleRequest{}
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	testing.expect(t, proto.decode_Temporal_Api_Workflowservice_V1_PatchScheduleRequest(patch_encoded[:], &patch_request))
+	context.allocator = previous_allocator
+	testing.expect_value(t, patch_request.identity, identity)
+	testing.expect_value(t, patch_request.request_id, "patch-request")
+	testing.expect_value(t, patch_request.schedule_id, "patched-schedule")
+
+	delete_encoded, delete_error := temporal_client.encode_delete_schedule_request(
+		"default",
+		"deleted-schedule",
+		identity,
+	)
+	defer delete(delete_encoded)
+	defer temporal_client.error_free(&delete_error)
+	testing.expectf(t, delete_error.message == nil, "Schedule delete encode failed: %s", string(delete_error.message))
+	delete_request := proto.Temporal_Api_Workflowservice_V1_DeleteScheduleRequest{}
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	testing.expect(t, proto.decode_Temporal_Api_Workflowservice_V1_DeleteScheduleRequest(delete_encoded[:], &delete_request))
+	context.allocator = previous_allocator
+	testing.expect_value(t, delete_request.identity, identity)
+	testing.expect_value(t, delete_request.schedule_id, "deleted-schedule")
 }
 
 @(test)

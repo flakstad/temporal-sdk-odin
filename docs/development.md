@@ -995,7 +995,11 @@ The test starts the Odin Workflow/Activity Worker, calls
 `ExecuteMultiOperation` through Core against a missing Workflow ID, waits for
 the Update result, repeats the call against the running execution, and requires
 the same Run ID with `started_by_request=false`. It then signals the Workflow
-to completion. `scripts/integration-test.sh` enables the same dev-server flag
+to completion. The example supplies a non-default `Connect_Options.identity`;
+the script fetches JSON history and requires that identity on at least four
+events, covering Workflow start, both Updates, and the final Signal rather than
+only checking Odin-side request construction. `scripts/integration-test.sh`
+enables the same dev-server flag
 and runs this proof automatically. Exact wire/ownership tests cover the two
 nested responses, and a 500-case property varies both 0–12 argument lists.
 
@@ -1523,6 +1527,12 @@ remain caller-owned, and repeated encoding must remain byte-identical.
 Another 500 cases do the same for zero to twelve ordered Update arguments while
 also checking Workflow/run identity, Update/request IDs, headers, and
 byte-identical request encoding.
+Configured Client identity is additionally checked on exact protobuf requests
+for Workflow start, Signal-With-Start, Signal, Update, Update-With-Start,
+cancel, reset, terminate, Schedule create/update/backfill/patch/delete,
+Workflow options/pause, asynchronous Activity completion, and Nexus operations.
+The request encoders fall back to the documented default only when invoked
+directly with an empty identity.
 Another 500 generated Workflow Reset requests vary event IDs, optional Run IDs,
 and every signal/Update/Nexus reapply exclusion. They decode the exact pinned
 request type and require namespace, client identity, target, reason, request ID,

@@ -69,6 +69,7 @@ signal_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 			},
 			signal_headers = &headers,
 		},
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -99,6 +100,7 @@ signal_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.workflow_type.name != "property_workflow" ||
 	   request.task_queue.name != "property-queue" ||
 	   request.request_id != "property-request-id" ||
+	   request.identity != "property-client@test" ||
 	   request.signal_name != "property-signal" ||
 	   !bytes.equal(request.input.payloads[0].data, transmute([]u8)workflow_input_value) ||
 	   !bytes.equal(request.signal_input.payloads[0].data, transmute([]u8)signal_input_value) ||
@@ -189,6 +191,7 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		"property-signal",
 		input_views[:argument_count],
 		{request_id = "property-request-id", headers = &headers},
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -223,6 +226,7 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.workflow_execution.run_id != run_id ||
 	   request.signal_name != "property-signal" ||
 	   request.request_id != "property-request-id" ||
+	   request.identity != "property-client@test" ||
 	   request.header.fields[0].key != "property-header" {
 		return pbt.fail("generated Signal scalar fields changed during round trip")
 	}
@@ -262,6 +266,7 @@ signal_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		"property-signal",
 		input_views[:argument_count],
 		{request_id = "property-request-id", headers = &headers},
+		"property-client@test",
 	)
 	defer delete(reencoded)
 	defer temporal_client.error_free(&reencode_error)
@@ -336,6 +341,7 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		input_views[:argument_count],
 		{update_id = "property-update-id", headers = &headers},
 		"property-request-id",
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -369,6 +375,7 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   request.workflow_execution.run_id != run_id ||
 	   request.first_execution_run_id != "property-first-run-id" ||
 	   request.request.meta.update_id != "property-update-id" ||
+	   request.request.meta.identity != "property-client@test" ||
 	   request.request.request_id != "property-request-id" ||
 	   request.request.input.name != "property-update" ||
 	   request.request.input.header.fields[0].key != "property-header" {
@@ -414,6 +421,7 @@ update_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		input_views[:argument_count],
 		{update_id = "property-update-id", headers = &headers},
 		"property-request-id",
+		"property-client@test",
 	)
 	defer delete(reencoded)
 	defer temporal_client.error_free(&reencode_error)
@@ -480,6 +488,7 @@ update_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		nil,
 		nil,
 		"property-update-request-id",
+		"property-client@test",
 	)
 	defer delete(encoded)
 	defer temporal_client.error_free(&encode_error)
@@ -519,6 +528,8 @@ update_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	   len(update.value.workflow_execution.run_id) != 0 ||
 	   len(update.value.first_execution_run_id) != 0 ||
 	   update.value.request.meta.update_id != "property-update-id" ||
+	   start.value.identity != "property-client@test" ||
+	   update.value.request.meta.identity != "property-client@test" ||
 	   update.value.request.request_id != "property-update-request-id" ||
 	   len(update.value.request.input.args.payloads) != update_count {
 		return pbt.fail("generated Update-With-Start fields changed during round trip")
@@ -557,6 +568,7 @@ update_with_start_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		nil,
 		nil,
 		"property-update-request-id",
+		"property-client@test",
 	)
 	defer delete(reencoded)
 	defer temporal_client.error_free(&reencode_error)

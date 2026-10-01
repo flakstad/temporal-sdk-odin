@@ -139,6 +139,22 @@ Client :: struct {
 	interceptors: [dynamic]Client_Interceptor,
 }
 
+DEFAULT_CLIENT_IDENTITY :: "temporal-sdk-odin@local"
+
+request_identity :: proc(identity: string) -> string {
+	if len(identity) > 0 {
+		return identity
+	}
+	return DEFAULT_CLIENT_IDENTITY
+}
+
+client_request_identity :: proc(client: ^Client) -> string {
+	if client != nil {
+		return request_identity(client.identity)
+	}
+	return DEFAULT_CLIENT_IDENTITY
+}
+
 connect :: proc(
 	target_url := "http://localhost:7233",
 	namespace := "default",
@@ -152,7 +168,7 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 	}
 	identity := options.identity
 	if len(identity) == 0 {
-		identity = "temporal-sdk-odin@local"
+		identity = DEFAULT_CLIENT_IDENTITY
 	}
 	core_options := temporal_core.Client_Connection_Options{
 		target_url = options.target_url,
@@ -1265,6 +1281,7 @@ encode_start_workflow_request_payloads :: proc(
 	inputs: []codec.Payload_View,
 	options: Start_Workflow_Options,
 	header_override: ^Headers = nil,
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Temporal namespace must not be empty")
@@ -1301,7 +1318,7 @@ encode_start_workflow_request_payloads :: proc(
 		workflow_type = &workflow_type_value,
 		task_queue = &task_queue,
 		input = &input_payloads,
-		identity = "temporal-sdk-odin@local",
+		identity = request_identity(identity),
 		request_id = request_id,
 		workflow_id_reuse_policy = workflow_id_reuse_policy_to_proto(options.id_reuse_policy),
 		workflow_id_conflict_policy = workflow_id_conflict_policy_to_proto(options.id_conflict_policy),
@@ -1537,6 +1554,7 @@ encode_start_workflow_request :: proc(
 	input: codec.Payload_View,
 	options: Start_Workflow_Options,
 	header_override: ^Headers = nil,
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	inputs := [?]codec.Payload_View{input}
 	return encode_start_workflow_request_payloads(
@@ -1545,6 +1563,7 @@ encode_start_workflow_request :: proc(
 		inputs[:],
 		options,
 		header_override,
+		identity,
 	)
 }
 
@@ -1564,6 +1583,7 @@ start_workflow_payloads_unintercepted :: proc(
 		inputs,
 		options,
 		headers,
+		client_request_identity(client),
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -1713,6 +1733,7 @@ encode_update_with_start_request_payloads :: proc(
 	start_headers: ^Headers = nil,
 	update_headers: ^Headers = nil,
 	explicit_update_request_id := "",
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if message := update_with_start_options_error(options); len(message) > 0 {
 		return nil, error_from_string(.Invalid_Argument, message)
@@ -1730,6 +1751,7 @@ encode_update_with_start_request_payloads :: proc(
 		workflow_inputs,
 		options.start_options,
 		start_headers,
+		identity,
 	)
 	if start_error.message != nil {
 		return nil, start_error
@@ -1744,6 +1766,7 @@ encode_update_with_start_request_payloads :: proc(
 		update_inputs,
 		update_options,
 		explicit_update_request_id,
+		identity,
 	)
 	if update_error.message != nil {
 		return nil, update_error
@@ -1916,6 +1939,8 @@ update_with_start_payloads_unintercepted :: proc(
 		options,
 		start_headers,
 		update_headers,
+		"",
+		client_request_identity(client),
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -2077,6 +2102,7 @@ encode_signal_with_start_workflow_request :: proc(
 	signal_name: string,
 	signal_input: codec.Payload_View,
 	options: Signal_With_Start_Options,
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(signal_name) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Workflow signal name must not be empty")
@@ -2090,6 +2116,8 @@ encode_signal_with_start_workflow_request :: proc(
 		workflow_type,
 		workflow_input,
 		options.start_options,
+		nil,
+		identity,
 	)
 	if start_error.message != nil {
 		return nil, start_error
@@ -2193,6 +2221,7 @@ signal_with_start_workflow_payload_unintercepted :: proc(
 		signal_name,
 		signal_input,
 		options,
+		client_request_identity(client),
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -2385,6 +2414,7 @@ signal_workflow_payload_terminal :: proc(input: ^Client_Signal_Workflow_Input) -
 		input.signal_name,
 		input.inputs,
 		options,
+		client_request_identity(input.handle.client),
 	)
 	if request_error.message != nil {
 		return request_error
@@ -2446,6 +2476,7 @@ encode_signal_workflow_request_payloads :: proc(
 	namespace, workflow_id, run_id, signal_name: string,
 	inputs: []codec.Payload_View,
 	options: Signal_Workflow_Options = {},
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 || len(workflow_id) == 0 || len(signal_name) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Signal namespace, Workflow ID, and name are required")
@@ -2470,7 +2501,7 @@ encode_signal_workflow_request_payloads :: proc(
 		namespace = namespace,
 		workflow_execution = &execution,
 		signal_name = signal_name,
-		identity = "temporal-sdk-odin@local",
+		identity = request_identity(identity),
 		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
 	}
 	if len(inputs) > 0 {
@@ -2503,6 +2534,7 @@ encode_signal_workflow_request :: proc(
 	namespace, workflow_id, run_id, signal_name: string,
 	input: codec.Payload_View,
 	options: Signal_Workflow_Options = {},
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	inputs := [?]codec.Payload_View{input}
 	return encode_signal_workflow_request_payloads(
@@ -2512,6 +2544,7 @@ encode_signal_workflow_request :: proc(
 		signal_name,
 		inputs[:],
 		options,
+		identity,
 	)
 }
 
@@ -2959,7 +2992,7 @@ poll_update_result_payload :: proc(
 		request := proto.Temporal_Api_Workflowservice_V1_PollWorkflowExecutionUpdateRequest{
 			namespace = client.namespace,
 			update_ref = &update_ref,
-			identity = "temporal-sdk-odin@local",
+			identity = client_request_identity(client),
 			wait_policy = &wait_policy,
 		}
 		request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollWorkflowExecutionUpdateRequest(&request)
@@ -3027,6 +3060,7 @@ encode_update_workflow_request_payloads :: proc(
 	inputs: []codec.Payload_View,
 	options: Update_Workflow_Options = {},
 	explicit_request_id := "",
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	if len(namespace) == 0 || len(workflow_id) == 0 || len(update_name) == 0 {
 		return nil, error_from_string(.Invalid_Argument, "Update namespace, Workflow ID, and name are required")
@@ -3050,7 +3084,7 @@ encode_update_workflow_request_payloads :: proc(
 	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
 	meta := proto.Temporal_Api_Update_V1_Meta{
 		update_id = resolve_request_id(options.update_id, update_id_buffer[:]),
-		identity = "temporal-sdk-odin@local",
+		identity = request_identity(identity),
 	}
 	update_input := proto.Temporal_Api_Update_V1_Input{
 		name = update_name,
@@ -3099,6 +3133,7 @@ encode_update_workflow_request :: proc(
 	input: codec.Payload_View,
 	options: Update_Workflow_Options = {},
 	explicit_request_id := "",
+	identity := DEFAULT_CLIENT_IDENTITY,
 ) -> (request_bytes: [dynamic]u8, error: Error) {
 	inputs := [?]codec.Payload_View{input}
 	return encode_update_workflow_request_payloads(
@@ -3110,6 +3145,7 @@ encode_update_workflow_request :: proc(
 		inputs[:],
 		options,
 		explicit_request_id,
+		identity,
 	)
 }
 
@@ -3150,6 +3186,8 @@ start_update_payloads_unintercepted :: proc(
 		update_name,
 		inputs,
 		options,
+		"",
+		client_request_identity(handle.client),
 	)
 	if request_error.message != nil {
 		return {}, request_error
@@ -3499,21 +3537,45 @@ execute_update_json :: proc(
 	return {}
 }
 
+encode_cancel_workflow_request :: proc(
+	namespace, identity, workflow_id, run_id, first_execution_run_id, reason: string,
+	request_id := "",
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow cancellation requires namespace and Workflow ID")
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{
+		namespace = namespace,
+		workflow_execution = &execution,
+		identity = request_identity(identity),
+		request_id = resolve_request_id(request_id, request_id_buffer[:]),
+		first_execution_run_id = first_execution_run_id,
+		reason = reason,
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(&request), {}
+}
+
 cancel_workflow_terminal :: proc(input: ^Client_Cancel_Workflow_Input) -> Error {
 	if input == nil || !workflow_handle_valid(input.handle) {
 		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
 	}
-	execution := workflow_execution(input.handle)
-	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
-	request := proto.Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest{
-		namespace = input.handle.client.namespace,
-		workflow_execution = &execution,
-		identity = "temporal-sdk-odin@local",
-		request_id = resolve_request_id(input.request_id, request_id_buffer[:]),
-		first_execution_run_id = input.handle.first_execution_run_id,
-		reason = input.reason,
+	request_bytes, request_error := encode_cancel_workflow_request(
+		input.handle.client.namespace,
+		client_request_identity(input.handle.client),
+		input.handle.id,
+		input.handle.run_id,
+		input.handle.first_execution_run_id,
+		input.reason,
+		input.request_id,
+	)
+	if request_error.message != nil {
+		return request_error
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_RequestCancelWorkflowExecutionRequest(&request)
 	defer delete(request_bytes)
 	return rpc_empty_response(input.handle, "RequestCancelWorkflowExecution", request_bytes[:])
 }
@@ -3895,7 +3957,7 @@ encode_reset_workflow_request :: proc(
 		request_id = resolve_request_id(options.request_id, request_id_buffer[:]),
 		reset_reapply_exclude_types = exclude_types,
 		post_reset_operations = post_reset_storage.operations,
-		identity = identity,
+		identity = request_identity(identity),
 	}
 	return proto.encode_Temporal_Api_Workflowservice_V1_ResetWorkflowExecutionRequest(
 		&request,
@@ -3910,7 +3972,7 @@ reset_workflow_terminal :: proc(
 	}
 	request_bytes, request_error := encode_reset_workflow_request(
 		input.handle.client.namespace,
-		input.handle.client.identity,
+		client_request_identity(input.handle.client),
 		input.handle.id,
 		input.handle.run_id,
 		input.options,
@@ -3966,31 +4028,57 @@ reset_workflow :: proc(
 	return client_reset_workflow_chain(&state, &input)
 }
 
-terminate_workflow_terminal :: proc(input: ^Client_Terminate_Workflow_Input) -> Error {
-	if input == nil || !workflow_handle_valid(input.handle) {
-		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+encode_terminate_workflow_request :: proc(
+	namespace, identity, workflow_id, run_id, first_execution_run_id, reason: string,
+	details: codec.Payload_View = {},
+	has_details := false,
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow termination requires namespace and Workflow ID")
 	}
-	execution := workflow_execution(input.handle)
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
 	detail_payloads := proto.Temporal_Api_Common_V1_Payloads{}
 	defer delete(detail_payloads.payloads)
 	payload := proto.Temporal_Api_Common_V1_Payload{}
-	if input.has_details {
-		payload = proto.encode_payload(input.details)
+	if has_details {
+		payload = proto.encode_payload(details)
 		defer delete(payload.metadata)
 		defer delete(payload.external_payloads)
 		append(&detail_payloads.payloads, payload)
 	}
 	request := proto.Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest{
-		namespace = input.handle.client.namespace,
+		namespace = namespace,
 		workflow_execution = &execution,
-		reason = input.reason,
-		identity = "temporal-sdk-odin@local",
-		first_execution_run_id = input.handle.first_execution_run_id,
+		reason = reason,
+		identity = request_identity(identity),
+		first_execution_run_id = first_execution_run_id,
 	}
-	if input.has_details {
+	if has_details {
 		request.details = &detail_payloads
 	}
-	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request)
+	return proto.encode_Temporal_Api_Workflowservice_V1_TerminateWorkflowExecutionRequest(&request), {}
+}
+
+terminate_workflow_terminal :: proc(input: ^Client_Terminate_Workflow_Input) -> Error {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	request_bytes, request_error := encode_terminate_workflow_request(
+		input.handle.client.namespace,
+		client_request_identity(input.handle.client),
+		input.handle.id,
+		input.handle.run_id,
+		input.handle.first_execution_run_id,
+		input.reason,
+		input.details,
+		input.has_details,
+	)
+	if request_error.message != nil {
+		return request_error
+	}
 	defer delete(request_bytes)
 	return rpc_empty_response(input.handle, "TerminateWorkflowExecution", request_bytes[:])
 }
