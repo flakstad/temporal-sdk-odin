@@ -770,10 +770,11 @@ returns gRPC 12/`UNIMPLEMENTED` for `StartActivityExecution`. CLI 1.9.1/Server
 1.32.0 live-proves successful Start/Poll/Describe/result through an Odin Worker,
 Visibility List/Count with an exact Activity-ID query, and scheduled-state
 cancellation, termination, and deletion. The entire implemented slice has typed
-Client outbound interceptors. The SDK capability remains false because the
-pinned upstream Service also exposes newer Pause/Unpause/Reset and
-`UpdateActivityExecutionOptions` RPCs that are not yet protobuf roots or Odin
-surfaces.
+Client outbound interceptors. Pause, Unpause, and Reset use the generic Core
+RPC bridge as well and are live-proven through a paused scheduled execution on
+Server 1.32. The SDK capability remains false because
+`UpdateActivityExecutionOptions` has a generated protobuf contract but no Odin
+surface yet.
 
 Memory ownership follows the existing poll boundary. The C callback lends a
 Core `ByteArray`; `temporal/core` copies it into an Odin allocation and calls
@@ -3182,9 +3183,9 @@ that observes, but never unsafely terminates, callbacks beyond a configured
 deadline. Standalone Activity Start/Poll/Describe/result,
 cancel/terminate/delete, and Visibility List/Count are now live-proven against
 Server 1.32. Start metadata and the typed Client interceptor family are also
-implemented and wire-/unit-tested. The next slice is the newer
-Pause/Unpause/Reset and execution-option update family, beginning by adding
-those request/response messages to the generated protobuf roots. Infinite Workflow
+implemented and wire-/unit-tested. Pause/Unpause/Reset are now generated,
+intercepted, wire-tested, and live-proven. The next slice is the remaining
+`UpdateActivityExecutionOptions` request/owned-response pair. Infinite Workflow
 code and SDK-managed subprocess execution remain process-boundary work. The capability inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.
@@ -3204,7 +3205,7 @@ a non-mutating probe exists.
 | Nexus from Workflows | Implemented | `GetSystemInfo.nexus` | Advertised and live-proven | Live suite exposed a timeout behavior change still under classification |
 | Standalone Nexus | Implemented | Safe count RPC | gRPC 12 `UNIMPLEMENTED` | Live-proven on 1.32.0 when `nexusoperation.enableStandalone=true` |
 | Workflow Pause/Unpause | Implemented | No safe probe or System Info bit | Unknown; no mutation is attempted | Live-proven on 1.32.0 |
-| Standalone Activity lifecycle | Partial: Start/Poll/Describe/result/cancel/terminate/delete/List/Count plus Start metadata/interceptors; Pause/Unpause/Reset/options pending | No safe probe; capability remains false | Start returns gRPC 12 `UNIMPLEMENTED` | Full listed live slice proven through an Odin Worker on 1.32.0 |
+| Standalone Activity lifecycle | Partial: Start/Poll/Describe/result/cancel/terminate/delete/List/Count, metadata/interceptors, Pause/Unpause/Reset; options update pending | No safe probe; capability remains false | Start returns gRPC 12 `UNIMPLEMENTED` | Listed lifecycle and controls live-proven through an Odin Worker on 1.32.0 |
 
 The matrix deliberately distinguishes “SDK surface absent”, “server said
 UNIMPLEMENTED”, and “not safely observed”. Authentication or namespace errors

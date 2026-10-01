@@ -83,8 +83,8 @@ server_feature_evidence_name :: proc(evidence: Server_Feature_Evidence) -> strin
 
 // server_feature_sdk_implemented describes the public Odin surface, not
 // server support. The initial standalone Activity lifecycle, metadata,
-// Visibility, and interceptors exist, but newer Pause/Unpause/Reset and
-// execution-option update RPCs remain, so it is still false.
+// Visibility, interceptors, and Pause/Unpause/Reset exist, but the
+// execution-option update RPC remains, so it is still false.
 server_feature_sdk_implemented :: proc(feature: Server_Feature) -> bool {
 	switch feature {
 	case .Schedules, .Schedule_Count, .Nexus, .Standalone_Nexus, .Workflow_Pause:

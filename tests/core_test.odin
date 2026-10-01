@@ -108,6 +108,8 @@ Client_Interceptor_Test_State :: struct {
 	activity_describe_seen:  bool,
 	activity_mutation_seen:  bool,
 	activity_mutation_kind:  temporal_client.Standalone_Activity_Mutation_Kind,
+	activity_control_seen:   bool,
+	activity_control_kind:   temporal_client.Standalone_Activity_Control_Kind,
 	activity_list_seen:      bool,
 	activity_count_seen:     bool,
 }
@@ -726,6 +728,31 @@ client_interceptor_test_standalone_activity_mutation :: proc(
 		result = temporal_client.error_from_string(.Rpc, "standalone Activity mutation short circuit")
 	} else {
 		result = temporal_client.client_standalone_activity_mutation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
+client_interceptor_test_standalone_activity_control :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Standalone_Activity_Control_Input,
+	next: temporal_client.Client_Standalone_Activity_Control_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.reason = "intercepted Activity control"
+	} else {
+		node.state.activity_control_seen = input.options.reason == "intercepted Activity control"
+		node.state.activity_control_kind = input.kind
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "standalone Activity control short circuit")
+	} else {
+		result = temporal_client.client_standalone_activity_control_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -11205,6 +11232,7 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 			poll_standalone_activity = client_interceptor_test_poll_standalone_activity,
 			describe_standalone_activity = client_interceptor_test_describe_standalone_activity,
 			standalone_activity_mutation = client_interceptor_test_standalone_activity_mutation,
+			standalone_activity_control = client_interceptor_test_standalone_activity_control,
 			list_standalone_activities = client_interceptor_test_list_standalone_activities,
 			count_standalone_activities = client_interceptor_test_count_standalone_activities,
 		})
@@ -11260,6 +11288,22 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 		temporal_client.error_free(&mutation_error)
 		testing.expect(t, state.activity_mutation_seen)
 		testing.expect_value(t, state.activity_mutation_kind, kind)
+		for event, index in expected do testing.expect_value(t, state.events[index], event)
+	}
+
+	for kind in temporal_client.Standalone_Activity_Control_Kind {
+		if kind == .Invalid do continue
+		state.count = 0
+		state.activity_control_seen = false
+		control_error := temporal_client.standalone_activity_control(
+			&handle,
+			kind,
+			{reason = "caller reason"},
+		)
+		testing.expect_value(t, string(control_error.message), "standalone Activity control short circuit")
+		temporal_client.error_free(&control_error)
+		testing.expect(t, state.activity_control_seen)
+		testing.expect_value(t, state.activity_control_kind, kind)
 		for event, index in expected do testing.expect_value(t, state.events[index], event)
 	}
 
@@ -25927,6 +25971,90 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 	defer temporal_client.standalone_activity_poll_result_free(&empty_result)
 	defer temporal_client.error_free(&empty_error)
 	testing.expect(t, is_empty && empty_error.message == nil)
+}
+
+@(test)
+standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^testing.T) {
+	pause_bytes, pause_error := temporal_client.encode_standalone_activity_control_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		.Pause,
+		{reason = "maintenance", request_id = "pause-request"},
+	)
+	defer delete(pause_bytes)
+	defer temporal_client.error_free(&pause_error)
+	testing.expect(t, pause_error.message == nil)
+
+	unpause_bytes, unpause_error := temporal_client.encode_standalone_activity_control_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		.Unpause,
+		{reason = "ready", request_id = "unpause-request", jitter = 250 * time.Millisecond},
+	)
+	defer delete(unpause_bytes)
+	defer temporal_client.error_free(&unpause_error)
+	testing.expect(t, unpause_error.message == nil)
+
+	reset_bytes, reset_error := temporal_client.encode_standalone_activity_control_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		.Reset,
+		{
+			request_id = "reset-request",
+			jitter = time.Second,
+			keep_paused = true,
+			restore_original_options = true,
+			reset_heartbeat = true,
+		},
+	)
+	defer delete(reset_bytes)
+	defer temporal_client.error_free(&reset_error)
+	testing.expect(t, reset_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	pause := proto.Temporal_Api_Workflowservice_V1_PauseActivityExecutionRequest{}
+	unpause := proto.Temporal_Api_Workflowservice_V1_UnpauseActivityExecutionRequest{}
+	reset := proto.Temporal_Api_Workflowservice_V1_ResetActivityExecutionRequest{}
+	pause_ok := proto.decode_Temporal_Api_Workflowservice_V1_PauseActivityExecutionRequest(pause_bytes[:], &pause)
+	unpause_ok := proto.decode_Temporal_Api_Workflowservice_V1_UnpauseActivityExecutionRequest(unpause_bytes[:], &unpause)
+	reset_ok := proto.decode_Temporal_Api_Workflowservice_V1_ResetActivityExecutionRequest(reset_bytes[:], &reset)
+	context.allocator = previous_allocator
+	testing.expect(t, pause_ok && unpause_ok && reset_ok)
+	testing.expect_value(t, pause.namespace, "orders")
+	testing.expect_value(t, pause.activity_id, "activity-42")
+	testing.expect_value(t, pause.run_id, "run-42")
+	testing.expect_value(t, pause.resource_id, "activity:activity-42")
+	testing.expect_value(t, pause.reason, "maintenance")
+	testing.expect_value(t, pause.request_id, "pause-request")
+	testing.expect(t, unpause.jitter != nil)
+	if unpause.jitter != nil do testing.expect_value(t, unpause.jitter.nanos, i32(250_000_000))
+	testing.expect_value(t, unpause.reason, "ready")
+	testing.expect(t, reset.jitter != nil)
+	testing.expect(t, reset.keep_paused)
+	testing.expect(t, reset.restore_original_options)
+	testing.expect(t, reset.reset_heartbeat)
+
+	invalid_bytes, invalid_error := temporal_client.encode_standalone_activity_control_request(
+		"orders",
+		"odin-client",
+		"activity-42",
+		"run-42",
+		.Unpause,
+		{jitter = -time.Second},
+	)
+	delete(invalid_bytes)
+	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&invalid_error)
 }
 
 @(test)

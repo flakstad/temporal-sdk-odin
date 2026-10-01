@@ -66,6 +66,14 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.TerminateActivityExecutionResponse \
   temporal.api.workflowservice.v1.DeleteActivityExecutionRequest \
   temporal.api.workflowservice.v1.DeleteActivityExecutionResponse \
+  temporal.api.workflowservice.v1.PauseActivityExecutionRequest \
+  temporal.api.workflowservice.v1.PauseActivityExecutionResponse \
+  temporal.api.workflowservice.v1.UnpauseActivityExecutionRequest \
+  temporal.api.workflowservice.v1.UnpauseActivityExecutionResponse \
+  temporal.api.workflowservice.v1.ResetActivityExecutionRequest \
+  temporal.api.workflowservice.v1.ResetActivityExecutionResponse \
+  temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsRequest \
+  temporal.api.workflowservice.v1.UpdateActivityExecutionOptionsResponse \
   temporal.api.workflowservice.v1.ListActivityExecutionsRequest \
   temporal.api.workflowservice.v1.ListActivityExecutionsResponse \
   temporal.api.workflowservice.v1.CountActivityExecutionsRequest \

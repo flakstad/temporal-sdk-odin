@@ -80,4 +80,11 @@ for mode in cancel terminate; do
   grep -q "was $expected_terminal and deleted through the Odin Client" "$client_log"
 done
 
-echo "Standalone Activity start/poll/describe/list/count/result/cancel/terminate/delete integration passed."
+STANDALONE_ACTIVITY_MODE=control \
+  TEMPORAL_ODIN_TASK_QUEUE="$task_queue-no-worker" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-standalone-activity.sh" >"$client_log" 2>&1
+cat "$client_log"
+grep -q 'was paused, reset, unpaused, terminated, and deleted through the Odin Client' "$client_log"
+
+echo "Standalone Activity lifecycle, visibility, pause/unpause/reset integration passed."

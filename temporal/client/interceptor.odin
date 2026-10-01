@@ -582,6 +582,44 @@ Client_Standalone_Activity_Mutation_Interceptor_Proc :: #type proc(
 	next: Client_Standalone_Activity_Mutation_Next,
 ) -> Error
 
+Standalone_Activity_Control_Kind :: enum {
+	Invalid,
+	Pause,
+	Unpause,
+	Reset,
+}
+
+Standalone_Activity_Control_Options :: struct {
+	reason:                   string,
+	request_id:               string,
+	jitter:                   time.Duration,
+	keep_paused:              bool,
+	restore_original_options: bool,
+	reset_heartbeat:          bool,
+}
+
+Client_Standalone_Activity_Control_Input :: struct {
+	handle:  ^Standalone_Activity_Handle,
+	kind:    Standalone_Activity_Control_Kind,
+	options: Standalone_Activity_Control_Options,
+}
+
+Client_Standalone_Activity_Control_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Standalone_Activity_Control_Input,
+) -> Error
+
+Client_Standalone_Activity_Control_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Standalone_Activity_Control_Next_Proc,
+}
+
+Client_Standalone_Activity_Control_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Standalone_Activity_Control_Input,
+	next: Client_Standalone_Activity_Control_Next,
+) -> Error
+
 Client_List_Standalone_Activities_Input :: struct {
 	client:    ^Client,
 	options:   List_Standalone_Activities_Options,
@@ -741,6 +779,7 @@ Client_Interceptor :: struct {
 	poll_standalone_activity:     Client_Poll_Standalone_Activity_Interceptor_Proc,
 	describe_standalone_activity: Client_Describe_Standalone_Activity_Interceptor_Proc,
 	standalone_activity_mutation: Client_Standalone_Activity_Mutation_Interceptor_Proc,
+	standalone_activity_control:  Client_Standalone_Activity_Control_Interceptor_Proc,
 	list_standalone_activities:   Client_List_Standalone_Activities_Interceptor_Proc,
 	count_standalone_activities:  Client_Count_Standalone_Activities_Interceptor_Proc,
 	describe_schedule:  Client_Describe_Schedule_Interceptor_Proc,
@@ -999,6 +1038,16 @@ client_standalone_activity_mutation_next :: proc(
 ) -> Error {
 	if next.invoke == nil || input == nil {
 		return error_from_string(.Invalid_Argument, "invalid standalone Activity mutation interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_standalone_activity_control_next :: proc(
+	next: Client_Standalone_Activity_Control_Next,
+	input: ^Client_Standalone_Activity_Control_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid standalone Activity control interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -1640,6 +1689,27 @@ client_standalone_activity_mutation_chain :: proc(
 		)
 	}
 	return standalone_activity_mutation_terminal(input)
+}
+
+client_standalone_activity_control_chain :: proc(
+	data: rawptr,
+	input: ^Client_Standalone_Activity_Control_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid standalone Activity control interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.standalone_activity_control == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.standalone_activity_control(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_standalone_activity_control_chain},
+		)
+	}
+	return standalone_activity_control_terminal(input)
 }
 
 client_list_standalone_activities_chain :: proc(

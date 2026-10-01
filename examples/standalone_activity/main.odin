@@ -43,6 +43,21 @@ verify_visibility :: proc(client: ^temporal_client.Client, activity_id: string) 
 	fail("Standalone Activity did not become visible through List/Count")
 }
 
+wait_for_status :: proc(
+	handle: ^temporal_client.Standalone_Activity_Handle,
+	status: temporal_client.Standalone_Activity_Status,
+) {
+	for _ in 0 ..< 50 {
+		description, describe_error := temporal_client.describe_standalone_activity(handle)
+		if describe_error.message != nil do fail("Standalone Activity status Describe failed", &describe_error)
+		matches := description.status == status
+		temporal_client.standalone_activity_description_free(&description)
+		if matches do return
+		time.sleep(100 * time.Millisecond)
+	}
+	fail("Standalone Activity did not reach the expected status")
+}
+
 main :: proc() {
 	client, connect_error := temporal_client.connect()
 	if connect_error.message != nil do fail("Temporal connection failed", &connect_error)
@@ -86,6 +101,48 @@ main :: proc() {
 		fail("Temporal returned an invalid standalone Activity description")
 	}
 	temporal_client.standalone_activity_description_free(&description)
+	if mode == "control" {
+		pause_error := temporal_client.pause_standalone_activity(
+			&handle,
+			{reason = "Odin control integration pause"},
+		)
+		if pause_error.message != nil do fail("Standalone Activity pause failed", &pause_error)
+		wait_for_status(&handle, .Paused)
+		reset_error := temporal_client.reset_standalone_activity(
+			&handle,
+			{keep_paused = true, reset_heartbeat = true},
+		)
+		if reset_error.message != nil do fail("Standalone Activity reset failed", &reset_error)
+		wait_for_status(&handle, .Paused)
+		unpause_error := temporal_client.unpause_standalone_activity(
+			&handle,
+			{reason = "Odin control integration resume"},
+		)
+		if unpause_error.message != nil do fail("Standalone Activity unpause failed", &unpause_error)
+		wait_for_status(&handle, .Running)
+		terminate_error := temporal_client.terminate_standalone_activity(
+			&handle,
+			"Odin control integration cleanup",
+		)
+		if terminate_error.message != nil do fail("Standalone Activity control cleanup failed", &terminate_error)
+		terminal, terminal_error := temporal_client.poll_standalone_activity(
+			&handle,
+			{timeout = 10 * time.Second},
+		)
+		temporal_client.standalone_activity_poll_result_free(&terminal)
+		if terminal_error.kind != .Standalone_Activity_Terminated {
+			fail("Standalone Activity control cleanup reached an unexpected state", &terminal_error)
+		}
+		temporal_client.error_free(&terminal_error)
+		delete_error := temporal_client.delete_standalone_activity(&handle)
+		if delete_error.message != nil do fail("Standalone Activity control deletion failed", &delete_error)
+		fmt.printf(
+			"Standalone Activity %s/%s was paused, reset, unpaused, terminated, and deleted through the Odin Client.\n",
+			handle.id,
+			handle.run_id,
+		)
+		return
+	}
 	if mode == "cancel" || mode == "terminate" {
 		mutation_error: temporal_client.Error
 		if mode == "cancel" {
