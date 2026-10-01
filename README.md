@@ -492,13 +492,14 @@ traps that process on attempt 1, starts a replacement Odin worker, and requires
 Temporal to redeliver attempt 2 and complete the still-running Workflow. A
 mixed Workflow/Activity process is not protected by this pattern. Suspended
 Workflow recovery is also live-proven: `./scripts/workflow-crash-integration-test.sh`
-kills the whole Worker after a committed Workflow Task, starts an identical
-replacement, and requires fresh-stack history replay plus Signal-driven
-completion. The production supervisor contract is documented in
-[`docs/supervision.md`](docs/supervision.md). The SDK does not yet manage a
-subprocess executor itself. Canceling a Client wait does not cancel an
-already accepted durable Update; the current Temporal Service exposes no such
-operation.
+runs the SDK's `temporal/supervisor`, kills child generation 1 after a committed
+Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
+fresh-stack history replay, and Signal-driven completion. The whole-Worker
+supervisor contract is documented in
+[`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow or
+per-Activity subprocess pools are not implemented. Canceling a Client wait does
+not cancel an already accepted durable Update; the current Temporal Service
+exposes no such operation.
 
 Activity and Nexus executor shutdown now has an explicit uncooperative-callback
 policy. The zero value keeps the safe default—wait without a watchdog. A Worker
@@ -2213,6 +2214,7 @@ temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/nexus/           sync/async Nexus operation context and results
 temporal/worker/          Activity/Workflow/Nexus registry and concurrent polling
+temporal/supervisor/      whole-Worker child process lifecycle and restart policy
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
 temporal/workflow/        explicit-state and stackful-fiber experiments
@@ -2225,6 +2227,7 @@ examples/update_with_start/ atomic create-or-attach Update proof
 examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary-history compatibility corpus runner
+examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker

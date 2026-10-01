@@ -757,21 +757,30 @@ to Core, so process supervision remains the only sound containment boundary.
 
 ### Workflow process crash and replacement
 
-The external process contract is specified in
+The whole-Worker process contract is specified in
 [`supervision.md`](supervision.md). Its focused acceptance test is:
 
 ```bash
 ./scripts/workflow-crash-integration-test.sh
 ```
 
-The first Odin Worker completes the initial Workflow Task and suspends a
-condition Workflow without any in-process continuation being durable. The test
-then sends `SIGKILL`, verifies that the CLI result wait remains open, and starts
-an identical Worker on the same unique task queue. After a Signal, the
-replacement must log a replay activation that reconstructs the waiting
-condition, process the new activation, and complete. This proves Server-owned
-durability and fresh-fiber reconstruction across abrupt process loss; it does
-not provide in-process panic recovery or an SDK-managed subprocess executor.
+The SDK `temporal/supervisor` starts the first Odin Worker, waits for an
+application readiness probe confirming its poller, and observes the initial
+Workflow Task suspend on a condition. The test then sends `SIGKILL` to child
+generation 1 and verifies that the CLI result wait remains open. The supervisor
+must observe the failed exit, apply its backoff, start generation 2, and report
+the replacement ready on the same unique task queue. After a Signal, that child
+logs replay of the waiting condition and completes. Exact lifecycle statistics
+require two starts/readiness events, one restart, one failed exit, and one clean
+exit. This proves SDK-managed whole-Worker replacement plus Server-owned
+durability; it does not provide in-process panic recovery or a per-execution
+subprocess pool.
+
+Unit tests cover invalid policies, pre-requested stop, clean exit, readiness
+timeout with child termination, and bounded restart exhaustion. A 500-case PBT
+property generates initial/maximum backoff, multipliers, and transition counts,
+requiring every delay to remain monotonic, overflow-safe in the generated
+domain, and exactly saturated at the configured maximum.
 
 Workflows have the corresponding registration levels:
 

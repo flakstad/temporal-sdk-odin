@@ -19,6 +19,7 @@ import proto "../temporal/core/proto"
 import temporal_failure "../temporal/failure"
 import nexus "../temporal/nexus"
 import protobuf "../temporal/protobuf"
+import supervisor "../temporal/supervisor"
 import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
@@ -26,6 +27,112 @@ import fiber_raw "../temporal/workflow/fiber/raw"
 fiber_guard_test_entry :: proc "c" (user_data: rawptr) {
 	called := cast(^bool)user_data
 	called^ = true
+}
+
+Supervisor_Test_State :: struct {
+	events: [32]supervisor.Event,
+	count:  int,
+}
+
+supervisor_test_observer :: proc(user_data: rawptr, event: supervisor.Event) {
+	state := cast(^Supervisor_Test_State)user_data
+	if state.count < len(state.events) {
+		state.events[state.count] = event
+		state.count += 1
+	}
+}
+
+supervisor_test_ready :: proc(_: rawptr, _: int, _: int) -> bool {
+	return true
+}
+
+supervisor_test_never_ready :: proc(_: rawptr, _: int, _: int) -> bool {
+	return false
+}
+
+@(test)
+supervisor_validates_policy_and_honors_a_pre_requested_stop :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/sh", "-c", "exit 0"}
+	options := supervisor.options_default(command[:])
+	validation_error := supervisor.options_validate(options)
+	defer supervisor.error_free(&validation_error)
+	testing.expect(t, validation_error.message == nil)
+
+	invalid := options
+	invalid.policy.poll_interval = 0
+	invalid_error := supervisor.options_validate(invalid)
+	defer supervisor.error_free(&invalid_error)
+	testing.expect(t, invalid_error.message != nil)
+
+	control := supervisor.Control{}
+	supervisor.request_stop(&control)
+	stats, run_error := supervisor.run(&control, options)
+	defer supervisor.error_free(&run_error)
+	testing.expect(t, run_error.message == nil)
+	testing.expect(t, stats.stop_was_requested)
+	testing.expect_value(t, stats.children_started, 0)
+}
+
+@(test)
+supervisor_restarts_failed_children_with_a_bounded_policy :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/sh", "-c", "exit 7"}
+	options := supervisor.options_default(command[:])
+	options.policy.maximum_consecutive_restarts = 2
+	options.policy.initial_backoff = time.Millisecond
+	options.policy.maximum_backoff = 2 * time.Millisecond
+	options.policy.poll_interval = time.Millisecond
+	state := Supervisor_Test_State{}
+	options.observer = supervisor_test_observer
+	options.user_data = &state
+	stats, run_error := supervisor.run(nil, options)
+	defer supervisor.error_free(&run_error)
+	testing.expectf(t, run_error.message != nil, "Supervisor unexpectedly succeeded")
+	testing.expectf(
+		t,
+		strings.contains(string(run_error.message), "restart limit"),
+		"Unexpected Supervisor failure: %s",
+		string(run_error.message),
+	)
+	testing.expect_value(t, stats.children_started, 3)
+	testing.expect_value(t, stats.children_ready, 3)
+	testing.expect_value(t, stats.restarts, 2)
+	testing.expect_value(t, stats.failed_exits, 3)
+	testing.expect_value(t, stats.last_exit_code, 7)
+	testing.expect(t, state.count >= 11)
+}
+
+@(test)
+supervisor_enforces_readiness_and_clean_exit_lifecycle :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/sh", "-c", "exit 0"}
+	ready_options := supervisor.options_default(command[:])
+	ready_options.readiness_probe = supervisor_test_ready
+	ready_options.policy.readiness_timeout = time.Second
+	ready_options.policy.poll_interval = time.Millisecond
+	ready_stats, ready_error := supervisor.run(nil, ready_options)
+	defer supervisor.error_free(&ready_error)
+	testing.expectf(
+		t,
+		ready_error.message == nil,
+		"Ready child supervision failed: %s",
+		string(ready_error.message),
+	)
+	testing.expect_value(t, ready_stats.children_started, 1)
+	testing.expect_value(t, ready_stats.children_ready, 1)
+	testing.expect_value(t, ready_stats.clean_exits, 1)
+
+	slow_command := [?]string{"/bin/sh", "-c", "sleep 1"}
+	timeout_options := supervisor.options_default(slow_command[:])
+	timeout_options.policy.restart = .Never
+	timeout_options.readiness_probe = supervisor_test_never_ready
+	timeout_options.policy.readiness_timeout = 10 * time.Millisecond
+	timeout_options.policy.termination_grace = 20 * time.Millisecond
+	timeout_options.policy.poll_interval = time.Millisecond
+	timeout_stats, timeout_error := supervisor.run(nil, timeout_options)
+	defer supervisor.error_free(&timeout_error)
+	testing.expectf(t, timeout_error.message != nil, "Readiness timeout unexpectedly succeeded")
+	testing.expect_value(t, timeout_stats.readiness_timeouts, 1)
+	testing.expect_value(t, timeout_stats.termination_requests, 1)
+	testing.expect_value(t, timeout_stats.failed_exits, 1)
 }
 
 Callback_Drain_Test_State :: struct {

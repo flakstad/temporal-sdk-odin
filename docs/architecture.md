@@ -3133,7 +3133,7 @@ Workflows are enabled.
    timers, Signal waits, main/Signal/Update fibers, propagated durable
    deadlines, and replay. Client Update result waits are now bounded and locally
    cancellable without implying durable Update cancellation. It does not yet prove
-   panic containment, replay-history JSON import,
+   per-execution panic containment, replay-history JSON import,
    richer nondeterminism diagnostics, growable stacks, recoverable stack
    overflow, or
    a production deterministic scheduler.
@@ -3164,7 +3164,8 @@ Workflows are enabled.
    models typed success, retryability, failure type,
    details, next-retry delay, deadline/execution metadata, effective Retry
    Policy, and prior heartbeat details. Its Activity-only process-isolation
-   policy is now live-proven, while an SDK-managed subprocess executor remains
+   policy is now live-proven. The SDK now manages optional whole-Worker child
+   restart/readiness/backoff, while a per-Activity subprocess executor remains
    unimplemented. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
@@ -3263,14 +3264,15 @@ deadline. Standalone Activity Start/Poll/Describe/result,
 cancel/terminate/delete, Visibility List/Count, Pause/Unpause/Reset, and
 masked execution-option updates are now implemented, intercepted,
 wire-tested, and live-proven against Server 1.32. This completes the pinned
-standalone Activity client family. The next vertical milestone should return
-to production hardening of the Workflow runtime: isolate an uncooperative or
+standalone Activity client family. The next vertical milestone should continue
+production hardening of the Workflow runtime: isolate an uncooperative or
 panicking Workflow execution at a process boundary while preserving Core's
-task/completion lifecycle. The smaller precursor—an external-worker supervision
-contract plus an abrupt crash/restart acceptance test—is now documented and
-live-proven for a suspended Workflow. An SDK-managed process pool should follow
-only if this evidence justifies the added runtime. Infinite Workflow code and
-SDK-managed subprocess execution remain process-boundary work. The capability
+task/completion lifecycle. The SDK now provides the smaller whole-Worker
+supervisor itself, including readiness, bounded crash-loop backoff, thread-safe
+stop, TERM/grace/KILL, lifecycle events, unit tests, and a live abrupt-crash/
+replay proof. A fine-grained process pool should follow only if this evidence
+justifies the added IPC runtime. Infinite Workflow detection and per-execution
+subprocess dispatch remain process-boundary work. The capability
 inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.
@@ -3422,14 +3424,15 @@ the durable operation itself depends on a server protocol capability; the
 current Temporal protocol does not expose that as a language-token operation.
 
 Activity panic containment is defined as an Activity-only supervised process
-and its crash/replacement retry path is live-proven. An SDK-managed subprocess
-executor remains future work unless Odin gains supported recovery. Activity and
-Nexus callback drains now have deadline observation without forced thread
-termination; truly stuck callbacks still require the supervisor to replace the
-process. Infinite Workflow code cannot reach the activation boundary needed for
-cooperative shutdown and has the same process-level limitation. A statechart
-oracle can later expand the now-live graceful-shutdown path to retry/failure
-races.
+and its crash/replacement retry path is live-proven. The SDK can now supervise
+and restart that whole Worker child; a per-Activity subprocess executor remains
+future work unless Odin gains supported recovery. Activity and Nexus callback
+drains now have deadline observation without forced thread termination; truly
+stuck callbacks still require the supervisor's parent process to detect and
+replace the child. Infinite Workflow code cannot reach the activation boundary
+needed for cooperative shutdown and has the same process-level limitation. A
+statechart oracle can later expand the now-live graceful-shutdown path to
+retry/failure races.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed
