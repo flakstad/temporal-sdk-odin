@@ -23166,3 +23166,136 @@ standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
 	defer temporal_client.error_free(&empty_error)
 	testing.expect(t, is_empty && empty_error.message == nil)
 }
+
+@(test)
+standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
+	schedule_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 123}
+	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_010}
+	cancel_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_005}
+	timeout := proto.Google_Protobuf_Duration{seconds = 90, nanos = 456}
+	execution_duration := proto.Google_Protobuf_Duration{seconds = 10}
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	result := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"terminated"`)}
+	search_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"blue"`)}
+	summary_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Nexus summary"`)}
+	payloads := [?]^proto.Temporal_Api_Common_V1_Payload{&input, &result, &search_payload, &summary_payload}
+	for payload in payloads {
+		append(&payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		})
+	}
+	defer delete(input.metadata)
+	defer delete(result.metadata)
+	defer delete(search_payload.metadata)
+	defer delete(summary_payload.metadata)
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	defer delete(search_attributes.indexed_fields)
+	append(&search_attributes.indexed_fields, proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+		key = "Color",
+		value = &search_payload,
+	})
+	user_metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{summary = &summary_payload}
+	attempt_failure := proto.Temporal_Api_Failure_V1_Failure{message = "attempt unavailable"}
+	cancel_failure := proto.Temporal_Api_Failure_V1_Failure{message = "cancel endpoint unavailable"}
+	cancellation := proto.Temporal_Api_Nexus_V1_NexusOperationExecutionCancellationInfo{
+		requested_time = &cancel_time,
+		state = .NEXUS_OPERATION_CANCELLATION_STATE_FAILED,
+		attempt = 2,
+		last_attempt_failure = &cancel_failure,
+		blocked_reason = "retry backoff",
+		reason = "caller requested cancellation",
+	}
+	info := proto.Temporal_Api_Nexus_V1_NexusOperationExecutionInfo{
+		operation_id = "operation-owned",
+		run_id = "info-run",
+		endpoint = "payments",
+		service = "payment-service",
+		operation = "charge",
+		status = .NEXUS_OPERATION_EXECUTION_STATUS_TERMINATED,
+		state = .PENDING_NEXUS_OPERATION_STATE_STARTED,
+		schedule_to_close_timeout = &timeout,
+		attempt = 3,
+		schedule_time = &schedule_time,
+		close_time = &close_time,
+		last_attempt_failure = &attempt_failure,
+		execution_duration = &execution_duration,
+		cancellation_info = &cancellation,
+		request_id = "request-owned",
+		operation_token = "token-owned",
+		state_transition_count = 7,
+		search_attributes = &search_attributes,
+		user_metadata = &user_metadata,
+		identity = "odin-client",
+		state_size_bytes = 4096,
+	}
+	defer delete(info.nexus_header)
+	append(&info.nexus_header, proto.Temporal_Api_Nexus_V1_NexusOperationExecutionInfo_NexusHeaderEntry{
+		key = "x-odin-sdk",
+		value = "description-test",
+	})
+	terminated_info := proto.Temporal_Api_Failure_V1_TerminatedFailureInfo{}
+	terminated_failure := proto.Temporal_Api_Failure_V1_Failure{
+		message = "terminated by test",
+		failure_info = proto.Temporal_Api_Failure_V1_Failure_Failure_Info_Terminated_Failure_Info{
+			value = &terminated_info,
+		},
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse{
+		run_id = "response-run",
+		info = &info,
+		input = &input,
+		long_poll_token = transmute([]u8)string("next-token"),
+		outcome = proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse_Outcome_Failure{
+			value = &terminated_failure,
+		},
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse(&response)
+	description, decode_error := temporal_client.decode_nexus_operation_description(encoded[:])
+	delete(encoded)
+	defer temporal_client.nexus_operation_description_free(&description)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "Nexus Describe decode failed: %s", string(decode_error.message))
+	testing.expect_value(t, description.operation_id, "operation-owned")
+	testing.expect_value(t, description.run_id, "response-run")
+	testing.expect_value(t, description.endpoint, "payments")
+	testing.expect_value(t, description.status, temporal_client.Nexus_Operation_Status.Terminated)
+	testing.expect_value(t, description.state, temporal_client.Pending_Nexus_Operation_State.Started)
+	testing.expect(t, description.schedule_to_close_timeout.present)
+	testing.expect_value(t, description.schedule_to_close_timeout.value, 90 * time.Second + 456)
+	testing.expect(t, description.schedule_time.present && description.close_time.present)
+	testing.expect_value(t, description.execution_duration.value, 10 * time.Second)
+	testing.expect_value(t, description.last_failure_message, "attempt unavailable")
+	testing.expect(t, len(description.last_failure_proto) > 0)
+	testing.expect(t, description.cancellation.present)
+	testing.expect_value(t, description.cancellation.state, temporal_client.Nexus_Operation_Cancellation_State.Failed)
+	testing.expect_value(t, description.cancellation.reason, "caller requested cancellation")
+	testing.expect(t, len(description.cancellation.last_failure_proto) > 0)
+	testing.expect_value(t, len(description.headers), 1)
+	testing.expect_value(t, description.headers[0].value, "description-test")
+	testing.expect_value(t, len(description.search_attributes), 1)
+	testing.expect(t, description.has_static_summary)
+	testing.expect_value(t, description.static_summary, "Nexus summary")
+	testing.expect(t, description.has_input)
+	testing.expect(t, bytes.equal(description.input.data, transmute([]u8)string(`"Odin"`)))
+	testing.expect(t, description.has_failure)
+	testing.expect_value(t, description.failure_kind, temporal_client.Error_Kind.Nexus_Operation_Terminated)
+	testing.expect_value(t, description.failure_message, "terminated by test")
+	testing.expect(t, len(description.failure_proto) > 0)
+	testing.expect(t, bytes.equal(description.long_poll_token, transmute([]u8)string("next-token")))
+
+	completed_response := proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse{
+		run_id = "response-run",
+		info = &info,
+		outcome = proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse_Outcome_Result{
+			value = &result,
+		},
+	}
+	completed_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse(&completed_response)
+	completed, completed_error := temporal_client.decode_nexus_operation_description(completed_bytes[:])
+	delete(completed_bytes)
+	defer temporal_client.nexus_operation_description_free(&completed)
+	defer temporal_client.error_free(&completed_error)
+	testing.expect(t, completed_error.message == nil && completed.has_result)
+	testing.expect(t, bytes.equal(completed.result.data, transmute([]u8)string(`"terminated"`)))
+}

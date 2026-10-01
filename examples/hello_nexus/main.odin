@@ -78,6 +78,8 @@ main :: proc() {
 	}
 	cancel_mode_buffer: [64]u8
 	cancel_mode := os.get_env(cancel_mode_buffer[:], "TEMPORAL_NEXUS_STANDALONE_CANCEL") == "1"
+	lifecycle_mode_buffer: [64]u8
+	lifecycle_mode := os.get_env(lifecycle_mode_buffer[:], "TEMPORAL_NEXUS_STANDALONE_LIFECYCLE") == "1"
 	max_tasks := 1
 	if cancel_mode {
 		max_tasks = 2
@@ -102,6 +104,19 @@ main :: proc() {
 		if cancel_error.message != nil {
 			fmt.eprintf("Nexus cancel handler registration failed: %s\n", string(cancel_error.message))
 			worker.error_free(&cancel_error)
+			_ = worker.close(&nexus_worker)
+			os.exit(1)
+		}
+	} else if lifecycle_mode {
+		wait_error := worker.register_json_nexus_operation_result(
+			&nexus_worker,
+			"odin-greeting-service",
+			"wait-for-terminate",
+			wait_for_cancel,
+		)
+		if wait_error.message != nil {
+			fmt.eprintf("Nexus async operation registration failed: %s\n", string(wait_error.message))
+			worker.error_free(&wait_error)
 			_ = worker.close(&nexus_worker)
 			os.exit(1)
 		}
@@ -139,6 +154,8 @@ main :: proc() {
 			os.exit(1)
 		}
 		fmt.println("one asynchronous Nexus operation was canceled and worker shut down cleanly")
+	} else if lifecycle_mode {
+		fmt.println("one asynchronous Nexus operation was started for lifecycle control and worker shut down cleanly")
 	} else {
 		fmt.println("one synchronous Nexus operation completed and worker shut down cleanly")
 	}

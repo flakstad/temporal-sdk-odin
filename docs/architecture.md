@@ -551,16 +551,24 @@ with these verified method names:
 
 - `StartNexusOperationExecution`;
 - `PollNexusOperationExecution`;
-- `RequestCancelNexusOperationExecution`.
+- `RequestCancelNexusOperationExecution`;
+- `DescribeNexusOperationExecution`;
+- `TerminateNexusOperationExecution`;
+- `DeleteNexusOperationExecution`.
 
 `temporal/client/nexus_operation.odin` now exposes an owned
 `Nexus_Operation_Handle`, borrowed start options, codec-neutral and typed JSON
 start/result helpers, Started/Closed polling, monotonic local wait timeouts,
-Core cancellation tokens, and cancellation requests. Starts carry all three
-operation timeouts, ID reuse/conflict policies, Nexus string headers, generic
+Core cancellation tokens, cancellation requests, an allocator-owned typed
+description, termination, and deletion. The description preserves execution
+and pending status, all server timing/attempt fields, cancellation state,
+headers, Search Attributes, static summary/details, optional input/result or
+encoded terminal Failure, and the opaque long-poll token. Starts carry all
+three operation timeouts, ID reuse/conflict policies, Nexus string headers, generic
 Links, and completion callbacks. Search Attributes, UI summary/details, and
-on-conflict attachment options remain to be added. Describe/list/count,
-terminate, and delete are also still outside this first slice.
+on-conflict attachment options remain to be added to Start. Describe does not
+yet surface response Links or completion-callback details; list/count remain
+outside this slice.
 
 The server compatibility boundary was measured rather than inferred:
 
@@ -585,6 +593,10 @@ operation token; the Client requests cancellation, Server dispatches
 token. `RequestCancelNexusOperationExecution` means that cancellation was
 requested, not that the asynchronous operation is already in a terminal
 canceled state. Terminal outcome still comes from the handler/callback path.
+The third path starts an unfinished asynchronous operation, describes its
+owned `Running` state and input, terminates it, observes the typed
+`Terminated` outcome through both Poll and Describe, deletes it, and requires a
+subsequent Describe to return gRPC status 5/`NOT_FOUND`.
 
 The poll RPC may return a successful empty response when a server long poll
 expires. Odin treats that as a repoll signal, recomputes the remaining
@@ -2833,14 +2845,15 @@ a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
 
-The capability probe and owned standalone Nexus start/poll/cancel slice are now
-complete. The next smallest vertical milestone is the read/control half of
-that same execution model: generate `DescribeNexusOperationExecution`, expose
-an owned description including status, cancellation state, input/outcome and
-long-poll token, then add terminate/delete. This gives cancellation callers an
-authoritative state view and lets the integration suite clean up deliberately
-unfinished async probes. List/count and Search Attribute/UI metadata support
-can then reuse the established Visibility and start-metadata patterns.
+The capability probe and owned standalone Nexus start/poll/cancel plus
+describe/terminate/delete slices are now complete and live-proven. The next
+smallest vertical milestone is `ListNexusOperationExecutions` and
+`CountNexusOperationExecutions`, reusing the existing allocator-owned
+Visibility pagination/query model. Before widening that surface, Describe can
+also expose response Links and completion-callback details, while Start can
+reuse the established Search Attribute/UI metadata builders. Activity Worker
+is not the next milestone: it is already implemented and extensively
+live-tested.
 
 The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,

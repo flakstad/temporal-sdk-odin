@@ -1115,14 +1115,23 @@ Run the focused 1.32 integration separately with:
 
 When the connected Service recognizes the RPC, the main integration script
 also invokes this focused script. It creates an endpoint targeting
-`odin-hello-nexus` and exercises two paths:
+`odin-hello-nexus` and exercises three paths:
 
 ```text
 Odin Client start -> Server 1.32 -> Core Nexus poll -> Odin hello handler
 Odin Client poll  <- durable result <- Core completion <- JSON Payload
 
 Odin Client cancel -> Server 1.32 -> Core CancelOperation -> Odin cancel handler
+
+Odin Client Describe running state -> terminate -> Poll/Describe terminal state
+Odin Client delete -> subsequent Describe returns gRPC NOT_FOUND
 ```
+
+The lifecycle path exercises the exact generic Core bridge RPC names
+`DescribeNexusOperationExecution`, `TerminateNexusOperationExecution`, and
+`DeleteNexusOperationExecution`. No additional raw C ABI symbol is involved.
+Every field returned from Describe is cloned out of the temporary protobuf
+decode arena and released with `nexus_operation_description_free`.
 
 On older Services the exact capability probe remains required and this focused
 branch is skipped; all existing Workflow-to-Nexus integration still runs.

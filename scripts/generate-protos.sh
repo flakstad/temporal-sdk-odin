@@ -56,6 +56,12 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.PollNexusOperationExecutionResponse \
   temporal.api.workflowservice.v1.RequestCancelNexusOperationExecutionRequest \
   temporal.api.workflowservice.v1.RequestCancelNexusOperationExecutionResponse \
+  temporal.api.workflowservice.v1.DescribeNexusOperationExecutionRequest \
+  temporal.api.workflowservice.v1.DescribeNexusOperationExecutionResponse \
+  temporal.api.workflowservice.v1.TerminateNexusOperationExecutionRequest \
+  temporal.api.workflowservice.v1.TerminateNexusOperationExecutionResponse \
+  temporal.api.workflowservice.v1.DeleteNexusOperationExecutionRequest \
+  temporal.api.workflowservice.v1.DeleteNexusOperationExecutionResponse \
   temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryRequest \
   temporal.api.workflowservice.v1.GetWorkflowExecutionHistoryResponse \
   temporal.api.workflowservice.v1.DescribeWorkflowExecutionRequest \

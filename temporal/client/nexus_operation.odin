@@ -3,6 +3,7 @@ package client
 import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:encoding/uuid"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
@@ -75,6 +76,100 @@ Nexus_Operation_Poll_Result :: struct {
 	has_result:      bool,
 }
 
+Nexus_Operation_Status :: enum i32 {
+	Unspecified = 0,
+	Running = 1,
+	Completed = 2,
+	Failed = 3,
+	Canceled = 4,
+	Terminated = 5,
+	Timed_Out = 6,
+}
+
+Pending_Nexus_Operation_State :: enum i32 {
+	Unspecified = 0,
+	Scheduled = 1,
+	Backing_Off = 2,
+	Started = 3,
+	Blocked = 4,
+}
+
+Nexus_Operation_Cancellation_State :: enum i32 {
+	Unspecified = 0,
+	Scheduled = 1,
+	Backing_Off = 2,
+	Succeeded = 3,
+	Failed = 4,
+	Timed_Out = 5,
+	Blocked = 6,
+}
+
+Nexus_Operation_Cancellation_Description :: struct {
+	present:                    bool,
+	requested_time:             Optional_Time,
+	state:                      Nexus_Operation_Cancellation_State,
+	attempt:                    i32,
+	last_attempt_complete_time: Optional_Time,
+	next_attempt_schedule_time: Optional_Time,
+	last_failure_message:       string,
+	last_failure_proto:         []u8,
+	blocked_reason:             string,
+	reason:                     string,
+}
+
+Describe_Nexus_Operation_Options :: struct {
+	include_input:      bool,
+	include_outcome:    bool,
+	long_poll_token:    []u8,
+	timeout:            time.Duration,
+	cancellation_token: ^Client_Cancellation_Token,
+}
+
+Nexus_Operation_Description :: struct {
+	operation_id:               string,
+	run_id:                     string,
+	endpoint:                   string,
+	service:                    string,
+	operation:                  string,
+	identity:                   string,
+	request_id:                 string,
+	operation_token:            string,
+	status:                     Nexus_Operation_Status,
+	state:                      Pending_Nexus_Operation_State,
+	schedule_to_close_timeout:  Optional_Duration,
+	schedule_to_start_timeout:  Optional_Duration,
+	start_to_close_timeout:     Optional_Duration,
+	attempt:                    i32,
+	schedule_time:              Optional_Time,
+	expiration_time:            Optional_Time,
+	close_time:                 Optional_Time,
+	last_attempt_complete_time: Optional_Time,
+	next_attempt_schedule_time: Optional_Time,
+	execution_duration:         Optional_Duration,
+	last_failure_message:       string,
+	last_failure_proto:         []u8,
+	blocked_reason:             string,
+	state_transition_count:     i64,
+	state_size_bytes:           i64,
+	cancellation:               Nexus_Operation_Cancellation_Description,
+	headers:                    [dynamic]Nexus_Operation_Header,
+	search_attributes:          [dynamic]Named_Payload,
+	static_summary:             string,
+	has_static_summary:         bool,
+	static_details:             string,
+	has_static_details:         bool,
+	input:                      codec.Payload,
+	has_input:                  bool,
+	result:                     codec.Payload,
+	has_result:                 bool,
+	failure_kind:               Error_Kind,
+	failure_message:            string,
+	failure_proto:              []u8,
+	has_failure:                bool,
+	long_poll_token:            []u8,
+	allocator:                  mem.Allocator,
+}
+
 nexus_operation_handle_free :: proc(handle: ^Nexus_Operation_Handle) {
 	if handle == nil do return
 	heap := allocator_runtime.heap_allocator()
@@ -88,6 +183,48 @@ nexus_operation_poll_result_free :: proc(result: ^Nexus_Operation_Poll_Result) {
 	delete(result.operation_token)
 	codec.payload_free(&result.result)
 	result^ = {}
+}
+
+nexus_operation_description_free :: proc(description: ^Nexus_Operation_Description) {
+	if description == nil do return
+	allocator := description.allocator
+	if allocator.procedure == nil {
+		description^ = {}
+		return
+	}
+	delete(description.operation_id, allocator)
+	delete(description.run_id, allocator)
+	delete(description.endpoint, allocator)
+	delete(description.service, allocator)
+	delete(description.operation, allocator)
+	delete(description.identity, allocator)
+	delete(description.request_id, allocator)
+	delete(description.operation_token, allocator)
+	delete(description.last_failure_message, allocator)
+	delete(description.last_failure_proto, allocator)
+	delete(description.blocked_reason, allocator)
+	delete(description.cancellation.last_failure_message, allocator)
+	delete(description.cancellation.last_failure_proto, allocator)
+	delete(description.cancellation.blocked_reason, allocator)
+	delete(description.cancellation.reason, allocator)
+	for &header in description.headers {
+		delete(header.key, allocator)
+		delete(header.value, allocator)
+	}
+	for &attribute in description.search_attributes {
+		delete(attribute.key, allocator)
+		codec.payload_free(&attribute.payload)
+	}
+	delete(description.headers)
+	delete(description.search_attributes)
+	delete(description.static_summary, allocator)
+	delete(description.static_details, allocator)
+	codec.payload_free(&description.input)
+	codec.payload_free(&description.result)
+	delete(description.failure_message, allocator)
+	delete(description.failure_proto, allocator)
+	delete(description.long_poll_token, allocator)
+	description^ = {}
 }
 
 nexus_operation_handle_valid :: proc(handle: ^Nexus_Operation_Handle) -> bool {
@@ -349,12 +486,9 @@ start_nexus_operation_json :: proc(
 	return start_nexus_operation_payload(client, codec.payload_view(&payload), options)
 }
 
-nexus_operation_failure_error :: proc(
+nexus_operation_failure_kind :: proc(
 	failure: ^proto.Temporal_Api_Failure_V1_Failure,
-) -> Error {
-	if failure == nil {
-		return error_from_string(.Malformed_Response, "Nexus operation failure outcome is missing")
-	}
+) -> Error_Kind {
 	kind := Error_Kind.Nexus_Operation_Failed
 	current := failure
 	for current != nil {
@@ -369,6 +503,16 @@ nexus_operation_failure_error :: proc(
 		if kind != .Nexus_Operation_Failed do break
 		current = current.cause
 	}
+	return kind
+}
+
+nexus_operation_failure_error :: proc(
+	failure: ^proto.Temporal_Api_Failure_V1_Failure,
+) -> Error {
+	if failure == nil {
+		return error_from_string(.Malformed_Response, "Nexus operation failure outcome is missing")
+	}
+	kind := nexus_operation_failure_kind(failure)
 	message := failure.message
 	if len(message) == 0 {
 		cause := failure.cause
@@ -380,6 +524,231 @@ nexus_operation_failure_error :: proc(
 	if len(message) == 0 do message = "Nexus operation failed"
 	details := proto.encode_Temporal_Api_Failure_V1_Failure(failure)
 	return {kind = kind, message = bytes.clone(transmute([]u8)message), details = details[:]}
+}
+
+nexus_operation_status_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_NexusOperationExecutionStatus,
+) -> (Nexus_Operation_Status, bool) {
+	numeric := i32(value)
+	if numeric < i32(Nexus_Operation_Status.Unspecified) || numeric > i32(Nexus_Operation_Status.Timed_Out) {
+		return {}, false
+	}
+	return Nexus_Operation_Status(numeric), true
+}
+
+pending_nexus_operation_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_PendingNexusOperationState,
+) -> (Pending_Nexus_Operation_State, bool) {
+	numeric := i32(value)
+	if numeric < i32(Pending_Nexus_Operation_State.Unspecified) || numeric > i32(Pending_Nexus_Operation_State.Blocked) {
+		return {}, false
+	}
+	return Pending_Nexus_Operation_State(numeric), true
+}
+
+nexus_operation_cancellation_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_NexusOperationCancellationState,
+) -> (Nexus_Operation_Cancellation_State, bool) {
+	numeric := i32(value)
+	if numeric < i32(Nexus_Operation_Cancellation_State.Unspecified) || numeric > i32(Nexus_Operation_Cancellation_State.Blocked) {
+		return {}, false
+	}
+	return Nexus_Operation_Cancellation_State(numeric), true
+}
+
+nexus_operation_clone_failure_proto :: proc(
+	failure: ^proto.Temporal_Api_Failure_V1_Failure,
+	allocator: mem.Allocator,
+) -> ([]u8, bool) {
+	if failure == nil do return nil, true
+	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(failure)
+	defer delete(encoded)
+	return bytes.clone(encoded[:], allocator), true
+}
+
+decode_nexus_operation_description :: proc(
+	data: []u8,
+	allocator := context.allocator,
+) -> (description: Nexus_Operation_Description, error: Error) {
+	if allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation description allocator is not initialized")
+	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {}, error_from_string(.Malformed_Response, "could not initialize Nexus operation Describe arena")
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	response := proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse(data, &response)
+	context.allocator = previous_allocator
+	if !decoded || response.info == nil || len(response.info.operation_id) == 0 || len(response.run_id) == 0 {
+		return {}, error_from_string(.Malformed_Response, "Temporal returned a malformed Nexus operation Describe response")
+	}
+
+	description.allocator = allocator
+	description.headers = make([dynamic]Nexus_Operation_Header, allocator)
+	description.search_attributes = make([dynamic]Named_Payload, allocator)
+	failed := false
+	defer if failed {
+		nexus_operation_description_free(&description)
+	}
+	info := response.info
+	status_ok, state_ok: bool
+	description.status, status_ok = nexus_operation_status_from_proto(info.status)
+	description.state, state_ok = pending_nexus_operation_state_from_proto(info.state)
+	if !status_ok || !state_ok {
+		failed = true
+		return {}, error_from_string(.Malformed_Response, "Temporal returned an unknown Nexus operation state")
+	}
+
+	clone_targets := []struct {source: string, target: ^string}{
+		{info.operation_id, &description.operation_id},
+		{response.run_id, &description.run_id},
+		{info.endpoint, &description.endpoint},
+		{info.service, &description.service},
+		{info.operation, &description.operation},
+		{info.identity, &description.identity},
+		{info.request_id, &description.request_id},
+		{info.operation_token, &description.operation_token},
+		{info.blocked_reason, &description.blocked_reason},
+	}
+	for target in clone_targets {
+		ok: bool
+		target.target^, ok = description_clone_string(target.source, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate Nexus operation description")
+		}
+	}
+	description.schedule_to_close_timeout = description_duration(info.schedule_to_close_timeout)
+	description.schedule_to_start_timeout = description_duration(info.schedule_to_start_timeout)
+	description.start_to_close_timeout = description_duration(info.start_to_close_timeout)
+	description.attempt = info.attempt
+	description.schedule_time = description_time(info.schedule_time)
+	description.expiration_time = description_time(info.expiration_time)
+	description.close_time = description_time(info.close_time)
+	description.last_attempt_complete_time = description_time(info.last_attempt_complete_time)
+	description.next_attempt_schedule_time = description_time(info.next_attempt_schedule_time)
+	description.execution_duration = description_duration(info.execution_duration)
+	description.state_transition_count = info.state_transition_count
+	description.state_size_bytes = info.state_size_bytes
+	ok: bool
+	description.last_failure_message, ok = description_failure_message(info.last_attempt_failure, allocator)
+	if ok {
+		description.last_failure_proto, ok = nexus_operation_clone_failure_proto(info.last_attempt_failure, allocator)
+	}
+	if !ok {
+		failed = true
+		return {}, error_from_string(.Malformed_Response, "could not preserve Nexus operation attempt failure")
+	}
+
+	if info.cancellation_info != nil {
+		source := info.cancellation_info
+		description.cancellation.present = true
+		description.cancellation.requested_time = description_time(source.requested_time)
+		description.cancellation.state, ok = nexus_operation_cancellation_state_from_proto(source.state)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "Temporal returned an unknown Nexus cancellation state")
+		}
+		description.cancellation.attempt = source.attempt
+		description.cancellation.last_attempt_complete_time = description_time(source.last_attempt_complete_time)
+		description.cancellation.next_attempt_schedule_time = description_time(source.next_attempt_schedule_time)
+		description.cancellation.last_failure_message, ok = description_failure_message(source.last_attempt_failure, allocator)
+		if ok {
+			description.cancellation.last_failure_proto, ok = nexus_operation_clone_failure_proto(source.last_attempt_failure, allocator)
+		}
+		if ok {
+			description.cancellation.blocked_reason, ok = description_clone_string(source.blocked_reason, allocator)
+		}
+		if ok {
+			description.cancellation.reason, ok = description_clone_string(source.reason, allocator)
+		}
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate Nexus cancellation description")
+		}
+	}
+
+	for source in info.nexus_header {
+		header := Nexus_Operation_Header{}
+		header.key, ok = description_clone_string(source.key, allocator)
+		if ok do header.value, ok = description_clone_string(source.value, allocator)
+		if !ok {
+			delete(header.key, allocator)
+			delete(header.value, allocator)
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate Nexus operation header")
+		}
+		append(&description.headers, header)
+	}
+	if info.search_attributes != nil {
+		for source in info.search_attributes.indexed_fields {
+			attribute: Named_Payload
+			attribute, ok = description_clone_named_payload(source.key, source.value, allocator)
+			if !ok {
+				failed = true
+				return {}, error_from_string(.Payload_Conversion, "could not copy Nexus operation Search Attribute")
+			}
+			append(&description.search_attributes, attribute)
+		}
+	}
+	if info.user_metadata != nil {
+		description.static_summary, description.has_static_summary, ok = description_decode_user_metadata_string(
+			info.user_metadata.summary,
+			allocator,
+		)
+		if ok {
+			description.static_details, description.has_static_details, ok = description_decode_user_metadata_string(
+				info.user_metadata.details,
+				allocator,
+			)
+		}
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Payload_Conversion, "could not decode Nexus operation user metadata")
+		}
+	}
+	if response.input != nil {
+		description.input, ok = description_clone_payload(response.input, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Payload_Conversion, "could not copy Nexus operation input")
+		}
+		description.has_input = true
+	}
+	#partial switch outcome in response.outcome {
+	case proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse_Outcome_Result:
+		if outcome.value == nil {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "Nexus operation result outcome is missing")
+		}
+		description.result, ok = description_clone_payload(outcome.value, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Payload_Conversion, "could not copy Nexus operation result")
+		}
+		description.has_result = true
+	case proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse_Outcome_Failure:
+		if outcome.value == nil {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "Nexus operation failure outcome is missing")
+		}
+		description.failure_kind = nexus_operation_failure_kind(outcome.value)
+		description.failure_message, ok = description_failure_message(outcome.value, allocator)
+		if ok do description.failure_proto, ok = nexus_operation_clone_failure_proto(outcome.value, allocator)
+		if !ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not preserve Nexus operation outcome failure")
+		}
+		description.has_failure = true
+	}
+	if len(response.long_poll_token) > 0 {
+		description.long_poll_token = bytes.clone(response.long_poll_token, allocator)
+	}
+	return description, {}
 }
 
 decode_nexus_operation_poll_response :: proc(
@@ -574,6 +943,131 @@ cancel_nexus_operation :: proc(
 		handle.client.connection,
 		.Workflow,
 		"RequestCancelNexusOperationExecution",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil do return error_from_core(&rpc_result.error)
+	return {}
+}
+
+describe_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	options: Describe_Nexus_Operation_Options = {},
+	allocator := context.allocator,
+) -> (Nexus_Operation_Description, Error) {
+	if !nexus_operation_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	if allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation description allocator is not initialized")
+	}
+	if options.timeout < 0 {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation Describe timeout must not be negative")
+	}
+	if options.cancellation_token != nil && options.cancellation_token.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation Describe cancellation token is not initialized")
+	}
+	if len(options.long_poll_token) > 0 && len(handle.run_id) == 0 {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation Run ID is required for long-poll Describe")
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionRequest{
+		namespace = handle.client.namespace,
+		operation_id = handle.id,
+		run_id = handle.run_id,
+		include_input = options.include_input,
+		include_outcome = options.include_outcome,
+		long_poll_token = options.long_poll_token,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionRequest(&request)
+	defer delete(request_bytes)
+	timeout_millis := u32(10_000)
+	retry := true
+	if len(options.long_poll_token) > 0 {
+		timeout_millis = 0
+	}
+	if options.timeout > 0 {
+		millis := i64(options.timeout / time.Millisecond)
+		if options.timeout % time.Millisecond != 0 do millis += 1
+		if millis > i64(4_294_967_295) do millis = i64(4_294_967_295)
+		timeout_millis = u32(millis)
+		retry = false
+	}
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"DescribeNexusOperationExecution",
+		request_bytes[:],
+		retry = retry,
+		timeout_millis = timeout_millis,
+		cancellation_token = options.cancellation_token,
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil {
+		if options.timeout > 0 && update_poll_failure_is_timeout(
+			rpc_result.error.status_code,
+			string(rpc_result.error.message),
+			true,
+		) {
+			return {}, error_from_core(&rpc_result.error, .Wait_Timed_Out)
+		}
+		if options.cancellation_token != nil && rpc_result.error.status_code == 0 &&
+		   string(rpc_result.error.message) == "Cancelled" {
+			return {}, error_from_core(&rpc_result.error, .Wait_Canceled)
+		}
+		return {}, error_from_core(&rpc_result.error)
+	}
+	return decode_nexus_operation_description(rpc_result.protobuf, allocator)
+}
+
+terminate_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	reason := "",
+	request_id := "",
+) -> Error {
+	if !nexus_operation_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	actual_request_id := request_id
+	request_id_buffer: [uuid.EXPECTED_LENGTH]u8
+	if len(actual_request_id) == 0 {
+		actual_request_id = uuid.to_string_buffer(uuid.generate_v4(), request_id_buffer[:])
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_TerminateNexusOperationExecutionRequest{
+		namespace = handle.client.namespace,
+		operation_id = handle.id,
+		run_id = handle.run_id,
+		identity = handle.client.identity,
+		request_id = actual_request_id,
+		reason = reason,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_TerminateNexusOperationExecutionRequest(&request)
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"TerminateNexusOperationExecution",
+		request_bytes[:],
+	)
+	defer delete(rpc_result.protobuf)
+	if rpc_result.error.message != nil do return error_from_core(&rpc_result.error)
+	return {}
+}
+
+delete_nexus_operation :: proc(handle: ^Nexus_Operation_Handle) -> Error {
+	if !nexus_operation_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_DeleteNexusOperationExecutionRequest{
+		namespace = handle.client.namespace,
+		operation_id = handle.id,
+		run_id = handle.run_id,
+	}
+	request_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DeleteNexusOperationExecutionRequest(&request)
+	defer delete(request_bytes)
+	rpc_result := temporal_core.client_rpc_call(
+		handle.client.connection,
+		.Workflow,
+		"DeleteNexusOperationExecution",
 		request_bytes[:],
 	)
 	defer delete(rpc_result.protobuf)
