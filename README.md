@@ -8,7 +8,7 @@ fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
-sends typed signals, requests cancellation, terminates executions, and updates
+sends typed signals, requests cancellation, pauses/unpauses or terminates executions, and updates
 versioning/priority/time-skipping execution options with explicit field masks. It now
 starts, polls, describes, requests cancellation of, terminates, and deletes
 standalone Nexus operations through an owned Odin handle. Describe owns status,
@@ -1017,6 +1017,15 @@ raw_update, err := temporal_client.start_update_payloads_with_options(
 defer temporal_client.update_handle_free(&raw_update)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 
+err = temporal_client.pause_workflow(
+    &handle,
+    {reason = "downstream dependency outage"},
+)
+err = temporal_client.unpause_workflow(
+    &handle,
+    {reason = "downstream dependency recovered"},
+)
+
 priority := temporal_client.Priority{priority_key = 2}
 priority_path := [?]string{"priority"}
 post_reset := [?]temporal_client.Post_Reset_Operation{{
@@ -1107,6 +1116,15 @@ fast-forward ID and must be freed explicitly. It also exposes Server's optional
 update timestamp. Server 1.32 live-proves priority write, canonical response,
 history/Describe read-back, and the outbound interceptor path; that server does
 not yet populate the newer response timestamp.
+
+Experimental Workflow Pause is also exposed as explicit Client operations.
+`pause_workflow` and `unpause_workflow` borrow a handle, accept reason plus an
+optional idempotence ID, generate UUIDv4 IDs by default, and share one typed
+outbound-interceptor family. Server 1.32 live-proves Paused status, Query
+rejection, accepted-but-deferred Signal delivery, Unpause, and both history
+events. Self-hosted use requires Server 1.30 or newer with
+`frontend.WorkflowPauseEnabled=true`; it is not silently advertised as a stable
+capability on older or unconfigured Services.
 
 The combined example now uses the reusable registration boundary:
 

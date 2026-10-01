@@ -407,6 +407,21 @@ request/response pair to the existing deterministic proto roots; the C ABI is
 unchanged and Core already dispatches the `UpdateWorkflowExecutionOptions`
 symbol.
 
+Workflow Pause follows the same Service-owned boundary. Odin does not suspend
+or serialize a fiber itself: `PauseWorkflowExecution` changes the open
+execution's server status and suppresses new Workflow/Activity dispatch until
+`UnpauseWorkflowExecution`. The language layer encodes namespace, Workflow/run
+ID, Core Client identity, reason, and an explicit or generated UUIDv4 request
+ID, then uses the existing generic RPC C symbol. Both operations share one
+typed outbound-interceptor family. A feature-enabled Server 1.32 run proves
+status 8/Paused, typed Query rejection, acceptance of a Signal without an Odin
+activation, subsequent delivery only after Unpause, and history event types 58
+and 59. This is deliberately marked experimental: [Temporal's current Pause
+documentation](https://github.com/temporalio/documentation/blob/main/docs/encyclopedia/workflow/workflow-pause.mdx)
+requires self-hosted Server 1.30+ with `frontend.WorkflowPauseEnabled` and notes
+that the API may change. Generated request/response roots and the pinned Core
+dispatcher are versioned together; no C ABI extension is needed.
+
 `client.Client` heap-owns a stable Core runtime and connection because
 `core.Client` retains a pointer to its runtime. It also owns its namespace.
 `Workflow_Handle` owns Workflow/run ID strings and borrows the Client. Closing
@@ -2849,7 +2864,8 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
-   Visibility list/count plus Workflow execution-option updates are live-proven. Query reject conditions and static
+   Visibility list/count, Workflow execution-option updates, and feature-gated
+   Workflow Pause/Unpause are live-proven. Query reject conditions and static
    summary/details, query headers, and eager Workflow start are now wire- and
    live-proven, but the public Client still lacks a supported-server matrix for
    newer Schedule methods.
@@ -2916,9 +2932,11 @@ process-wide route. Workflow reset now exposes both `PostResetOperation` arms,
 with atomic priority update proven on Server 1.32 and the unsupported Signal arm
 called out explicitly. Ordinary `UpdateWorkflowExecutionOptions` now reuses the
 same validated model, is intercepted, and is live-proven through canonical
-response plus Describe. The next smallest Client completeness milestone is a
-supported-server inventory of remaining WorkflowService control RPCs, followed
-by the smallest stable operation that closes a real language-SDK parity gap.
+response plus Describe. The supported-server inventory identified experimental
+Workflow Pause as a coherent control gap; Pause/Unpause is now intercepted and
+live-proven with deferred Signal delivery. The next smallest stable Client
+parity gap is Workflow deletion, including explicit chain/run targeting and
+clear safety semantics before exposing the destructive call.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 

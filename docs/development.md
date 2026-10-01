@@ -910,6 +910,14 @@ defer temporal_client.workflow_handle_free(&existing)
 signal_error := temporal_client.signal_workflow_json(&existing, "approval", approval)
 cancel_error := temporal_client.cancel_workflow(&existing, "no longer needed")
 terminate_error := temporal_client.terminate_workflow(&existing, "operator decision")
+pause_error := temporal_client.pause_workflow(
+    &existing,
+    {reason = "downstream dependency outage"},
+)
+unpause_error := temporal_client.unpause_workflow(
+    &existing,
+    {reason = "downstream dependency recovered"},
+)
 
 reset, reset_error := temporal_client.reset_workflow(
     &existing,
@@ -971,6 +979,33 @@ Workflow to completion. CLI 1.9.1/Server 1.32.0 omits the response's newer
 `update_time` field, so the owned result models it as optional. The request and
 response have direct wire/ownership tests; the 500-case reset property exercises
 the shared option encoder across arbitrary ordered operations.
+
+Workflow Pause is a feature-gated experimental Service API. Start a compatible
+local server explicitly:
+
+```bash
+temporal server start-dev \
+  --headless \
+  --dynamic-config-value frontend.WorkflowPauseEnabled=true
+
+TEMPORAL_ODIN_WORKFLOW_PAUSE_ENABLED=1 ./scripts/integration-test.sh
+```
+
+Or, with that server already running, execute only the focused proof:
+
+```bash
+./scripts/workflow-pause-integration-test.sh
+```
+
+The focused test reaches a durable Signal wait, pauses the Workflow through the
+public intercepted Client API, verifies Paused status and Query rejection,
+sends a Signal, and proves no Odin activation processes it before Unpause. It
+then unpauses, completes normally, and requires both pause history events. The
+request wire contract and interceptor nesting have direct unit coverage; a
+500-case property preserves operation kind, optional run targeting, identity,
+reason, and idempotence ID. The test accepts symbolic event/status names and
+their numeric values because older CLIs do not know the newer enums even when
+connected to Server 1.32.
 
 Queries use the same borrowed handle and Core generic-RPC path:
 

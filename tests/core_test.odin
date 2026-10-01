@@ -61,6 +61,7 @@ Client_Interceptor_Test_State :: struct {
 	cancel_reason_seen:      bool,
 	reset_options_seen:      bool,
 	workflow_options_seen:   bool,
+	workflow_pause_seen:     bool,
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
@@ -253,6 +254,31 @@ client_interceptor_test_workflow_options :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result, result_error
+}
+
+client_interceptor_test_workflow_pause :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Workflow_Pause_Mutation_Input,
+	next: temporal_client.Client_Workflow_Pause_Mutation_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.reason = "intercepted pause reason"
+	} else {
+		node.state.workflow_pause_seen = input.kind == .Pause &&
+		                                 input.options.reason == "intercepted pause reason"
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "Workflow pause short circuit")
+	} else {
+		result = temporal_client.client_workflow_pause_mutation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
 }
 
 client_interceptor_test_terminate :: proc(
@@ -10028,6 +10054,115 @@ client_workflow_options_interceptors_nest_and_propagate_mutations :: proc(t: ^te
 	for event, index in expected {
 		testing.expect_value(t, state.events[index], event)
 	}
+}
+
+@(test)
+client_workflow_pause_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			workflow_pause_mutation = client_interceptor_test_workflow_pause,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			workflow_pause_mutation = client_interceptor_test_workflow_pause,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+	pause_error := temporal_client.pause_workflow(&handle, {reason = "caller reason"})
+	defer temporal_client.error_free(&pause_error)
+	testing.expect_value(t, pause_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(pause_error.message), "Workflow pause short circuit")
+	testing.expect(t, state.workflow_pause_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_workflow_pause_requests_preserve_exact_control_fields :: proc(t: ^testing.T) {
+	pause_bytes, pause_error := temporal_client.encode_workflow_pause_mutation_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"run-id",
+		.Pause,
+		{reason = "dependency outage", request_id = "pause-request"},
+	)
+	defer delete(pause_bytes)
+	defer temporal_client.error_free(&pause_error)
+	testing.expect(t, pause_error.message == nil)
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	pause_request := proto.Temporal_Api_Workflowservice_V1_PauseWorkflowExecutionRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_PauseWorkflowExecutionRequest(
+		pause_bytes[:],
+		&pause_request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, pause_request.namespace, "orders")
+	testing.expect_value(t, pause_request.workflow_id, "workflow-id")
+	testing.expect_value(t, pause_request.run_id, "run-id")
+	testing.expect_value(t, pause_request.identity, "odin-client@test")
+	testing.expect_value(t, pause_request.reason, "dependency outage")
+	testing.expect_value(t, pause_request.request_id, "pause-request")
+	virtual.arena_destroy(&arena)
+
+	unpause_bytes, unpause_error := temporal_client.encode_workflow_pause_mutation_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"",
+		.Unpause,
+		{reason = "dependency recovered", request_id = "unpause-request"},
+	)
+	defer delete(unpause_bytes)
+	defer temporal_client.error_free(&unpause_error)
+	testing.expect(t, unpause_error.message == nil)
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	previous_allocator = context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	unpause_request := proto.Temporal_Api_Workflowservice_V1_UnpauseWorkflowExecutionRequest{}
+	decoded = proto.decode_Temporal_Api_Workflowservice_V1_UnpauseWorkflowExecutionRequest(
+		unpause_bytes[:],
+		&unpause_request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, unpause_request.workflow_id, "workflow-id")
+	testing.expect_value(t, unpause_request.run_id, "")
+	testing.expect_value(t, unpause_request.reason, "dependency recovered")
+	testing.expect_value(t, unpause_request.request_id, "unpause-request")
+	virtual.arena_destroy(&arena)
+
+	invalid_bytes, invalid_error := temporal_client.encode_workflow_pause_mutation_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"",
+		.Invalid,
+		{},
+	)
+	defer delete(invalid_bytes)
+	defer temporal_client.error_free(&invalid_error)
+	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	testing.expect_value(t, len(invalid_bytes), 0)
 }
 
 @(test)

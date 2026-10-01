@@ -131,6 +131,23 @@ workflow_options_interceptor :: proc(
 	return result, result_error
 }
 
+workflow_pause_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Workflow_Pause_Mutation_Input,
+	next: temporal_client.Client_Workflow_Pause_Mutation_Next,
+) -> temporal_client.Error {
+	fmt.printf(
+		"Client Workflow pause interceptor entered kind=%v reason=%q\n",
+		input.kind,
+		input.options.reason,
+	)
+	result := temporal_client.client_workflow_pause_mutation_next(next, input)
+	if result.message == nil {
+		fmt.println("Client Workflow pause interceptor exited after Core")
+	}
+	return result
+}
+
 terminate_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Terminate_Workflow_Input,
@@ -172,6 +189,7 @@ run :: proc() -> int {
 		cancel_workflow = cancel_interceptor,
 		reset_workflow = reset_interceptor,
 		update_workflow_execution_options = workflow_options_interceptor,
+		workflow_pause_mutation = workflow_pause_interceptor,
 		terminate_workflow = terminate_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -208,6 +226,13 @@ run :: proc() -> int {
 	case "cancel":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.cancel_workflow(&handle, reason)
+	case "pause", "unpause":
+		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
+		if action == "pause" {
+			operation_error = temporal_client.pause_workflow(&handle, {reason = reason})
+		} else {
+			operation_error = temporal_client.unpause_workflow(&handle, {reason = reason})
+		}
 	case "reset":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		event_id_value := env("TEMPORAL_CLIENT_RESET_EVENT_ID", event_id_buffer[:])

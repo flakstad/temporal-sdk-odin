@@ -110,6 +110,10 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.RespondActivityTaskCanceledRequest \
   temporal.api.workflowservice.v1.RespondActivityTaskCanceledByIdRequest \
   temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.PauseWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.PauseWorkflowExecutionResponse \
+  temporal.api.workflowservice.v1.UnpauseWorkflowExecutionRequest \
+  temporal.api.workflowservice.v1.UnpauseWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.ResetWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.ResetWorkflowExecutionResponse \
   temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsRequest \

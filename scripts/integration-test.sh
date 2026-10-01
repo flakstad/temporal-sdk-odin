@@ -188,6 +188,13 @@ else
   echo "Skipping standalone Nexus integration: the connected Temporal Service does not expose the pre-release RPCs."
 fi
 
+if [[ "${TEMPORAL_ODIN_WORKFLOW_PAUSE_ENABLED:-}" == "1" ]]; then
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+    "$repo_root/scripts/workflow-pause-integration-test.sh"
+else
+  echo 'Skipping Workflow Pause integration: set TEMPORAL_ODIN_WORKFLOW_PAUSE_ENABLED=1 for a feature-enabled Server.'
+fi
+
 metrics_port=$((19000 + $$ % 1000))
 metrics_address="127.0.0.1:${metrics_port}"
 TEMPORAL_CORE_PROMETHEUS_BIND_ADDRESS="$metrics_address" \
