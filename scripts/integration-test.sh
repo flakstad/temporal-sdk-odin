@@ -2689,6 +2689,68 @@ for _ in {1..30}; do
     break
   fi
   if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Odin Child Signal token cancellation Worker exited before polling" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+child_signal_token_cancel_parent_id="odin-sdk-child-signal-token-cancel-$$-$(date +%s)"
+TEMPORAL_CLIENT_SCENARIO=child-signal-token-cancel \
+  TEMPORAL_CLIENT_WORKFLOW_ID="$child_signal_token_cancel_parent_id" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-client-start.sh" >"$workflow_output_file"
+child_signal_token_cancel_output="$(<"$workflow_output_file")"
+echo "$child_signal_token_cancel_output"
+grep -q \
+  "Odin canceled Child Signal token before start workflow_id=$child_signal_token_cancel_parent_id" \
+  <<<"$child_signal_token_cancel_output"
+grep -q 'result="Child Signal token canceled before Child start"' \
+  <<<"$child_signal_token_cancel_output"
+grep -q 'Client Signal-With-Start interceptor entered before Core' \
+  <<<"$child_signal_token_cancel_output"
+grep -q 'Client result interceptor exited after terminal Workflow result' \
+  <<<"$child_signal_token_cancel_output"
+
+temporal workflow show \
+  --workflow-id "$child_signal_token_cancel_parent_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+jq -e '
+  ([.events[]
+    | select(.eventType == "EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED")]
+    | length == 1) and
+  ([.events[]
+    | select(.eventType == "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED")]
+    | length == 1) and
+  ([.events[]
+    | select(.eventType == "EVENT_TYPE_CHILD_WORKFLOW_EXECUTION_COMPLETED")]
+    | length == 1) and
+  ([.events[]
+    | select(.eventType == "EVENT_TYPE_SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED")]
+    | length == 0)
+' "$typed_history_file" >/dev/null
+
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -q 'Workflow signal-Child interceptor entered' "$worker_log"
+grep -q 'started=1' "$worker_log"
+if grep -q 'child_signaled=1' "$worker_log"; then
+  echo "Canceled Child Signal unexpectedly emitted a Core Signal command" >&2
+  exit 1
+fi
+grep -q "Child Workflow completed end-to-end and worker shut down cleanly" "$worker_log"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-child-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Child Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
     echo "Odin explicit Child Workflow cancellation Worker exited before polling" >&2
     cat "$worker_log" >&2
     exit 1

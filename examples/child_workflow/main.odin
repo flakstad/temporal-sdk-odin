@@ -19,6 +19,8 @@ FAILURE_PARENT_WORKFLOW_TYPE :: "odin_child_failure_parent_workflow"
 FAILURE_CHILD_WORKFLOW_TYPE :: "odin_failing_child_workflow"
 SIGNAL_PARENT_WORKFLOW_TYPE :: "odin_child_signal_parent_workflow"
 SIGNAL_CHILD_WORKFLOW_TYPE :: "odin_signaled_child_workflow"
+SIGNAL_TOKEN_CANCEL_PARENT_WORKFLOW_TYPE :: "odin_child_signal_token_cancel_parent_workflow"
+SIGNAL_TOKEN_CANCEL_CHILD_WORKFLOW_TYPE :: "odin_child_signal_token_cancel_child_workflow"
 EXPLICIT_CANCEL_PARENT_WORKFLOW_TYPE :: "odin_child_explicit_cancel_parent_workflow"
 DUPLICATE_PARENT_WORKFLOW_TYPE :: "odin_child_duplicate_parent_workflow"
 EXTERNAL_TARGET_WORKFLOW_TYPE :: "odin_external_target_workflow"
@@ -274,6 +276,78 @@ signal_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> st
 		return "Signaled Child Workflow did not complete"
 	}
 	return result.value
+}
+
+Signal_Token_Cancel_State :: struct {
+	token:     workflow.Cancellation_Token,
+	requested: bool,
+}
+
+cancel_child_signal_token :: proc(
+	_: ^workflow.Fiber_Context,
+	state: ^Signal_Token_Cancel_State,
+	_: string,
+) {
+	state.requested = workflow.cancellation_request(
+		state.token,
+		"live Child Signal token canceled before Child start",
+	)
+}
+
+signal_token_cancel_child_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	return "Child Signal token cancellation target completed"
+}
+
+signal_token_cancel_parent_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	workflow_id: string,
+) -> string {
+	state := Signal_Token_Cancel_State{
+		token = workflow.cancellation_detached(ctx),
+	}
+	if state.token.id == 0 ||
+	   !workflow.set_signal_routine_json(
+		   ctx,
+		   "cancel-child-signal-token",
+		   &state,
+		   cancel_child_signal_token,
+	   ) {
+		return "could not configure live Child Signal token cancellation"
+	}
+	child_id, allocation_error := strings.concatenate({workflow_id, "-child"})
+	if allocation_error != nil {
+		return "could not allocate live Child Workflow ID"
+	}
+	defer delete(child_id)
+	future := workflow.start_child_workflow_json(
+		ctx,
+		SIGNAL_TOKEN_CANCEL_CHILD_WORKFLOW_TYPE,
+		workflow_id,
+		{
+			workflow_id = child_id,
+			workflow_execution_timeout = time.Minute,
+		},
+	)
+	signal := workflow.signal_child_workflow_json_with_options(
+		ctx,
+		future,
+		"must-not-reach-child",
+		"not-delivered",
+		{cancellation_token = state.token},
+	)
+	if !state.requested || signal.status != .Canceled ||
+	   signal.failure_message != "live Child Signal token canceled before Child start" {
+		return "live Child Signal start wait ignored cancellation"
+	}
+	result := workflow.await_child_workflow_result(ctx, future)
+	if result.status != .Succeeded ||
+	   result.value != "Child Signal token cancellation target completed" {
+		return "Child Signal token cancellation target did not complete"
+	}
+	return "Child Signal token canceled before Child start"
 }
 
 explicit_cancel_parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -859,6 +933,32 @@ main :: proc() {
 	if signal_child_error.message != nil {
 		fmt.eprintf("Signal child registration failed: %s\n", string(signal_child_error.message))
 		worker.error_free(&signal_child_error)
+		os.exit(1)
+	}
+	signal_token_cancel_parent_error := worker.register_workflow(
+		&sdk_worker,
+		SIGNAL_TOKEN_CANCEL_PARENT_WORKFLOW_TYPE,
+		signal_token_cancel_parent_workflow,
+	)
+	if signal_token_cancel_parent_error.message != nil {
+		fmt.eprintf(
+			"Signal-token-cancel parent registration failed: %s\n",
+			string(signal_token_cancel_parent_error.message),
+		)
+		worker.error_free(&signal_token_cancel_parent_error)
+		os.exit(1)
+	}
+	signal_token_cancel_child_error := worker.register_workflow(
+		&sdk_worker,
+		SIGNAL_TOKEN_CANCEL_CHILD_WORKFLOW_TYPE,
+		signal_token_cancel_child_workflow,
+	)
+	if signal_token_cancel_child_error.message != nil {
+		fmt.eprintf(
+			"Signal-token-cancel child registration failed: %s\n",
+			string(signal_token_cancel_child_error.message),
+		)
+		worker.error_free(&signal_token_cancel_child_error)
 		os.exit(1)
 	}
 	explicit_cancel_parent_error := worker.register_workflow(

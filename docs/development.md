@@ -1788,6 +1788,11 @@ resolves in the token-cancellation activation, covers both Core job orders,
 and requires zero Child Signal commands plus byte-identical fresh-stack replay.
 The direct Child-start waiter regression remains pending until Core supplies a
 start resolution, proving that only the Signal convenience gained this wakeup.
+The live CLI-devserver case uses Client Signal-With-Start to place the
+cancellation Signal in the initial Workflow activation. It requires one
+started/completed Child Workflow and zero
+`SIGNAL_EXTERNAL_WORKFLOW_EXECUTION_INITIATED` history events, avoiding a
+wall-clock race between a normal Client Signal and Child-start resolution.
 The external Workflow
 property generates 500 namespace/Workflow ID/optional Run ID identities,
 signal names, summaries, JSON payloads, and cancellation reasons. It checks exact

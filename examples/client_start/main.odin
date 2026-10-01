@@ -786,6 +786,62 @@ run :: proc() -> int {
 		)
 		return 0
 	}
+	if scenario == "child-signal-token-cancel" {
+		handle, start_error := temporal_client.signal_with_start_workflow_json(
+			&client,
+			"odin_child_signal_token_cancel_parent_workflow",
+			workflow_id,
+			"cancel-child-signal-token",
+			"cancel-before-start",
+			{
+				start_options = {
+					id = workflow_id,
+					task_queue = "odin-child-workflow",
+					workflow_execution_timeout = time.Minute,
+					workflow_run_timeout = time.Minute,
+					workflow_task_timeout = 10 * time.Second,
+				},
+			},
+		)
+		if start_error.message != nil {
+			fmt.eprintf(
+				"Child Signal token cancellation Signal-With-Start failed: %s\n",
+				string(start_error.message),
+			)
+			temporal_client.error_free(&start_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&handle)
+		if !handle.started_by_request {
+			fmt.eprintln("Child Signal token cancellation did not start the Workflow Execution")
+			return 1
+		}
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		defer delete(result)
+		if result_error.message != nil {
+			fmt.eprintf(
+				"Child Signal token cancellation result failed: %s\n",
+				string(result_error.message),
+			)
+			temporal_client.error_free(&result_error)
+			return 1
+		}
+		if result != "Child Signal token canceled before Child start" {
+			fmt.eprintf(
+				"Child Signal token cancellation returned unexpected result: %q\n",
+				result,
+			)
+			return 1
+		}
+		fmt.printf(
+			"Odin canceled Child Signal token before start workflow_id=%s run_id=%s result=%q\n",
+			workflow_id,
+			handle.run_id,
+			result,
+		)
+		return 0
+	}
 	if scenario == "terminal-failure" {
 		handle, start_error := temporal_client.start_workflow_json(
 			&client,

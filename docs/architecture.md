@@ -2641,6 +2641,15 @@ emits `CancelSignalWorkflow(seq)`. The waiter ID is part of the per-fiber
 execution snapshot so main, Signal, and Update fibers remain isolated; it is
 never serialized.
 
+The CLI-devserver acceptance path now proves the same pre-start transition
+across the public Odin Client, Core bridge, Server, and Workflow worker. Client
+Signal-With-Start places the cancellation Signal in the initial activation.
+The parent starts a Child and enters the internal Signal prerequisite wait;
+the Signal routine cancels the explicit token before Core resolves Child
+start. Parent history contains the Child start/completion but no
+`SignalExternalWorkflowExecutionInitiated` event. This is deliberately based
+on activation ordering rather than host timing.
+
 A separate acceptance trace starts a Signal routine waiting on an unhandled
 Signal and an Update routine waiting on a durable timer under the same child
 token. Main cancels that token only after both routines have already had their

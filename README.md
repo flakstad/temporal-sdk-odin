@@ -1954,6 +1954,10 @@ the Signal call and emits no `SignalExternalWorkflowExecution`. It does not
 change a direct `await_child_workflow_start`. Once either a Child or external
 Signal has been commanded, the same token emits Core's
 `CancelSignalWorkflow` and returns `.Canceled`.
+The CLI-devserver suite drives the pre-start case through an atomic
+Signal-With-Start request. The cancellation Signal is therefore present in the
+initial activation; history proves that the Child starts and completes while
+the canceled Child Signal never becomes a Core command.
 
 After applying every Core job, the Workflow scheduler drains ready Signal,
 Update, and main fibers to a deterministic fixed point. Cancellation in a
