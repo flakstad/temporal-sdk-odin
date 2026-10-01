@@ -279,6 +279,101 @@ Client_Count_Workflows_Interceptor_Proc :: #type proc(
 	next: Client_Count_Workflows_Next,
 ) -> (Workflow_Count, Error)
 
+Client_Start_Nexus_Operation_Input :: struct {
+	client:  ^Client,
+	input:   activity_codec.Payload_View,
+	options: Start_Nexus_Operation_Options,
+}
+
+Client_Start_Nexus_Operation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Start_Nexus_Operation_Input,
+) -> (Nexus_Operation_Handle, Error)
+
+Client_Start_Nexus_Operation_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Start_Nexus_Operation_Next_Proc,
+}
+
+Client_Start_Nexus_Operation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Start_Nexus_Operation_Input,
+	next: Client_Start_Nexus_Operation_Next,
+) -> (Nexus_Operation_Handle, Error)
+
+Client_Poll_Nexus_Operation_Input :: struct {
+	handle:     ^Nexus_Operation_Handle,
+	wait_stage: Nexus_Operation_Wait_Stage,
+	options:    Nexus_Operation_Wait_Options,
+}
+
+Client_Poll_Nexus_Operation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Poll_Nexus_Operation_Input,
+) -> (Nexus_Operation_Poll_Result, Error)
+
+Client_Poll_Nexus_Operation_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Poll_Nexus_Operation_Next_Proc,
+}
+
+Client_Poll_Nexus_Operation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Poll_Nexus_Operation_Input,
+	next: Client_Poll_Nexus_Operation_Next,
+) -> (Nexus_Operation_Poll_Result, Error)
+
+Client_Describe_Nexus_Operation_Input :: struct {
+	handle:    ^Nexus_Operation_Handle,
+	options:   Describe_Nexus_Operation_Options,
+	allocator: mem.Allocator,
+}
+
+Client_Describe_Nexus_Operation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Describe_Nexus_Operation_Input,
+) -> (Nexus_Operation_Description, Error)
+
+Client_Describe_Nexus_Operation_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Describe_Nexus_Operation_Next_Proc,
+}
+
+Client_Describe_Nexus_Operation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Describe_Nexus_Operation_Input,
+	next: Client_Describe_Nexus_Operation_Next,
+) -> (Nexus_Operation_Description, Error)
+
+Nexus_Operation_Mutation_Kind :: enum {
+	Cancel,
+	Terminate,
+	Delete,
+}
+
+Client_Nexus_Operation_Mutation_Input :: struct {
+	handle:     ^Nexus_Operation_Handle,
+	kind:       Nexus_Operation_Mutation_Kind,
+	reason:     string,
+	request_id: string,
+}
+
+Client_Nexus_Operation_Mutation_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Nexus_Operation_Mutation_Input,
+) -> Error
+
+Client_Nexus_Operation_Mutation_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Nexus_Operation_Mutation_Next_Proc,
+}
+
+Client_Nexus_Operation_Mutation_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Nexus_Operation_Mutation_Input,
+	next: Client_Nexus_Operation_Mutation_Next,
+) -> Error
+
 Client_List_Nexus_Operations_Input :: struct {
 	client:    ^Client,
 	options:   List_Nexus_Operations_Options,
@@ -404,6 +499,10 @@ Client_Interceptor :: struct {
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
 	count_workflows:    Client_Count_Workflows_Interceptor_Proc,
+	start_nexus_operation:    Client_Start_Nexus_Operation_Interceptor_Proc,
+	poll_nexus_operation:     Client_Poll_Nexus_Operation_Interceptor_Proc,
+	describe_nexus_operation: Client_Describe_Nexus_Operation_Interceptor_Proc,
+	nexus_operation_mutation: Client_Nexus_Operation_Mutation_Interceptor_Proc,
 	list_nexus_operations:  Client_List_Nexus_Operations_Interceptor_Proc,
 	count_nexus_operations: Client_Count_Nexus_Operations_Interceptor_Proc,
 	describe_schedule:  Client_Describe_Schedule_Interceptor_Proc,
@@ -531,6 +630,46 @@ client_count_workflows_next :: proc(
 ) -> (Workflow_Count, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Workflow count interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_start_nexus_operation_next :: proc(
+	next: Client_Start_Nexus_Operation_Next,
+	input: ^Client_Start_Nexus_Operation_Input,
+) -> (Nexus_Operation_Handle, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation start interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_poll_nexus_operation_next :: proc(
+	next: Client_Poll_Nexus_Operation_Next,
+	input: ^Client_Poll_Nexus_Operation_Input,
+) -> (Nexus_Operation_Poll_Result, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation poll interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_describe_nexus_operation_next :: proc(
+	next: Client_Describe_Nexus_Operation_Next,
+	input: ^Client_Describe_Nexus_Operation_Input,
+) -> (Nexus_Operation_Description, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation Describe interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_nexus_operation_mutation_next :: proc(
+	next: Client_Nexus_Operation_Mutation_Next,
+	input: ^Client_Nexus_Operation_Mutation_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid Nexus operation mutation interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -889,6 +1028,90 @@ client_count_workflows_chain :: proc(
 		)
 	}
 	return count_workflows_terminal(input)
+}
+
+client_start_nexus_operation_chain :: proc(
+	data: rawptr,
+	input: ^Client_Start_Nexus_Operation_Input,
+) -> (Nexus_Operation_Handle, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation start interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.start_nexus_operation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.start_nexus_operation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_start_nexus_operation_chain},
+		)
+	}
+	return start_nexus_operation_payload_terminal(input)
+}
+
+client_poll_nexus_operation_chain :: proc(
+	data: rawptr,
+	input: ^Client_Poll_Nexus_Operation_Input,
+) -> (Nexus_Operation_Poll_Result, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation poll interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.poll_nexus_operation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.poll_nexus_operation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_poll_nexus_operation_chain},
+		)
+	}
+	return poll_nexus_operation_terminal(input)
+}
+
+client_describe_nexus_operation_chain :: proc(
+	data: rawptr,
+	input: ^Client_Describe_Nexus_Operation_Input,
+) -> (Nexus_Operation_Description, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation Describe interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.describe_nexus_operation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.describe_nexus_operation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_describe_nexus_operation_chain},
+		)
+	}
+	return describe_nexus_operation_terminal(input)
+}
+
+client_nexus_operation_mutation_chain :: proc(
+	data: rawptr,
+	input: ^Client_Nexus_Operation_Mutation_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid Nexus operation mutation interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.nexus_operation_mutation == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.nexus_operation_mutation(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_nexus_operation_mutation_chain},
+		)
+	}
+	return nexus_operation_mutation_terminal(input)
 }
 
 client_list_nexus_operations_chain :: proc(

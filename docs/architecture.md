@@ -569,7 +569,9 @@ encoded terminal Failure, and the opaque long-poll token. The list API owns its
 limited execution summaries, typed status/times, Search Attribute Payloads,
 and pagination token. Count preserves both the approximate total and optional
 group values as codec-neutral Payloads. Both participate in the public Client
-outbound-interceptor chain. Starts carry all three operation timeouts, ID
+outbound-interceptor chain. Start, Poll/result waiting, Describe, and the
+cancel/terminate/delete mutation family participate in the same chain, giving
+the complete standalone lifecycle typed nested continuations. Starts carry all three operation timeouts, ID
 reuse/conflict policies, Nexus string headers, typed Search Attributes, static
 summary/details, generic Links, completion callbacks, and the three upstream
 `Use_Existing` attachment flags. Describe owns and decodes all six common Link
@@ -607,7 +609,12 @@ owned `Running` state and input, terminates it, observes the typed
 an exact Visibility query, deletes it, and requires a subsequent Describe to
 return gRPC status 5/`NOT_FOUND`. It also round-trips a custom typed Search
 Attribute and static summary/details and proves that `Use_Existing` returns the
-same Run ID without dispatching another handler task.
+same Run ID without dispatching another handler task. The initial Describe
+returns an opaque token which is sent on the later Describe; Server then returns
+the changed terminal state and outcome. Contrary to the pinned proto comment
+that a token is absent once complete, Server 1.32.0 still returns a 132-byte
+token with that terminal response. Odin therefore keeps the token opaque and
+does not infer liveness from its presence.
 
 The pinned API schema includes operation Links, completion callbacks, and the
 three on-conflict attachment flags. Exact wire and allocator-ownership tests
@@ -1997,8 +2004,9 @@ a connection-mutation input and remain direct Core ABI calls at the terminal;
 all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks fifteen nested operation families and arbitrary
-short-circuit depth. `get_result` surrounds the whole logical
+A 500-case property checks twenty-one nested operation families and arbitrary
+short-circuit depth, including all six standalone Nexus lifecycle/Visibility
+interceptor groups. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. The Update wait interceptor likewise wraps
 the complete result long poll and returns an owned Payload. Live start,
@@ -2866,12 +2874,14 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
-cancel, describe, terminate, delete, list, and count—is now wired through Core
-and live-proven. Its typed Start/Describe data surface is also implemented; the
-Server 1.32 persistence limitation above remains explicit. The next smallest
-vertical milestone is adding outbound-interceptor hooks for standalone Nexus
-start, poll/result wait, Describe, cancel, terminate, and delete so tracing and
-policy layers see the complete Client surface rather than only list/count.
+cancel, describe, terminate, delete, list, and count—is now wired through Core,
+live-proven, and covered by typed Client outbound interceptors. Its typed
+Start/Describe data surface is also implemented; the Server 1.32 persistence
+and terminal-token limitations above remain explicit. The next smallest
+vertical milestone is exposing Core log forwarding in the idiomatic Runtime/
+Client options. The raw callback/accessors already exist, but the language
+layer must copy borrowed log fields inside the callback, safely route callbacks
+from arbitrary Core threads, and prove shutdown removes the process-wide route.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 

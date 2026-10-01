@@ -1142,6 +1142,15 @@ The lifecycle path exercises the exact generic Core bridge RPC names
 Every field returned from Describe is cloned out of the temporary protobuf
 decode arena and released with `nexus_operation_description_free`.
 
+The running Describe's opaque token is supplied to the terminal Describe so
+the Service returns the changed state. CLI 1.9.1/Server 1.32.0 returns a
+132-byte token even with the terminal response, contrary to the pinned proto
+comment that it is absent when complete. Treat the token only as opaque input
+for a follow-on Describe; its presence is not a liveness test. All six public
+operation groups enter typed Client outbound interceptors before their existing
+protobuf/RPC terminal. Unit and 500-case PBT tests require nested entry/unwind
+order, short-circuiting, and mutable-input propagation.
+
 On older Services the exact capability probe remains required and this focused
 branch is skipped; all existing Workflow-to-Nexus integration still runs.
 `RequestCancelNexusOperationExecution` acknowledges the request, not terminal
@@ -1900,8 +1909,9 @@ metadata, external details, headers, and deterministic request bytes.
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
-cancellation, termination, Workflow result waiting, Visibility list/count, and
-Schedule Describe/List/Count/Matching-Times. Each operation has a dedicated
+cancellation, termination, Workflow result waiting, Visibility list/count,
+standalone Nexus start/poll/describe/mutation/list/count, and Schedule
+Describe/List/Count/Matching-Times. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time
@@ -1942,8 +1952,9 @@ application-level synchronization.
 
 The unit and 500-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
-Visibility queries, and the complete Schedule surface. The generative chain
-now varies fifteen operation families. The `workflow-properties` live scenario
+Visibility queries, the complete standalone Nexus surface, and the complete
+Schedule surface. The generative chain now varies twenty-one operation
+families. The `workflow-properties` live scenario
 wraps both Visibility RPCs; the Schedule lifecycle wraps every read RPC and
 all seven create/mutation paths through Core. Every `client_start` live scenario
 also replaces RPC metadata, sets an API key, clears it, and requires the

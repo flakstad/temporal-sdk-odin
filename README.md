@@ -17,7 +17,9 @@ group-capable count APIs expose the standalone-operation Visibility surface.
 Start supports typed Search Attributes, static summary/details, generic Links,
 completion callbacks, and explicit `Use_Existing` attachment options. Describe
 owns all six Link variants and all three pinned callback variants with delivery
-state, attempts, timing, and Failure bytes.
+state, attempts, timing, and Failure bytes. The complete standalone lifecycle
+also participates in the typed Client outbound-interceptor chain; its Describe
+token is exercised against the live Service to observe a later state.
 This pre-release server
 feature is live-proven against Temporal Server 1.32.0 with
 `nexusoperation.enableStandalone=true`; the
@@ -428,11 +430,14 @@ Client connections accept an ordered `[]Client_Interceptor`. The current
 typesafe outbound surface wraps Workflow start, Signal-With-Start, Signal,
 Query, Workflow result waiting, Update start/result waiting, cancellation,
 termination, and Workflow
-Visibility list/count, standalone Nexus list/count, plus Schedule
+Visibility list/count, standalone Nexus start/poll/describe, cancel/terminate/
+delete, list/count, plus Schedule
 Describe/List/Count/Matching-Times; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
 Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`.
+Standalone Nexus cancel, terminate, and delete similarly share
+`Nexus_Operation_Mutation_Kind`.
 Live RPC-metadata and API-key replacement share a corresponding
 `Connection_Mutation_Kind` input:
 

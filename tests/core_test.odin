@@ -66,6 +66,11 @@ Client_Interceptor_Test_State :: struct {
 	get_result_input_seen:   bool,
 	list_query_seen:         bool,
 	count_query_seen:        bool,
+	nexus_start_seen:        bool,
+	nexus_poll_seen:         bool,
+	nexus_describe_seen:     bool,
+	nexus_mutation_seen:     bool,
+	nexus_mutation_kind:     temporal_client.Nexus_Operation_Mutation_Kind,
 }
 
 Client_Interceptor_Test_Node :: struct {
@@ -354,6 +359,106 @@ client_interceptor_test_count_nexus_operations :: proc(
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
 	return result, result_error
+}
+
+client_interceptor_test_start_nexus_operation :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Start_Nexus_Operation_Input,
+	next: temporal_client.Client_Start_Nexus_Operation_Next,
+) -> (temporal_client.Nexus_Operation_Handle, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.operation = "intercepted-operation"
+	} else {
+		node.state.nexus_start_seen = input.options.operation == "intercepted-operation"
+	}
+	result: temporal_client.Nexus_Operation_Handle
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Nexus start short circuit")
+	} else {
+		result, result_error = temporal_client.client_start_nexus_operation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_poll_nexus_operation :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Poll_Nexus_Operation_Input,
+	next: temporal_client.Client_Poll_Nexus_Operation_Next,
+) -> (temporal_client.Nexus_Operation_Poll_Result, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.wait_stage = .Started
+	} else {
+		node.state.nexus_poll_seen = input.wait_stage == .Started
+	}
+	result: temporal_client.Nexus_Operation_Poll_Result
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Nexus poll short circuit")
+	} else {
+		result, result_error = temporal_client.client_poll_nexus_operation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_describe_nexus_operation :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Describe_Nexus_Operation_Input,
+	next: temporal_client.Client_Describe_Nexus_Operation_Next,
+) -> (temporal_client.Nexus_Operation_Description, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.include_input = true
+	} else {
+		node.state.nexus_describe_seen = input.options.include_input
+	}
+	result: temporal_client.Nexus_Operation_Description
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Nexus Describe short circuit")
+	} else {
+		result, result_error = temporal_client.client_describe_nexus_operation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_nexus_operation_mutation :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Nexus_Operation_Mutation_Input,
+	next: temporal_client.Client_Nexus_Operation_Mutation_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.reason = "intercepted Nexus mutation"
+	} else {
+		node.state.nexus_mutation_seen = input.reason == "intercepted Nexus mutation"
+		node.state.nexus_mutation_kind = input.kind
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "Nexus mutation short circuit")
+	} else {
+		result = temporal_client.client_nexus_operation_mutation_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
 }
 
 @(test)
@@ -9649,6 +9754,85 @@ client_visibility_interceptors_nest_and_propagate_queries :: proc(t: ^testing.T)
 	testing.expect_value(t, state.count, 4)
 	for event, index in expected {
 		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_nexus_lifecycle_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		namespace = "default",
+		identity = "odin-interceptor-test",
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	nodes := [?]^Client_Interceptor_Test_Node{&first, &second}
+	for node in nodes {
+		append(&client.interceptors, temporal_client.Client_Interceptor{
+			user_data = node,
+			start_nexus_operation = client_interceptor_test_start_nexus_operation,
+			poll_nexus_operation = client_interceptor_test_poll_nexus_operation,
+			describe_nexus_operation = client_interceptor_test_describe_nexus_operation,
+			nexus_operation_mutation = client_interceptor_test_nexus_operation_mutation,
+		})
+	}
+	handle := temporal_client.Nexus_Operation_Handle{
+		client = &client,
+		id = "interceptor-operation",
+		run_id = "interceptor-run",
+	}
+	expected := [?]int{1, 2, -2, -1}
+
+	started, start_error := temporal_client.start_nexus_operation_payload(
+		&client,
+		{},
+		{
+			id = "interceptor-operation",
+			endpoint = "endpoint",
+			service = "service",
+			operation = "caller-operation",
+			schedule_to_close_timeout = time.Minute,
+		},
+	)
+	temporal_client.nexus_operation_handle_free(&started)
+	testing.expect_value(t, string(start_error.message), "Nexus start short circuit")
+	temporal_client.error_free(&start_error)
+	testing.expect(t, state.nexus_start_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	state.count = 0
+	polled, poll_error := temporal_client.poll_nexus_operation(&handle, .Closed)
+	temporal_client.nexus_operation_poll_result_free(&polled)
+	testing.expect_value(t, string(poll_error.message), "Nexus poll short circuit")
+	temporal_client.error_free(&poll_error)
+	testing.expect(t, state.nexus_poll_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	state.count = 0
+	description, describe_error := temporal_client.describe_nexus_operation(&handle)
+	temporal_client.nexus_operation_description_free(&description)
+	testing.expect_value(t, string(describe_error.message), "Nexus Describe short circuit")
+	temporal_client.error_free(&describe_error)
+	testing.expect(t, state.nexus_describe_seen)
+	for event, index in expected do testing.expect_value(t, state.events[index], event)
+
+	for kind in temporal_client.Nexus_Operation_Mutation_Kind {
+		state.count = 0
+		state.nexus_mutation_seen = false
+		mutation_error := temporal_client.nexus_operation_mutation(
+			&handle,
+			kind,
+			"caller reason",
+		)
+		testing.expect_value(t, string(mutation_error.message), "Nexus mutation short circuit")
+		temporal_client.error_free(&mutation_error)
+		testing.expect(t, state.nexus_mutation_seen)
+		testing.expect_value(t, state.nexus_mutation_kind, kind)
+		for event, index in expected do testing.expect_value(t, state.events[index], event)
 	}
 }
 

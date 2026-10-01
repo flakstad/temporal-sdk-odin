@@ -164,7 +164,7 @@ main :: proc() {
 		   description.headers[0].value != "standalone-nexus" ||
 		   !description.has_static_summary || description.static_summary != "Odin standalone lifecycle" ||
 		   !description.has_static_details || description.static_details != "Live SDK integration proof" ||
-		   len(description.search_attributes) != 1 ||
+		   len(description.search_attributes) != 1 || len(description.long_poll_token) == 0 ||
 		   !bytes.equal(codec.payload_view(&description.input).data, transmute([]u8)string(`"Odin"`)) {
 			fmt.eprintf(
 				"Describe diagnostics: status=%v input=%v identity=%q headers=%d summary=%v/%q details=%v/%q search=%d links=%d callbacks=%d\n",
@@ -192,6 +192,8 @@ main :: proc() {
 			temporal_client.nexus_operation_description_free(&description)
 			fail("Nexus operation Describe returned an unexpected completion callback")
 		}
+		long_poll_token := bytes.clone(description.long_poll_token)
+		defer delete(long_poll_token)
 		temporal_client.nexus_operation_description_free(&description)
 
 		terminate_error := temporal_client.terminate_nexus_operation(
@@ -212,7 +214,11 @@ main :: proc() {
 
 		terminated, terminated_error := temporal_client.describe_nexus_operation(
 			&handle,
-			{include_outcome = true},
+			{
+				include_outcome = true,
+				long_poll_token = long_poll_token,
+				timeout = 10 * time.Second,
+			},
 		)
 		if terminated_error.message != nil do fail("Terminated Nexus operation Describe failed", &terminated_error)
 		if terminated.status != .Terminated || !terminated.has_failure ||

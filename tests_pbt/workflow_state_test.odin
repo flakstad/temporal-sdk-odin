@@ -5247,7 +5247,8 @@ temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if virtual.arena_init_growing(&decode_arena) != nil {
 		return pbt.error("could not initialize Temporal Link decode arena")
 	}
-	defer virtual.arena_destroy(&decode_arena)
+	decode_arena_active := true
+	defer if decode_arena_active do virtual.arena_destroy(&decode_arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	request := proto.Temporal_Api_Workflowservice_V1_StartWorkflowExecutionRequest{}
@@ -5308,6 +5309,51 @@ temporal_link_encoding_property :: proc(t: ^pbt.T) -> pbt.Result {
 		   len(value.value.component_path) != 2 || value.value.component_path[1] != identifier ||
 		   value.value.request_id != "generated-callback-request" {
 			return pbt.fail("Callback identity changed during encoding")
+		}
+	}
+	owned_link, owned_link_error := temporal_client.link_from_proto(&request.links[0])
+	defer temporal_client.error_free(&owned_link_error)
+	if owned_link_error.message != nil {
+		return pbt.fail("generated Temporal Link could not be cloned from protobuf")
+	}
+	defer temporal_client.link_free(&owned_link)
+	virtual.arena_destroy(&decode_arena)
+	decode_arena_active = false
+	if owned_link.kind != link.kind {
+		return pbt.fail("owned Temporal Link kind changed after decode arena destruction")
+	}
+	switch kind_index {
+	case 0:
+		if owned_link.workflow_event.workflow_id != identifier ||
+		   owned_link.workflow_event.reference_kind != link.workflow_event.reference_kind ||
+		   owned_link.workflow_event.event_id != link.workflow_event.event_id ||
+		   owned_link.workflow_event.request_id != link.workflow_event.request_id ||
+		   owned_link.workflow_event.event_type != event_type {
+			return pbt.fail("owned WorkflowEvent Link changed after arena destruction")
+		}
+	case 1:
+		if owned_link.batch_job.job_id != identifier {
+			return pbt.fail("owned BatchJob Link changed after arena destruction")
+		}
+	case 2:
+		if owned_link.activity.activity_id != identifier {
+			return pbt.fail("owned Activity Link changed after arena destruction")
+		}
+	case 3:
+		if owned_link.nexus_operation.operation_id != identifier {
+			return pbt.fail("owned NexusOperation Link changed after arena destruction")
+		}
+	case 4:
+		if owned_link.workflow.workflow_id != identifier ||
+		   owned_link.workflow.reason != "generated reason" {
+			return pbt.fail("owned Workflow Link changed after arena destruction")
+		}
+	case 5:
+		if owned_link.callback.business_id != identifier ||
+		   owned_link.callback.execution_kind != execution_kind ||
+		   len(owned_link.callback.component_path) != 2 ||
+		   owned_link.callback.component_path[1] != identifier {
+			return pbt.fail("owned Callback Link changed after arena destruction")
 		}
 	}
 	return pbt.pass()

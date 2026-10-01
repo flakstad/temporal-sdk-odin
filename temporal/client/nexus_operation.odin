@@ -565,11 +565,15 @@ encode_start_nexus_operation_request :: proc(
 	return proto.encode_Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest(&request), {}
 }
 
-start_nexus_operation_payload :: proc(
-	client: ^Client,
-	input: codec.Payload_View,
-	options: Start_Nexus_Operation_Options,
+start_nexus_operation_payload_terminal :: proc(
+	interceptor_input: ^Client_Start_Nexus_Operation_Input,
 ) -> (Nexus_Operation_Handle, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation start interceptor input is missing")
+	}
+	client := interceptor_input.client
+	input := interceptor_input.input
+	options := interceptor_input.options
 	if client == nil || client.connection == nil || client.connection.handle == nil {
 		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
 	}
@@ -610,6 +614,23 @@ start_nexus_operation_payload :: proc(
 	if handle_error.message != nil do return {}, handle_error
 	handle.started_by_request = response.started
 	return handle, {}
+}
+
+start_nexus_operation_payload :: proc(
+	client: ^Client,
+	input: codec.Payload_View,
+	options: Start_Nexus_Operation_Options,
+) -> (Nexus_Operation_Handle, Error) {
+	if client == nil || client.connection == nil || client.connection.handle == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal Client is not initialized")
+	}
+	interceptor_input := Client_Start_Nexus_Operation_Input{
+		client = client,
+		input = input,
+		options = options,
+	}
+	state := Client_Interceptor_State{client = client}
+	return client_start_nexus_operation_chain(&state, &interceptor_input)
 }
 
 start_nexus_operation_json :: proc(
@@ -1072,11 +1093,15 @@ decode_nexus_operation_poll_response :: proc(
 	return result, false, {}
 }
 
-poll_nexus_operation :: proc(
-	handle: ^Nexus_Operation_Handle,
-	wait_stage := Nexus_Operation_Wait_Stage.Closed,
-	options: Nexus_Operation_Wait_Options = {},
+poll_nexus_operation_terminal :: proc(
+	interceptor_input: ^Client_Poll_Nexus_Operation_Input,
 ) -> (Nexus_Operation_Poll_Result, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation poll interceptor input is missing")
+	}
+	handle := interceptor_input.handle
+	wait_stage := interceptor_input.wait_stage
+	options := interceptor_input.options
 	if !nexus_operation_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
 	}
@@ -1146,6 +1171,23 @@ poll_nexus_operation :: proc(
 	}
 }
 
+poll_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	wait_stage := Nexus_Operation_Wait_Stage.Closed,
+	options: Nexus_Operation_Wait_Options = {},
+) -> (Nexus_Operation_Poll_Result, Error) {
+	if !nexus_operation_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	interceptor_input := Client_Poll_Nexus_Operation_Input{
+		handle = handle,
+		wait_stage = wait_stage,
+		options = options,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_poll_nexus_operation_chain(&state, &interceptor_input)
+}
+
 get_nexus_operation_result_payload :: proc(
 	handle: ^Nexus_Operation_Handle,
 	options: Nexus_Operation_Wait_Options = {},
@@ -1180,7 +1222,7 @@ get_nexus_operation_result_json :: proc(
 	return {}
 }
 
-cancel_nexus_operation :: proc(
+cancel_nexus_operation_rpc :: proc(
 	handle: ^Nexus_Operation_Handle,
 	reason := "",
 	request_id := "",
@@ -1214,11 +1256,15 @@ cancel_nexus_operation :: proc(
 	return {}
 }
 
-describe_nexus_operation :: proc(
-	handle: ^Nexus_Operation_Handle,
-	options: Describe_Nexus_Operation_Options = {},
-	allocator := context.allocator,
+describe_nexus_operation_terminal :: proc(
+	interceptor_input: ^Client_Describe_Nexus_Operation_Input,
 ) -> (Nexus_Operation_Description, Error) {
+	if interceptor_input == nil {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation Describe interceptor input is missing")
+	}
+	handle := interceptor_input.handle
+	options := interceptor_input.options
+	allocator := interceptor_input.allocator
 	if !nexus_operation_handle_valid(handle) {
 		return {}, error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
 	}
@@ -1283,7 +1329,24 @@ describe_nexus_operation :: proc(
 	return decode_nexus_operation_description(rpc_result.protobuf, allocator)
 }
 
-terminate_nexus_operation :: proc(
+describe_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	options: Describe_Nexus_Operation_Options = {},
+	allocator := context.allocator,
+) -> (Nexus_Operation_Description, Error) {
+	if !nexus_operation_handle_valid(handle) {
+		return {}, error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	interceptor_input := Client_Describe_Nexus_Operation_Input{
+		handle = handle,
+		options = options,
+		allocator = allocator,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_describe_nexus_operation_chain(&state, &interceptor_input)
+}
+
+terminate_nexus_operation_rpc :: proc(
 	handle: ^Nexus_Operation_Handle,
 	reason := "",
 	request_id := "",
@@ -1317,7 +1380,7 @@ terminate_nexus_operation :: proc(
 	return {}
 }
 
-delete_nexus_operation :: proc(handle: ^Nexus_Operation_Handle) -> Error {
+delete_nexus_operation_rpc :: proc(handle: ^Nexus_Operation_Handle) -> Error {
 	if !nexus_operation_handle_valid(handle) {
 		return error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
 	}
@@ -1337,4 +1400,64 @@ delete_nexus_operation :: proc(handle: ^Nexus_Operation_Handle) -> Error {
 	defer delete(rpc_result.protobuf)
 	if rpc_result.error.message != nil do return error_from_core(&rpc_result.error)
 	return {}
+}
+
+nexus_operation_mutation_terminal :: proc(
+	input: ^Client_Nexus_Operation_Mutation_Input,
+) -> Error {
+	if input == nil {
+		return error_from_string(.Invalid_Argument, "Nexus operation mutation interceptor input is missing")
+	}
+	switch input.kind {
+	case .Cancel:
+		return cancel_nexus_operation_rpc(input.handle, input.reason, input.request_id)
+	case .Terminate:
+		return terminate_nexus_operation_rpc(input.handle, input.reason, input.request_id)
+	case .Delete:
+		return delete_nexus_operation_rpc(input.handle)
+	}
+	return error_from_string(.Invalid_Argument, "Nexus operation mutation kind is invalid")
+}
+
+nexus_operation_mutation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	kind: Nexus_Operation_Mutation_Kind,
+	reason := "",
+	request_id := "",
+) -> Error {
+	if !nexus_operation_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Nexus operation handle is not initialized")
+	}
+	if int(kind) < int(Nexus_Operation_Mutation_Kind.Cancel) ||
+	   int(kind) > int(Nexus_Operation_Mutation_Kind.Delete) {
+		return error_from_string(.Invalid_Argument, "Nexus operation mutation kind is invalid")
+	}
+	input := Client_Nexus_Operation_Mutation_Input{
+		handle = handle,
+		kind = kind,
+		reason = reason,
+		request_id = request_id,
+	}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_nexus_operation_mutation_chain(&state, &input)
+}
+
+cancel_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	reason := "",
+	request_id := "",
+) -> Error {
+	return nexus_operation_mutation(handle, .Cancel, reason, request_id)
+}
+
+terminate_nexus_operation :: proc(
+	handle: ^Nexus_Operation_Handle,
+	reason := "",
+	request_id := "",
+) -> Error {
+	return nexus_operation_mutation(handle, .Terminate, reason, request_id)
+}
+
+delete_nexus_operation :: proc(handle: ^Nexus_Operation_Handle) -> Error {
+	return nexus_operation_mutation(handle, .Delete)
 }
