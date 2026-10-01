@@ -23124,6 +23124,27 @@ standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
 	)
 	testing.expect_value(t, metadata_error, codec.Error.None)
 	headers := [?]temporal_client.Nexus_Operation_Header{{key = "traceparent", value = "00-odin"}}
+	metadata := temporal_client.Start_Metadata{}
+	start_metadata_error := temporal_client.start_metadata_init(&metadata)
+	testing.expect(t, start_metadata_error.message == nil)
+	temporal_client.error_free(&start_metadata_error)
+	defer temporal_client.start_metadata_free(&metadata)
+	summary_error := temporal_client.start_metadata_set_static_summary(&metadata, "Standalone charge")
+	testing.expect(t, summary_error.message == nil)
+	temporal_client.error_free(&summary_error)
+	search_error := temporal_client.start_metadata_add_search_attribute_json(
+		&metadata,
+		"OrderId",
+		.Keyword,
+		"order-42",
+	)
+	testing.expect(t, search_error.message == nil)
+	temporal_client.error_free(&search_error)
+	on_conflict := temporal_client.Nexus_Operation_On_Conflict_Options{
+		attach_request_id = true,
+		attach_completion_callbacks = true,
+		attach_links = true,
+	}
 	request_bytes, request_error := temporal_client.encode_start_nexus_operation_request(
 		"orders",
 		"odin-client",
@@ -23139,6 +23160,8 @@ standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
 			start_to_close_timeout = 30 * time.Second,
 			id_reuse_policy = .Reject_Duplicate,
 			id_conflict_policy = .Use_Existing,
+			on_conflict_options = &on_conflict,
+			metadata = &metadata,
 			headers = headers[:],
 		},
 	)
@@ -23163,10 +23186,44 @@ standalone_nexus_client_encodes_and_owns_poll_outcomes :: proc(t: ^testing.T) {
 		testing.expect_value(t, request.operation_id, "standalone-1")
 		testing.expect_value(t, request.endpoint, "payments")
 		testing.expect_value(t, request.id_conflict_policy, proto.Temporal_Api_Enums_V1_NexusOperationIdConflictPolicy.NEXUS_OPERATION_ID_CONFLICT_POLICY_USE_EXISTING)
+		testing.expect(t, request.on_conflict_options != nil)
+		if request.on_conflict_options != nil {
+			testing.expect(t, request.on_conflict_options.attach_request_id)
+			testing.expect(t, request.on_conflict_options.attach_completion_callbacks)
+			testing.expect(t, request.on_conflict_options.attach_links)
+		}
+		testing.expect(t, request.user_metadata != nil && request.user_metadata.summary != nil)
+		if request.user_metadata != nil && request.user_metadata.summary != nil {
+			testing.expect(t, bytes.equal(
+				request.user_metadata.summary.data,
+				transmute([]u8)string(`"Standalone charge"`),
+			))
+		}
+		testing.expect(t, request.search_attributes != nil)
+		if request.search_attributes != nil {
+			testing.expect_value(t, len(request.search_attributes.indexed_fields), 1)
+		}
 		testing.expect_value(t, len(request.nexus_header), 1)
 		testing.expect(t, request.input != nil && bytes.equal(request.input.data, input.data))
 	}
 	virtual.arena_destroy(&decode_arena)
+	invalid_conflict_bytes, invalid_conflict_error := temporal_client.encode_start_nexus_operation_request(
+		"orders",
+		"odin-client",
+		codec.payload_view(&input),
+		{
+			id = "standalone-invalid-conflict",
+			endpoint = "payments",
+			service = "payment-service",
+			operation = "charge",
+			schedule_to_close_timeout = time.Minute,
+			id_conflict_policy = .Fail,
+			on_conflict_options = &on_conflict,
+		},
+	)
+	delete(invalid_conflict_bytes)
+	testing.expect_value(t, invalid_conflict_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.error_free(&invalid_conflict_error)
 
 	started_response := proto.Temporal_Api_Workflowservice_V1_PollNexusOperationExecutionResponse{
 		run_id = "run-1",
@@ -23322,6 +23379,106 @@ standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 		key = "x-odin-sdk",
 		value = "description-test",
 	})
+	defer delete(info.links)
+	operation_link_value := proto.Temporal_Api_Common_V1_Link_NexusOperation{
+		namespace = "default",
+		operation_id = "linked-operation",
+		run_id = "linked-run",
+	}
+	append(&info.links, proto.Temporal_Api_Common_V1_Link{
+		variant = proto.Temporal_Api_Common_V1_Link_Variant_Nexus_Operation{
+			value = &operation_link_value,
+		},
+	})
+	callback_execution := proto.Temporal_Api_Common_V1_Execution{
+		type = .EXECUTION_TYPE_NEXUS_OPERATION,
+		business_id = "callback-business",
+		run_id = "callback-run",
+	}
+	callback_link_value := proto.Temporal_Api_Common_V1_Link_Callback{
+		namespace = "default",
+		execution = &callback_execution,
+		request_id = "callback-link-request",
+	}
+	defer delete(callback_link_value.component_path)
+	append(&callback_link_value.component_path, "callbacks", "0", "completion")
+	callback_link := proto.Temporal_Api_Common_V1_Link{
+		variant = proto.Temporal_Api_Common_V1_Link_Variant_Callback{
+			value = &callback_link_value,
+		},
+	}
+	callback_nexus := proto.Temporal_Api_Common_V1_Callback_Nexus{url = "https://callbacks.invalid/nexus"}
+	defer delete(callback_nexus.header)
+	append(&callback_nexus.header, proto.Temporal_Api_Common_V1_Callback_Nexus_HeaderEntry{
+		key = "authorization",
+		value = "test-secret",
+	})
+	common_callback := proto.Temporal_Api_Common_V1_Callback{
+		variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus{value = &callback_nexus},
+	}
+	defer delete(common_callback.links)
+	append(&common_callback.links, callback_link)
+	callback_trigger_value := proto.Temporal_Api_Nexusoperation_V1_CallbackInfo_OperationCompleted{}
+	callback_trigger := proto.Temporal_Api_Nexusoperation_V1_CallbackInfo_Trigger{
+		variant = proto.Temporal_Api_Nexusoperation_V1_CallbackInfo_Trigger_Variant_Operation_Completed{
+			value = &callback_trigger_value,
+		},
+	}
+	callback_failure := proto.Temporal_Api_Failure_V1_Failure{message = "callback attempt failed"}
+	callback_info := proto.Temporal_Api_Callback_V1_CallbackInfo{
+		callback = &common_callback,
+		registration_time = &schedule_time,
+		state = .CALLBACK_STATE_BACKING_OFF,
+		attempt = 2,
+		last_attempt_failure = &callback_failure,
+		next_attempt_schedule_time = &close_time,
+		blocked_reason = "callback circuit open",
+		request_id = "callback-request",
+	}
+	completion_callback := proto.Temporal_Api_Nexusoperation_V1_CallbackInfo{
+		trigger = &callback_trigger,
+		info = &callback_info,
+	}
+	internal_callback_value := proto.Temporal_Api_Common_V1_Callback_Internal{
+		data = transmute([]u8)string("internal-callback-data"),
+	}
+	internal_common_callback := proto.Temporal_Api_Common_V1_Callback{
+		variant = proto.Temporal_Api_Common_V1_Callback_Variant_Internal{
+			value = &internal_callback_value,
+		},
+	}
+	internal_callback_info := proto.Temporal_Api_Callback_V1_CallbackInfo{
+		callback = &internal_common_callback,
+		state = .CALLBACK_STATE_SUCCEEDED,
+		request_id = "internal-request",
+	}
+	internal_completion_callback := proto.Temporal_Api_Nexusoperation_V1_CallbackInfo{
+		trigger = &callback_trigger,
+		info = &internal_callback_info,
+	}
+	handler_source_context := proto.Temporal_Api_Common_V1_Payload{
+		data = transmute([]u8)string(`{"source":"odin"}`),
+	}
+	handler_callback_value := proto.Temporal_Api_Common_V1_Callback_NexusHandler{
+		task_queue_name = "callback-queue",
+		service = "callback-service",
+		operation = "callback-operation",
+		source_context = &handler_source_context,
+	}
+	handler_common_callback := proto.Temporal_Api_Common_V1_Callback{
+		variant = proto.Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler{
+			value = &handler_callback_value,
+		},
+	}
+	handler_callback_info := proto.Temporal_Api_Callback_V1_CallbackInfo{
+		callback = &handler_common_callback,
+		state = .CALLBACK_STATE_STANDBY,
+		request_id = "handler-request",
+	}
+	handler_completion_callback := proto.Temporal_Api_Nexusoperation_V1_CallbackInfo{
+		trigger = &callback_trigger,
+		info = &handler_callback_info,
+	}
 	terminated_info := proto.Temporal_Api_Failure_V1_TerminatedFailureInfo{}
 	terminated_failure := proto.Temporal_Api_Failure_V1_Failure{
 		message = "terminated by test",
@@ -23338,6 +23495,13 @@ standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 			value = &terminated_failure,
 		},
 	}
+	defer delete(response.completion_callbacks)
+	append(
+		&response.completion_callbacks,
+		completion_callback,
+		internal_completion_callback,
+		handler_completion_callback,
+	)
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeNexusOperationExecutionResponse(&response)
 	description, decode_error := temporal_client.decode_nexus_operation_description(encoded[:])
 	delete(encoded)
@@ -23362,6 +23526,41 @@ standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(description.headers), 1)
 	testing.expect_value(t, description.headers[0].value, "description-test")
 	testing.expect_value(t, len(description.search_attributes), 1)
+	testing.expect_value(t, len(description.links), 1)
+	if len(description.links) == 1 {
+		testing.expect_value(t, description.links[0].kind, temporal_client.Link_Kind.Nexus_Operation)
+		testing.expect_value(t, description.links[0].nexus_operation.operation_id, "linked-operation")
+	}
+	testing.expect_value(t, len(description.completion_callbacks), 3)
+	if len(description.completion_callbacks) == 3 {
+		callback := &description.completion_callbacks[0]
+		testing.expect(t, callback.operation_completed)
+		testing.expect_value(t, callback.kind, temporal_client.Nexus_Operation_Callback_Kind.Nexus)
+		testing.expect_value(t, callback.url, "https://callbacks.invalid/nexus")
+		testing.expect_value(t, callback.state, temporal_client.Nexus_Operation_Callback_State.Backing_Off)
+		testing.expect_value(t, callback.attempt, i32(2))
+		testing.expect_value(t, callback.last_failure_message, "callback attempt failed")
+		testing.expect(t, len(callback.last_failure_proto) > 0)
+		testing.expect_value(t, len(callback.headers), 1)
+		testing.expect_value(t, len(callback.links), 1)
+		if len(callback.links) == 1 {
+			callback_link_description := &callback.links[0]
+			testing.expect_value(t, callback_link_description.kind, temporal_client.Link_Kind.Callback)
+			testing.expect_value(t, len(callback_link_description.callback.component_path), 3)
+			testing.expect_value(t, callback_link_description.callback.component_path[2], "completion")
+		}
+		internal_callback := &description.completion_callbacks[1]
+		testing.expect_value(t, internal_callback.kind, temporal_client.Nexus_Operation_Callback_Kind.Internal)
+		testing.expect(t, bytes.equal(
+			internal_callback.internal_data,
+			transmute([]u8)string("internal-callback-data"),
+		))
+		handler_callback := &description.completion_callbacks[2]
+		testing.expect_value(t, handler_callback.kind, temporal_client.Nexus_Operation_Callback_Kind.Nexus_Handler)
+		testing.expect_value(t, handler_callback.task_queue_name, "callback-queue")
+		testing.expect(t, handler_callback.has_source_context)
+		testing.expect(t, bytes.equal(handler_callback.source_context.data, handler_source_context.data))
+	}
 	testing.expect(t, description.has_static_summary)
 	testing.expect_value(t, description.static_summary, "Nexus summary")
 	testing.expect(t, description.has_input)

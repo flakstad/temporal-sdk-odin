@@ -37,6 +37,12 @@ Nexus_Operation_Header :: struct {
 	value: string,
 }
 
+Nexus_Operation_On_Conflict_Options :: struct {
+	attach_request_id:           bool,
+	attach_completion_callbacks: bool,
+	attach_links:                bool,
+}
+
 // Start_Nexus_Operation_Options borrows all strings and slices for the duration
 // of the synchronous start call. The returned handle owns its IDs.
 Start_Nexus_Operation_Options :: struct {
@@ -50,6 +56,10 @@ Start_Nexus_Operation_Options :: struct {
 	start_to_close_timeout:    time.Duration,
 	id_reuse_policy:           Nexus_Operation_Id_Reuse_Policy,
 	id_conflict_policy:        Nexus_Operation_Id_Conflict_Policy,
+	on_conflict_options:       ^Nexus_Operation_On_Conflict_Options,
+	// Reuses the owned Client metadata builder. Only Search Attributes and
+	// static summary/details apply to standalone Nexus operations.
+	metadata:                  ^Start_Metadata,
 	headers:                   []Nexus_Operation_Header,
 	links:                     []Link,
 	completion_callbacks:      []Nexus_Completion_Callback,
@@ -104,6 +114,23 @@ Nexus_Operation_Cancellation_State :: enum i32 {
 	Blocked = 6,
 }
 
+Nexus_Operation_Callback_State :: enum i32 {
+	Unspecified = 0,
+	Standby = 1,
+	Scheduled = 2,
+	Backing_Off = 3,
+	Failed = 4,
+	Succeeded = 5,
+	Blocked = 6,
+}
+
+Nexus_Operation_Callback_Kind :: enum {
+	Unspecified,
+	Nexus,
+	Internal,
+	Nexus_Handler,
+}
+
 Nexus_Operation_Cancellation_Description :: struct {
 	present:                    bool,
 	requested_time:             Optional_Time,
@@ -115,6 +142,29 @@ Nexus_Operation_Cancellation_Description :: struct {
 	last_failure_proto:         []u8,
 	blocked_reason:             string,
 	reason:                     string,
+}
+
+Nexus_Operation_Completion_Callback_Description :: struct {
+	operation_completed:        bool,
+	kind:                       Nexus_Operation_Callback_Kind,
+	url:                        string,
+	headers:                    [dynamic]Nexus_Callback_Header,
+	links:                      [dynamic]Link,
+	internal_data:              []u8,
+	task_queue_name:            string,
+	service:                    string,
+	operation:                  string,
+	source_context:             codec.Payload,
+	has_source_context:         bool,
+	registration_time:          Optional_Time,
+	state:                      Nexus_Operation_Callback_State,
+	attempt:                    i32,
+	last_attempt_complete_time: Optional_Time,
+	last_failure_message:       string,
+	last_failure_proto:         []u8,
+	next_attempt_schedule_time: Optional_Time,
+	blocked_reason:             string,
+	request_id:                 string,
 }
 
 Describe_Nexus_Operation_Options :: struct {
@@ -154,6 +204,8 @@ Nexus_Operation_Description :: struct {
 	cancellation:               Nexus_Operation_Cancellation_Description,
 	headers:                    [dynamic]Nexus_Operation_Header,
 	search_attributes:          [dynamic]Named_Payload,
+	links:                      [dynamic]Link,
+	completion_callbacks:       [dynamic]Nexus_Operation_Completion_Callback_Description,
 	static_summary:             string,
 	has_static_summary:         bool,
 	static_details:             string,
@@ -183,6 +235,31 @@ nexus_operation_poll_result_free :: proc(result: ^Nexus_Operation_Poll_Result) {
 	delete(result.operation_token)
 	codec.payload_free(&result.result)
 	result^ = {}
+}
+
+nexus_operation_completion_callback_description_free :: proc(
+	callback: ^Nexus_Operation_Completion_Callback_Description,
+	allocator: mem.Allocator,
+) {
+	if callback == nil do return
+	delete(callback.url, allocator)
+	for &header in callback.headers {
+		delete(header.key, allocator)
+		delete(header.value, allocator)
+	}
+	for &link in callback.links do link_free(&link)
+	delete(callback.headers)
+	delete(callback.links)
+	delete(callback.internal_data, allocator)
+	delete(callback.task_queue_name, allocator)
+	delete(callback.service, allocator)
+	delete(callback.operation, allocator)
+	codec.payload_free(&callback.source_context)
+	delete(callback.last_failure_message, allocator)
+	delete(callback.last_failure_proto, allocator)
+	delete(callback.blocked_reason, allocator)
+	delete(callback.request_id, allocator)
+	callback^ = {}
 }
 
 nexus_operation_description_free :: proc(description: ^Nexus_Operation_Description) {
@@ -215,8 +292,14 @@ nexus_operation_description_free :: proc(description: ^Nexus_Operation_Descripti
 		delete(attribute.key, allocator)
 		codec.payload_free(&attribute.payload)
 	}
+	for &link in description.links do link_free(&link)
+	for &callback in description.completion_callbacks {
+		nexus_operation_completion_callback_description_free(&callback, allocator)
+	}
 	delete(description.headers)
 	delete(description.search_attributes)
+	delete(description.links)
+	delete(description.completion_callbacks)
 	delete(description.static_summary, allocator)
 	delete(description.static_details, allocator)
 	codec.payload_free(&description.input)
@@ -319,6 +402,12 @@ start_nexus_operation_options_error :: proc(options: Start_Nexus_Operation_Optio
 	   i32(options.id_conflict_policy) > i32(Nexus_Operation_Id_Conflict_Policy.Use_Existing) {
 		return "Nexus operation ID conflict policy is invalid"
 	}
+	if options.on_conflict_options != nil && options.id_conflict_policy != .Use_Existing {
+		return "Nexus operation on-conflict options require Use Existing conflict policy"
+	}
+	if options.metadata != nil && options.metadata.allocator.procedure == nil {
+		return "Nexus operation start metadata is not initialized"
+	}
 	for header in options.headers {
 		if len(header.key) == 0 do return "Nexus operation header keys must not be empty"
 	}
@@ -375,8 +464,58 @@ encode_start_nexus_operation_request :: proc(
 		id_reuse_policy = nexus_operation_id_reuse_policy_to_proto(options.id_reuse_policy),
 		id_conflict_policy = nexus_operation_id_conflict_policy_to_proto(options.id_conflict_policy),
 	}
+	on_conflict_options := proto.Temporal_Api_Nexusoperation_V1_OnConflictOptions{}
+	if options.on_conflict_options != nil {
+		on_conflict_options = {
+			attach_request_id = options.on_conflict_options.attach_request_id,
+			attach_completion_callbacks = options.on_conflict_options.attach_completion_callbacks,
+			attach_links = options.on_conflict_options.attach_links,
+		}
+		request.on_conflict_options = &on_conflict_options
+	}
 	if options.schedule_to_start_timeout > 0 do request.schedule_to_start_timeout = &schedule_to_start
 	if options.start_to_close_timeout > 0 do request.start_to_close_timeout = &start_to_close
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	user_metadata := proto.Temporal_Api_Sdk_V1_UserMetadata{}
+	static_summary := proto.Temporal_Api_Common_V1_Payload{}
+	static_details := proto.Temporal_Api_Common_V1_Payload{}
+	search_payloads: []proto.Temporal_Api_Common_V1_Payload
+	defer delete(search_attributes.indexed_fields)
+	defer free_start_proto_payloads(search_payloads)
+	defer delete(static_summary.metadata)
+	defer delete(static_summary.external_payloads)
+	defer delete(static_details.metadata)
+	defer delete(static_details.external_payloads)
+	if options.metadata != nil {
+		metadata := options.metadata
+		if metadata.has_static_summary {
+			static_summary = proto.encode_payload(codec.payload_view(&metadata.static_summary))
+			user_metadata.summary = &static_summary
+		}
+		if metadata.has_static_details {
+			static_details = proto.encode_payload(codec.payload_view(&metadata.static_details))
+			user_metadata.details = &static_details
+		}
+		if metadata.has_static_summary || metadata.has_static_details {
+			request.user_metadata = &user_metadata
+		}
+		if len(metadata.search_attributes) > 0 {
+			search_payloads = make([]proto.Temporal_Api_Common_V1_Payload, len(metadata.search_attributes))
+			for &entry, index in metadata.search_attributes {
+				search_payloads[index] = proto.encode_payload(codec.payload_view(&entry.payload))
+			}
+			for entry, index in metadata.search_attributes {
+				append(
+					&search_attributes.indexed_fields,
+					proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+						key = entry.key,
+						value = &search_payloads[index],
+					},
+				)
+			}
+			request.search_attributes = &search_attributes
+		}
+	}
 	defer delete(request.nexus_header)
 	for header in options.headers {
 		append(&request.nexus_header, proto.Temporal_Api_Workflowservice_V1_StartNexusOperationExecutionRequest_NexusHeaderEntry{
@@ -556,6 +695,17 @@ nexus_operation_cancellation_state_from_proto :: proc(
 	return Nexus_Operation_Cancellation_State(numeric), true
 }
 
+nexus_operation_callback_state_from_proto :: proc(
+	value: proto.Temporal_Api_Enums_V1_CallbackState,
+) -> (Nexus_Operation_Callback_State, bool) {
+	numeric := i32(value)
+	if numeric < i32(Nexus_Operation_Callback_State.Unspecified) ||
+	   numeric > i32(Nexus_Operation_Callback_State.Blocked) {
+		return {}, false
+	}
+	return Nexus_Operation_Callback_State(numeric), true
+}
+
 nexus_operation_clone_failure_proto :: proc(
 	failure: ^proto.Temporal_Api_Failure_V1_Failure,
 	allocator: mem.Allocator,
@@ -564,6 +714,98 @@ nexus_operation_clone_failure_proto :: proc(
 	encoded := proto.encode_Temporal_Api_Failure_V1_Failure(failure)
 	defer delete(encoded)
 	return bytes.clone(encoded[:], allocator), true
+}
+
+decode_nexus_operation_completion_callback :: proc(
+	source: ^proto.Temporal_Api_Nexusoperation_V1_CallbackInfo,
+	allocator: mem.Allocator,
+) -> (callback: Nexus_Operation_Completion_Callback_Description, error: Error) {
+	if source == nil || source.trigger == nil || source.info == nil || source.info.callback == nil {
+		return {}, error_from_string(.Malformed_Response, "Nexus completion callback is incomplete")
+	}
+	callback.headers = make([dynamic]Nexus_Callback_Header, allocator)
+	callback.links = make([dynamic]Link, allocator)
+	succeeded := false
+	defer if !succeeded {
+		nexus_operation_completion_callback_description_free(&callback, allocator)
+	}
+	#partial switch trigger in source.trigger.variant {
+	case proto.Temporal_Api_Nexusoperation_V1_CallbackInfo_Trigger_Variant_Operation_Completed:
+		// OperationCompleted is an empty marker message. The generated decoder
+		// may represent its zero-sized pointer as nil; the selected union arm is
+		// the presence signal.
+		callback.operation_completed = true
+	case:
+		return {}, error_from_string(.Malformed_Response, "Nexus completion callback has an unknown trigger")
+	}
+	info := source.info
+	ok: bool
+	callback.state, ok = nexus_operation_callback_state_from_proto(info.state)
+	if !ok do return {}, error_from_string(.Malformed_Response, "Nexus completion callback has an unknown state")
+	callback.registration_time = description_time(info.registration_time)
+	callback.attempt = info.attempt
+	callback.last_attempt_complete_time = description_time(info.last_attempt_complete_time)
+	callback.next_attempt_schedule_time = description_time(info.next_attempt_schedule_time)
+	callback.last_failure_message, ok = description_failure_message(info.last_attempt_failure, allocator)
+	if ok {
+		callback.last_failure_proto, ok = nexus_operation_clone_failure_proto(info.last_attempt_failure, allocator)
+	}
+	if ok do callback.blocked_reason, ok = description_clone_string(info.blocked_reason, allocator)
+	if ok do callback.request_id, ok = description_clone_string(info.request_id, allocator)
+	if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Nexus completion callback state")
+
+	common := info.callback
+	for &source_link in common.links {
+		owned_link, link_error := link_from_proto(&source_link, allocator)
+		if link_error.message != nil {
+			return {}, link_error
+		}
+		append(&callback.links, owned_link)
+	}
+	#partial switch variant in common.variant {
+	case proto.Temporal_Api_Common_V1_Callback_Variant_Nexus:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Nexus callback value is missing")
+		}
+		callback.kind = .Nexus
+		callback.url, ok = description_clone_string(variant.value.url, allocator)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Nexus callback URL")
+		for source_header in variant.value.header {
+			header := Nexus_Callback_Header{}
+			header.key, ok = description_clone_string(source_header.key, allocator)
+			if ok do header.value, ok = description_clone_string(source_header.value, allocator)
+			if !ok {
+				delete(header.key, allocator)
+				delete(header.value, allocator)
+				return {}, error_from_string(.Malformed_Response, "could not allocate Nexus callback header")
+			}
+			append(&callback.headers, header)
+		}
+	case proto.Temporal_Api_Common_V1_Callback_Variant_Internal:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "internal callback value is missing")
+		}
+		callback.kind = .Internal
+		callback.internal_data = bytes.clone(variant.value.data, allocator)
+	case proto.Temporal_Api_Common_V1_Callback_Variant_Nexus_Handler:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Nexus handler callback value is missing")
+		}
+		callback.kind = .Nexus_Handler
+		callback.task_queue_name, ok = description_clone_string(variant.value.task_queue_name, allocator)
+		if ok do callback.service, ok = description_clone_string(variant.value.service, allocator)
+		if ok do callback.operation, ok = description_clone_string(variant.value.operation, allocator)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Nexus handler callback")
+		if variant.value.source_context != nil {
+			callback.source_context, ok = description_clone_payload(variant.value.source_context, allocator)
+			if !ok do return {}, error_from_string(.Payload_Conversion, "could not clone Nexus handler callback context")
+			callback.has_source_context = true
+		}
+	case:
+		return {}, error_from_string(.Malformed_Response, "Nexus completion callback has no callback variant")
+	}
+	succeeded = true
+	return callback, {}
 }
 
 decode_nexus_operation_description :: proc(
@@ -590,6 +832,11 @@ decode_nexus_operation_description :: proc(
 	description.allocator = allocator
 	description.headers = make([dynamic]Nexus_Operation_Header, allocator)
 	description.search_attributes = make([dynamic]Named_Payload, allocator)
+	description.links = make([dynamic]Link, allocator)
+	description.completion_callbacks = make(
+		[dynamic]Nexus_Operation_Completion_Callback_Description,
+		allocator,
+	)
 	failed := false
 	defer if failed {
 		nexus_operation_description_free(&description)
@@ -710,6 +957,23 @@ decode_nexus_operation_description :: proc(
 			failed = true
 			return {}, error_from_string(.Payload_Conversion, "could not decode Nexus operation user metadata")
 		}
+	}
+	for &source_link in info.links {
+		owned_link, link_decode_error := link_from_proto(&source_link, allocator)
+		if link_decode_error.message != nil {
+			error_free(&link_decode_error)
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not decode Nexus operation Link")
+		}
+		append(&description.links, owned_link)
+	}
+	for &source_callback in response.completion_callbacks {
+		callback, callback_error := decode_nexus_operation_completion_callback(&source_callback, allocator)
+		if callback_error.message != nil {
+			failed = true
+			return {}, callback_error
+		}
+		append(&description.completion_callbacks, callback)
 	}
 	if response.input != nil {
 		description.input, ok = description_clone_payload(response.input, allocator)

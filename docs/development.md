@@ -1127,6 +1127,14 @@ Odin Client Describe running state -> terminate -> Poll/Describe terminal state
 Odin Client list/count exact Visibility query -> delete -> Describe NOT_FOUND
 ```
 
+The lifecycle start registers the custom `OdinNexusTest` Keyword Search
+Attribute, stores static summary/details, and makes a second
+`Use_Existing` start that must return the original Run ID. The pinned request
+also sends Links, completion callbacks, and on-conflict attachment flags. CLI
+1.9.1/Server 1.32.0 currently returns zero Links/callbacks from Describe even
+when they were sent on the original Start; exact unit wire/ownership tests cover
+those experimental fields until a server release persists and returns them.
+
 The lifecycle path exercises the exact generic Core bridge RPC names
 `DescribeNexusOperationExecution`, `TerminateNexusOperationExecution`, and
 `DeleteNexusOperationExecution`, then `ListNexusOperationExecutions` and

@@ -34,23 +34,63 @@ main :: proc() {
 	if lifecycle_mode do operation_name = "wait-for-terminate"
 	operation_id := fmt.aprintf("odin-standalone-nexus-%d", time.now()._nsec)
 	defer delete(operation_id)
+	metadata := temporal_client.Start_Metadata{}
+	if lifecycle_mode {
+		metadata_error := temporal_client.start_metadata_init(&metadata)
+		if metadata_error.message != nil do fail("Nexus operation metadata initialization failed", &metadata_error)
+		summary_error := temporal_client.start_metadata_set_static_summary(&metadata, "Odin standalone lifecycle")
+		if summary_error.message != nil do fail("Nexus operation summary failed", &summary_error)
+		details_error := temporal_client.start_metadata_set_static_details(&metadata, "Live SDK integration proof")
+		if details_error.message != nil do fail("Nexus operation details failed", &details_error)
+		search_error := temporal_client.start_metadata_add_search_attribute_json(
+			&metadata,
+			"OdinNexusTest",
+			.Keyword,
+			operation_id,
+		)
+		if search_error.message != nil do fail("Nexus operation Search Attribute failed", &search_error)
+	}
+	defer temporal_client.start_metadata_free(&metadata)
+	initial_links := [?]temporal_client.Link{{
+		kind = .Workflow,
+		workflow = {
+			namespace = "default",
+			workflow_id = "odin-initial-link",
+			run_id = "00000000-0000-0000-0000-000000000001",
+			reason = "standalone Nexus integration",
+		},
+	}}
+	initial_callback_headers := [?]temporal_client.Nexus_Callback_Header{{
+		key = "x-odin-callback",
+		value = "initial",
+	}}
+	initial_callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+		url = "https://callbacks.invalid/odin-initial",
+		headers = initial_callback_headers[:],
+	}}
+	start_options := temporal_client.Start_Nexus_Operation_Options{
+		id = operation_id,
+		endpoint = endpoint,
+		service = "odin-greeting-service",
+		operation = operation_name,
+		schedule_to_close_timeout = time.Minute,
+		id_reuse_policy = .Reject_Duplicate,
+		id_conflict_policy = .Fail,
+		headers = []temporal_client.Nexus_Operation_Header{{
+			key = "x-odin-sdk",
+			value = "standalone-nexus",
+		}},
+	}
+	if lifecycle_mode {
+		start_options.metadata = &metadata
+		start_options.links = initial_links[:]
+		start_options.completion_callbacks = initial_callbacks[:]
+	}
 
 	handle, start_error := temporal_client.start_nexus_operation_json(
 		&client,
 		"Odin",
-		{
-			id = operation_id,
-			endpoint = endpoint,
-			service = "odin-greeting-service",
-			operation = operation_name,
-			schedule_to_close_timeout = time.Minute,
-			id_reuse_policy = .Reject_Duplicate,
-			id_conflict_policy = .Fail,
-			headers = []temporal_client.Nexus_Operation_Header{{
-				key = "x-odin-sdk",
-				value = "standalone-nexus",
-			}},
-		},
+		start_options,
 	)
 	if start_error.message != nil do fail("Nexus operation start failed", &start_error)
 	defer temporal_client.nexus_operation_handle_free(&handle)
@@ -69,6 +109,50 @@ main :: proc() {
 			fail("Nexus operation lifecycle start poll omitted its operation token")
 		}
 		temporal_client.nexus_operation_poll_result_free(&started)
+		conflict_links := [?]temporal_client.Link{{
+			kind = .Workflow,
+			workflow = {
+				namespace = "default",
+				workflow_id = "odin-conflict-link",
+				run_id = "00000000-0000-0000-0000-000000000002",
+				reason = "attached on conflict",
+			},
+		}}
+		callback_headers := [?]temporal_client.Nexus_Callback_Header{{
+			key = "x-odin-callback",
+			value = "attached-on-conflict",
+		}}
+		conflict_callbacks := [?]temporal_client.Nexus_Completion_Callback{{
+			url = "https://callbacks.invalid/odin-standalone",
+			headers = callback_headers[:],
+		}}
+		on_conflict := temporal_client.Nexus_Operation_On_Conflict_Options{
+			attach_request_id = true,
+			attach_completion_callbacks = true,
+			attach_links = true,
+		}
+		existing, existing_error := temporal_client.start_nexus_operation_json(
+			&client,
+			"Odin",
+			{
+				id = operation_id,
+				endpoint = endpoint,
+				service = "odin-greeting-service",
+				operation = operation_name,
+				schedule_to_close_timeout = time.Minute,
+				id_reuse_policy = .Reject_Duplicate,
+				id_conflict_policy = .Use_Existing,
+				on_conflict_options = &on_conflict,
+				links = conflict_links[:],
+				completion_callbacks = conflict_callbacks[:],
+			},
+		)
+		if existing_error.message != nil do fail("Nexus operation Use Existing failed", &existing_error)
+		if existing.started_by_request || existing.run_id != handle.run_id {
+			temporal_client.nexus_operation_handle_free(&existing)
+			fail("Nexus operation Use Existing returned an unexpected execution")
+		}
+		temporal_client.nexus_operation_handle_free(&existing)
 
 		description, describe_error := temporal_client.describe_nexus_operation(
 			&handle,
@@ -78,9 +162,35 @@ main :: proc() {
 		if description.status != .Running || !description.has_input ||
 		   description.identity != client.identity || len(description.headers) != 1 ||
 		   description.headers[0].value != "standalone-nexus" ||
+		   !description.has_static_summary || description.static_summary != "Odin standalone lifecycle" ||
+		   !description.has_static_details || description.static_details != "Live SDK integration proof" ||
+		   len(description.search_attributes) != 1 ||
 		   !bytes.equal(codec.payload_view(&description.input).data, transmute([]u8)string(`"Odin"`)) {
+			fmt.eprintf(
+				"Describe diagnostics: status=%v input=%v identity=%q headers=%d summary=%v/%q details=%v/%q search=%d links=%d callbacks=%d\n",
+				description.status,
+				description.has_input,
+				description.identity,
+				len(description.headers),
+				description.has_static_summary,
+				description.static_summary,
+				description.has_static_details,
+				description.static_details,
+				len(description.search_attributes),
+				len(description.links),
+				len(description.completion_callbacks),
+			)
 			temporal_client.nexus_operation_description_free(&description)
 			fail("Nexus operation Describe returned unexpected running state")
+		}
+		if len(description.links) > 0 && description.links[0].kind != .Workflow {
+			temporal_client.nexus_operation_description_free(&description)
+			fail("Nexus operation Describe returned an unexpected Link")
+		}
+		if len(description.completion_callbacks) > 0 &&
+		   description.completion_callbacks[0].kind != .Nexus {
+			temporal_client.nexus_operation_description_free(&description)
+			fail("Nexus operation Describe returned an unexpected completion callback")
 		}
 		temporal_client.nexus_operation_description_free(&description)
 

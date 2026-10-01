@@ -569,11 +569,14 @@ encoded terminal Failure, and the opaque long-poll token. The list API owns its
 limited execution summaries, typed status/times, Search Attribute Payloads,
 and pagination token. Count preserves both the approximate total and optional
 group values as codec-neutral Payloads. Both participate in the public Client
-outbound-interceptor chain. Starts carry all
-three operation timeouts, ID reuse/conflict policies, Nexus string headers, generic
-Links, and completion callbacks. Search Attributes, UI summary/details, and
-on-conflict attachment options remain to be added to Start. Describe does not
-yet surface response Links or completion-callback details.
+outbound-interceptor chain. Starts carry all three operation timeouts, ID
+reuse/conflict policies, Nexus string headers, typed Search Attributes, static
+summary/details, generic Links, completion callbacks, and the three upstream
+`Use_Existing` attachment flags. Describe owns and decodes all six common Link
+variants plus Nexus, Internal, and NexusHandler callbacks, including delivery
+state, attempt timing, headers, source context, Links, and encoded failure.
+The shared Link owner uses a dynamic string collection rather than a fixed
+four-string ceiling because callback component paths are unbounded.
 
 The server compatibility boundary was measured rather than inferred:
 
@@ -602,7 +605,18 @@ The third path starts an unfinished asynchronous operation, describes its
 owned `Running` state and input, terminates it, observes the typed
 `Terminated` outcome through both Poll and Describe, finds and counts it through
 an exact Visibility query, deletes it, and requires a subsequent Describe to
-return gRPC status 5/`NOT_FOUND`.
+return gRPC status 5/`NOT_FOUND`. It also round-trips a custom typed Search
+Attribute and static summary/details and proves that `Use_Existing` returns the
+same Run ID without dispatching another handler task.
+
+The pinned API schema includes operation Links, completion callbacks, and the
+three on-conflict attachment flags. Exact wire and allocator-ownership tests
+cover those fields and every Link/callback variant. The current CLI 1.9.1 dev
+Server 1.32.0 accepts the fields but returns zero operation Links and callbacks
+from Describe, including fields supplied on the original Start. Therefore the
+focused live test does not claim persistence of those still-experimental
+fields; a newer server must be rechecked before that capability is advertised
+as live-proven.
 
 The poll RPC may return a successful empty response when a server long poll
 expires. Odin treats that as a repoll signal, recomputes the remaining
@@ -2853,11 +2867,13 @@ a comparison point; it is not yet enough to freeze the public API.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core
-and live-proven. The next smallest vertical milestone is filling the remaining
-typed data gaps: Start should reuse the established Search Attribute/static UI
-metadata and on-conflict attachment builders, while Describe should expose
-response Links and completion-callback details. Activity Worker is not the next
-milestone: it is already implemented and extensively live-tested.
+and live-proven. Its typed Start/Describe data surface is also implemented; the
+Server 1.32 persistence limitation above remains explicit. The next smallest
+vertical milestone is adding outbound-interceptor hooks for standalone Nexus
+start, poll/result wait, Describe, cancel, terminate, and delete so tracing and
+policy layers see the complete Client surface rather than only list/count.
+Activity Worker is not the next milestone: it is already implemented and
+extensively live-tested.
 
 The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,

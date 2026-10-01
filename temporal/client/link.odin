@@ -80,8 +80,7 @@ Link :: struct {
 	workflow:        Workflow_Link,
 	callback:        Callback_Link,
 	owner_allocator: allocator_runtime.Allocator,
-	owned_strings:   [4]string,
-	owned_count:     int,
+	owned_strings:   [dynamic]string,
 }
 
 link_free :: proc(link: ^Link) {
@@ -89,11 +88,28 @@ link_free :: proc(link: ^Link) {
 		return
 	}
 	if link.owner_allocator.procedure != nil {
-		for index in 0..<link.owned_count {
-			delete(link.owned_strings[index], link.owner_allocator)
+		for value in link.owned_strings {
+			delete(value, link.owner_allocator)
 		}
+		delete(link.owned_strings)
+		delete(link.callback.component_path)
 	}
 	link^ = {}
+}
+
+link_clone_component :: proc(link: ^Link, value: string) -> (string, bool) {
+	if link == nil || link.owner_allocator.procedure == nil {
+		return "", false
+	}
+	if len(value) == 0 {
+		return "", true
+	}
+	owned, allocation_error := strings.clone(value, link.owner_allocator)
+	if allocation_error != nil {
+		return "", false
+	}
+	append(&link.owned_strings, owned)
+	return owned, true
 }
 
 link_decode_component :: proc(
@@ -101,8 +117,7 @@ link_decode_component :: proc(
 	value: string,
 	query: bool,
 ) -> (decoded: string, ok: bool) {
-	if link == nil || link.owner_allocator.procedure == nil ||
-	   link.owned_count >= len(link.owned_strings) {
+	if link == nil || link.owner_allocator.procedure == nil {
 		return "", false
 	}
 	builder := strings.builder_make(link.owner_allocator)
@@ -135,8 +150,7 @@ link_decode_component :: proc(
 	}
 	decoded = strings.to_string(builder)
 	ok = true
-	link.owned_strings[link.owned_count] = decoded
-	link.owned_count += 1
+	append(&link.owned_strings, decoded)
 	return decoded, true
 }
 
@@ -254,7 +268,10 @@ link_from_nexus :: proc(
 	if allocator.procedure == nil {
 		return {}, error_from_string(.Invalid_Argument, "Nexus Link allocator is invalid")
 	}
-	result := Link{owner_allocator = allocator}
+	result := Link{
+		owner_allocator = allocator,
+		owned_strings = make([dynamic]string, allocator),
+	}
 	succeeded := false
 	defer if !succeeded do link_free(&result)
 
@@ -384,6 +401,131 @@ link_from_nexus :: proc(
 		unreachable()
 	case .Callback:
 		unreachable()
+	}
+	succeeded = true
+	return result, {}
+}
+
+// link_from_proto clones every string and callback component path from a
+// decoded common.v1.Link. The result outlives the protobuf decode arena and
+// must be released with link_free.
+link_from_proto :: proc(
+	source: ^proto.Temporal_Api_Common_V1_Link,
+	allocator := context.allocator,
+) -> (result: Link, error: Error) {
+	if source == nil || allocator.procedure == nil {
+		return {}, error_from_string(.Invalid_Argument, "Temporal Link source and allocator are required")
+	}
+	result.owner_allocator = allocator
+	result.owned_strings = make([dynamic]string, allocator)
+	succeeded := false
+	defer if !succeeded do link_free(&result)
+
+	#partial switch variant in source.variant {
+	case proto.Temporal_Api_Common_V1_Link_Variant_Workflow_Event:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Workflow Event Link has no value")
+		}
+		value := variant.value
+		result.kind = .Workflow_Event
+		ok: bool
+		result.workflow_event.namespace, ok = link_clone_component(&result, value.namespace)
+		if ok do result.workflow_event.workflow_id, ok = link_clone_component(&result, value.workflow_id)
+		if ok do result.workflow_event.run_id, ok = link_clone_component(&result, value.run_id)
+		if !ok {
+			return {}, error_from_string(.Malformed_Response, "could not allocate Workflow Event Link")
+		}
+		#partial switch reference in value.reference {
+		case proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Event_Ref:
+			if reference.value == nil || i32(reference.value.event_type) < 0 ||
+			   i32(reference.value.event_type) >= len(WORKFLOW_EVENT_TYPE_PROTO_NAMES) {
+				return {}, error_from_string(.Malformed_Response, "Workflow Event Link has an invalid event reference")
+			}
+			result.workflow_event.reference_kind = .Event_Id
+			result.workflow_event.has_event_reference = true
+			result.workflow_event.event_id = reference.value.event_id
+			result.workflow_event.event_type = Workflow_Event_Type(reference.value.event_type)
+		case proto.Temporal_Api_Common_V1_Link_WorkflowEvent_Reference_Request_Id_Ref:
+			if reference.value == nil || i32(reference.value.event_type) < 0 ||
+			   i32(reference.value.event_type) >= len(WORKFLOW_EVENT_TYPE_PROTO_NAMES) {
+				return {}, error_from_string(.Malformed_Response, "Workflow Event Link has an invalid request reference")
+			}
+			result.workflow_event.reference_kind = .Request_Id
+			result.workflow_event.event_type = Workflow_Event_Type(reference.value.event_type)
+			result.workflow_event.request_id, ok = link_clone_component(&result, reference.value.request_id)
+			if !ok {
+				return {}, error_from_string(.Malformed_Response, "could not allocate Workflow Event request ID")
+			}
+		}
+	case proto.Temporal_Api_Common_V1_Link_Variant_Batch_Job:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Batch Job Link has no value")
+		}
+		result.kind = .Batch_Job
+		ok: bool
+		result.batch_job.job_id, ok = link_clone_component(&result, variant.value.job_id)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Batch Job Link")
+	case proto.Temporal_Api_Common_V1_Link_Variant_Activity:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Activity Link has no value")
+		}
+		result.kind = .Activity
+		ok: bool
+		result.activity.namespace, ok = link_clone_component(&result, variant.value.namespace)
+		if ok do result.activity.activity_id, ok = link_clone_component(&result, variant.value.activity_id)
+		if ok do result.activity.run_id, ok = link_clone_component(&result, variant.value.run_id)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Activity Link")
+	case proto.Temporal_Api_Common_V1_Link_Variant_Nexus_Operation:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Nexus Operation Link has no value")
+		}
+		result.kind = .Nexus_Operation
+		ok: bool
+		result.nexus_operation.namespace, ok = link_clone_component(&result, variant.value.namespace)
+		if ok do result.nexus_operation.operation_id, ok = link_clone_component(&result, variant.value.operation_id)
+		if ok do result.nexus_operation.run_id, ok = link_clone_component(&result, variant.value.run_id)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Nexus Operation Link")
+	case proto.Temporal_Api_Common_V1_Link_Variant_Workflow:
+		if variant.value == nil {
+			return {}, error_from_string(.Malformed_Response, "Workflow Link has no value")
+		}
+		result.kind = .Workflow
+		ok: bool
+		result.workflow.namespace, ok = link_clone_component(&result, variant.value.namespace)
+		if ok do result.workflow.workflow_id, ok = link_clone_component(&result, variant.value.workflow_id)
+		if ok do result.workflow.run_id, ok = link_clone_component(&result, variant.value.run_id)
+		if ok do result.workflow.reason, ok = link_clone_component(&result, variant.value.reason)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Workflow Link")
+	case proto.Temporal_Api_Common_V1_Link_Variant_Callback:
+		if variant.value == nil || variant.value.execution == nil {
+			return {}, error_from_string(.Malformed_Response, "Callback Link has no execution")
+		}
+		value := variant.value
+		execution_type := i32(value.execution.type)
+		if execution_type <= i32(Execution_Kind.Unspecified) ||
+		   execution_type > i32(Execution_Kind.Nexus_Operation) {
+			return {}, error_from_string(.Malformed_Response, "Callback Link has an unknown execution type")
+		}
+		result.kind = .Callback
+		result.callback.execution_kind = Execution_Kind(execution_type)
+		result.callback.component_path = make([]string, len(value.component_path), allocator)
+		ok: bool
+		result.callback.namespace, ok = link_clone_component(&result, value.namespace)
+		if ok do result.callback.business_id, ok = link_clone_component(&result, value.execution.business_id)
+		if ok do result.callback.run_id, ok = link_clone_component(&result, value.execution.run_id)
+		if ok do result.callback.request_id, ok = link_clone_component(&result, value.request_id)
+		if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Callback Link")
+		for component, index in value.component_path {
+			owned: string
+			owned, ok = link_clone_component(&result, component)
+			if !ok do return {}, error_from_string(.Malformed_Response, "could not allocate Callback Link path")
+			result.callback.component_path[index] = owned
+		}
+	case:
+		return {}, error_from_string(.Malformed_Response, "Temporal Link has no variant")
+	}
+	if message := link_error(result); len(message) > 0 {
+		return {}, error_from_string(.Malformed_Response, message)
 	}
 	succeeded = true
 	return result, {}

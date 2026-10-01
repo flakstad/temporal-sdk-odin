@@ -14,6 +14,10 @@ standalone Nexus operations through an owned Odin handle. Describe owns status,
 pending/cancellation state, timing, input/outcome, headers, Search Attributes,
 UI metadata, failures, and the opaque long-poll token. Paginated list and
 group-capable count APIs expose the standalone-operation Visibility surface.
+Start supports typed Search Attributes, static summary/details, generic Links,
+completion callbacks, and explicit `Use_Existing` attachment options. Describe
+owns all six Link variants and all three pinned callback variants with delivery
+state, attempts, timing, and Failure bytes.
 This pre-release server
 feature is live-proven against Temporal Server 1.32.0 with
 `nexusoperation.enableStandalone=true`; the

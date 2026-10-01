@@ -41,6 +41,17 @@ temporal operator nexus endpoint create \
   --command-timeout 10s \
   --output none
 
+if ! search_attribute_output="$(temporal operator search-attribute create \
+  --namespace default \
+  --name OdinNexusTest \
+  --type Keyword \
+  --command-timeout 15s 2>&1)"; then
+  if ! grep -qi 'already exists' <<<"$search_attribute_output"; then
+    echo "$search_attribute_output" >&2
+    exit 1
+  fi
+fi
+
 run_worker() {
   local mode="$1"
   : >"$worker_log"
