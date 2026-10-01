@@ -360,6 +360,19 @@ Child stderr contains the logger/metric hook emitted before the fatal signal,
 but its queued structured diagnostic frames cannot be delivered after the
 process dies. The live assertions intentionally distinguish those two paths.
 
+The adjacent Odin panic path uses the same containment contract:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=panic \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+The callback invokes Odin's real `panic`, so the runtime prints the source
+location and terminates through its trap instruction (`SIGTRAP` or `SIGILL`,
+depending on target). The parent retains the signal number and drives the same
+failed-completion, Core eviction, and fresh-generation replay sequence. No
+attempt is made to unwind an Odin panic through the C/minicoro trampoline.
+
 ### Ownership at the experimental callback
 
 - Core's poll result owns the activation bytes. `worker.run` borrows them to the
@@ -421,5 +434,5 @@ still required:
 
 The next discriminating vertical slice is cross-platform pipe/process
 validation and packaging of the executor binary on the four supported target
-triples. Production isolation still needs the same containment proof for Odin
-panics and other fatal native child exits.
+triples. Production isolation still needs policy and classification coverage
+for additional fatal native child exits and infinitely running Workflow code.

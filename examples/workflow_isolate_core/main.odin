@@ -253,6 +253,7 @@ run :: proc() -> int {
 	expected_protocol_failures := 0
 	expected_activation_failures := 1
 	expect_guard_signal := false
+	expect_panic_signal := false
 	activation_timeout := 5 * time.Second
 	switch first_mode {
 	case "crash":
@@ -294,6 +295,10 @@ run :: proc() -> int {
 		first_argument = "--child-stack-overflow"
 		expected_child_exits = 1
 		expect_guard_signal = true
+	case "panic":
+		first_argument = "--child-panic"
+		expected_child_exits = 1
+		expect_panic_signal = true
 	case:
 		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_FIRST_MODE: %s\n", first_mode)
 		return 1
@@ -485,6 +490,8 @@ run :: proc() -> int {
 	manager_stats := workflow_isolate.manager_stats(&executor_manager)
 	guard_signal_observed := manager_stats.last_child_exit_code == int(posix.SIGSEGV) ||
 		manager_stats.last_child_exit_code == int(posix.SIGBUS)
+	panic_signal_observed := manager_stats.last_child_exit_code == int(posix.SIGILL) ||
+		manager_stats.last_child_exit_code == int(posix.SIGTRAP)
 	expected_generations := 5
 	if cache_mode == "sticky" {
 		expected_generations = 3
@@ -512,6 +519,7 @@ run :: proc() -> int {
 	   manager_stats.capacity_rejections != 0 ||
 	   manager_stats.protocol_failures != expected_protocol_failures ||
 	   (expect_guard_signal && !guard_signal_observed) ||
+	   (expect_panic_signal && !panic_signal_observed) ||
 	   observations.timer_commands_with_sequence != expected_timer_sequences ||
 	   observations.timer_commands_without_sequence != 0 ||
 	   observations.diagnostic_logs != 2 || observations.diagnostic_metrics != 2 ||
@@ -519,7 +527,7 @@ run :: proc() -> int {
 	   manager_stats.diagnostics_received != 4 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d last_child_exit_code=%d expect_guard_signal=%v timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d last_child_exit_code=%d expect_guard_signal=%v expect_panic_signal=%v timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
@@ -529,6 +537,7 @@ run :: proc() -> int {
 			manager_stats.child_exits,
 			manager_stats.last_child_exit_code,
 			expect_guard_signal,
+			expect_panic_signal,
 			manager_stats.activation_timeouts,
 			manager_stats.generations_started,
 			expected_generations,

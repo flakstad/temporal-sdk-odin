@@ -26,6 +26,7 @@ Child_Fault_Mode :: enum {
 	Metadata_Mismatch,
 	Nondeterministic,
 	Stack_Overflow,
+	Panic,
 }
 
 executor_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
@@ -115,6 +116,8 @@ run_child :: proc(
 		registry_revision = .Incompatible_Nondeterminism
 	} else if fault_mode == .Stack_Overflow {
 		registry_revision = .Stack_Overflow
+	} else if fault_mode == .Panic {
+		registry_revision = .Panic
 	}
 	registration_error := workflow_app.register_revision(&registry, registry_revision)
 	if registration_error.message != nil {
@@ -144,7 +147,7 @@ run_child :: proc(
 	}
 	defer workflow_isolate.executor_host_close(&host)
 	if fault_mode != .None && fault_mode != .Nondeterministic &&
-	   fault_mode != .Stack_Overflow {
+	   fault_mode != .Stack_Overflow && fault_mode != .Panic {
 		manifest_request, read_error := workflow_isolate.read(os.stdin)
 		if read_error.kind != .None ||
 		   manifest_request.frame.kind != .Manifest_Request {
@@ -554,6 +557,10 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child-stack-overflow" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""
 		os.exit(run_child(.Stack_Overflow, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-panic" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Panic, task_queue))
 	}
 	os.exit(run_parent())
 }

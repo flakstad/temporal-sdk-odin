@@ -3134,9 +3134,10 @@ Workflows are enabled.
    deadlines, and replay. Client Update result waits are now bounded and locally
    cancellable without implying durable Update cancellation. A real guard-page
    overflow is now contained by the per-run executor, followed by Core eviction
-   and fresh-process replay. It does not yet prove Odin-panic containment,
+   and fresh-process replay. A real Odin panic is contained by the same process
+   boundary without unwinding through C/minicoro. It does not yet prove
    replay-history JSON import, richer nondeterminism diagnostics, growable
-   stacks, or a production deterministic scheduler.
+   stacks, infinite-loop containment, or a production deterministic scheduler.
 5. **Cross-platform artifacts.** macOS arm64 and a clean Ubuntu 24.04 arm64
    container are locally executed through unit/property tests, all example
    builds, packaging, and packaged-runtime smoke. The repository defines the

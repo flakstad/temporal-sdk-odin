@@ -534,6 +534,9 @@ The same manager now survives a real guarded Workflow-stack overflow: it
 preserves the child's `SIGSEGV`/`SIGBUS` exit code, fails one Workflow Task,
 waits for Core eviction, and completes both executions through fresh-process
 replay.
+It likewise contains a real Odin Workflow panic (`SIGTRAP`/`SIGILL`) without
+attempting to unwind through C, then recovers through the same Core-owned
+history path.
 It still lacks production pool hardening.
 Replay-aware child logging, per-runtime metric-emitter creation, and
 inbound/outbound interceptor configuration are now explicit host options; the

@@ -868,6 +868,19 @@ preserve that exit code, and Core eviction/replay must complete both executions
 in replacement children. This complements `scripts/fiber-guard-test.sh`, which
 proves the guard mapping and signal in a smaller native fork test.
 
+Exercise an actual Odin Workflow panic with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=panic \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+The child must print the intentional panic and terminate with `SIGTRAP` or
+`SIGILL`; Core eviction/replay must then produce both ordinary Workflow
+results. This deliberately tests process recovery rather than installing a
+custom assertion handler or unwinding through the native fiber trampoline.
+
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
 `register_external_workflow_registry` copies only the Workflow type-name

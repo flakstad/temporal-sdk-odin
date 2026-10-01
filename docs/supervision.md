@@ -72,6 +72,14 @@ the Workflow by replaying committed history on a fresh fiber. In-memory globals,
 fiber stacks, allocator contents, and work performed after the last successful
 Workflow Activation Completion are not durable.
 
+The experimental per-run manager in `temporal/workflow/isolate` narrows this
+failure domain for Workflows. Live tests now force both an Odin panic and a
+guard-page stack overflow inside one executor child, preserve the terminating
+signal, fail one Workflow Task, and recover through Core eviction/replay while
+the parent Worker stays alive. The whole-Worker supervisor remains necessary
+for in-process Workflows, Activities, Nexus callbacks, parent-process faults,
+and infinite executor children that exceed the manager's configured deadline.
+
 This recovery model is why Workflow code must be deterministic and must not
 perform direct filesystem, network, database, wall-clock, or random side
 effects. Put those effects in Activities. An Activity may be delivered again

@@ -65,7 +65,7 @@ output="$(
 echo "$output"
 workflow_log_count="$(grep -c 'isolated-executor workflow_log message="workflow_started"' <<<"$output" || true)"
 expected_hook_count=2
-if [[ "$first_mode" == "stack-overflow" ]]; then
+if [[ "$first_mode" == "stack-overflow" || "$first_mode" == "panic" ]]; then
   expected_hook_count=3
 fi
 if [[ "$workflow_log_count" != "$expected_hook_count" ]]; then
@@ -112,11 +112,15 @@ grep -q 'missing_timer_sequences=0' <<<"$output"
 grep -q 'diagnostic_logs=2' <<<"$output"
 grep -q 'diagnostic_metrics=2' <<<"$output"
 grep -q 'diagnostics_received=4' <<<"$output"
-if [[ "$first_mode" == "crash" || "$first_mode" == "stack-overflow" ]]; then
+if [[ "$first_mode" == "crash" || "$first_mode" == "stack-overflow" ||
+      "$first_mode" == "panic" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"
   if [[ "$first_mode" == "stack-overflow" ]]; then
     grep -q 'isolated-executor forcing guarded Workflow stack overflow' <<<"$output"
+  elif [[ "$first_mode" == "panic" ]]; then
+    grep -q 'isolated-executor forcing Odin Workflow panic' <<<"$output"
+    grep -q 'intentional isolated Workflow panic containment probe' <<<"$output"
   fi
 elif [[ "$first_mode" == "hang" || "$first_mode" == "late" ]]; then
   grep -q 'child_exits=0' <<<"$output"

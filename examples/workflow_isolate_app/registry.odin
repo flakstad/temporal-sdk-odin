@@ -18,6 +18,7 @@ Registry_Revision :: enum {
 	Ordinary,
 	Incompatible_Nondeterminism,
 	Stack_Overflow,
+	Panic,
 }
 
 stack_overflow_enabled := true
@@ -37,6 +38,11 @@ consume_workflow_stack :: #force_no_inline proc(depth: u64) -> u64 {
 force_workflow_stack_overflow :: proc() {
 	fmt.eprintln("isolated-executor forcing guarded Workflow stack overflow")
 	_ = consume_workflow_stack(1)
+}
+
+force_workflow_panic :: proc() -> ! {
+	fmt.eprintln("isolated-executor forcing Odin Workflow panic")
+	panic("intentional isolated Workflow panic containment probe")
 }
 
 greeting_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
@@ -83,6 +89,20 @@ stack_overflow_json_workflow :: proc(
 	return {}
 }
 
+panic_string_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	force_workflow_panic()
+}
+
+panic_json_workflow :: proc(
+	_: ^workflow.Fiber_Context,
+	_: string,
+) -> Farewell_Result {
+	force_workflow_panic()
+}
+
 register :: proc(registry: ^workflow.Registry) -> workflow.Error {
 	return register_revision(registry, .Ordinary)
 }
@@ -98,6 +118,9 @@ register_revision :: proc(
 	if revision == .Stack_Overflow {
 		greeting_callback = stack_overflow_string_workflow
 		farewell_callback = stack_overflow_json_workflow
+	} else if revision == .Panic {
+		greeting_callback = panic_string_workflow
+		farewell_callback = panic_json_workflow
 	}
 	greeting_error := workflow.registry_register_workflow(
 		registry,
@@ -127,6 +150,13 @@ register_revision :: proc(
 			registry,
 			NONDETERMINISM_WORKFLOW_TYPE,
 			stack_overflow_string_workflow,
+		)
+	}
+	if revision == .Panic {
+		return workflow.registry_register_workflow(
+			registry,
+			NONDETERMINISM_WORKFLOW_TYPE,
+			panic_string_workflow,
 		)
 	}
 	return workflow.registry_register_workflow(
