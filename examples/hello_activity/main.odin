@@ -26,6 +26,8 @@ shutdown_activity_observed: bool
 shutdown_activity_reason: activity.Cancel_Reason
 shutdown_activity_details: activity.Cancellation_Details
 shutdown_activity_details_present: bool
+uncooperative_callback_observed: bool
+uncooperative_callback_info: worker.Callback_Drain_Info
 async_task_token: []u8
 async_workflow_id: string
 async_workflow_run_id: string
@@ -111,6 +113,12 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 		shutdown_activity_observed = true
 		return "Worker shutdown acknowledged"
 	}
+	if name == "uncooperative-drain" {
+		// Deliberately ignore cancellation long enough for the bounded-run drain
+		// watchdog to report the callback. It still returns so this example can
+		// prove that observation does not unsafely terminate the executor thread.
+		time.sleep(250 * time.Millisecond)
+	}
 	if strings.has_prefix(name, "load-") {
 		sync.mutex_lock(&load_stats_mutex)
 		load_activities_active += 1
@@ -163,6 +171,24 @@ hello :: proc(ctx: ^activity.Context, name: string) -> string {
 		return ""
 	}
 	return greeting
+}
+
+uncooperative_callback_observer :: proc(
+	_: rawptr,
+	info: ^worker.Callback_Drain_Info,
+) {
+	if info == nil {
+		return
+	}
+	uncooperative_callback_info = info^
+	sync.atomic_store_explicit(&uncooperative_callback_observed, true, .Release)
+	fmt.printf(
+		"uncooperative callback observed kind=%v reason=%v outstanding=%d after=%v\n",
+		info.kind,
+		info.reason,
+		info.outstanding,
+		info.warning_after,
+	)
 }
 
 Shutdown_Request_State :: struct {
@@ -321,6 +347,8 @@ main :: proc() {
 	shutdown_case := shutdown_value != ""
 	resource_tuner_value := os.get_env(env_buffer[:], "ACTIVITY_RESOURCE_TUNER")
 	resource_tuner_case := resource_tuner_value != ""
+	uncooperative_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_UNCOOPERATIVE")
+	uncooperative_case := uncooperative_value != ""
 	activity_slots := load_case ? 3 : 10
 	graceful_shutdown_period := shutdown_case ? 200 * time.Millisecond : temporal_core.DEFAULT_GRACEFUL_SHUTDOWN_PERIOD
 	task_queue_buffer: [128]u8
@@ -425,10 +453,14 @@ main :: proc() {
 		}
 	}
 	run_started := time.tick_now()
-	run_stats, run_error := worker.run(
-		&activity_worker,
-		{max_activity_tasks = max_tasks},
-	)
+	run_options := worker.Run_Options{max_activity_tasks = max_tasks}
+	if uncooperative_case || shutdown_case {
+		run_options.uncooperative_callbacks = {
+			warning_after = 50 * time.Millisecond,
+			observer = uncooperative_callback_observer,
+		}
+	}
+	run_stats, run_error := worker.run(&activity_worker, run_options)
 	if shutdown_thread != nil {
 		thread.join(shutdown_thread)
 		thread.destroy(shutdown_thread)
@@ -445,7 +477,23 @@ main :: proc() {
 		worker.error_free(&close_error)
 		os.exit(1)
 	}
-	if async_case {
+	if uncooperative_case {
+		observed := sync.atomic_load_explicit(&uncooperative_callback_observed, .Acquire)
+		info := uncooperative_callback_info
+		if !observed || info.kind != .Activity || info.reason != .Bounded_Run ||
+		   info.outstanding != 1 || info.warning_after != 50 * time.Millisecond {
+			fmt.eprintf(
+				"uncooperative callback invariant failed: observed=%v kind=%v reason=%v outstanding=%d after=%v\n",
+				observed,
+				info.kind,
+				info.reason,
+				info.outstanding,
+				info.warning_after,
+			)
+			os.exit(1)
+		}
+		fmt.println("uncooperative Activity drain was observed without unsafe thread termination")
+	} else if async_case {
 		defer async_identity_free()
 		if len(async_task_token) == 0 || len(async_workflow_id) == 0 ||
 		   len(async_workflow_run_id) == 0 || len(async_activity_id) == 0 {
@@ -557,6 +605,11 @@ main :: proc() {
 	if shutdown_case {
 		shutdown_elapsed := time.tick_since(shutdown_state.requested_at)
 		details := shutdown_activity_details
+		callback_observed := sync.atomic_load_explicit(
+			&uncooperative_callback_observed,
+			.Acquire,
+		)
+		callback_info := uncooperative_callback_info
 		if !shutdown_state.activity_started || !shutdown_activity_observed ||
 		   shutdown_activity_reason != .Worker_Shutdown ||
 		   !shutdown_activity_details_present || !details.is_worker_shutdown ||
@@ -565,9 +618,11 @@ main :: proc() {
 		   shutdown_elapsed < 150 * time.Millisecond ||
 		   shutdown_elapsed > 5 * time.Second ||
 		   run_stats.activity_tasks_completed != 1 ||
-		   run_stats.activity_cancellations_received != 1 {
+		   run_stats.activity_cancellations_received != 1 ||
+		   !callback_observed || callback_info.kind != .Activity ||
+		   callback_info.reason != .Worker_Shutdown || callback_info.outstanding != 1 {
 			fmt.eprintf(
-				"Activity shutdown invariant failed: started=%v observed=%v reason=%v details=%v elapsed=%v completed=%d cancellations=%d\n",
+				"Activity shutdown invariant failed: started=%v observed=%v reason=%v details=%v elapsed=%v completed=%d cancellations=%d callback_observed=%v callback_info=%v\n",
 				shutdown_state.activity_started,
 				shutdown_activity_observed,
 				shutdown_activity_reason,
@@ -575,11 +630,13 @@ main :: proc() {
 				shutdown_elapsed,
 				run_stats.activity_tasks_completed,
 				run_stats.activity_cancellations_received,
+				callback_observed,
+				callback_info,
 			)
 			os.exit(1)
 		}
 		fmt.printf(
-			"Activity observed Worker_Shutdown after grace period and drained cleanly elapsed=%v\n",
+			"Activity observed Worker_Shutdown after grace period, emitted the callback-drain warning, and drained cleanly elapsed=%v\n",
 			shutdown_elapsed,
 		)
 	} else if load_case {
@@ -634,6 +691,8 @@ main :: proc() {
 		fmt.printf("Activity deferred completion and Odin Client applied mode=%s\n", async_mode)
 	} else if resource_tuner_case {
 		fmt.println("resource-based Activity tuner completed one task and shut down cleanly")
+	} else if uncooperative_case {
+		fmt.println("uncooperative callback policy completed its live bounded-drain path")
 	} else {
 		fmt.println("one Activity Task completed and worker shut down cleanly")
 	}

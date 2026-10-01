@@ -460,6 +460,32 @@ mixed Workflow/Activity process is not protected by this pattern, and the SDK
 does not yet manage a subprocess executor itself. Canceling a Client wait does not cancel an
 already accepted durable Update; the current Temporal Service exposes no such
 operation.
+
+Activity and Nexus executor shutdown now has an explicit uncooperative-callback
+policy. The zero value keeps the safe default—wait without a watchdog. A Worker
+can instead request one notification after a deadline:
+
+```odin
+stats, err := worker.run(&w, {
+    uncooperative_callbacks = {
+        warning_after = 5 * time.Second,
+        observer = callback_drain_observer,
+        user_data = supervisor_state,
+    },
+})
+```
+
+The observer receives Activity/Nexus kind, shutdown/bounded/error reason, the
+active callback count, and configured duration on a dedicated thread. It must
+return promptly; it may log or terminate the whole process under a supervisor,
+but must not close or free the still-running Worker. The SDK deliberately never uses Odin's unsafe
+thread-termination primitive. `scripts/uncooperative-callback-integration-test.sh`
+proves bounded drain, while the normal shutdown scenario proves notification
+starts at `request_shutdown`, precedes Core's grace-period cancellation, and
+still permits clean completion. An infinite Workflow callback remains a process
+supervision concern because it occupies the deterministic Workflow executor
+before a shutdown activation can be processed.
+
 Synchronous Nexus operation handling and Workflow-side calling are now a
 live-proven vertical slice. The
 raw/Core packages bind the pinned bridge's separate Nexus poll and completion

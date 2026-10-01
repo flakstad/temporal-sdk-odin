@@ -883,6 +883,10 @@ run_activity_case() {
     ACTIVITY_RESOURCE_TUNER=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  elif [[ "$mode" == "uncooperative" ]]; then
+    ACTIVITY_EXPECT_UNCOOPERATIVE=1 \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   else
     TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
@@ -921,6 +925,10 @@ run_activity_case() {
     ACTIVITY_ASYNC_MODE="${mode#async-}" \
       ACTIVITY_WORKFLOW_ID="$activity_workflow_id" \
       cargo run --quiet \
+      --manifest-path "$repo_root/native/Cargo.toml" \
+      --package activity-test-driver
+  elif [[ "$mode" == "uncooperative" ]]; then
+    ACTIVITY_INPUT=uncooperative-drain cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   else
@@ -975,6 +983,10 @@ run_activity_case() {
     fi
   elif [[ "$mode" == "resource-tuner" ]]; then
     grep -q "resource-based Activity tuner completed one task and shut down cleanly" "$worker_log"
+  elif [[ "$mode" == "uncooperative" ]]; then
+    grep -q "uncooperative callback observed kind=Activity reason=Bounded_Run outstanding=1" "$worker_log"
+    grep -q "uncooperative Activity drain was observed without unsafe thread termination" "$worker_log"
+    grep -q "uncooperative callback policy completed its live bounded-drain path" "$worker_log"
   else
     grep -q "one Activity Task completed and worker shut down cleanly" "$worker_log"
   fi
@@ -992,6 +1004,9 @@ run_activity_case async-id-cancel
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/activity-panic-integration-test.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/uncooperative-callback-integration-test.sh"
 
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
@@ -1083,7 +1098,8 @@ ACTIVITY_SHUTDOWN=1 cargo run --quiet \
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
-grep -q "Activity observed Worker_Shutdown after grace period and drained cleanly" "$worker_log"
+grep -q "uncooperative callback observed kind=Activity reason=Worker_Shutdown outstanding=1" "$worker_log"
+grep -q "Activity observed Worker_Shutdown after grace period, emitted the callback-drain warning, and drained cleanly" "$worker_log"
 
 TEMPORAL_ODIN_SCENARIO=typed-payload \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

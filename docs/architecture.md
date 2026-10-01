@@ -2805,7 +2805,14 @@ keeps an Activity heartbeating, initiates shutdown from a coordinating Odin
 thread, receives the exact `Worker_Shutdown` primary reason and sole detail
 flag after 200 ms, returns cooperatively, and verifies Core flushes its terminal
 completion before finalization. An uncooperative callback can therefore still
-hold shutdown open, which is intentional and must remain explicit in the API.
+hold shutdown open. `Run_Options.uncooperative_callbacks` makes that boundary
+observable without claiming unsafe recovery: `request_shutdown` starts a
+watchdog immediately, active Activity/Nexus callbacks are counted atomically,
+and one observer call per still-active kind fires after the configured duration.
+Bounded/error drains use the same observer around thread-pool finish. The zero
+value waits silently. No executor thread is killed, and observer code must not
+free the Worker; a deployment may use the notification to terminate the whole
+process under a supervisor.
 
 ### Worker configuration boundary
 
@@ -2989,8 +2996,9 @@ Workflows are enabled.
    shutdown case also validates the configurable grace delay, concurrent
    heartbeats, exact Core cancellation flags, completion flush, and clean
    finalization. Activity-only process crash/replacement is live-proven; the
-   remaining concurrency risks are mixed-process panic containment and
-   uncooperative callbacks.
+   remaining concurrency risks are mixed-process panic containment, infinite
+   Workflow code, and process-level recovery after an uncooperative callback
+   notification.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -3128,8 +3136,11 @@ chain/run targeting and safety semantics. Activity-only process
 crash/replacement is now live-proven with a real panic, Start-To-Close timeout,
 retry, and replacement Odin worker. Fixed Workflow stacks now have a
 live-tested native guard page on macOS/Linux; they do not grow, and overflow is
-a process fault. The next higher-value hardening slice is an explicit
-uncooperative-callback shutdown policy. The capability inventory is now a
+a process fault. Activity/Nexus shutdown now has a live-proven watchdog policy
+that observes, but never unsafely terminates, callbacks beyond a configured
+deadline. The next higher-value hardening slice is full standalone Activity
+client lifecycle support against a compatible Server, while infinite Workflow
+code and SDK-managed subprocess execution remain process-boundary work. The capability inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3281,9 +3292,13 @@ current Temporal protocol does not expose that as a language-token operation.
 
 Activity panic containment is defined as an Activity-only supervised process
 and its crash/replacement retry path is live-proven. An SDK-managed subprocess
-executor and uncooperative-callback containment remain future work unless Odin
-gains supported recovery. A statechart oracle can later expand the now-live
-graceful-shutdown path to retry/failure races.
+executor remains future work unless Odin gains supported recovery. Activity and
+Nexus callback drains now have deadline observation without forced thread
+termination; truly stuck callbacks still require the supervisor to replace the
+process. Infinite Workflow code cannot reach the activation boundary needed for
+cooperative shutdown and has the same process-level limitation. A statechart
+oracle can later expand the now-live graceful-shutdown path to retry/failure
+races.
 
 In parallel, add CI compile/smoke jobs
 for macOS x86_64 and Linux x86_64/arm64 before treating minicoro as a committed

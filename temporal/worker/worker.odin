@@ -7,6 +7,7 @@ import "core:bytes"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+import "core:sync"
 import "core:thread"
 import "core:time"
 import activity "../activity"
@@ -276,6 +277,42 @@ Rejected_Workflow_Run :: struct {
 Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
 Worker_Ready_Proc :: #type proc(user_data: rawptr) -> bool
 
+Callback_Drain_Kind :: enum {
+	Activity,
+	Nexus,
+}
+
+Callback_Drain_Reason :: enum {
+	Worker_Shutdown,
+	Bounded_Run,
+	Worker_Error,
+}
+
+Callback_Drain_Info :: struct {
+	kind:           Callback_Drain_Kind,
+	reason:         Callback_Drain_Reason,
+	outstanding:    int,
+	warning_after: time.Duration,
+}
+
+Callback_Drain_Observer :: #type proc(
+	user_data: rawptr,
+	// info is borrowed only for this callback invocation.
+	info: ^Callback_Drain_Info,
+)
+
+// Uncooperative_Callback_Policy observes an Activity/Nexus executor drain that
+// exceeds warning_after. The observer runs once on a dedicated watchdog thread.
+// It may log or terminate the process, but must return promptly and must not
+// close/free the Worker. Odin callbacks cannot be preempted safely, so the
+// default zero value waits without a watchdog and forced per-thread termination
+// is deliberately unsupported.
+Uncooperative_Callback_Policy :: struct {
+	warning_after: time.Duration,
+	observer:      Callback_Drain_Observer,
+	user_data:     rawptr,
+}
+
 Run_Options :: struct {
 	// Zero means no bound. These limits exist for tests and examples; production
 	// workers normally run until request_shutdown is called.
@@ -292,6 +329,7 @@ Run_Options :: struct {
 	// before polling. This permits same-Connection eager Workflow starts.
 	on_ready:                Worker_Ready_Proc,
 	on_ready_data:           rawptr,
+	uncooperative_callbacks: Uncooperative_Callback_Policy,
 }
 
 Run_Stats :: struct {
@@ -434,6 +472,12 @@ Worker :: struct {
 	workflow_logger:        workflow.Logger,
 	mode:                   Worker_Mode,
 	replay_runtime:         ^temporal_core.Runtime,
+	uncooperative_callback_policy: Uncooperative_Callback_Policy,
+	activity_callbacks_active: int,
+	nexus_callbacks_active: int,
+	shutdown_watch_mutex: sync.Mutex,
+	shutdown_watch_done: sync.Sema,
+	shutdown_watch_thread: ^thread.Thread,
 }
 
 Replay_Failure_Kind :: enum {
@@ -2023,7 +2067,7 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	arena_error := virtual.arena_init_growing(&arena)
 	if arena_error != nil {
 		execution.error = error_from_string("could not initialize activity allocation arena")
-		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		worker_initiate_shutdown(execution.worker)
 		return
 	}
 	defer virtual.arena_destroy(&arena)
@@ -2034,7 +2078,9 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 		inputs = execution.input_views,
 	}
 	chain_state := Activity_Execute_Chain_State{execution = execution}
+	sync.atomic_add_explicit(&execution.worker.activity_callbacks_active, 1, .Acq_Rel)
 	result := activity_execute_chain_invoke(&chain_state, &input)
+	sync.atomic_sub_explicit(&execution.worker.activity_callbacks_active, 1, .Acq_Rel)
 	context.allocator = previous_allocator
 	defer codec.payload_free(&result.payload)
 	defer activity.application_failure_free(&result.failure)
@@ -2096,7 +2142,7 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
 	if core_error.message != nil {
 		execution.error = error_from_core(&core_error)
-		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		worker_initiate_shutdown(execution.worker)
 	}
 }
 
@@ -2355,6 +2401,154 @@ process_workflow_activation :: proc(
 	return
 }
 
+Callback_Drain_Watch :: struct {
+	done:     sync.Sema,
+	policy:   Uncooperative_Callback_Policy,
+	info:     Callback_Drain_Info,
+}
+
+uncooperative_callback_policy_validate :: proc(
+	policy: Uncooperative_Callback_Policy,
+) -> Error {
+	if policy.warning_after < 0 {
+		return error_from_string("uncooperative callback warning duration must not be negative")
+	}
+	if (policy.warning_after > 0) != (policy.observer != nil) {
+		return error_from_string(
+			"uncooperative callback warning duration and observer must be configured together",
+		)
+	}
+	return {}
+}
+
+callback_drain_watch_main :: proc(state: ^Callback_Drain_Watch) {
+	if state == nil || state.policy.observer == nil || state.policy.warning_after <= 0 {
+		return
+	}
+	finished := sync.sema_wait_with_timeout(&state.done, state.policy.warning_after)
+	if !finished {
+		state.policy.observer(state.policy.user_data, &state.info)
+	}
+}
+
+// callback_pool_finish preserves the safe wait-for-callback ownership rule.
+// When configured it observes, but never forcibly terminates, an executor
+// drain that exceeds the policy duration. The returned flag says whether a
+// watchdog was required for this drain.
+callback_pool_finish :: proc(
+	pool: ^thread.Pool,
+	policy: Uncooperative_Callback_Policy,
+	kind: Callback_Drain_Kind,
+	reason: Callback_Drain_Reason,
+) -> (watch_started: bool) {
+	if pool == nil {
+		return false
+	}
+	outstanding := thread.pool_num_outstanding(pool)
+	watch := Callback_Drain_Watch{
+		policy = policy,
+		info = {
+			kind = kind,
+			reason = reason,
+			outstanding = outstanding,
+			warning_after = policy.warning_after,
+		},
+	}
+	watch_thread: ^thread.Thread
+	if reason != .Worker_Shutdown && outstanding > 0 && policy.warning_after > 0 &&
+	   policy.observer != nil {
+		watch_thread = thread.create_and_start_with_poly_data(&watch, callback_drain_watch_main)
+		watch_started = watch_thread != nil
+	}
+	thread.pool_finish(pool)
+	if watch_thread != nil {
+		sync.sema_post(&watch.done)
+		thread.join(watch_thread)
+		thread.destroy(watch_thread)
+	}
+	return
+}
+
+worker_shutdown_watch_main :: proc(worker: ^Worker) {
+	if worker == nil {
+		return
+	}
+	policy := worker.uncooperative_callback_policy
+	if policy.observer == nil || policy.warning_after <= 0 {
+		return
+	}
+	finished := sync.sema_wait_with_timeout(&worker.shutdown_watch_done, policy.warning_after)
+	if finished {
+		return
+	}
+	activity_count := sync.atomic_load_explicit(&worker.activity_callbacks_active, .Acquire)
+	if activity_count > 0 {
+		info := Callback_Drain_Info{
+			kind = .Activity,
+			reason = .Worker_Shutdown,
+			outstanding = activity_count,
+			warning_after = policy.warning_after,
+		}
+		policy.observer(policy.user_data, &info)
+	}
+	nexus_count := sync.atomic_load_explicit(&worker.nexus_callbacks_active, .Acquire)
+	if nexus_count > 0 {
+		info := Callback_Drain_Info{
+			kind = .Nexus,
+			reason = .Worker_Shutdown,
+			outstanding = nexus_count,
+			warning_after = policy.warning_after,
+		}
+		policy.observer(policy.user_data, &info)
+	}
+}
+
+worker_shutdown_watch_start :: proc(worker: ^Worker) {
+	if worker == nil || worker.uncooperative_callback_policy.observer == nil ||
+	   worker.uncooperative_callback_policy.warning_after <= 0 {
+		return
+	}
+	sync.mutex_lock(&worker.shutdown_watch_mutex)
+	defer sync.mutex_unlock(&worker.shutdown_watch_mutex)
+	if worker.shutdown_watch_thread != nil {
+		return
+	}
+	worker.shutdown_watch_thread = thread.create_and_start_with_poly_data(
+		worker,
+		worker_shutdown_watch_main,
+	)
+}
+
+worker_shutdown_watch_stop :: proc(worker: ^Worker) {
+	if worker == nil {
+		return
+	}
+	sync.mutex_lock(&worker.shutdown_watch_mutex)
+	watch_thread := worker.shutdown_watch_thread
+	if watch_thread != nil {
+		sync.sema_post(&worker.shutdown_watch_done)
+	}
+	sync.mutex_unlock(&worker.shutdown_watch_mutex)
+	if watch_thread == nil {
+		return
+	}
+	thread.join(watch_thread)
+	thread.destroy(watch_thread)
+	sync.mutex_lock(&worker.shutdown_watch_mutex)
+	if worker.shutdown_watch_thread == watch_thread {
+		worker.shutdown_watch_thread = nil
+	}
+	sync.mutex_unlock(&worker.shutdown_watch_mutex)
+}
+
+worker_initiate_shutdown :: proc(worker: ^Worker) {
+	if worker == nil {
+		return
+	}
+	worker_shutdown_watch_start(worker)
+	temporal_core.worker_initiate_shutdown(&worker.core)
+}
+
 reap_activity_executions :: proc(
 	routes: ^Activity_Execution_Routes,
 	pool: ^thread.Pool,
@@ -2389,6 +2583,7 @@ run_activity_loop :: proc(
 	worker: ^Worker,
 	max_tasks: int,
 	executor_threads: int,
+	callback_policy: Uncooperative_Callback_Policy,
 ) -> (completed: int, cancellations: int, peak_in_flight: int, error: Error) {
 	routes := make(
 		Activity_Execution_Routes,
@@ -2404,9 +2599,10 @@ run_activity_loop :: proc(
 	)
 	thread.pool_start(&pool)
 	pool_finished := false
+	drain_reason := Callback_Drain_Reason.Worker_Error
 	defer {
 		if !pool_finished {
-			thread.pool_finish(&pool)
+			callback_pool_finish(&pool, callback_policy, .Activity, drain_reason)
 			_, cleanup_error := reap_activity_executions(&routes, &pool)
 			error_free(&cleanup_error)
 		}
@@ -2424,6 +2620,7 @@ run_activity_loop :: proc(
 			return completed, cancellations, peak_in_flight, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
+			drain_reason = .Worker_Shutdown
 			break
 		}
 
@@ -2482,7 +2679,10 @@ run_activity_loop :: proc(
 			peak_in_flight = max(peak_in_flight, len(routes))
 		}
 	}
-	thread.pool_finish(&pool)
+	if drain_reason != .Worker_Shutdown {
+		drain_reason = .Bounded_Run
+	}
+	callback_pool_finish(&pool, callback_policy, .Activity, drain_reason)
 	pool_finished = true
 	reaped, reap_error := reap_activity_executions(&routes, &pool)
 	completed += reaped
@@ -2666,18 +2866,20 @@ nexus_execution_main :: proc(execution: ^Nexus_Execution) {
 	arena: virtual.Arena
 	if virtual.arena_init_growing(&arena) != nil {
 		execution.error = error_from_string("could not initialize Nexus operation allocation arena")
-		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		worker_initiate_shutdown(execution.worker)
 		return
 	}
 	defer virtual.arena_destroy(&arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&arena)
 	if execution.kind == .Cancel_Operation {
+		sync.atomic_add_explicit(&execution.worker.nexus_callbacks_active, 1, .Acq_Rel)
 		result := execution.cancel_invoke(
 			execution.cancel_callback_data,
 			&execution.ctx,
 			execution.operation_token,
 		)
+		sync.atomic_sub_explicit(&execution.worker.nexus_callbacks_active, 1, .Acq_Rel)
 		context.allocator = previous_allocator
 		completion: [dynamic]u8
 		if nexus.is_cancellation_requested(&execution.ctx) {
@@ -2698,15 +2900,17 @@ nexus_execution_main :: proc(execution: ^Nexus_Execution) {
 		core_error := temporal_core.worker_complete_nexus(&execution.worker.core, completion[:])
 		if core_error.message != nil {
 			execution.error = error_from_core(&core_error)
-			temporal_core.worker_initiate_shutdown(&execution.worker.core)
+			worker_initiate_shutdown(execution.worker)
 		}
 		return
 	}
+	sync.atomic_add_explicit(&execution.worker.nexus_callbacks_active, 1, .Acq_Rel)
 	result := execution.invoke(
 		execution.callback_data,
 		&execution.ctx,
 		codec.payload_view(&execution.input),
 	)
+	sync.atomic_sub_explicit(&execution.worker.nexus_callbacks_active, 1, .Acq_Rel)
 	context.allocator = previous_allocator
 	defer nexus.payload_result_free(&result)
 
@@ -2748,7 +2952,7 @@ nexus_execution_main :: proc(execution: ^Nexus_Execution) {
 	core_error := temporal_core.worker_complete_nexus(&execution.worker.core, completion[:])
 	if core_error.message != nil {
 		execution.error = error_from_core(&core_error)
-		temporal_core.worker_initiate_shutdown(&execution.worker.core)
+		worker_initiate_shutdown(execution.worker)
 	}
 }
 
@@ -2894,6 +3098,7 @@ reap_nexus_executions :: proc(
 run_nexus_loop :: proc(
 	worker: ^Worker,
 	max_tasks, executor_threads: int,
+	callback_policy: Uncooperative_Callback_Policy,
 ) -> (
 	completed: int,
 	cancellations: int,
@@ -2907,9 +3112,10 @@ run_nexus_loop :: proc(
 	thread.pool_init(&pool, allocator_runtime.heap_allocator(), executor_threads)
 	thread.pool_start(&pool)
 	pool_finished := false
+	drain_reason := Callback_Drain_Reason.Worker_Error
 	defer {
 		if !pool_finished {
-			thread.pool_finish(&pool)
+			callback_pool_finish(&pool, callback_policy, .Nexus, drain_reason)
 			_, cleanup_error := reap_nexus_executions(&routes, &pool)
 			error_free(&cleanup_error)
 		}
@@ -2927,6 +3133,7 @@ run_nexus_loop :: proc(
 			return completed, cancellations, cancel_operations, peak_in_flight, error_from_core(&poll.error)
 		}
 		if poll.shutdown {
+			drain_reason = .Worker_Shutdown
 			break
 		}
 
@@ -2986,7 +3193,10 @@ run_nexus_loop :: proc(
 			peak_in_flight = max(peak_in_flight, len(routes))
 		}
 	}
-	thread.pool_finish(&pool)
+	if drain_reason != .Worker_Shutdown {
+		drain_reason = .Bounded_Run
+	}
+	callback_pool_finish(&pool, callback_policy, .Nexus, drain_reason)
 	pool_finished = true
 	reaped, reap_error := reap_nexus_executions(&routes, &pool)
 	completed += reaped
@@ -3367,6 +3577,7 @@ Activity_Thread_State :: struct {
 	worker:    ^Worker,
 	max_tasks: int,
 	executor_threads: int,
+	callback_policy: Uncooperative_Callback_Policy,
 	completed: int,
 	cancellations: int,
 	peak_in_flight: int,
@@ -3388,6 +3599,7 @@ Nexus_Thread_State :: struct {
 	cancellations:  int,
 	cancel_operations: int,
 	peak_in_flight: int,
+	callback_policy: Uncooperative_Callback_Policy,
 	error:          Error,
 }
 
@@ -3395,16 +3607,21 @@ activity_thread_main :: proc(state: ^Activity_Thread_State) {
 	state.completed,
 	state.cancellations,
 	state.peak_in_flight,
-	state.error = run_activity_loop(state.worker, state.max_tasks, state.executor_threads)
+	state.error = run_activity_loop(
+		state.worker,
+		state.max_tasks,
+		state.executor_threads,
+		state.callback_policy,
+	)
 	if state.error.message != nil {
-		temporal_core.worker_initiate_shutdown(&state.worker.core)
+		worker_initiate_shutdown(state.worker)
 	}
 }
 
 workflow_thread_main :: proc(state: ^Workflow_Thread_State) {
 	state.stats, state.error = run_workflow_loop(state.worker, state.options)
 	if state.error.message != nil {
-		temporal_core.worker_initiate_shutdown(&state.worker.core)
+		worker_initiate_shutdown(state.worker)
 	}
 }
 
@@ -3413,9 +3630,14 @@ nexus_thread_main :: proc(state: ^Nexus_Thread_State) {
 	state.cancellations,
 	state.cancel_operations,
 	state.peak_in_flight,
-	state.error = run_nexus_loop(state.worker, state.max_tasks, state.executor_threads)
+	state.error = run_nexus_loop(
+		state.worker,
+		state.max_tasks,
+		state.executor_threads,
+		state.callback_policy,
+	)
 	if state.error.message != nil {
-		temporal_core.worker_initiate_shutdown(&state.worker.core)
+		worker_initiate_shutdown(state.worker)
 	}
 }
 
@@ -3435,6 +3657,10 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if options.max_activity_tasks < 0 || options.max_nexus_tasks < 0 ||
 	   options.max_workflow_executions < 0 {
 		return {}, error_from_string("worker run limits must not be negative")
+	}
+	callback_policy_error := uncooperative_callback_policy_validate(options.uncooperative_callbacks)
+	if callback_policy_error.message != nil {
+		return {}, callback_policy_error
 	}
 	poll_workflows := len(worker.workflow_registrations) > 0
 	poll_remote_activities := len(worker.activity_registrations) > 0 && !options.disable_activity_polling
@@ -3480,8 +3706,13 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		temporal_core.error_free(&close_error)
 		return {}, result
 	}
+	worker.uncooperative_callback_policy = options.uncooperative_callbacks
 	worker.lifecycle = .Running
-	defer { worker.lifecycle = .Stopped }
+	defer {
+		worker_shutdown_watch_stop(worker)
+		worker.uncooperative_callback_policy = {}
+		worker.lifecycle = .Stopped
+	}
 	if options.on_ready != nil && !options.on_ready(options.on_ready_data) {
 		return {}, error_from_string("worker ready callback failed")
 	}
@@ -3490,7 +3721,12 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		stats.activity_tasks_completed,
 		stats.activity_cancellations_received,
 		stats.activity_executions_peak_owned,
-		error = run_activity_loop(worker, options.max_activity_tasks, activity_executor_threads)
+		error = run_activity_loop(
+			worker,
+			options.max_activity_tasks,
+			activity_executor_threads,
+			options.uncooperative_callbacks,
+		)
 		return
 	}
 	if poll_workflows && !poll_activities && !poll_nexus {
@@ -3501,7 +3737,12 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		stats.nexus_cancellations_received,
 		stats.nexus_cancel_operations_received,
 		stats.nexus_executions_peak_owned,
-		error = run_nexus_loop(worker, options.max_nexus_tasks, worker.max_concurrent_nexus_tasks)
+		error = run_nexus_loop(
+			worker,
+			options.max_nexus_tasks,
+			worker.max_concurrent_nexus_tasks,
+			options.uncooperative_callbacks,
+		)
 		return
 	}
 
@@ -3509,12 +3750,14 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		worker = worker,
 		max_tasks = options.max_activity_tasks,
 		executor_threads = activity_executor_threads,
+		callback_policy = options.uncooperative_callbacks,
 	}
 	workflow_state := Workflow_Thread_State{worker = worker, options = options}
 	nexus_state := Nexus_Thread_State{
 		worker = worker,
 		max_tasks = options.max_nexus_tasks,
 		executor_threads = worker.max_concurrent_nexus_tasks,
+		callback_policy = options.uncooperative_callbacks,
 	}
 	workflow_thread: ^thread.Thread
 	activity_thread: ^thread.Thread
@@ -3528,7 +3771,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if poll_activities {
 		activity_thread = thread.create_and_start_with_poly_data(&activity_state, activity_thread_main)
 		if activity_thread == nil {
-			temporal_core.worker_initiate_shutdown(&worker.core)
+			worker_initiate_shutdown(worker)
 			if workflow_thread != nil {
 				thread.join(workflow_thread)
 				thread.destroy(workflow_thread)
@@ -3540,7 +3783,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 	if poll_nexus {
 		nexus_thread = thread.create_and_start_with_poly_data(&nexus_state, nexus_thread_main)
 		if nexus_thread == nil {
-			temporal_core.worker_initiate_shutdown(&worker.core)
+			worker_initiate_shutdown(worker)
 			if workflow_thread != nil {
 				thread.join(workflow_thread)
 				thread.destroy(workflow_thread)
@@ -3560,7 +3803,7 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 		// has evicted, stop otherwise-unbounded Activity and Nexus polls so all
 		// enabled streams can join. Task-count limits only stop their own stream.
 		if options.max_workflow_executions > 0 && workflow_state.error.message == nil {
-			temporal_core.worker_initiate_shutdown(&worker.core)
+			worker_initiate_shutdown(worker)
 		}
 	}
 	if activity_thread != nil do thread.join(activity_thread)
@@ -3599,7 +3842,7 @@ request_shutdown :: proc(worker: ^Worker) {
 	if worker == nil || worker.lifecycle != .Running {
 		return
 	}
-	temporal_core.worker_initiate_shutdown(&worker.core)
+	worker_initiate_shutdown(worker)
 }
 
 close :: proc(worker: ^Worker) -> Error {
@@ -3670,6 +3913,10 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.versioning = {}
 	worker.nondeterminism_policy = {}
 	worker.workflow_stacks = {}
+	worker.uncooperative_callback_policy = {}
+	worker.activity_callbacks_active = 0
+	worker.nexus_callbacks_active = 0
+	worker.shutdown_watch_thread = nil
 	worker.mode = .Online
 	return error_from_core(&core_error)
 }

@@ -7,6 +7,8 @@ import "core:bytes"
 import "core:fmt"
 import "core:mem/virtual"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 import activity "../temporal/activity"
 import temporal_client "../temporal/client"
@@ -24,6 +26,27 @@ import fiber_raw "../temporal/workflow/fiber/raw"
 fiber_guard_test_entry :: proc "c" (user_data: rawptr) {
 	called := cast(^bool)user_data
 	called^ = true
+}
+
+Callback_Drain_Test_State :: struct {
+	release:  sync.Sema,
+	observed: bool,
+	info:     worker.Callback_Drain_Info,
+}
+
+callback_drain_test_task :: proc(task: thread.Task) {
+	state := cast(^Callback_Drain_Test_State)task.data
+	sync.sema_wait(&state.release)
+}
+
+callback_drain_test_observer :: proc(
+	user_data: rawptr,
+	info: ^worker.Callback_Drain_Info,
+) {
+	state := cast(^Callback_Drain_Test_State)user_data
+	state.observed = true
+	state.info = info^
+	sync.sema_post(&state.release)
 }
 
 @(test)
@@ -8155,6 +8178,80 @@ workflow_fibers_reserve_a_native_guard_page :: proc(t: ^testing.T) {
 	testing.expect(t, called)
 	testing.expect_value(t, fiber_raw.status(fiber), fiber_raw.State.Dead)
 	testing.expect_value(t, fiber_raw.destroy(fiber), fiber_raw.Result.Success)
+}
+
+@(test)
+worker_uncooperative_callback_policy_validates_complete_configuration :: proc(t: ^testing.T) {
+	negative_error := worker.uncooperative_callback_policy_validate({warning_after = -time.Millisecond})
+	testing.expect(t, negative_error.message != nil)
+	worker.error_free(&negative_error)
+
+	duration_only_error := worker.uncooperative_callback_policy_validate({warning_after = time.Millisecond})
+	testing.expect(t, duration_only_error.message != nil)
+	worker.error_free(&duration_only_error)
+
+	observer_only_error := worker.uncooperative_callback_policy_validate({observer = callback_drain_test_observer})
+	testing.expect(t, observer_only_error.message != nil)
+	worker.error_free(&observer_only_error)
+
+	valid_error := worker.uncooperative_callback_policy_validate({
+		warning_after = time.Millisecond,
+		observer = callback_drain_test_observer,
+	})
+	testing.expect(t, valid_error.message == nil)
+	worker.error_free(&valid_error)
+}
+
+@(test)
+worker_callback_drain_watch_observes_but_does_not_kill_executor :: proc(t: ^testing.T) {
+	state := Callback_Drain_Test_State{}
+	pool := thread.Pool{}
+	heap := allocator_runtime.heap_allocator()
+	thread.pool_init(&pool, heap, 1)
+	defer thread.pool_destroy(&pool)
+	thread.pool_add_task(&pool, heap, callback_drain_test_task, &state)
+	thread.pool_start(&pool)
+
+	watch_started := worker.callback_pool_finish(
+		&pool,
+		{
+			warning_after = 10 * time.Millisecond,
+			observer = callback_drain_test_observer,
+			user_data = &state,
+		},
+		.Activity,
+		.Bounded_Run,
+	)
+	testing.expect(t, watch_started)
+	testing.expect(t, state.observed)
+	testing.expect_value(t, state.info.kind, worker.Callback_Drain_Kind.Activity)
+	testing.expect_value(t, state.info.reason, worker.Callback_Drain_Reason.Bounded_Run)
+	testing.expect_value(t, state.info.outstanding, 1)
+	testing.expect_value(t, state.info.warning_after, 10 * time.Millisecond)
+	_, completed := thread.pool_pop_done(&pool)
+	testing.expect(t, completed)
+}
+
+@(test)
+worker_shutdown_watch_counts_active_nexus_callbacks_before_core_drain :: proc(t: ^testing.T) {
+	state := Callback_Drain_Test_State{}
+	sdk_worker := worker.Worker{
+		uncooperative_callback_policy = {
+			warning_after = 5 * time.Millisecond,
+			observer = callback_drain_test_observer,
+			user_data = &state,
+		},
+		nexus_callbacks_active = 2,
+	}
+	worker.worker_shutdown_watch_start(&sdk_worker)
+	notified := sync.sema_wait_with_timeout(&state.release, time.Second)
+	worker.worker_shutdown_watch_stop(&sdk_worker)
+	testing.expect(t, notified)
+	testing.expect(t, state.observed)
+	testing.expect_value(t, state.info.kind, worker.Callback_Drain_Kind.Nexus)
+	testing.expect_value(t, state.info.reason, worker.Callback_Drain_Reason.Worker_Shutdown)
+	testing.expect_value(t, state.info.outstanding, 2)
+	testing.expect_value(t, state.info.warning_after, 5 * time.Millisecond)
 }
 
 @(test)

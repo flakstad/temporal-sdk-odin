@@ -708,6 +708,39 @@ the recommended supervisor/replacement process boundary, not in-process
 recovery. Co-locating Workflow and Activity registrations still makes an
 Activity panic fatal to that entire worker process.
 
+### Uncooperative callback shutdown policy
+
+`Run_Options.uncooperative_callbacks` configures a duration, observer, and
+borrowed user pointer. Duration and observer must either both be set or both be
+zero; negative durations are rejected before Core Worker creation. On explicit
+or SDK-initiated shutdown, the Worker starts a watchdog before forwarding the
+request to Core. Activity and Nexus callback entry/exit update atomic counters.
+After the deadline, the watchdog invokes the observer once for each still-active
+kind with a `Callback_Drain_Info`. Bounded and error drains use the same model
+around `thread.pool_finish`.
+
+The observer is diagnostic/process-policy code. It runs on a dedicated thread,
+must return promptly, and may record telemetry or terminate the process, but it
+must not call `worker.close`, release registrations, or otherwise free callback-owned state.
+The SDK continues waiting because Odin's standard pool termination uses OS
+thread cancellation and explicitly warns that resources may remain owned.
+
+Two live paths cover the timing boundary. The existing Worker-shutdown scenario
+starts its 50 ms watchdog when `request_shutdown` is called, reports one active
+Activity, then receives Core's `Worker_Shutdown` cancellation after the 200 ms
+grace period and finalizes cleanly. The focused bounded-drain proof is:
+
+```bash
+./scripts/uncooperative-callback-integration-test.sh
+```
+
+Its Activity ignores cancellation for 250 ms. The 50 ms observer fires with
+`kind=Activity`, `reason=Bounded_Run`, and `outstanding=1`; the callback later
+returns normally, proving observation does not kill the executor. Unit tests
+also cover incomplete policy rejection and a semaphore-controlled pool drain.
+Workflow callbacks are excluded: an infinite Workflow invocation cannot yield
+to Core, so process supervision remains the only sound containment boundary.
+
 Workflows have the corresponding registration levels:
 
 ```odin
