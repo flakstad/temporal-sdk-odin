@@ -10147,6 +10147,214 @@ worker_graceful_shutdown_period_rounds_for_c_abi_and_is_owned_by_worker :: proc(
 	worker.error_free(&close_error)
 }
 
+Custom_Slot_Test_State :: struct {
+	reserve_calls:        int,
+	cancel_calls:         int,
+	try_calls:            int,
+	mark_used_calls:      int,
+	release_calls:        int,
+	available_calls:      int,
+	free_calls:           int,
+	reserve_context_ok:   bool,
+	mark_info_ok:         bool,
+	release_info_missing: bool,
+}
+
+custom_slot_test_reserve :: proc(
+	user_data: rawptr,
+	ctx: ^temporal_core.Slot_Reserve_Context,
+	_: temporal_core.Slot_Reservation,
+) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.reserve_calls += 1
+	state.reserve_context_ok = ctx != nil && ctx.slot_kind == .Activity &&
+		ctx.task_queue == "custom-slots" && ctx.worker_identity == "odin@test" &&
+		ctx.worker_build_id == "build-7" && !ctx.is_sticky
+}
+
+custom_slot_test_cancel :: proc(
+	user_data: rawptr,
+	_: temporal_core.Slot_Reservation,
+) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.cancel_calls += 1
+}
+
+custom_slot_test_try :: proc(
+	user_data: rawptr,
+	ctx: ^temporal_core.Slot_Reserve_Context,
+) -> uintptr {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.try_calls += 1
+	if ctx == nil || ctx.slot_kind != .Activity {
+		return 0
+	}
+	return 99
+}
+
+custom_slot_test_mark_used :: proc(
+	user_data: rawptr,
+	info: ^temporal_core.Slot_Info,
+	permit: uintptr,
+) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.mark_used_calls += 1
+	state.mark_info_ok = info != nil && info.slot_kind == .Activity &&
+		info.activity_type == "hello" && permit == 99
+}
+
+custom_slot_test_release :: proc(
+	user_data: rawptr,
+	info: ^temporal_core.Slot_Info,
+	permit: uintptr,
+) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.release_calls += 1
+	state.release_info_missing = info == nil && permit == 99
+}
+
+custom_slot_test_available :: proc(user_data: rawptr) -> (uintptr, bool) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.available_calls += 1
+	return 7, true
+}
+
+custom_slot_test_free :: proc(user_data: rawptr) {
+	state := cast(^Custom_Slot_Test_State)user_data
+	state.free_calls += 1
+}
+
+@(test)
+custom_activity_slot_supplier_binds_callback_views_and_frees_once :: proc(t: ^testing.T) {
+	missing := temporal_core.Custom_Slot_Supplier{reserve = custom_slot_test_reserve}
+	missing_error := temporal_core.custom_slot_supplier_validate(missing)
+	testing.expect(t, missing_error.message != nil)
+	temporal_core.error_free(&missing_error)
+
+	state := Custom_Slot_Test_State{}
+	supplier := temporal_core.Custom_Slot_Supplier{
+		reserve = custom_slot_test_reserve,
+		cancel_reserve = custom_slot_test_cancel,
+		try_reserve = custom_slot_test_try,
+		mark_used = custom_slot_test_mark_used,
+		release = custom_slot_test_release,
+		available_slots = custom_slot_test_available,
+		free = custom_slot_test_free,
+		user_data = &state,
+	}
+	binding, binding_error := temporal_core.custom_slot_supplier_binding_create(supplier)
+	testing.expectf(
+		t,
+		binding_error.message == nil,
+		"custom supplier binding failed: %s",
+		string(binding_error.message),
+	)
+	temporal_core.error_free(&binding_error)
+	testing.expect(t, binding != nil)
+	defer temporal_core.custom_slot_supplier_binding_destroy(binding)
+	testing.expect(t, binding.raw_callbacks.user_data == binding)
+
+	reserve_context := raw.Slot_Reserve_Context{
+		slot_type = .Activity,
+		task_queue = temporal_core.byte_ref("custom-slots"),
+		worker_identity = temporal_core.byte_ref("odin@test"),
+		worker_build_id = temporal_core.byte_ref("build-7"),
+	}
+	completion_context := raw.Slot_Reserve_Completion_Context{}
+	binding.raw_callbacks.reserve(
+		&reserve_context,
+		&completion_context,
+		binding.raw_callbacks.user_data,
+	)
+	testing.expect_value(t, state.reserve_calls, 1)
+	testing.expect(t, state.reserve_context_ok)
+
+	permit := binding.raw_callbacks.try_reserve(
+		&reserve_context,
+		binding.raw_callbacks.user_data,
+	)
+	testing.expect_value(t, permit, uintptr(99))
+	testing.expect_value(t, state.try_calls, 1)
+
+	mark_context := raw.Slot_Mark_Used_Context{
+		slot_info = {
+			tag = .Activity,
+			activity = {activity_type = temporal_core.byte_ref("hello")},
+		},
+		slot_permit = permit,
+	}
+	binding.raw_callbacks.mark_used(
+		&mark_context,
+		binding.raw_callbacks.user_data,
+	)
+	testing.expect_value(t, state.mark_used_calls, 1)
+	testing.expect(t, state.mark_info_ok)
+
+	release_context := raw.Slot_Release_Context{slot_permit = permit}
+	binding.raw_callbacks.release(
+		&release_context,
+		binding.raw_callbacks.user_data,
+	)
+	testing.expect_value(t, state.release_calls, 1)
+	testing.expect(t, state.release_info_missing)
+
+	available: uintptr
+	known := binding.raw_callbacks.available_slots(
+		&available,
+		binding.raw_callbacks.user_data,
+	)
+	testing.expect(t, known)
+	testing.expect_value(t, available, uintptr(7))
+	testing.expect_value(t, state.available_calls, 1)
+
+	binding.raw_callbacks.free(&binding.raw_callbacks)
+	testing.expect_value(t, state.free_calls, 1)
+
+	// The pinned bridge currently does not invoke its documented free callback,
+	// so the SDK's post-worker-free fallback must run the user hook as well.
+	fallback_state := Custom_Slot_Test_State{}
+	fallback_supplier := supplier
+	fallback_supplier.user_data = &fallback_state
+	fallback_binding, fallback_error := temporal_core.custom_slot_supplier_binding_create(
+		fallback_supplier,
+	)
+	testing.expectf(
+		t,
+		fallback_error.message == nil,
+		"fallback custom supplier binding failed: %s",
+		string(fallback_error.message),
+	)
+	temporal_core.error_free(&fallback_error)
+	testing.expect(t, fallback_binding != nil)
+	temporal_core.custom_slot_supplier_binding_destroy(fallback_binding)
+	testing.expect_value(t, fallback_state.free_calls, 1)
+
+	testing.expect(t, !temporal_core.slot_reservation_complete({}, 1))
+	testing.expect(t, !temporal_core.slot_reservation_complete({handle = &completion_context}, 0))
+	testing.expect(t, !temporal_core.slot_reservation_cancel_complete({}))
+}
+
+@(test)
+custom_activity_slot_supplier_rejects_resource_tuner_conflict :: proc(t: ^testing.T) {
+	state := Custom_Slot_Test_State{}
+	options := temporal_core.worker_options_default()
+	options.custom_activity_slot_supplier = {
+		reserve = custom_slot_test_reserve,
+		cancel_reserve = custom_slot_test_cancel,
+		try_reserve = custom_slot_test_try,
+		mark_used = custom_slot_test_mark_used,
+		release = custom_slot_test_release,
+		user_data = &state,
+	}
+	options.resource_based_activity_tuner = temporal_core.resource_based_activity_tuner(
+		0.8,
+		0.8,
+	)
+	validation_error := temporal_core.worker_options_validate(options)
+	testing.expect(t, validation_error.message != nil)
+	temporal_core.error_free(&validation_error)
+}
+
 @(test)
 worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	options := temporal_core.worker_options_default()

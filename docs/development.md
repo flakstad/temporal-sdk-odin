@@ -495,9 +495,58 @@ constructor. Every enabled resource supplier must carry identical CPU/memory
 targets because the C bridge creates one shared resource controller and rejects
 mixed resource options. The Odin callback pools are sized from the suppliers'
 maximums so Core never grants work without matching executor capacity. Workflow
-slots remain fixed-size, and custom suppliers are not exposed yet. The public
-Nexus executor enables polling only when an operation is registered and uses
-the configured Nexus poller behavior.
+slots remain fixed-size. The public Nexus executor enables polling only when an
+operation is registered and uses the configured Nexus poller behavior.
+
+Activity slots may instead be supplied by Odin callbacks:
+
+```odin
+options.custom_activity_slot_supplier = {
+    reserve = reserve_slot,
+    cancel_reserve = cancel_reservation,
+    try_reserve = try_reserve_slot,
+    mark_used = mark_slot_used,
+    release = release_slot,
+    available_slots = available_slots, // optional
+    free = supplier_free,              // optional
+    user_data = &supplier_state,
+}
+```
+
+Callbacks can be concurrent and must return promptly. `reserve` retains the
+opaque `worker.Slot_Reservation` and later calls exactly one of
+`worker.slot_reservation_complete(reservation, nonzero_permit)` or
+`worker.slot_reservation_cancel_complete(reservation)`. A successful completion
+consumes the handle; using it again is memory corruption in the upstream ABI.
+All strings in `Slot_Reserve_Context` and `Slot_Info` are callback-scoped views.
+Clone them before retaining them. Permit IDs must be unique among live permits,
+and `release` may receive nil task info when a reserved slot was never used.
+
+The callback table is copied into SDK-owned address-stable memory and remains
+pinned until Core has dropped the supplier. `user_data` is borrowed and must
+remain valid until `worker.close` returns; the SDK never deallocates it. The
+optional `free` hook runs exactly once for every binding successfully created,
+including when Core Worker construction fails. The pinned Rust adapter does
+not currently invoke the C header's documented supplier-drop callback, so Odin
+also runs the hook after `temporal_core_worker_free`. An exactly-once flag keeps
+this compatible with a future upstream fix. A custom Activity supplier cannot
+be combined with the resource-based Activity tuner, and
+`max_concurrent_activities` continues to size the Odin executor pool.
+
+Run the focused capacity/cancellation proof against the CLI dev server:
+
+```bash
+temporal server start-dev --headless
+./scripts/custom-slot-supplier-integration-test.sh
+```
+
+It uses one custom permit with multiple Core pollers, completes an Activity,
+and requires queued reservation, cancellation, mark-used, release, and free
+callbacks to drain without leaked permits.
+
+A 1,000-case PBT property generates partial and complete callback tables plus
+resource-tuner combinations, proving that incomplete or conflicting policies
+are rejected before `worker_new`.
 Prefer fixed slots for ordinary Workers; Temporal recommends resource-based
 tuning when resource protection or workload-specific scaling warrants it.
 Pairing it with `worker.poller_autoscaling` avoids excessive pollers at low

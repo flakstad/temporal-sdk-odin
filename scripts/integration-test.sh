@@ -1088,6 +1088,10 @@ run_activity_case() {
     ACTIVITY_RESOURCE_TUNER=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
+  elif [[ "$mode" == "custom-slot-supplier" ]]; then
+    ACTIVITY_CUSTOM_SLOT_SUPPLIER=1 \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
+      "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == "uncooperative" ]]; then
     ACTIVITY_EXPECT_UNCOOPERATIVE=1 \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
@@ -1188,6 +1192,8 @@ run_activity_case() {
     fi
   elif [[ "$mode" == "resource-tuner" ]]; then
     grep -q "resource-based Activity tuner completed one task and shut down cleanly" "$worker_log"
+  elif [[ "$mode" == "custom-slot-supplier" ]]; then
+    grep -Eq "custom Activity slot supplier completed through Core reserve=[0-9]+ cancel=[0-9]+ release=[0-9]+ pending_peak=[0-9]+ capacity=1" "$worker_log"
   elif [[ "$mode" == "uncooperative" ]]; then
     grep -q "uncooperative callback observed kind=Activity reason=Bounded_Run outstanding=1" "$worker_log"
     grep -q "uncooperative Activity drain was observed without unsafe thread termination" "$worker_log"
@@ -1202,6 +1208,7 @@ run_activity_case failure
 run_activity_case typed
 run_activity_case retry
 run_activity_case resource-tuner
+run_activity_case custom-slot-supplier
 run_activity_case async-token-complete
 run_activity_case async-id-complete
 run_activity_case async-token-failure

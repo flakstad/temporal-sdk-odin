@@ -347,6 +347,8 @@ main :: proc() {
 	shutdown_case := shutdown_value != ""
 	resource_tuner_value := os.get_env(env_buffer[:], "ACTIVITY_RESOURCE_TUNER")
 	resource_tuner_case := resource_tuner_value != ""
+	custom_slot_value := os.get_env(env_buffer[:], "ACTIVITY_CUSTOM_SLOT_SUPPLIER")
+	custom_slot_case := custom_slot_value != ""
 	uncooperative_value := os.get_env(env_buffer[:], "ACTIVITY_EXPECT_UNCOOPERATIVE")
 	uncooperative_case := uncooperative_value != ""
 	activity_slots := load_case ? 3 : 10
@@ -361,6 +363,21 @@ main :: proc() {
 	worker_options.max_concurrent_activities = activity_slots
 	worker_options.graceful_shutdown_period = graceful_shutdown_period
 	worker_options.activity_task_poller_behavior = worker.poller_simple_maximum(2)
+	custom_slot_state: Custom_Activity_Slot_State
+	if custom_slot_case {
+		custom_activity_slot_state_init(&custom_slot_state, 1)
+		worker_options.custom_activity_slot_supplier = custom_activity_slot_supplier(
+			&custom_slot_state,
+		)
+		// Three pollers force at least one reservation to remain pending while
+		// the single issued permit processes the bounded Activity task.
+		worker_options.activity_task_poller_behavior = worker.poller_simple_maximum(3)
+	}
+	defer {
+		if custom_slot_case {
+			custom_activity_slot_state_destroy(&custom_slot_state)
+		}
+	}
 	if resource_tuner_case {
 		worker_options.resource_based_activity_tuner =
 			worker.resource_based_activity_tuner_with_options(
@@ -689,6 +706,39 @@ main :: proc() {
 		fmt.println("retryable Activity failed once, then completed and worker shut down cleanly")
 	} else if async_case {
 		fmt.printf("Activity deferred completion and Odin Client applied mode=%s\n", async_mode)
+	} else if custom_slot_case {
+		sync.mutex_lock(&custom_slot_state.mutex)
+		valid := custom_slot_state.reserve_calls >= 3 &&
+			custom_slot_state.cancel_calls >= 1 &&
+			custom_slot_state.mark_used_calls == 1 &&
+			custom_slot_state.release_calls >= 1 &&
+			custom_slot_state.completed_reservations >= 1 &&
+			custom_slot_state.completed_cancellations >= 1 &&
+			custom_slot_state.pending_peak >= 1 &&
+			custom_slot_state.peak_in_use == 1 &&
+			custom_slot_state.in_use == 0 && len(custom_slot_state.pending) == 0 &&
+			custom_slot_state.saw_activity_reservation &&
+			custom_slot_state.saw_hello_activity && custom_slot_state.freed &&
+			!custom_slot_state.protocol_error
+		reserve_calls := custom_slot_state.reserve_calls
+		cancel_calls := custom_slot_state.cancel_calls
+		release_calls := custom_slot_state.release_calls
+		pending_peak := custom_slot_state.pending_peak
+		sync.mutex_unlock(&custom_slot_state.mutex)
+		if !valid {
+			fmt.eprintf(
+				"custom Activity slot supplier invariant failed: %+v\n",
+				custom_slot_state,
+			)
+			os.exit(1)
+		}
+		fmt.printf(
+			"custom Activity slot supplier completed through Core reserve=%d cancel=%d release=%d pending_peak=%d capacity=1\n",
+			reserve_calls,
+			cancel_calls,
+			release_calls,
+			pending_peak,
+		)
 	} else if resource_tuner_case {
 		fmt.println("resource-based Activity tuner completed one task and shut down cleanly")
 	} else if uncooperative_case {

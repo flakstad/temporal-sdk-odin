@@ -1298,6 +1298,8 @@ temporal_core_worker_request_workflow_eviction
 temporal_core_worker_initiate_shutdown
 temporal_core_worker_finalize_shutdown
 temporal_core_worker_free
+temporal_core_complete_async_reserve
+temporal_core_complete_async_cancel_reserve
 ```
 
 The integration path actually executed on macOS arm64:
@@ -3052,16 +3054,18 @@ process under a supervisor.
 
 `worker.create_with_options` now exposes the subset of the pinned Core worker
 builder that the Odin executor can honor without introducing another runtime:
-worker identity override, fixed or resource-based Activity/Nexus capacity,
+worker identity override, fixed, resource-based, or custom Activity capacity,
+fixed or resource-based Nexus capacity,
 Workflow cache size and sticky timeout, heartbeat throttling, worker-local and
 task-queue Activity rate limits, graceful shutdown, Workflow/Activity poller behavior,
 sticky/nonsticky poll ratio, and eager Activity reservation count. The original
 `worker.create` is a compatibility convenience that fills the same
 `worker.Options` defaults.
-Resource-based Workflow suppliers, custom slot suppliers, plugins, storage
-drivers, and the experimental payload-error limit remain deliberately
-unexposed. Fixed or resource-based Nexus slots and poller behavior configure
-the public synchronous/async executor and its raw poll/completion lifecycle.
+Resource-based Workflow suppliers, custom Workflow/Local-Activity/Nexus slot
+suppliers, plugins, storage drivers, and the experimental payload-error limit
+remain deliberately unexposed. Fixed or resource-based Nexus slots and poller
+behavior configure the public synchronous/async executor and its raw
+poll/completion lifecycle.
 
 The public `Poller_Behavior` is an owned tagged Odin value. Immediately before
 `temporal_core_worker_new`, `Worker_Option_Bindings` translates it to the C
@@ -3094,6 +3098,46 @@ supersedes `max_concurrent_nexus_tasks` and sizes its separate callback pool
 from the configured maximum. This safely permits Core to vary granted slots
 between the minimum and maximum without outgrowing the Odin executor. Workflow
 activation execution remains serial, so its supplier remains fixed.
+
+Activity suppliers additionally support the bridge's custom callback arm. Odin
+maps `TemporalCoreSlotReserveCtx` and tagged `TemporalCoreSlotInfo` into
+callback-scoped views and leaves task polling, eager reservation decisions, and
+permit lifecycle scheduling in Core. The language callback owns the policy: it
+must return unique nonzero permits, remain thread-safe, and eventually complete
+every async reservation with `temporal_core_complete_async_reserve` or
+`temporal_core_complete_async_cancel_reserve`. Core then returns that same
+permit to mark-used and release callbacks.
+
+The completion context is a consuming capability, not an owned Odin object.
+Upstream frees it after a successful completion and documents reuse or double
+completion as memory corruption. The idiomatic wrapper therefore exposes an
+opaque `Slot_Reservation` and completion procedures without exposing its raw
+layout. Nil handles and zero permits are rejected locally; synchronization and
+single-completion discipline remain the supplier's responsibility.
+
+`temporal_core_worker_new` copies the tagged supplier arm but retains the
+callback-table pointer for the Worker lifetime. Odin allocates an
+address-stable binding per Core Worker, routes callbacks through that binding,
+and frees it only after `temporal_core_worker_free`. User `user_data` remains
+borrowed until `worker.close`. The bridge's free callback and Odin fallback
+cleanup share an exactly-once flag, covering both normal drop and construction
+failure without double-calling the user's optional cleanup hook. This fallback
+is not merely defensive in the pinned revision: the C header says `free` runs
+when the supplier is dropped, but the Rust adapter stores a copied raw
+callback-table pointer in `CustomSlotSupplier` and never owns/drops the
+pointed-to `CustomSlotSupplierCallbacks` value whose `Drop` implementation
+invokes `free`. The live test consequently observes Odin's
+post-`worker_free` fallback. If Core later starts honoring the documented
+callback, the flag makes the same cleanup path safe without an ABI change.
+
+The first vertical slice deliberately exposes custom remote-Activity slots
+only. `max_concurrent_activities` still bounds the language callback executor,
+and custom/resource-based Activity policies are mutually exclusive. A live
+capacity-one supplier with multiple pollers proves asynchronous reservation,
+queued cancellation during bounded shutdown, mark-used, release with and
+without task info, and final cleanup against the CLI dev server. Workflow,
+Local Activity, and Nexus use the same raw ABI but remain gated until their
+language executor capacity contracts are specified and tested.
 
 The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
 rejects negative, NaN, and infinite values; positive values cross unchanged.

@@ -31,6 +31,7 @@ Client :: struct {
 Worker :: struct {
 	handle:                    ^raw.Worker,
 	runtime:                   ^Runtime,
+	custom_activity_supplier:  ^Custom_Slot_Supplier_Binding,
 	workflows_enabled:         bool,
 	local_activities_enabled:  bool,
 	remote_activities_enabled: bool,
@@ -192,6 +193,85 @@ Resource_Based_Slot_Options :: struct {
 	ramp_throttle: time.Duration,
 }
 
+Slot_Kind :: enum {
+	Workflow,
+	Activity,
+	Local_Activity,
+	Nexus,
+}
+
+// Slot_Reserve_Context fields are borrowed callback-scoped views. Clone a
+// string before retaining it after the callback returns.
+Slot_Reserve_Context :: struct {
+	slot_kind:       Slot_Kind,
+	task_queue:      string,
+	worker_identity: string,
+	worker_build_id: string,
+	is_sticky:       bool,
+}
+
+Slot_Info :: struct {
+	slot_kind:      Slot_Kind,
+	workflow_type:  string,
+	activity_type:  string,
+	nexus_operation: string,
+	nexus_service:   string,
+	is_sticky:       bool,
+}
+
+Slot_Reservation :: struct {
+	handle: ^raw.Slot_Reserve_Completion_Context,
+}
+
+Slot_Reserve_Callback :: #type proc(
+	user_data:  rawptr,
+	ctx:        ^Slot_Reserve_Context,
+	reservation: Slot_Reservation,
+)
+Slot_Cancel_Reserve_Callback :: #type proc(
+	user_data:   rawptr,
+	reservation: Slot_Reservation,
+)
+Slot_Try_Reserve_Callback :: #type proc(
+	user_data: rawptr,
+	ctx:       ^Slot_Reserve_Context,
+) -> uintptr
+Slot_Mark_Used_Callback :: #type proc(
+	user_data: rawptr,
+	info:      ^Slot_Info,
+	permit:    uintptr,
+)
+Slot_Release_Callback :: #type proc(
+	user_data: rawptr,
+	info:      ^Slot_Info,
+	permit:    uintptr,
+)
+Slot_Available_Callback :: #type proc(user_data: rawptr) -> (available: uintptr, known: bool)
+Slot_Supplier_Free_Callback :: #type proc(user_data: rawptr)
+
+// Custom_Slot_Supplier callbacks may run concurrently on Core threads and
+// must be thread-safe. Permit zero is reserved for "not available". Every
+// asynchronous reservation must be completed exactly once with
+// slot_reservation_complete or slot_reservation_cancel_complete.
+Custom_Slot_Supplier :: struct {
+	reserve:         Slot_Reserve_Callback,
+	cancel_reserve:  Slot_Cancel_Reserve_Callback,
+	try_reserve:     Slot_Try_Reserve_Callback,
+	mark_used:       Slot_Mark_Used_Callback,
+	release:         Slot_Release_Callback,
+	available_slots: Slot_Available_Callback,
+	free:            Slot_Supplier_Free_Callback,
+	user_data:       rawptr,
+}
+
+Custom_Slot_Supplier_Binding :: struct {
+	raw_callbacks:   raw.Custom_Slot_Supplier_Callbacks,
+	supplier:        Custom_Slot_Supplier,
+	released_by_core: bool,
+}
+
+#assert(offset_of(Custom_Slot_Supplier_Binding, raw_callbacks) == 0)
+
 // Resource_Based_Activity_Tuner_Options controls the Activity and Local
 // Activity suppliers that share one Core resource controller. Workflow and
 // Nexus suppliers remain fixed until those Odin executors support the matching
@@ -313,6 +393,7 @@ Worker_Options :: struct {
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                   Resource_Based_Activity_Tuner_Options,
 	resource_based_nexus_tuner:                      Resource_Based_Nexus_Tuner_Options,
+	custom_activity_slot_supplier:                   Custom_Slot_Supplier,
 }
 
 worker_options_default :: proc() -> Worker_Options {
@@ -411,6 +492,278 @@ runtime_log_ref_view :: proc(value: raw.Byte_Array_Ref) -> string {
 		return ""
 	}
 	return string(([^]u8)(value.data)[:int(value.size)])
+}
+
+slot_ref_view :: proc(value: raw.Byte_Array_Ref) -> string {
+	if value.data == nil || value.size == 0 {
+		return ""
+	}
+	return string(([^]u8)(value.data)[:int(value.size)])
+}
+
+slot_kind_from_raw :: proc(value: raw.Slot_Kind_Type) -> Slot_Kind {
+	switch value {
+	case .Workflow:       return .Workflow
+	case .Activity:       return .Activity
+	case .Local_Activity: return .Local_Activity
+	case .Nexus:          return .Nexus
+	}
+	return .Activity
+}
+
+slot_reserve_context_from_raw :: proc(value: ^raw.Slot_Reserve_Context) -> Slot_Reserve_Context {
+	if value == nil {
+		return {}
+	}
+	return {
+		slot_kind = slot_kind_from_raw(value.slot_type),
+		task_queue = slot_ref_view(value.task_queue),
+		worker_identity = slot_ref_view(value.worker_identity),
+		worker_build_id = slot_ref_view(value.worker_build_id),
+		is_sticky = value.is_sticky,
+	}
+}
+
+slot_info_from_raw :: proc(value: ^raw.Slot_Info) -> Slot_Info {
+	if value == nil {
+		return {}
+	}
+	switch value.tag {
+	case .Workflow:
+		return {
+			slot_kind = .Workflow,
+			workflow_type = slot_ref_view(value.workflow.workflow_type),
+			is_sticky = value.workflow.is_sticky,
+		}
+	case .Activity:
+		return {
+			slot_kind = .Activity,
+			activity_type = slot_ref_view(value.activity.activity_type),
+		}
+	case .Local_Activity:
+		return {
+			slot_kind = .Local_Activity,
+			activity_type = slot_ref_view(value.local_activity.activity_type),
+		}
+	case .Nexus:
+		return {
+			slot_kind = .Nexus,
+			nexus_operation = slot_ref_view(value.nexus.operation),
+			nexus_service = slot_ref_view(value.nexus.service),
+		}
+	}
+	return {}
+}
+
+custom_slot_supplier_enabled :: proc(value: Custom_Slot_Supplier) -> bool {
+	return value.reserve != nil || value.cancel_reserve != nil ||
+	       value.try_reserve != nil || value.mark_used != nil ||
+	       value.release != nil || value.available_slots != nil ||
+	       value.free != nil || value.user_data != nil
+}
+
+custom_slot_supplier_validate :: proc(value: Custom_Slot_Supplier) -> Error {
+	if !custom_slot_supplier_enabled(value) {
+		return {}
+	}
+	if value.reserve == nil || value.cancel_reserve == nil ||
+	   value.try_reserve == nil || value.mark_used == nil || value.release == nil {
+		return client_option_error(
+			"custom slot supplier requires reserve, cancel_reserve, try_reserve, mark_used, and release callbacks",
+		)
+	}
+	return {}
+}
+
+custom_slot_supplier_binding :: proc(user_data: rawptr) -> ^Custom_Slot_Supplier_Binding {
+	return cast(^Custom_Slot_Supplier_Binding)user_data
+}
+
+custom_slot_reserve_bridge :: proc "c" (
+	raw_context: ^raw.Slot_Reserve_Context,
+	completion_context: ^raw.Slot_Reserve_Completion_Context,
+	user_data: rawptr,
+) {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.reserve == nil {
+		return
+	}
+	view := slot_reserve_context_from_raw(raw_context)
+	binding.supplier.reserve(
+		binding.supplier.user_data,
+		&view,
+		{handle = completion_context},
+	)
+}
+
+custom_slot_cancel_reserve_bridge :: proc "c" (
+	completion_context: ^raw.Slot_Reserve_Completion_Context,
+	user_data: rawptr,
+) {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.cancel_reserve == nil {
+		return
+	}
+	binding.supplier.cancel_reserve(
+		binding.supplier.user_data,
+		{handle = completion_context},
+	)
+}
+
+custom_slot_try_reserve_bridge :: proc "c" (
+	raw_context: ^raw.Slot_Reserve_Context,
+	user_data: rawptr,
+) -> uintptr {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.try_reserve == nil {
+		return 0
+	}
+	view := slot_reserve_context_from_raw(raw_context)
+	return binding.supplier.try_reserve(binding.supplier.user_data, &view)
+}
+
+custom_slot_mark_used_bridge :: proc "c" (
+	raw_context: ^raw.Slot_Mark_Used_Context,
+	user_data: rawptr,
+) {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.mark_used == nil || raw_context == nil {
+		return
+	}
+	info := slot_info_from_raw(&raw_context.slot_info)
+	binding.supplier.mark_used(
+		binding.supplier.user_data,
+		&info,
+		raw_context.slot_permit,
+	)
+}
+
+custom_slot_release_bridge :: proc "c" (
+	raw_context: ^raw.Slot_Release_Context,
+	user_data: rawptr,
+) {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.release == nil || raw_context == nil {
+		return
+	}
+	info: Slot_Info
+	info_pointer: ^Slot_Info
+	if raw_context.slot_info != nil {
+		info = slot_info_from_raw(raw_context.slot_info)
+		info_pointer = &info
+	}
+	binding.supplier.release(
+		binding.supplier.user_data,
+		info_pointer,
+		raw_context.slot_permit,
+	)
+}
+
+custom_slot_available_bridge :: proc "c" (
+	available_slots: ^uintptr,
+	user_data: rawptr,
+) -> bool {
+	context = allocator_runtime.default_context()
+	binding := custom_slot_supplier_binding(user_data)
+	if binding == nil || binding.supplier.available_slots == nil || available_slots == nil {
+		return false
+	}
+	available, known := binding.supplier.available_slots(binding.supplier.user_data)
+	if known {
+		available_slots^ = available
+	}
+	return known
+}
+
+custom_slot_free_bridge :: proc "c" (callbacks: ^raw.Custom_Slot_Supplier_Callbacks) {
+	context = allocator_runtime.default_context()
+	if callbacks == nil {
+		return
+	}
+	// raw_callbacks is the first field, so Core's pointer is also the binding.
+	binding := cast(^Custom_Slot_Supplier_Binding)callbacks
+	if binding.released_by_core {
+		return
+	}
+	binding.released_by_core = true
+	if binding.supplier.free != nil {
+		binding.supplier.free(binding.supplier.user_data)
+	}
+}
+
+custom_slot_supplier_binding_create :: proc(
+	supplier: Custom_Slot_Supplier,
+) -> (binding: ^Custom_Slot_Supplier_Binding, error: Error) {
+	validation_error := custom_slot_supplier_validate(supplier)
+	if validation_error.message != nil {
+		return nil, validation_error
+	}
+	if !custom_slot_supplier_enabled(supplier) {
+		return nil, {}
+	}
+	heap := allocator_runtime.heap_allocator()
+	allocated_binding, allocation_error := new(Custom_Slot_Supplier_Binding, heap)
+	if allocation_error != nil {
+		return nil, client_option_error("could not allocate custom slot supplier binding")
+	}
+	binding = allocated_binding
+	binding.supplier = supplier
+	binding.raw_callbacks = {
+		reserve = custom_slot_reserve_bridge,
+		cancel_reserve = custom_slot_cancel_reserve_bridge,
+		try_reserve = custom_slot_try_reserve_bridge,
+		mark_used = custom_slot_mark_used_bridge,
+		release = custom_slot_release_bridge,
+		free = custom_slot_free_bridge,
+		user_data = binding,
+	}
+	if supplier.available_slots != nil {
+		binding.raw_callbacks.available_slots = custom_slot_available_bridge
+	}
+	return binding, {}
+}
+
+custom_slot_supplier_binding_destroy :: proc(binding: ^Custom_Slot_Supplier_Binding) {
+	if binding == nil {
+		return
+	}
+	if !binding.released_by_core && binding.supplier.free != nil {
+		binding.supplier.free(binding.supplier.user_data)
+	}
+	binding^ = {}
+	free(binding, allocator_runtime.heap_allocator())
+}
+
+custom_slot_supplier_raw :: proc(binding: ^Custom_Slot_Supplier_Binding) -> raw.Slot_Supplier {
+	if binding == nil {
+		return {}
+	}
+	return {
+		tag = .Custom,
+		custom = {callbacks = &binding.raw_callbacks},
+	}
+}
+
+// A successful call consumes the reservation handle from Core's perspective.
+// Calling either completion function again with the same handle is memory
+// corruption in the upstream C ABI and is therefore forbidden.
+slot_reservation_complete :: proc(reservation: Slot_Reservation, permit: uintptr) -> bool {
+	if reservation.handle == nil || permit == 0 {
+		return false
+	}
+	return raw.complete_async_reserve(reservation.handle, permit)
+}
+
+slot_reservation_cancel_complete :: proc(reservation: Slot_Reservation) -> bool {
+	if reservation.handle == nil {
+		return false
+	}
+	return raw.complete_async_cancel_reserve(reservation.handle)
 }
 
 runtime_log_clone_ref :: proc(value: raw.Byte_Array_Ref) -> (owned: string, ok: bool) {
@@ -1062,7 +1415,11 @@ resource_based_nexus_tuner_validate :: proc(
 }
 
 worker_options_validate :: proc(options: Worker_Options) -> Error {
-	if !options.resource_based_activity_tuner.enabled && options.max_activity_slots <= 0 {
+	custom_activity_enabled := custom_slot_supplier_enabled(
+		options.custom_activity_slot_supplier,
+	)
+	if !options.resource_based_activity_tuner.enabled && !custom_activity_enabled &&
+	   options.max_activity_slots <= 0 {
 		return client_option_error("max activity slots must be positive")
 	}
 	if !options.resource_based_nexus_tuner.enabled && options.max_nexus_task_slots <= 0 {
@@ -1142,6 +1499,17 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	nexus_tuner_error := resource_based_nexus_tuner_validate(options.resource_based_nexus_tuner)
 	if nexus_tuner_error.message != nil {
 		return nexus_tuner_error
+	}
+	custom_activity_error := custom_slot_supplier_validate(
+		options.custom_activity_slot_supplier,
+	)
+	if custom_activity_error.message != nil {
+		return custom_activity_error
+	}
+	if custom_activity_enabled && options.resource_based_activity_tuner.enabled {
+		return client_option_error(
+			"custom and resource-based Activity slot suppliers cannot both be enabled",
+		)
 	}
 	if options.resource_based_activity_tuner.enabled &&
 	   options.resource_based_nexus_tuner.enabled &&
@@ -1341,6 +1709,12 @@ worker_create :: proc(
 	if nondeterminism_error.message != nil {
 		return {}, nondeterminism_error
 	}
+	custom_activity_binding, custom_activity_error := custom_slot_supplier_binding_create(
+		worker_options.custom_activity_slot_supplier,
+	)
+	if custom_activity_error.message != nil {
+		return {}, custom_activity_error
+	}
 	workflow_type_refs := make(
 		[]raw.Byte_Array_Ref,
 		len(nondeterminism_policy.fail_workflow_types),
@@ -1363,14 +1737,21 @@ worker_create :: proc(
 	}
 	options.nondeterminism_as_workflow_fail = fail_all_workflows
 	options.nondeterminism_as_workflow_fail_for_types = fail_workflow_types
+	if custom_activity_binding != nil {
+		options.tuner.activity_slot_supplier = custom_slot_supplier_raw(
+			custom_activity_binding,
+		)
+	}
 	result := raw.worker_new(client.handle, options)
 	if result.fail != nil {
 		error.message = copy_core_bytes(result.fail)
 		raw.byte_array_free(client.runtime.handle, result.fail)
+		custom_slot_supplier_binding_destroy(custom_activity_binding)
 		return
 	}
 	worker.handle = result.worker
 	worker.runtime = client.runtime
+	worker.custom_activity_supplier = custom_activity_binding
 	worker.workflows_enabled = enable_workflows
 	worker.local_activities_enabled = enable_local_activities
 	worker.remote_activities_enabled = enable_remote_activities
@@ -1718,7 +2099,12 @@ finalize_shutdown_invoke :: proc(handle: ^raw.Worker, user_data: rawptr, callbac
 }
 
 worker_close :: proc(worker: ^Worker) -> Error {
-	if worker == nil || worker.handle == nil {
+	if worker == nil {
+		return {}
+	}
+	if worker.handle == nil {
+		custom_slot_supplier_binding_destroy(worker.custom_activity_supplier)
+		worker.custom_activity_supplier = nil
 		return {}
 	}
 	worker_initiate_shutdown(worker)
@@ -1771,8 +2157,10 @@ worker_close :: proc(worker: ^Worker) -> Error {
 		error_free(&finalize_error)
 	}
 	raw.worker_free(worker.handle)
+	custom_slot_supplier_binding_destroy(worker.custom_activity_supplier)
 	worker.handle = nil
 	worker.runtime = nil
+	worker.custom_activity_supplier = nil
 	worker.workflows_enabled = false
 	worker.local_activities_enabled = false
 	worker.remote_activities_enabled = false

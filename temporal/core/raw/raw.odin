@@ -14,6 +14,7 @@ Runtime    :: struct { _opaque: u8 }
 Connection :: struct { _opaque: u8 }
 Worker     :: struct { _opaque: u8 }
 Worker_Replay_Pusher :: struct { _opaque: u8 }
+Slot_Reserve_Completion_Context :: struct { _opaque: u8 }
 Cancellation_Token :: struct { _opaque: u8 }
 Forwarded_Log :: struct { _opaque: u8 }
 Metric_Meter :: struct { _opaque: u8 }
@@ -352,8 +353,104 @@ Resource_Based_Slot_Supplier :: struct {
 	tuner_options:    Resource_Based_Tuner_Options,
 }
 
+Slot_Kind_Type :: enum c.int {
+	Workflow = 0,
+	Activity,
+	Local_Activity,
+	Nexus,
+}
+
+Slot_Reserve_Context :: struct {
+	slot_type:       Slot_Kind_Type,
+	task_queue:      Byte_Array_Ref,
+	worker_identity: Byte_Array_Ref,
+	worker_build_id: Byte_Array_Ref,
+	is_sticky:       bool,
+}
+
+Slot_Info_Tag :: enum c.int {
+	Workflow = 0,
+	Activity,
+	Local_Activity,
+	Nexus,
+}
+
+Workflow_Slot_Info :: struct {
+	workflow_type: Byte_Array_Ref,
+	is_sticky:     bool,
+}
+
+Activity_Slot_Info :: struct {
+	activity_type: Byte_Array_Ref,
+}
+
+Nexus_Slot_Info :: struct {
+	operation: Byte_Array_Ref,
+	service:   Byte_Array_Ref,
+}
+
+Slot_Info :: struct {
+	tag: Slot_Info_Tag,
+	using value: struct #raw_union {
+		workflow:       Workflow_Slot_Info,
+		activity:       Activity_Slot_Info,
+		local_activity: Activity_Slot_Info,
+		nexus:          Nexus_Slot_Info,
+	},
+}
+
+Slot_Mark_Used_Context :: struct {
+	slot_info:   Slot_Info,
+	slot_permit: uintptr,
+}
+
+Slot_Release_Context :: struct {
+	slot_info:   ^Slot_Info,
+	slot_permit: uintptr,
+}
+
+Custom_Slot_Supplier_Reserve_Callback :: #type proc "c" (
+	ctx:            ^Slot_Reserve_Context,
+	completion_ctx: ^Slot_Reserve_Completion_Context,
+	user_data:      rawptr,
+)
+Custom_Slot_Supplier_Cancel_Reserve_Callback :: #type proc "c" (
+	completion_ctx: ^Slot_Reserve_Completion_Context,
+	user_data:      rawptr,
+)
+Custom_Slot_Supplier_Try_Reserve_Callback :: #type proc "c" (
+	ctx:       ^Slot_Reserve_Context,
+	user_data: rawptr,
+) -> uintptr
+Custom_Slot_Supplier_Mark_Used_Callback :: #type proc "c" (
+	ctx:       ^Slot_Mark_Used_Context,
+	user_data: rawptr,
+)
+Custom_Slot_Supplier_Release_Callback :: #type proc "c" (
+	ctx:       ^Slot_Release_Context,
+	user_data: rawptr,
+)
+Custom_Slot_Supplier_Available_Slots_Callback :: #type proc "c" (
+	available_slots: ^uintptr,
+	user_data:       rawptr,
+) -> bool
+Custom_Slot_Supplier_Free_Callback :: #type proc "c" (
+	callbacks: ^Custom_Slot_Supplier_Callbacks,
+)
+
+Custom_Slot_Supplier_Callbacks :: struct {
+	reserve:         Custom_Slot_Supplier_Reserve_Callback,
+	cancel_reserve:  Custom_Slot_Supplier_Cancel_Reserve_Callback,
+	try_reserve:     Custom_Slot_Supplier_Try_Reserve_Callback,
+	mark_used:       Custom_Slot_Supplier_Mark_Used_Callback,
+	release:         Custom_Slot_Supplier_Release_Callback,
+	available_slots: Custom_Slot_Supplier_Available_Slots_Callback,
+	free:            Custom_Slot_Supplier_Free_Callback,
+	user_data:       rawptr,
+}
+
 Custom_Slot_Supplier_Callbacks_Impl :: struct {
-	callbacks: rawptr,
+	callbacks: ^Custom_Slot_Supplier_Callbacks,
 }
 
 Slot_Supplier_Tag :: enum c.int {
@@ -441,6 +538,8 @@ Worker_Poll_Callback :: #type proc "c" (
 #assert(size_of(Metric_Kind) == size_of(c.int))
 #assert(size_of(Worker_Versioning_Strategy_Tag) == size_of(c.int))
 #assert(size_of(Slot_Supplier_Tag) == size_of(c.int))
+#assert(size_of(Slot_Kind_Type) == size_of(c.int))
+#assert(size_of(Slot_Info_Tag) == size_of(c.int))
 when size_of(uintptr) == 8 {
 	// Values verified against Clang's layout of the pinned generated C header.
 	#assert(size_of(Byte_Array_Ref) == 16)
@@ -504,6 +603,19 @@ when size_of(uintptr) == 8 {
 	#assert(offset_of(Resource_Based_Slot_Supplier, maximum_slots) == 8)
 	#assert(offset_of(Resource_Based_Slot_Supplier, ramp_throttle_ms) == 16)
 	#assert(offset_of(Resource_Based_Slot_Supplier, tuner_options) == 24)
+	#assert(size_of(Slot_Reserve_Context) == 64)
+	#assert(offset_of(Slot_Reserve_Context, task_queue) == 8)
+	#assert(offset_of(Slot_Reserve_Context, is_sticky) == 56)
+	#assert(size_of(Workflow_Slot_Info) == 24)
+	#assert(size_of(Nexus_Slot_Info) == 32)
+	#assert(size_of(Slot_Info) == 40)
+	#assert(offset_of(Slot_Info, value) == 8)
+	#assert(size_of(Slot_Mark_Used_Context) == 48)
+	#assert(offset_of(Slot_Mark_Used_Context, slot_permit) == 40)
+	#assert(size_of(Slot_Release_Context) == 16)
+	#assert(size_of(Custom_Slot_Supplier_Callbacks) == 64)
+	#assert(offset_of(Custom_Slot_Supplier_Callbacks, user_data) == 56)
+	#assert(size_of(Custom_Slot_Supplier_Callbacks_Impl) == 8)
 	#assert(size_of(Slot_Supplier) == 48)
 	#assert(size_of(Tuner_Holder) == 192)
 	#assert(size_of(Worker_Task_Types) == 4)
@@ -649,4 +761,11 @@ foreign temporal_core {
 	worker_request_workflow_eviction :: proc(worker: ^Worker, run_id: Byte_Array_Ref) ---
 	worker_initiate_shutdown :: proc(worker: ^Worker) ---
 	worker_finalize_shutdown :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
+	complete_async_reserve :: proc(
+		completion_ctx: ^Slot_Reserve_Completion_Context,
+		permit_id: uintptr,
+	) -> bool ---
+	complete_async_cancel_reserve :: proc(
+		completion_ctx: ^Slot_Reserve_Completion_Context,
+	) -> bool ---
 }

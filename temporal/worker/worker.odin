@@ -403,6 +403,14 @@ Poller_Behavior :: temporal_core.Poller_Behavior
 Resource_Based_Slot_Options :: temporal_core.Resource_Based_Slot_Options
 Resource_Based_Activity_Tuner_Options :: temporal_core.Resource_Based_Activity_Tuner_Options
 Resource_Based_Nexus_Tuner_Options :: temporal_core.Resource_Based_Nexus_Tuner_Options
+Slot_Kind :: temporal_core.Slot_Kind
+Slot_Reserve_Context :: temporal_core.Slot_Reserve_Context
+Slot_Info :: temporal_core.Slot_Info
+Slot_Reservation :: temporal_core.Slot_Reservation
+Custom_Slot_Supplier :: temporal_core.Custom_Slot_Supplier
+
+slot_reservation_complete :: temporal_core.slot_reservation_complete
+slot_reservation_cancel_complete :: temporal_core.slot_reservation_cancel_complete
 
 poller_simple_maximum :: temporal_core.poller_simple_maximum
 poller_autoscaling :: temporal_core.poller_autoscaling
@@ -431,6 +439,7 @@ Options :: struct {
 	max_eager_activity_reservations_per_workflow_task: u32,
 	resource_based_activity_tuner:                    Resource_Based_Activity_Tuner_Options,
 	resource_based_nexus_tuner:                       Resource_Based_Nexus_Tuner_Options,
+	custom_activity_slot_supplier:                    Custom_Slot_Supplier,
 	versioning:                                      Worker_Versioning_Options,
 	nondeterminism_policy:                           Nondeterminism_Policy,
 	workflow_stacks:                                 workflow.Stack_Options,
@@ -636,6 +645,12 @@ create_with_options :: proc(
 	if len(options.namespace) == 0 {
 		return {}, error_from_string("namespace must not be empty")
 	}
+	if temporal_core.custom_slot_supplier_enabled(options.custom_activity_slot_supplier) &&
+	   options.max_concurrent_activities <= 0 {
+		return {}, error_from_string(
+			"custom Activity slot suppliers require positive executor concurrency",
+		)
+	}
 	core_options := temporal_core.Worker_Options{
 		identity_override = options.identity_override,
 		max_activity_slots = options.max_concurrent_activities,
@@ -658,6 +673,7 @@ create_with_options :: proc(
 			options.max_eager_activity_reservations_per_workflow_task,
 		resource_based_activity_tuner = options.resource_based_activity_tuner,
 		resource_based_nexus_tuner = options.resource_based_nexus_tuner,
+		custom_activity_slot_supplier = options.custom_activity_slot_supplier,
 	}
 	core_options_error := temporal_core.worker_options_validate(core_options)
 	if core_options_error.message != nil {

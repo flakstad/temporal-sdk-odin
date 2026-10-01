@@ -329,6 +329,19 @@ the CPU and memory targets must match when both tuners are enabled. Workflow
 slots remain fixed. The identity and all other referenced strings are owned by
 the Odin Worker until `worker.close`.
 
+Advanced Activity Workers may instead provide
+`options.custom_activity_slot_supplier`. Its thread-safe Odin callbacks receive
+callback-scoped reservation/task views, issue nonzero permit IDs, and observe
+mark-used/release events. Async reservations are explicitly completed through
+`worker.slot_reservation_complete` or
+`worker.slot_reservation_cancel_complete`. The SDK owns and pins the C callback
+table through Core Worker shutdown, while the configured `user_data` remains
+caller-owned until `worker.close`. Custom and resource-based Activity suppliers
+are mutually exclusive; `max_concurrent_activities` still sizes the Odin
+callback executor. A CLI-dev-server test proves capacity-one backpressure,
+queued reservation cancellation, permit release, and supplier cleanup through
+the real Core bridge.
+
 A running online Worker can move future polling and Worker heartbeats to a new
 Core connection with `worker.replace_client`. Both Client runtimes must remain
 open until `worker.close`; registrations, Workflow cache, task queue, and
