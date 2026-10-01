@@ -905,6 +905,27 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		second_result := workflow.await_activity(ctx, second)
 		return fmt.aprintf("%s & %s", first_result, second_result)
 	}
+	if name == "signal-join" {
+		cases := [?]workflow.Selector_Case{
+			workflow.selector_signal("alpha"),
+			workflow.selector_signal("beta"),
+		}
+		results: [2]workflow.Join_Case_Result
+		if workflow.join_all_into(ctx, cases[:], results[:]) != .Ready {
+			return "Signal join canceled"
+		}
+		alpha: string
+		beta: string
+		if results[0].kind != .Signal || results[1].kind != .Signal ||
+		   len(results[0].signal.values) != 1 || len(results[1].signal.values) != 1 ||
+		   results[0].signal.metadata.name != "alpha" ||
+		   results[1].signal.metadata.name != "beta" ||
+		   codec.decode_json(results[0].signal.values[0], &alpha) != .None ||
+		   codec.decode_json(results[1].signal.values[0], &beta) != .None {
+			return "Signal join result mismatch"
+		}
+		return fmt.aprintf("%s & %s", alpha, beta)
+	}
 	if name == "selector" {
 		start_fields := [?]workflow.Log_Field{
 			workflow.log_field_string("operation", "selector"),
@@ -2132,15 +2153,16 @@ main :: proc() {
 	expect_condition := scenario == "condition" || expect_cached_condition
 	expect_selector := scenario == "selector"
 	expect_join := scenario == "join-all"
+	expect_signal_join := scenario == "signal-join"
 	expect_scoped_metrics := scenario == "scoped-metrics"
 	expect_cancel := expect_cancel_timer || expect_cancel_activity || expect_cancel_cleanup ||
 		expect_activity_cancel_details
 	run_stats, run_error := worker.run(
 		&activity_worker,
 		{
-			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition ? 0 : (expect_update ? 4 : (expect_update_with_start ? 3 : ((expect_signal_handler || expect_local_activity_retry || expect_join) ? 2 : 1))),
+			max_activity_tasks = expect_cancel || expect_cancellation_tree || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition || expect_signal_join ? 0 : (expect_update ? 4 : (expect_update_with_start ? 3 : ((expect_signal_handler || expect_local_activity_retry || expect_join) ? 2 : 1))),
 			max_workflow_executions = expect_schedule_backfill ? 3 : 1,
-			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition,
+			disable_activity_polling = expect_cancel_timer || expect_cross_routine_cancellation || expect_cancellation_deadline || expect_signal_handler_failure || expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition || expect_signal_join,
 			enable_local_activities = expect_local_activity || expect_local_activity_retry,
 			on_workflow_activation = observe_activation,
 		},
@@ -2224,9 +2246,11 @@ main :: proc() {
 				fmt.eprintln("Signal-handler failure did not survive Core eviction and Worker recovery")
 				failed = true
 			}
-		} else if expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition {
+		} else if expect_patch || expect_deployment_versioning || expect_nondeterminism_fail || expect_properties || expect_signal_with_start || expect_multiple_workflow_arguments || expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition || expect_signal_join {
 			expected_signals := 0
 			if expect_signal_with_start {
+				expected_signals = 2
+			} else if expect_signal_join {
 				expected_signals = 2
 			} else if expect_multiple_signal_arguments || expect_multiple_query_arguments || expect_multiple_update_arguments || expect_condition || expect_properties {
 				expected_signals = 1
@@ -2422,6 +2446,8 @@ main :: proc() {
 		}
 	} else if expect_join {
 		fmt.println("Workflow join waited for both concurrent Activities in declaration order")
+	} else if expect_signal_join {
+		fmt.println("Workflow join consumed two unique Signals in declaration slots")
 	} else if expect_selector {
 		fmt.println("Workflow selector chose the ready Activity and canceled its losing timer")
 	} else {

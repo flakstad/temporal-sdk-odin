@@ -6278,6 +6278,48 @@ fiber_join_all_test_workflow :: proc(
 	return fmt.aprintf("%s/%s", first_result, second_result)
 }
 
+fiber_join_signals_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	cases := [?]workflow.Selector_Case{
+		workflow.selector_signal("alpha"),
+		workflow.selector_signal("beta"),
+	}
+	results: [2]workflow.Join_Case_Result
+	if workflow.join_all_into(ctx, cases[:], results[:]) != .Ready {
+		return "join canceled"
+	}
+	if results[0].kind != .Signal || results[1].kind != .Signal ||
+	   len(results[0].signal.values) != 1 || len(results[1].signal.values) != 1 ||
+	   results[0].signal.metadata.identity != "alpha-client" ||
+	   results[1].signal.metadata.identity != "beta-client" ||
+	   results[0].signal.metadata.originating_event_id != 31 ||
+	   results[1].signal.metadata.originating_event_id != 29 {
+		return "joined signal metadata mismatch"
+	}
+	alpha: string
+	beta: string
+	if codec.decode_json(results[0].signal.values[0], &alpha) != .None ||
+	   codec.decode_json(results[1].signal.values[0], &beta) != .None {
+		return "joined signal decode failed"
+	}
+	return fmt.aprintf("%s/%s", alpha, beta)
+}
+
+fiber_join_duplicate_signals_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	cases := [?]workflow.Selector_Case{
+		workflow.selector_signal("same"),
+		workflow.selector_signal("same"),
+	}
+	results: [2]workflow.Join_Case_Result
+	_ = workflow.join_all_into(ctx, cases[:], results[:])
+	return "unexpected"
+}
+
 workflow_mutex_signal_routine :: proc(
 	ctx: ^workflow.Fiber_Context,
 	state: ^Workflow_Mutex_Test_State,
@@ -20207,6 +20249,246 @@ workflow_join_all_waits_for_every_case_and_replays :: proc(t: ^testing.T) {
 	delete(terminal_completion)
 	delete(processed.completion)
 	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_join_all_into_consumes_unique_signals_after_every_case_is_ready :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_join_signals_test",
+		"test-queue",
+		fiber_join_signals_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("start")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_join_signals_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-join-signals-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "signal join initialization failed: %s", string(processed.error.message))
+	testing.expect(t, processed.waiting_join)
+	initial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	alpha_payload, alpha_error := codec.encode_json("A")
+	beta_payload, beta_error := codec.encode_json("B")
+	testing.expect_value(t, alpha_error, codec.Error.None)
+	testing.expect_value(t, beta_error, codec.Error.None)
+	defer codec.payload_free(&alpha_payload)
+	defer codec.payload_free(&beta_payload)
+	alpha_proto := proto.encode_payload(codec.payload_view(&alpha_payload))
+	beta_proto := proto.encode_payload(codec.payload_view(&beta_payload))
+	defer delete(alpha_proto.metadata)
+	defer delete(alpha_proto.external_payloads)
+	defer delete(beta_proto.metadata)
+	defer delete(beta_proto.external_payloads)
+	alpha_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "alpha",
+		identity = "alpha-client",
+		originating_event_id = 31,
+	}
+	beta_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "beta",
+		identity = "beta-client",
+		originating_event_id = 29,
+	}
+	defer delete(alpha_signal.input)
+	defer delete(beta_signal.input)
+	append(&alpha_signal.input, alpha_proto)
+	append(&beta_signal.input, beta_proto)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 5
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &beta_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "partial signal join failed: %s", string(processed.error.message))
+	testing.expect(t, processed.received_signal)
+	testing.expect(t, processed.waiting_join)
+	testing.expect(t, !processed.completed)
+	partial_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 7
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &alpha_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, processed.error.message == nil, "terminal signal join failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	testing.expect(t, !processed.waiting_join)
+	completion := inspect_workflow_completion(processed.completion[:])
+	testing.expect(t, completion.completed)
+	testing.expect_value(t, string(completion.completion_result), `"A/B"`)
+	delete(completion.failure_message)
+	delete(completion.completion_result)
+	terminal_completion := processed.completion
+	workflow.error_free(&processed.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.evicted)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.is_replaying = true
+	activation.history_length = 3
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], processed.completion[:]))
+	delete(initial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.history_length = 5
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &beta_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(partial_completion[:], processed.completion[:]))
+	delete(partial_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	activation.history_length = 7
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &alpha_signal,
+			},
+		},
+	)
+	processed = process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, bytes.equal(terminal_completion[:], processed.completion[:]))
+	delete(terminal_completion)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
+@(test)
+workflow_join_all_into_rejects_duplicate_signal_consumers :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_join_duplicate_signals_test",
+		"test-queue",
+		fiber_join_duplicate_signals_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("start")
+	testing.expect_value(t, input_error, codec.Error.None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_join_duplicate_signals_test",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "workflow-join-duplicate-signals-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	defer delete(processed.completion)
+	defer workflow.error_free(&processed.error)
+	testing.expectf(t, processed.error.message == nil, "duplicate Signal join processing failed: %s", string(processed.error.message))
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	defer delete(inspection.message)
+	defer delete(inspection.failure_type)
+	defer delete(inspection.child_workflow_id)
+	defer delete(inspection.child_workflow_type)
+	defer delete(inspection.cause_message)
+	defer delete(inspection.cause_type)
+	testing.expect(t, inspection.found)
+	testing.expect(t, inspection.non_retryable)
+	testing.expect_value(t, string(inspection.message), "invalid Workflow join")
+	testing.expect_value(t, string(inspection.failure_type), "OdinWorkflowJoinError")
 }
 
 @(test)

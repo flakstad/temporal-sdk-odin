@@ -198,8 +198,25 @@ if workflow.join_all(ctx, cases[:]) == .Ready {
 ```
 
 Activity, Nexus operation, Timer, Child Workflow start, and Child Workflow
-completion cases are supported. Exact duplicate cases are invalid. Signal cases are deliberately
-rejected until join can return consumed Signal payloads with explicit ownership.
+completion cases are supported. Signal joins use caller-provided result slots,
+so payload and metadata views are returned without a hidden allocation:
+
+```odin
+cases := [?]workflow.Selector_Case{
+	workflow.selector_signal("payment"),
+	workflow.selector_signal("inventory"),
+}
+results: [2]workflow.Join_Case_Result
+if workflow.join_all_into(ctx, cases[:], results[:]) == .Ready {
+	payment := results[0].signal
+	inventory := results[1].signal
+}
+```
+
+The result slice must match the case count and remains borrowed across
+suspension. On `.Ready`, each unique Signal is consumed into its corresponding
+slot; its Payload and metadata views borrow the Workflow run. Exact duplicate
+cases—including duplicate Signal names—are invalid.
 Cancellation is checked after the all-ready condition, and unfinished
 operations remain owned by the Workflow when join returns `.Canceled`.
 Selector/join composition over Child start and completion futures, including an

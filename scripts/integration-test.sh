@@ -618,6 +618,84 @@ grep -Eq "resolved=2 .*waiting_join=false .*completed=true" "$worker_log"
 grep -q "Workflow join waited for both concurrent Activities in declaration order" "$worker_log"
 echo "Workflow join waited for concurrent Activities through Core and Temporal Server"
 
+TEMPORAL_ODIN_SCENARIO=signal-join \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &
+worker_pid=$!
+for _ in {1..30}; do
+  if grep -q "Workflow Worker is polling" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null; then
+    echo "Signal-join Workflow Worker exited before polling; see $worker_log" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+signal_join_workflow_id="odin-sdk-signal-join-$$-$(date +%s)"
+temporal workflow execute \
+  --workflow-id "$signal_join_workflow_id" \
+  --type odin_hello_workflow \
+  --task-queue odin-hello-workflow \
+  --input '"signal-join"' \
+  --command-timeout 30s \
+  --output json >"$workflow_output_file" 2>&1 &
+workflow_cli_pid=$!
+
+for _ in {1..30}; do
+  if grep -Eq "waiting_join=true .*completed=false" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Signal-join Workflow did not suspend" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+temporal workflow signal \
+  --workflow-id "$signal_join_workflow_id" \
+  --name beta \
+  --input '"B"' \
+  --command-timeout 10s \
+  --output none
+
+for _ in {1..30}; do
+  if grep -Eq "signal=true .*waiting_join=true .*completed=false" "$worker_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$worker_pid" 2>/dev/null || ! kill -0 "$workflow_cli_pid" 2>/dev/null; then
+    echo "Signal-join Workflow resumed before alpha arrived" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+temporal workflow signal \
+  --workflow-id "$signal_join_workflow_id" \
+  --name alpha \
+  --input '"A"' \
+  --command-timeout 10s \
+  --output none
+
+wait "$workflow_cli_pid"
+workflow_cli_pid=""
+signal_join_output="$(<"$workflow_output_file")"
+echo "$signal_join_output"
+grep -Fq 'A \u0026 B' <<<"$signal_join_output"
+wait "$worker_pid"
+worker_pid=""
+cat "$worker_log"
+grep -Eq "replay=true .*waiting_join=true .*completed=false" "$worker_log"
+grep -Eq "signal=true .*waiting_join=true .*completed=false" "$worker_log"
+grep -Eq "signal=true .*waiting_join=false .*completed=true" "$worker_log"
+grep -q "Workflow join consumed two unique Signals in declaration slots" "$worker_log"
+echo "Workflow join consumed two Signals across Core activations and replay"
+
 TEMPORAL_ODIN_SCENARIO=multiple-signal-arguments \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-workflow.sh" >"$worker_log" 2>&1 &

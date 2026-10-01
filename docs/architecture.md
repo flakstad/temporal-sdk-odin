@@ -2155,10 +2155,12 @@ the existing typed Activity, Nexus operation, Timer, or Child Workflow
 `await_*` call reads each result synchronously in application-selected order.
 
 Exact duplicate cases are rejected because Odin handles are copyable whereas
-Rust futures are normally moved. Signal cases are also rejected for now:
-consuming several buffered Signals needs an explicit owned result collection,
-and silently allocating one would conflict with the SDK's ownership goals. The
-case slice is borrowed across suspension. If the selected cancellation token is
+Rust futures are normally moved. `join_all_into` extends the barrier to unique
+named Signals with a caller-provided result slice. It consumes each Signal into
+the corresponding `Join_Case_Result` only after every case is ready; Payload and
+metadata views borrow the Workflow run. This avoids both hidden allocation and
+ambiguous duplicate consumers. The case and result slices are borrowed across
+suspension. If the selected cancellation token is
 requested before every operation is ready, join returns `.Canceled` and leaves
 the operation handles under caller ownership. As with selector, this scheduler
 state never crosses the C ABI and adds no protobuf type or Core symbol.
@@ -2169,7 +2171,10 @@ order before checking three byte-identical replay completions. A 180-trace PBT
 suite varies all six Core job orders and both one/two-result activation splits.
 The live dev-server case runs a fast and a two-second Activity concurrently,
 observes a partial `waiting_join=true` activation, and completes in declaration
-order after Core eviction and replay.
+order after Core eviction and replay. A second 180-trace property varies Signal
+case order, delivery order, and activation splitting; the live Signal case
+delivers `beta` before `alpha`, remains suspended after the first delivery, and
+returns the values in case-slot order after replay.
 
 An unhandled Activity or Child Workflow failure is terminal for its Update
 routine, not for the enclosing Workflow Execution. The routine records the
@@ -3390,12 +3395,14 @@ Signal-handler buffer/order/replay cases, and 1,000
 statechart-backed Update lifecycle traces,
 against both the pinned library and `~/Projects/pbt`.
 
-The declaration-biased Workflow selector, allocation-free `join_all`, public
-Timer future, and distinct non-suspending timer-start interceptor are now
+The declaration-biased Workflow selector, allocation-free `join_all` and
+Signal-capable `join_all_into`, public Timer future, and distinct non-suspending
+timer-start interceptor are now
 implemented and live-proven. Two independent
 180-trace properties cover selector case/job order and join job/split order with
 fresh-stack replay; the selector property also carries generated Timer summaries
-through command metadata and replay. Timer duration, summary, and explicit
+through command metadata and replay. A third 180-trace property covers Signal
+join case/delivery order and activation splitting. Timer duration, summary, and explicit
 cancellation-token options are implemented. A 300-trace Child composition
 property now covers start/completion selectors, start/completion joins,
 explicit cancellation, partial readiness, and four byte-identical replay

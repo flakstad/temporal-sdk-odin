@@ -2152,15 +2152,21 @@ if workflow.join_all(ctx, cases[:]) == .Ready {
 `join_all` suspends until every declared Activity, Nexus operation, Timer, Child
 Workflow start, or Child Workflow completion is ready. The ordinary typed
 `await_*` operations then return synchronously and preserve declaration order.
-Duplicate cases and Signal cases are rejected; Signal joining is deferred until
-the API can return owned per-case values without surprising allocations. Cancellation returns
-`.Canceled` if all operations have not already become ready.
+`join_all_into` additionally accepts unique named Signals and writes their
+consumed Payload/metadata views into a caller-provided `[]Join_Case_Result`.
+This keeps the join allocation-free and makes Signal ownership explicit; the
+views borrow the Workflow run. Exact duplicate cases are rejected. Cancellation
+returns `.Canceled` if all cases have not already become ready.
 
 A 300-trace property composes both APIs around three Child Workflows. It varies
 start and completion declaration order, Core job order, and the explicitly
 canceled child; every intermediate completion must remain byte-identical after
 eviction and fresh-stack replay. This exercises Child start/completion futures
 as scheduler inputs rather than only testing their direct `await_*` paths.
+Another 180-trace property varies two Signal case orders, both Core delivery
+orders, and one/two-activation delivery. The CLI-devserver path sends `beta`
+before `alpha`, observes a partial joined wait, and completes with values in
+case-slot order after Core replay.
 
 Deadline tokens use Temporal timers and the activation timestamp rather than
 the host clock. Children inherit the earlier parent deadline; a shorter child

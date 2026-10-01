@@ -841,6 +841,14 @@ Join_Status :: enum {
 	Canceled,
 }
 
+// Join_Case_Result is written by join_all_into at the same index as its case.
+// Signal Payload views borrow the Workflow run; other case kinds keep using
+// their typed await APIs after the readiness barrier.
+Join_Case_Result :: struct {
+	kind:   Selector_Case_Kind,
+	signal: Payloads_Signal,
+}
+
 Selector_Result :: struct {
 	status: Selector_Status,
 	index:  int,
@@ -9167,14 +9175,16 @@ join_cases_equal :: proc(left, right: ^Selector_Case) -> bool {
 	return false
 }
 
-join_cases_valid :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> bool {
+join_cases_valid :: proc(
+	ctx: ^Fiber_Context,
+	cases: []Selector_Case,
+	allow_signals: bool,
+) -> bool {
 	if !selector_cases_valid(ctx, cases) {
 		return false
 	}
 	for &join_case, index in cases {
-		// Signal consumption needs an owned per-case result and is deliberately
-		// deferred. Durable operation handles have stable result APIs already.
-		if join_case.kind == .Signal {
+		if join_case.kind == .Signal && !allow_signals {
 			return false
 		}
 		for previous_index in 0..<index {
@@ -9212,17 +9222,7 @@ join_should_resume :: proc(ctx: ^Fiber_Context) -> bool {
 	)
 }
 
-// join_all waits until every durable case is ready. Cases are checked in slice
-// order and their existing await APIs can then retrieve results synchronously.
-// Failed or canceled operations are not hidden or implicitly discarded.
-// Signal cases are intentionally unsupported until their consumed result can
-// be returned without hidden allocation.
-join_all :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Join_Status {
-	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
-	   len(ctx.waiting_join_cases) != 0 || !join_cases_valid(ctx, cases) {
-		join_fail(ctx, "invalid Workflow join")
-		return .Canceled
-	}
+join_all_wait :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Join_Status {
 	instance := ctx.instance
 	token_id := current_cancellation_token_id(instance)
 	if join_all_ready(ctx, cases, token_id) {
@@ -9251,6 +9251,60 @@ join_all :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Join_Status {
 	}
 	join_fail(ctx, "Workflow join resumed before every case was ready")
 	return .Canceled
+}
+
+// join_all waits until every durable operation case is ready. Cases are
+// checked in slice order and their existing await APIs can then retrieve
+// results synchronously. Use join_all_into when Signal cases are required.
+// Failed or canceled operations are not hidden or implicitly discarded.
+join_all :: proc(ctx: ^Fiber_Context, cases: []Selector_Case) -> Join_Status {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(ctx.waiting_join_cases) != 0 || !join_cases_valid(ctx, cases, false) {
+		join_fail(ctx, "invalid Workflow join")
+		return .Canceled
+	}
+	return join_all_wait(ctx, cases)
+}
+
+// join_all_into is the allocation-free Signal-capable join. Results must have
+// exactly one slot per case and remain valid while the fiber is suspended. On
+// Ready, every Signal is consumed into its corresponding borrowed result;
+// durable operation handles remain available to their typed await APIs.
+join_all_into :: proc(
+	ctx: ^Fiber_Context,
+	cases: []Selector_Case,
+	results: []Join_Case_Result,
+) -> Join_Status {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   len(ctx.waiting_join_cases) != 0 || len(results) != len(cases) ||
+	   !join_cases_valid(ctx, cases, true) {
+		join_fail(ctx, "invalid Workflow join")
+		return .Canceled
+	}
+	for &result in results {
+		result = {}
+	}
+	status := join_all_wait(ctx, cases)
+	if status != .Ready {
+		return status
+	}
+	for &join_case, index in cases {
+		results[index].kind = join_case.kind
+		if join_case.kind != .Signal {
+			continue
+		}
+		signal, found := find_buffered_signal(ctx.instance, join_case.signal_name)
+		if !found {
+			join_fail(ctx, "joined Workflow Signal was not buffered")
+			return .Canceled
+		}
+		signal.consumed = true
+		results[index].signal = {
+			values = signal.input_views,
+			metadata = fiber_signal_context(signal),
+		}
+	}
+	return .Ready
 }
 
 selector_result :: proc(ctx: ^Fiber_Context, cases: []Selector_Case, index: int) -> Selector_Result {

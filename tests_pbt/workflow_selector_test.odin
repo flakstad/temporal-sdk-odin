@@ -1,6 +1,7 @@
 package workflow_pbt_test
 
 import "core:bytes"
+import "core:fmt"
 import "core:mem/virtual"
 import "core:testing"
 import "core:time"
@@ -601,6 +602,307 @@ workflow_join_all_waits_across_generated_resolution_orders :: proc(t: ^testing.T
 		"Workflow join waits across generated Core resolution orders",
 		join_order_property,
 		{num_tests = 180, seed = 0x4a4f_494e_5f41_4c4c},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+signal_join_property_workflow :: proc(ctx: ^workflow.Fiber_Context, flags: string) -> string {
+	reverse_cases := len(flags) > 0 && flags[0] == '1'
+	cases := [2]workflow.Selector_Case{
+		workflow.selector_signal("alpha"),
+		workflow.selector_signal("beta"),
+	}
+	if reverse_cases {
+		cases = {
+			workflow.selector_signal("beta"),
+			workflow.selector_signal("alpha"),
+		}
+	}
+	results: [2]workflow.Join_Case_Result
+	if workflow.join_all_into(ctx, cases[:], results[:]) != .Ready {
+		return "canceled"
+	}
+	values: [2]string
+	for &result, index in results {
+		if result.kind != .Signal || len(result.signal.values) != 1 ||
+		   result.signal.metadata.name != cases[index].signal_name {
+			return "wrong-result"
+		}
+		if codec.decode_json(result.signal.values[0], &values[index]) != .None {
+			return "decode-failed"
+		}
+	}
+	return fmt.aprintf(
+		"%s=%s/%s=%s",
+		results[0].signal.metadata.name,
+		values[0],
+		results[1].signal.metadata.name,
+		values[1],
+	)
+}
+
+append_signal_join_jobs :: proc(
+	jobs: ^[dynamic]proto.Coresdk_Workflow_Activation_WorkflowActivationJob,
+	reverse_delivery: bool,
+	begin, end: int,
+	alpha, beta: ^proto.Coresdk_Workflow_Activation_SignalWorkflow,
+) {
+	ordered := [2]^proto.Coresdk_Workflow_Activation_SignalWorkflow{alpha, beta}
+	if reverse_delivery {
+		ordered = {beta, alpha}
+	}
+	for index in begin..<end {
+		append(
+			jobs,
+			proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+				variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+					value = ordered[index],
+				},
+			},
+		)
+	}
+}
+
+signal_join_property :: proc(t: ^pbt.T) -> pbt.Result {
+	reverse_cases := pbt.draw(t, pbt.boolean())
+	reverse_delivery := pbt.draw(t, pbt.boolean())
+	split_activations := pbt.draw(t, pbt.boolean())
+	pbt.cover(t, reverse_cases, 35.0, "reversed Signal join cases")
+	pbt.cover(t, reverse_delivery, 35.0, "reversed Signal delivery")
+	pbt.cover(t, split_activations, 35.0, "split Signal activations")
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"pbt_signal_join_workflow",
+		"test-queue",
+		signal_join_property_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+	if init_error.message != nil {
+		return pbt.error("could not initialize Signal join runtime")
+	}
+
+	flags := reverse_cases ? "1" : "0"
+	input, input_error := codec.encode_json(flags)
+	defer codec.payload_free(&input)
+	if input_error != .None {
+		return pbt.error("could not encode Signal join input")
+	}
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "pbt_signal_join_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "pbt-signal-join-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.waiting_join || initial.completed {
+		return pbt.fail("generated Signal join Workflow did not initialize")
+	}
+	initial_completion := bytes.clone(initial.completion[:])
+	defer delete(initial_completion)
+
+	alpha_payload, alpha_error := codec.encode_json("A")
+	beta_payload, beta_error := codec.encode_json("B")
+	defer codec.payload_free(&alpha_payload)
+	defer codec.payload_free(&beta_payload)
+	if alpha_error != .None || beta_error != .None {
+		return pbt.error("could not encode Signal join values")
+	}
+	alpha_proto := proto.encode_payload(codec.payload_view(&alpha_payload))
+	beta_proto := proto.encode_payload(codec.payload_view(&beta_payload))
+	defer delete(alpha_proto.metadata)
+	defer delete(alpha_proto.external_payloads)
+	defer delete(beta_proto.metadata)
+	defer delete(beta_proto.external_payloads)
+	alpha_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "alpha",
+		identity = "alpha-client",
+		originating_event_id = 41,
+	}
+	beta_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "beta",
+		identity = "beta-client",
+		originating_event_id = 43,
+	}
+	defer delete(alpha_signal.input)
+	defer delete(beta_signal.input)
+	append(&alpha_signal.input, alpha_proto)
+	append(&beta_signal.input, beta_proto)
+
+	first_end := split_activations ? 1 : 2
+	partial_completion: []u8
+	defer delete(partial_completion)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append_signal_join_jobs(
+		&activation.jobs,
+		reverse_delivery,
+		0,
+		first_end,
+		&alpha_signal,
+		&beta_signal,
+	)
+	first_delivery := process_activation(&runtime, &activation)
+	defer destroy_process_result(&first_delivery)
+	if first_delivery.error.message != nil {
+		return pbt.fail("generated Signal join delivery failed")
+	}
+	if split_activations {
+		if first_delivery.completed || !first_delivery.waiting_join {
+			return pbt.fail("Signal join resumed after only one unique Signal")
+		}
+		partial_completion = bytes.clone(first_delivery.completion[:])
+	} else if !first_delivery.completed || first_delivery.waiting_join {
+		return pbt.fail("Signal join did not resume after both Signals")
+	}
+
+	terminal: workflow.Process_Result
+	if split_activations {
+		delete(activation.jobs)
+		activation.jobs = nil
+		activation.history_length = 8
+		append_signal_join_jobs(
+			&activation.jobs,
+			reverse_delivery,
+			1,
+			2,
+			&alpha_signal,
+			&beta_signal,
+		)
+		terminal = process_activation(&runtime, &activation)
+		if terminal.error.message != nil || !terminal.completed || terminal.waiting_join {
+			return pbt.fail("split Signal join did not complete")
+		}
+	} else {
+		terminal = first_delivery
+	}
+	defer {
+		if split_activations {
+			destroy_process_result(&terminal)
+		}
+	}
+	terminal_completion := bytes.clone(terminal.completion[:])
+	defer delete(terminal_completion)
+	result_payload, found := clone_pbt_workflow_result(terminal.completion[:])
+	defer codec.payload_free(&result_payload)
+	if !found {
+		return pbt.fail("Signal join completion had no result")
+	}
+	result: string
+	if codec.decode_json(codec.payload_view(&result_payload), &result) != .None {
+		return pbt.fail("Signal join completion result did not decode")
+	}
+	defer delete(result)
+	expected := reverse_cases ? "beta=B/alpha=A" : "alpha=A/beta=B"
+	if result != expected {
+		return pbt.fail("Signal join results did not follow case slots")
+	}
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_activation(&runtime, &activation)
+	defer destroy_process_result(&evicted)
+	if evicted.error.message != nil || !evicted.evicted {
+		return pbt.fail("Signal join Workflow did not evict")
+	}
+
+	activation.is_replaying = true
+	activation.history_length = 3
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_initial)
+	if replayed_initial.error.message != nil ||
+	   !bytes.equal(initial_completion, replayed_initial.completion[:]) {
+		return pbt.fail("Signal join initialization changed on replay")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append_signal_join_jobs(
+		&activation.jobs,
+		reverse_delivery,
+		0,
+		first_end,
+		&alpha_signal,
+		&beta_signal,
+	)
+	replayed_first := process_activation(&runtime, &activation)
+	defer destroy_process_result(&replayed_first)
+	if replayed_first.error.message != nil {
+		return pbt.fail("Signal join first replay delivery failed")
+	}
+	if split_activations {
+		if !bytes.equal(partial_completion, replayed_first.completion[:]) {
+			return pbt.fail("Signal join partial completion changed on replay")
+		}
+		delete(activation.jobs)
+		activation.jobs = nil
+		activation.history_length = 8
+		append_signal_join_jobs(
+			&activation.jobs,
+			reverse_delivery,
+			1,
+			2,
+			&alpha_signal,
+			&beta_signal,
+		)
+		replayed_terminal := process_activation(&runtime, &activation)
+		defer destroy_process_result(&replayed_terminal)
+		if replayed_terminal.error.message != nil ||
+		   !bytes.equal(terminal_completion, replayed_terminal.completion[:]) {
+			return pbt.fail("Signal join terminal completion changed on replay")
+		}
+	} else if !bytes.equal(terminal_completion, replayed_first.completion[:]) {
+		return pbt.fail("same-activation Signal join changed on replay")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_signal_join_is_deterministic_across_case_and_delivery_orders :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow Signal join is deterministic across case and delivery orders",
+		signal_join_property,
+		{num_tests = 180, seed = 0x5349_474e_414c_4a4f},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
