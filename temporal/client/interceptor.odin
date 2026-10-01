@@ -279,6 +279,50 @@ Client_Count_Workflows_Interceptor_Proc :: #type proc(
 	next: Client_Count_Workflows_Next,
 ) -> (Workflow_Count, Error)
 
+Client_List_Nexus_Operations_Input :: struct {
+	client:    ^Client,
+	options:   List_Nexus_Operations_Options,
+	allocator: mem.Allocator,
+}
+
+Client_List_Nexus_Operations_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_List_Nexus_Operations_Input,
+) -> (Nexus_Operation_List_Page, Error)
+
+Client_List_Nexus_Operations_Next :: struct {
+	data:   rawptr,
+	invoke: Client_List_Nexus_Operations_Next_Proc,
+}
+
+Client_List_Nexus_Operations_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_List_Nexus_Operations_Input,
+	next: Client_List_Nexus_Operations_Next,
+) -> (Nexus_Operation_List_Page, Error)
+
+Client_Count_Nexus_Operations_Input :: struct {
+	client:    ^Client,
+	query:     string,
+	allocator: mem.Allocator,
+}
+
+Client_Count_Nexus_Operations_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Count_Nexus_Operations_Input,
+) -> (Nexus_Operation_Count, Error)
+
+Client_Count_Nexus_Operations_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Count_Nexus_Operations_Next_Proc,
+}
+
+Client_Count_Nexus_Operations_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Count_Nexus_Operations_Input,
+	next: Client_Count_Nexus_Operations_Next,
+) -> (Nexus_Operation_Count, Error)
+
 Client_Describe_Schedule_Input :: struct {
 	handle:    ^Schedule_Handle,
 	allocator: mem.Allocator,
@@ -360,6 +404,8 @@ Client_Interceptor :: struct {
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
 	count_workflows:    Client_Count_Workflows_Interceptor_Proc,
+	list_nexus_operations:  Client_List_Nexus_Operations_Interceptor_Proc,
+	count_nexus_operations: Client_Count_Nexus_Operations_Interceptor_Proc,
 	describe_schedule:  Client_Describe_Schedule_Interceptor_Proc,
 	list_schedules:     Client_List_Schedules_Interceptor_Proc,
 	count_schedules:    Client_Count_Schedules_Interceptor_Proc,
@@ -485,6 +531,26 @@ client_count_workflows_next :: proc(
 ) -> (Workflow_Count, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Workflow count interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_list_nexus_operations_next :: proc(
+	next: Client_List_Nexus_Operations_Next,
+	input: ^Client_List_Nexus_Operations_Input,
+) -> (Nexus_Operation_List_Page, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation list interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_count_nexus_operations_next :: proc(
+	next: Client_Count_Nexus_Operations_Next,
+	input: ^Client_Count_Nexus_Operations_Input,
+) -> (Nexus_Operation_Count, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation count interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -823,6 +889,48 @@ client_count_workflows_chain :: proc(
 		)
 	}
 	return count_workflows_terminal(input)
+}
+
+client_list_nexus_operations_chain :: proc(
+	data: rawptr,
+	input: ^Client_List_Nexus_Operations_Input,
+) -> (Nexus_Operation_List_Page, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation list interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.list_nexus_operations == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.list_nexus_operations(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_list_nexus_operations_chain},
+		)
+	}
+	return list_nexus_operations_terminal(input)
+}
+
+client_count_nexus_operations_chain :: proc(
+	data: rawptr,
+	input: ^Client_Count_Nexus_Operations_Input,
+) -> (Nexus_Operation_Count, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Nexus operation count interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.count_nexus_operations == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.count_nexus_operations(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_count_nexus_operations_chain},
+		)
+	}
+	return count_nexus_operations_terminal(input)
 }
 
 client_describe_schedule_chain :: proc(data: rawptr, input: ^Client_Describe_Schedule_Input) -> (Schedule_Description, Error) {

@@ -304,6 +304,58 @@ client_interceptor_test_count_workflows :: proc(
 	return result, result_error
 }
 
+client_interceptor_test_list_nexus_operations :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_List_Nexus_Operations_Input,
+	next: temporal_client.Client_List_Nexus_Operations_Next,
+) -> (temporal_client.Nexus_Operation_List_Page, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.query = `Operation = "intercepted"`
+		input.options.page_size = 19
+	} else {
+		node.state.list_query_seen = input.options.query == `Operation = "intercepted"` &&
+		                             input.options.page_size == 19
+	}
+	result: temporal_client.Nexus_Operation_List_Page
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Nexus operation list short circuit")
+	} else {
+		result, result_error = temporal_client.client_list_nexus_operations_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_count_nexus_operations :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Count_Nexus_Operations_Input,
+	next: temporal_client.Client_Count_Nexus_Operations_Next,
+) -> (temporal_client.Nexus_Operation_Count, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.query = `ExecutionStatus = "Running"`
+	} else {
+		node.state.count_query_seen = input.query == `ExecutionStatus = "Running"`
+	}
+	result: temporal_client.Nexus_Operation_Count
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Nexus operation count short circuit")
+	} else {
+		result, result_error = temporal_client.client_count_nexus_operations_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
 @(test)
 workflow_nexus_operation_schedules_replays_and_resolves_synchronously :: proc(t: ^testing.T) {
 	interceptor_state := Workflow_Nexus_Interceptor_Test_State{}
@@ -9528,11 +9580,15 @@ client_visibility_interceptors_nest_and_propagate_queries :: proc(t: ^testing.T)
 			user_data = &first,
 			list_workflows = client_interceptor_test_list_workflows,
 			count_workflows = client_interceptor_test_count_workflows,
+			list_nexus_operations = client_interceptor_test_list_nexus_operations,
+			count_nexus_operations = client_interceptor_test_count_nexus_operations,
 		},
 		temporal_client.Client_Interceptor{
 			user_data = &second,
 			list_workflows = client_interceptor_test_list_workflows,
 			count_workflows = client_interceptor_test_count_workflows,
+			list_nexus_operations = client_interceptor_test_list_nexus_operations,
+			count_nexus_operations = client_interceptor_test_count_nexus_operations,
 		},
 	)
 
@@ -9557,6 +9613,38 @@ client_visibility_interceptors_nest_and_propagate_queries :: proc(t: ^testing.T)
 	testing.expect_value(t, count_error.kind, temporal_client.Error_Kind.Rpc)
 	testing.expect_value(t, string(count_error.message), "Workflow count short circuit")
 	temporal_client.error_free(&count_error)
+	testing.expect(t, state.count_query_seen)
+	testing.expect_value(t, state.count, 4)
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+
+	state.count = 0
+	state.list_query_seen = false
+	nexus_page, nexus_list_error := temporal_client.list_nexus_operations(
+		&client,
+		{page_size = 5, query = `Operation = "caller"`},
+	)
+	temporal_client.nexus_operation_list_page_free(&nexus_page)
+	testing.expect_value(t, nexus_list_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(nexus_list_error.message), "Nexus operation list short circuit")
+	temporal_client.error_free(&nexus_list_error)
+	testing.expect(t, state.list_query_seen)
+	testing.expect_value(t, state.count, 4)
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+
+	state.count = 0
+	state.count_query_seen = false
+	nexus_count, nexus_count_error := temporal_client.count_nexus_operations(
+		&client,
+		`Operation = "caller"`,
+	)
+	temporal_client.nexus_operation_count_free(&nexus_count)
+	testing.expect_value(t, nexus_count_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(nexus_count_error.message), "Nexus operation count short circuit")
+	temporal_client.error_free(&nexus_count_error)
 	testing.expect(t, state.count_query_seen)
 	testing.expect_value(t, state.count, 4)
 	for event, index in expected {
@@ -23298,4 +23386,84 @@ standalone_nexus_description_is_owned_and_typed :: proc(t: ^testing.T) {
 	defer temporal_client.error_free(&completed_error)
 	testing.expect(t, completed_error.message == nil && completed.has_result)
 	testing.expect(t, bytes.equal(completed.result.data, transmute([]u8)string(`"terminated"`)))
+}
+
+@(test)
+standalone_nexus_visibility_results_are_owned :: proc(t: ^testing.T) {
+	schedule_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000}
+	close_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_004}
+	duration := proto.Google_Protobuf_Duration{seconds = 4}
+	search_payload := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"gold"`)}
+	defer delete(search_payload.metadata)
+	append(&search_payload.metadata, proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+		key = "encoding",
+		value = transmute([]u8)string("json/plain"),
+	})
+	search_attributes := proto.Temporal_Api_Common_V1_SearchAttributes{}
+	defer delete(search_attributes.indexed_fields)
+	append(&search_attributes.indexed_fields, proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+		key = "Tier",
+		value = &search_payload,
+	})
+	entry := proto.Temporal_Api_Nexus_V1_NexusOperationExecutionListInfo{
+		operation_id = "listed-operation",
+		run_id = "listed-run",
+		endpoint = "payments",
+		service = "payment-service",
+		operation = "charge",
+		schedule_time = &schedule_time,
+		close_time = &close_time,
+		status = .NEXUS_OPERATION_EXECUTION_STATUS_COMPLETED,
+		search_attributes = &search_attributes,
+		state_transition_count = 4,
+		execution_duration = &duration,
+		state_size_bytes = 2048,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_ListNexusOperationExecutionsResponse{
+		next_page_token = transmute([]u8)string("page-two"),
+	}
+	defer delete(response.operations)
+	append(&response.operations, entry)
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListNexusOperationExecutionsResponse(&response)
+	page, page_error := temporal_client.decode_nexus_operation_list_page(encoded[:])
+	delete(encoded)
+	defer temporal_client.nexus_operation_list_page_free(&page)
+	defer temporal_client.error_free(&page_error)
+	testing.expectf(t, page_error.message == nil, "Nexus list decode failed: %s", string(page_error.message))
+	testing.expect_value(t, len(page.operations), 1)
+	if len(page.operations) == 1 {
+		listed := &page.operations[0]
+		testing.expect_value(t, listed.operation_id, "listed-operation")
+		testing.expect_value(t, listed.run_id, "listed-run")
+		testing.expect_value(t, listed.status, temporal_client.Nexus_Operation_Status.Completed)
+		testing.expect(t, listed.schedule_time.present && listed.close_time.present)
+		testing.expect_value(t, listed.execution_duration.value, 4 * time.Second)
+		testing.expect_value(t, listed.state_transition_count, i64(4))
+		testing.expect_value(t, listed.state_size_bytes, i64(2048))
+		testing.expect_value(t, len(listed.search_attributes), 1)
+	}
+	testing.expect(t, bytes.equal(page.next_page_token, transmute([]u8)string("page-two")))
+
+	group_value := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Completed"`)}
+	group := proto.Temporal_Api_Workflowservice_V1_CountNexusOperationExecutionsResponse_AggregationGroup{
+		count = 7,
+	}
+	defer delete(group.group_values)
+	append(&group.group_values, group_value)
+	count_response := proto.Temporal_Api_Workflowservice_V1_CountNexusOperationExecutionsResponse{count = 7}
+	defer delete(count_response.groups)
+	append(&count_response.groups, group)
+	count_bytes := proto.encode_Temporal_Api_Workflowservice_V1_CountNexusOperationExecutionsResponse(&count_response)
+	count, count_error := temporal_client.decode_nexus_operation_count(count_bytes[:])
+	delete(count_bytes)
+	defer temporal_client.nexus_operation_count_free(&count)
+	defer temporal_client.error_free(&count_error)
+	testing.expect(t, count_error.message == nil)
+	testing.expect_value(t, count.count, i64(7))
+	testing.expect_value(t, len(count.groups), 1)
+	if len(count.groups) == 1 {
+		testing.expect_value(t, count.groups[0].count, i64(7))
+		testing.expect_value(t, len(count.groups[0].values), 1)
+		testing.expect(t, bytes.equal(count.groups[0].values[0].data, group_value.data))
+	}
 }

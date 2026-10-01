@@ -1124,12 +1124,13 @@ Odin Client poll  <- durable result <- Core completion <- JSON Payload
 Odin Client cancel -> Server 1.32 -> Core CancelOperation -> Odin cancel handler
 
 Odin Client Describe running state -> terminate -> Poll/Describe terminal state
-Odin Client delete -> subsequent Describe returns gRPC NOT_FOUND
+Odin Client list/count exact Visibility query -> delete -> Describe NOT_FOUND
 ```
 
 The lifecycle path exercises the exact generic Core bridge RPC names
 `DescribeNexusOperationExecution`, `TerminateNexusOperationExecution`, and
-`DeleteNexusOperationExecution`. No additional raw C ABI symbol is involved.
+`DeleteNexusOperationExecution`, then `ListNexusOperationExecutions` and
+`CountNexusOperationExecutions`. No additional raw C ABI symbol is involved.
 Every field returned from Describe is cloned out of the temporary protobuf
 decode arena and released with `nexus_operation_description_free`.
 

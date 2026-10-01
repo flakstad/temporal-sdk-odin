@@ -12,7 +12,9 @@ sends typed signals, requests cancellation, and terminates executions. It now
 starts, polls, describes, requests cancellation of, terminates, and deletes
 standalone Nexus operations through an owned Odin handle. Describe owns status,
 pending/cancellation state, timing, input/outcome, headers, Search Attributes,
-UI metadata, failures, and the opaque long-poll token. This pre-release server
+UI metadata, failures, and the opaque long-poll token. Paginated list and
+group-capable count APIs expose the standalone-operation Visibility surface.
+This pre-release server
 feature is live-proven against Temporal Server 1.32.0 with
 `nexusoperation.enableStandalone=true`; the
 repository's established CLI 1.5.1/Server 1.29.1 baseline correctly
@@ -422,7 +424,8 @@ Client connections accept an ordered `[]Client_Interceptor`. The current
 typesafe outbound surface wraps Workflow start, Signal-With-Start, Signal,
 Query, Workflow result waiting, Update start/result waiting, cancellation,
 termination, and Workflow
-Visibility list/count plus Schedule Describe/List/Count/Matching-Times; each
+Visibility list/count, standalone Nexus list/count, plus Schedule
+Describe/List/Count/Matching-Times; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
 Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`.

@@ -111,6 +111,26 @@ main :: proc() {
 			fail("Terminated Nexus operation Describe omitted its terminal outcome")
 		}
 		temporal_client.nexus_operation_description_free(&terminated)
+		visibility_query := fmt.aprintf(`OperationId = "%s"`, handle.id)
+		defer delete(visibility_query)
+		page, list_error := temporal_client.list_nexus_operations(
+			&client,
+			{page_size = 1, query = visibility_query},
+		)
+		if list_error.message != nil do fail("Nexus operation list failed", &list_error)
+		if len(page.operations) != 1 || page.operations[0].operation_id != handle.id ||
+		   page.operations[0].status != .Terminated {
+			temporal_client.nexus_operation_list_page_free(&page)
+			fail("Nexus operation list omitted its terminated execution")
+		}
+		temporal_client.nexus_operation_list_page_free(&page)
+		count, count_error := temporal_client.count_nexus_operations(&client, visibility_query)
+		if count_error.message != nil do fail("Nexus operation count failed", &count_error)
+		if count.count != 1 {
+			temporal_client.nexus_operation_count_free(&count)
+			fail("Nexus operation count did not return one execution")
+		}
+		temporal_client.nexus_operation_count_free(&count)
 		delete_error := temporal_client.delete_nexus_operation(&handle)
 		if delete_error.message != nil do fail("Nexus operation deletion failed", &delete_error)
 		_, missing_error := temporal_client.describe_nexus_operation(&handle)
@@ -119,7 +139,7 @@ main :: proc() {
 		}
 		temporal_client.error_free(&missing_error)
 		fmt.printf(
-			"Standalone Nexus operation %s was described, terminated, and deleted through the Odin Client.\n",
+			"Standalone Nexus operation %s was described, listed, counted, terminated, and deleted through the Odin Client.\n",
 			handle.id,
 		)
 		return
