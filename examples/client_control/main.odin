@@ -346,7 +346,7 @@ run :: proc() -> int {
 		}
 		defer temporal_client.workflow_description_free(&description)
 		fmt.printf(
-			"Odin client described workflow_id=%s status=%v paused=%v pause_identity=%q pause_reason=%q pending_nexus=%d callbacks=%d versioning=%v behavior=%v deployment_name=%q build_id=%q revision=%d\n",
+			"Odin client described workflow_id=%s status=%v paused=%v pause_identity=%q pause_reason=%q pending_nexus=%d callbacks=%d versioning=%v behavior=%v deployment_name=%q build_id=%q revision=%d reset_points=%d request_ids=%d time_skipping=%v\n",
 			workflow_id,
 			description.status,
 			description.pause_info.present,
@@ -359,6 +359,9 @@ run :: proc() -> int {
 			description.versioning_info.deployment_version.name,
 			description.versioning_info.deployment_version.build_id,
 			description.versioning_info.revision_number,
+			len(description.auto_reset_points),
+			len(description.request_id_infos),
+			description.time_skipping_info.present,
 		)
 		return 0
 	case "query":

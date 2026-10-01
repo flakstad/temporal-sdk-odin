@@ -1793,8 +1793,11 @@ Activity/child/Nexus summaries, recursive Nexus failures, and owned canonical
 callback protobufs. The same ownership test covers legacy and current Worker
 Deployment identity, transitions (including a nil target meaning a transition
 to unversioned workers), execution overrides, Activity pause rules, and
-effective Activity options. The live deployment scenario additionally requires
-the Odin Describe path to return the Deployment name and Build ID. The
+effective Activity options. It also destroys the decode buffer before checking
+owned parent/root identities, auto-reset points, expiration/reset timestamps,
+request-ID event mappings, and nested time-skipping configuration/state. The
+live deployment scenario additionally requires the Odin Describe path to return
+the Deployment name and Build ID. The
 Visibility property adds 500 pages with zero to sixteen execution summaries,
 all current Workflow status values, and opaque terminal/non-terminal tokens,
 plus zero to eight grouped count results with arbitrary ASCII Payload bytes.

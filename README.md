@@ -45,7 +45,8 @@ chain from Odin Activity through Server history and back to the Odin Client. It
 also
 owns and types `DescribeWorkflowExecution` results—including identity, status,
 timeouts, priority, memo/Search Attributes, Workflow pause and deployment
-versioning metadata, effective pending-Activity options/routing, pending
+versioning metadata, parent/root identity, auto-reset points, request IDs,
+time-skipping state, effective pending-Activity options/routing, pending
 child/Nexus summaries, and owned callback protobufs—and
 iterates full Workflow history with explicit pagination tokens. Each history
 event includes stable metadata plus an owned canonical protobuf representation.

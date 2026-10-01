@@ -83,6 +83,7 @@ TEMPORAL_CLIENT_ACTION=describe \
 cat "$output_log"
 grep -q 'status=Paused paused=true' "$output_log"
 grep -q 'pause_reason="downstream dependency outage"' "$output_log"
+grep -Eq 'reset_points=[1-9][0-9]* request_ids=[1-9][0-9]* time_skipping=false' "$output_log"
 
 temporal workflow describe \
   --workflow-id "$workflow_id" \

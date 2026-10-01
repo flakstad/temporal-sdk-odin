@@ -113,6 +113,45 @@ Workflow_Versioning_Info :: struct {
 	continue_as_new_behavior: Continue_As_New_Versioning_Behavior,
 }
 
+Workflow_Execution_Reference :: struct {
+	workflow_id: string,
+	run_id:      string,
+	present:     bool,
+}
+
+Workflow_Reset_Point :: struct {
+	build_id:                         string,
+	binary_checksum:                  string,
+	run_id:                           string,
+	first_workflow_task_completed_id: i64,
+	create_time:                      Optional_Time,
+	expire_time:                      Optional_Time,
+	resettable:                       bool,
+}
+
+Workflow_Request_Id_Info :: struct {
+	request_id: string,
+	event_type: History_Event_Type,
+	event_id:   i64,
+	buffered:   bool,
+}
+
+Workflow_Time_Skipping_Fast_Forward_Info :: struct {
+	present:       bool,
+	duration:      Optional_Duration,
+	id:            string,
+	target_time:   Optional_Time,
+	has_completed: bool,
+}
+
+Workflow_Time_Skipping_Info :: struct {
+	present:                    bool,
+	current_time:               Optional_Time,
+	effective_config:           Workflow_Time_Skipping_State,
+	fast_forward_info:          Workflow_Time_Skipping_Fast_Forward_Info,
+	current_session_skip_count: i32,
+}
+
 Named_Payload :: struct {
 	key:     string,
 	payload: codec.Payload,
@@ -227,6 +266,17 @@ Workflow_Description :: struct {
 	inherited_build_id:          string,
 	worker_deployment_name:      string,
 	versioning_info:             Workflow_Versioning_Info,
+	parent_namespace_id:         string,
+	parent_execution:            Workflow_Execution_Reference,
+	root_execution:              Workflow_Execution_Reference,
+	auto_reset_points:           [dynamic]Workflow_Reset_Point,
+	execution_expiration_time:   Optional_Time,
+	run_expiration_time:         Optional_Time,
+	last_reset_time:             Optional_Time,
+	original_start_time:         Optional_Time,
+	reset_run_id:                string,
+	request_id_infos:            [dynamic]Workflow_Request_Id_Info,
+	time_skipping_info:          Workflow_Time_Skipping_Info,
 	static_summary:              string,
 	has_static_summary:          bool,
 	static_details:              string,
@@ -419,6 +469,83 @@ description_workflow_versioning_info :: proc(
 	return result, ok
 }
 
+workflow_execution_reference_free :: proc(
+	reference: ^Workflow_Execution_Reference,
+	allocator: mem.Allocator,
+) {
+	if reference == nil || allocator.procedure == nil do return
+	delete(reference.workflow_id, allocator)
+	delete(reference.run_id, allocator)
+	reference^ = {}
+}
+
+description_workflow_execution_reference :: proc(
+	source: ^proto.Temporal_Api_Common_V1_WorkflowExecution,
+	allocator: mem.Allocator,
+) -> (result: Workflow_Execution_Reference, ok: bool) {
+	if source == nil do return {}, true
+	result.present = true
+	result.workflow_id, ok = description_clone_string(source.workflow_id, allocator)
+	if ok do result.run_id, ok = description_clone_string(source.run_id, allocator)
+	if !ok do workflow_execution_reference_free(&result, allocator)
+	return result, ok
+}
+
+workflow_reset_point_free :: proc(point: ^Workflow_Reset_Point, allocator: mem.Allocator) {
+	if point == nil || allocator.procedure == nil do return
+	delete(point.build_id, allocator)
+	delete(point.binary_checksum, allocator)
+	delete(point.run_id, allocator)
+	point^ = {}
+}
+
+workflow_time_skipping_info_free :: proc(
+	info: ^Workflow_Time_Skipping_Info,
+	allocator: mem.Allocator,
+) {
+	if info == nil || allocator.procedure == nil do return
+	delete(info.effective_config.fast_forward.id, allocator)
+	delete(info.fast_forward_info.id, allocator)
+	info^ = {}
+}
+
+description_time_skipping_info :: proc(
+	source: ^proto.Temporal_Api_Common_V1_TimeSkippingInfo,
+	allocator: mem.Allocator,
+) -> (result: Workflow_Time_Skipping_Info, ok: bool) {
+	if source == nil do return {}, true
+	result.present = true
+	result.current_time = description_time(source.current_time)
+	result.current_session_skip_count = source.current_session_skip_count
+	ok = true
+	if source.effective_config != nil {
+		config := source.effective_config
+		result.effective_config.present = true
+		result.effective_config.enabled = config.enabled
+		result.effective_config.disable_propagation = config.disable_propagation
+		result.effective_config.max_session_skip_count = config.max_session_skip_count
+		if config.fast_forward_config != nil {
+			result.effective_config.fast_forward.present = true
+			result.effective_config.fast_forward.duration = description_duration(
+				config.fast_forward_config.duration,
+			).value
+			result.effective_config.fast_forward.id,
+			ok = description_clone_string(config.fast_forward_config.id, allocator)
+		}
+	}
+	if ok && source.fast_forward_info != nil {
+		fast_forward := source.fast_forward_info
+		result.fast_forward_info.present = true
+		result.fast_forward_info.duration = description_duration(fast_forward.fast_forward_duration)
+		result.fast_forward_info.target_time = description_time(fast_forward.target_time)
+		result.fast_forward_info.has_completed = fast_forward.has_completed
+		result.fast_forward_info.id,
+		ok = description_clone_string(fast_forward.fast_forward_id, allocator)
+	}
+	if !ok do workflow_time_skipping_info_free(&result, allocator)
+	return result, ok
+}
+
 description_clone_payload :: proc(
 	value: ^proto.Temporal_Api_Common_V1_Payload,
 	allocator: mem.Allocator,
@@ -516,6 +643,19 @@ workflow_description_free :: proc(description: ^Workflow_Description) {
 	delete(description.inherited_build_id, allocator)
 	delete(description.worker_deployment_name, allocator)
 	workflow_versioning_info_free(&description.versioning_info, allocator)
+	delete(description.parent_namespace_id, allocator)
+	workflow_execution_reference_free(&description.parent_execution, allocator)
+	workflow_execution_reference_free(&description.root_execution, allocator)
+	for &point in description.auto_reset_points {
+		workflow_reset_point_free(&point, allocator)
+	}
+	delete(description.auto_reset_points)
+	delete(description.reset_run_id, allocator)
+	for &request_info in description.request_id_infos {
+		delete(request_info.request_id, allocator)
+	}
+	delete(description.request_id_infos)
+	workflow_time_skipping_info_free(&description.time_skipping_info, allocator)
 	delete(description.pause_info.identity, allocator)
 	delete(description.pause_info.reason, allocator)
 	for &entry in description.memo {
@@ -616,6 +756,8 @@ decode_workflow_description :: proc(
 	description.pending_children = make([dynamic]Pending_Child_Workflow, allocator)
 	description.pending_nexus_operations = make([dynamic]Pending_Nexus_Operation, allocator)
 	description.callback_protos = make([dynamic][]u8, allocator)
+	description.auto_reset_points = make([dynamic]Workflow_Reset_Point, allocator)
+	description.request_id_infos = make([dynamic]Workflow_Request_Id_Info, allocator)
 	failed := false
 	defer if failed {
 		workflow_description_free(&description)
@@ -640,6 +782,7 @@ decode_workflow_description :: proc(
 		{info.assigned_build_id, &description.assigned_build_id},
 		{info.inherited_build_id, &description.inherited_build_id},
 		{info.worker_deployment_name, &description.worker_deployment_name},
+		{info.parent_namespace_id, &description.parent_namespace_id},
 	}
 	for target in clone_targets {
 		ok: bool
@@ -663,10 +806,76 @@ decode_workflow_description :: proc(
 	description.state_transition_count = info.state_transition_count
 	description.external_payload_size_bytes = info.external_payload_size_bytes
 	description.external_payload_count = info.external_payload_count
+	reference_ok: bool
+	description.parent_execution,
+	reference_ok = description_workflow_execution_reference(info.parent_execution, allocator)
+	if reference_ok {
+		description.root_execution,
+		reference_ok = description_workflow_execution_reference(info.root_execution, allocator)
+	}
+	if !reference_ok {
+		failed = true
+		return {}, error_from_string(.Malformed_Response, "could not allocate Workflow execution ancestry")
+	}
+	if info.auto_reset_points != nil {
+		for source in info.auto_reset_points.points {
+			point := Workflow_Reset_Point{
+				first_workflow_task_completed_id = source.first_workflow_task_completed_id,
+				create_time = description_time(source.create_time),
+				expire_time = description_time(source.expire_time),
+				resettable = source.resettable,
+			}
+			point_ok := true
+			point.build_id, point_ok = description_clone_string(source.build_id, allocator)
+			if point_ok {
+				point.binary_checksum,
+				point_ok = description_clone_string(source.binary_checksum, allocator)
+			}
+			if point_ok do point.run_id, point_ok = description_clone_string(source.run_id, allocator)
+			if !point_ok {
+				workflow_reset_point_free(&point, allocator)
+				failed = true
+				return {}, error_from_string(.Malformed_Response, "could not allocate Workflow reset point")
+			}
+			append(&description.auto_reset_points, point)
+		}
+	}
 	if response.workflow_extended_info != nil {
-		description.cancel_requested = response.workflow_extended_info.cancel_requested
-		if response.workflow_extended_info.pause_info != nil {
-			source := response.workflow_extended_info.pause_info
+		extended := response.workflow_extended_info
+		description.cancel_requested = extended.cancel_requested
+		description.execution_expiration_time = description_time(extended.execution_expiration_time)
+		description.run_expiration_time = description_time(extended.run_expiration_time)
+		description.last_reset_time = description_time(extended.last_reset_time)
+		description.original_start_time = description_time(extended.original_start_time)
+		extended_ok := true
+		description.reset_run_id, extended_ok = description_clone_string(extended.reset_run_id, allocator)
+		if extended_ok {
+			description.time_skipping_info,
+			extended_ok = description_time_skipping_info(extended.time_skipping_info, allocator)
+		}
+		if !extended_ok {
+			failed = true
+			return {}, error_from_string(.Malformed_Response, "could not allocate extended Workflow info")
+		}
+		for source in extended.request_id_infos {
+			if source.value == nil {
+				failed = true
+				return {}, error_from_string(.Malformed_Response, "Workflow request ID info omitted its value")
+			}
+			request_id, request_ok := description_clone_string(source.key, allocator)
+			if !request_ok {
+				failed = true
+				return {}, error_from_string(.Malformed_Response, "could not allocate Workflow request ID info")
+			}
+			append(&description.request_id_infos, Workflow_Request_Id_Info{
+				request_id = request_id,
+				event_type = History_Event_Type(source.value.event_type),
+				event_id = source.value.event_id,
+				buffered = source.value.buffered,
+			})
+		}
+		if extended.pause_info != nil {
+			source := extended.pause_info
 			description.pause_info.present = true
 			description.pause_info.paused_time = description_time(source.paused_time)
 			pause_ok: bool

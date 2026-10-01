@@ -24955,6 +24955,27 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		revision_number = 12,
 		continue_as_new_initial_versioning_behavior = .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_USE_RAMPING_VERSION,
 	}
+	parent_execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "parent-workflow",
+		run_id = "parent-run",
+	}
+	root_execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = "root-workflow",
+		run_id = "root-run",
+	}
+	reset_create_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_004}
+	reset_expire_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_004}
+	reset_points := proto.Temporal_Api_Workflow_V1_ResetPoints{}
+	defer delete(reset_points.points)
+	append(&reset_points.points, proto.Temporal_Api_Workflow_V1_ResetPointInfo{
+		build_id = "reset-build-v1",
+		binary_checksum = "legacy-checksum",
+		run_id = "reset-source-run",
+		first_workflow_task_completed_id = 44,
+		create_time = &reset_create_time,
+		expire_time = &reset_expire_time,
+		resettable = true,
+	})
 	info := proto.Temporal_Api_Workflow_V1_WorkflowExecutionInfo{
 		execution = &execution,
 		type = &workflow_type,
@@ -24962,8 +24983,11 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		close_time = &close_time,
 		status = .WORKFLOW_EXECUTION_STATUS_COMPLETED,
 		history_length = 17,
+		parent_namespace_id = "parent-namespace-id",
+		parent_execution = &parent_execution,
 		memo = &memo,
 		search_attributes = &search_attributes,
+		auto_reset_points = &reset_points,
 		state_transition_count = 8,
 		history_size_bytes = 4096,
 		execution_duration = &execution_duration,
@@ -24973,6 +24997,7 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		first_run_id = "first-run",
 		versioning_info = &versioning_info,
 		worker_deployment_name = "orders",
+		root_execution = &root_execution,
 		priority = &priority,
 		external_payload_size_bytes = 99,
 		external_payload_count = 2,
@@ -24988,10 +25013,56 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 		paused_time = &paused_time,
 		reason = "incident",
 	}
-	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{
-		cancel_requested = true,
-		pause_info = &pause_info,
+	execution_expiration_time := proto.Google_Protobuf_Timestamp{seconds = 1_900_000_001}
+	run_expiration_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_001}
+	last_reset_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_005}
+	original_start_time := proto.Google_Protobuf_Timestamp{seconds = 1_600_000_001}
+	request_info := proto.Temporal_Api_Workflow_V1_RequestIdInfo{
+		event_type = .EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+		event_id = 1,
+		buffered = false,
 	}
+	fast_forward_duration := proto.Google_Protobuf_Duration{seconds = 90}
+	fast_forward_target := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_100}
+	effective_fast_forward_duration := proto.Google_Protobuf_Duration{seconds = 120}
+	effective_fast_forward := proto.Temporal_Api_Common_V1_FastForwardConfig{
+		id = "effective-fast-forward",
+		duration = &effective_fast_forward_duration,
+	}
+	effective_time_skipping := proto.Temporal_Api_Common_V1_TimeSkippingConfig{
+		enabled = true,
+		fast_forward_config = &effective_fast_forward,
+		disable_propagation = true,
+		max_session_skip_count = 8,
+	}
+	fast_forward_info := proto.Temporal_Api_Common_V1_TimeSkippingFastForwardInfo{
+		fast_forward_duration = &fast_forward_duration,
+		fast_forward_id = "active-fast-forward",
+		target_time = &fast_forward_target,
+		has_completed = false,
+	}
+	current_time := proto.Google_Protobuf_Timestamp{seconds = 1_700_000_010}
+	time_skipping_info := proto.Temporal_Api_Common_V1_TimeSkippingInfo{
+		current_time = &current_time,
+		effective_config = &effective_time_skipping,
+		fast_forward_info = &fast_forward_info,
+		current_session_skip_count = 3,
+	}
+	extended := proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo{
+		execution_expiration_time = &execution_expiration_time,
+		run_expiration_time = &run_expiration_time,
+		cancel_requested = true,
+		last_reset_time = &last_reset_time,
+		original_start_time = &original_start_time,
+		reset_run_id = "latest-reset-run",
+		pause_info = &pause_info,
+		time_skipping_info = &time_skipping_info,
+	}
+	defer delete(extended.request_id_infos)
+	append(&extended.request_id_infos, proto.Temporal_Api_Workflow_V1_WorkflowExecutionExtendedInfo_RequestIdInfosEntry{
+		key = "start-request-id",
+		value = &request_info,
+	})
 	response := proto.Temporal_Api_Workflowservice_V1_DescribeWorkflowExecutionResponse{
 		execution_config = &config,
 		workflow_execution_info = &info,
@@ -25017,6 +25088,8 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect(t, arena_decode_error.message == nil)
 	testing.expect_value(t, arena_description.versioning_info.deployment_version.build_id, "orders-v3")
 	testing.expect_value(t, arena_description.pending_activities[0].activity_options.task_queue, "payments-activity")
+	testing.expect_value(t, arena_description.auto_reset_points[0].build_id, "reset-build-v1")
+	testing.expect_value(t, arena_description.time_skipping_info.fast_forward_info.id, "active-fast-forward")
 	temporal_client.workflow_description_free(&arena_description)
 	temporal_client.error_free(&arena_decode_error)
 	virtual.arena_destroy(&owned_arena)
@@ -25040,6 +25113,43 @@ client_describe_response_is_owned_and_typed :: proc(t: ^testing.T) {
 	testing.expect_value(t, description.assigned_build_id, "workflow-build-v2")
 	testing.expect_value(t, description.inherited_build_id, "parent-build-v1")
 	testing.expect_value(t, description.worker_deployment_name, "orders")
+	testing.expect_value(t, description.parent_namespace_id, "parent-namespace-id")
+	testing.expect(t, description.parent_execution.present)
+	testing.expect_value(t, description.parent_execution.workflow_id, "parent-workflow")
+	testing.expect(t, description.root_execution.present)
+	testing.expect_value(t, description.root_execution.run_id, "root-run")
+	testing.expect_value(t, len(description.auto_reset_points), 1)
+	testing.expect_value(t, description.auto_reset_points[0].build_id, "reset-build-v1")
+	testing.expect_value(t, description.auto_reset_points[0].binary_checksum, "legacy-checksum")
+	testing.expect_value(t, description.auto_reset_points[0].first_workflow_task_completed_id, i64(44))
+	testing.expect(t, description.auto_reset_points[0].resettable)
+	testing.expect(t, description.execution_expiration_time.present)
+	testing.expect(t, description.run_expiration_time.present)
+	testing.expect(t, description.last_reset_time.present)
+	testing.expect(t, description.original_start_time.present)
+	testing.expect_value(t, description.reset_run_id, "latest-reset-run")
+	testing.expect_value(t, len(description.request_id_infos), 1)
+	testing.expect_value(t, description.request_id_infos[0].request_id, "start-request-id")
+	testing.expect_value(
+		t,
+		description.request_id_infos[0].event_type,
+		temporal_client.History_Event_Type.Workflow_Execution_Started,
+	)
+	testing.expect_value(t, description.request_id_infos[0].event_id, i64(1))
+	testing.expect(t, description.time_skipping_info.present)
+	testing.expect(t, description.time_skipping_info.effective_config.enabled)
+	testing.expect_value(
+		t,
+		description.time_skipping_info.effective_config.fast_forward.id,
+		"effective-fast-forward",
+	)
+	testing.expect_value(t, description.time_skipping_info.fast_forward_info.id, "active-fast-forward")
+	testing.expect_value(
+		t,
+		description.time_skipping_info.fast_forward_info.duration.value,
+		90 * time.Second,
+	)
+	testing.expect_value(t, description.time_skipping_info.current_session_skip_count, i32(3))
 	testing.expect(t, description.versioning_info.present)
 	testing.expect_value(
 		t,
