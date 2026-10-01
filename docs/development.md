@@ -185,6 +185,15 @@ resumption without requiring a server:
 ./scripts/test.sh
 ```
 
+Before the Odin tests, the script runs `scripts/fiber-guard-test.sh`. It first
+proves normal guarded-fiber create/resume/destroy, then forks an isolated child,
+fills a minimum-size stack in 1 KiB frames, and requires `SIGSEGV` or `SIGBUS`
+at the inaccessible page. This is intentionally a subprocess test: stack
+overflow is a fatal process boundary, not an Odin error that can safely unwind
+through the C coroutine trampoline. The bridge reports guard-page and reserved
+mapping sizes through diagnostic-only raw symbols, and an Odin unit test checks
+the same lifecycle through the actual binding.
+
 The fast suite also creates Core's dedicated offline replay worker through the
 C ABI. It replays a complete synthetic `temporal.api.history.v1.History`, then
 runs an incompatible Workflow definition against the same history and requires

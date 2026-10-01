@@ -48,6 +48,15 @@ foreign fiber_lib {
 	@(link_name = "temporal_odin_fiber_stack_size")
 	stack_size :: proc(fiber: Handle) -> c.size_t ---
 
+	@(link_name = "temporal_odin_fiber_has_guard_page")
+	has_guard_page :: proc(fiber: Handle) -> c.int ---
+
+	@(link_name = "temporal_odin_fiber_guard_page_size")
+	guard_page_size :: proc(fiber: Handle) -> c.size_t ---
+
+	@(link_name = "temporal_odin_fiber_reserved_size")
+	reserved_size :: proc(fiber: Handle) -> c.size_t ---
+
 	@(link_name = "temporal_odin_fiber_destroy")
 	destroy :: proc(fiber: Handle) -> Result ---
 

@@ -446,9 +446,12 @@ end-to-end across eviction and fresh-stack replay. Workflow-scheduled Activities
 now accept IDs, task queues, all four server timeouts, Retry Policies,
 cancellation type, and eager-execution control. Workflow, Signal-handler, and
 Update-handler fiber stacks now have an explicit Worker policy with validated
-independent sizes, shared by online execution and offline replay. It does
-**not** yet provide guard-page/growable stack protection, in-process panic
-recovery, or a stable public API. Activity panic containment has a live-proven
+independent sizes, shared by online execution and offline replay. On macOS and
+Linux, each fixed stack is now backed by demand-paged virtual memory with an
+inaccessible guard page on its overflow edge. This turns silent adjacent-memory
+corruption into a process fault; it does **not** provide a growable stack,
+in-process panic/overflow recovery, or a stable public API. Activity panic
+containment has a live-proven
 deployment boundary: run Activities in an Activity-only Odin worker process
 under a supervisor. `./scripts/activity-panic-integration-test.sh` deliberately
 traps that process on attempt 1, starts a replacement Odin worker, and requires
@@ -1309,8 +1312,10 @@ temporal_worker, err := worker.create(
 Zero selects the default. Explicit values must be between 32 KiB and 16 MiB
 and are aligned to the native runtime's 16-byte boundary. The same option is
 available on `worker.create_replayer`, so replay uses the production stack
-policy. These are fully allocated fixed stacks, not growable or guard-page-backed
-virtual-memory stacks.
+policy. These are fixed-size, demand-paged virtual-memory stacks on macOS and
+Linux. A `PROT_NONE` page immediately below the downward-growing stack traps
+overflow before it reaches minicoro metadata. The fault terminates the process;
+workers still need process supervision, and stacks do not grow automatically.
 
 `register_json_activity` accepts ordinary typed Odin procedures such as
 `proc(^activity.Context, Greeting_Input) -> Greeting_Output`. The generic

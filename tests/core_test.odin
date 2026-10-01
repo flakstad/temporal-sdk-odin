@@ -21,6 +21,11 @@ import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
 
+fiber_guard_test_entry :: proc "c" (user_data: rawptr) {
+	called := cast(^bool)user_data
+	called^ = true
+}
+
 @(test)
 activity_execution_routes_preserve_opaque_binary_task_tokens :: proc(t: ^testing.T) {
 	routes := make(worker.Activity_Execution_Routes)
@@ -8124,6 +8129,32 @@ workflow_stack_options_default_align_and_reject_unsafe_sizes :: proc(t: ^testing
 	_, negative_error := workflow.stack_options_resolve({update_handler = -1})
 	testing.expect(t, negative_error.message != nil)
 	workflow.error_free(&negative_error)
+}
+
+@(test)
+workflow_fibers_reserve_a_native_guard_page :: proc(t: ^testing.T) {
+	called := false
+	fiber: fiber_raw.Handle
+	create_result := fiber_raw.create(
+		&fiber,
+		fiber_guard_test_entry,
+		&called,
+		uint(workflow.MIN_FIBER_STACK_SIZE),
+	)
+	testing.expect_value(t, create_result, fiber_raw.Result.Success)
+	if create_result != .Success {
+		return
+	}
+	testing.expect(t, fiber_raw.has_guard_page(fiber) != 0)
+	testing.expect(t, fiber_raw.guard_page_size(fiber) > 0)
+	testing.expect(
+		t,
+		fiber_raw.reserved_size(fiber) > fiber_raw.stack_size(fiber),
+	)
+	testing.expect_value(t, fiber_raw.resume(fiber), fiber_raw.Result.Success)
+	testing.expect(t, called)
+	testing.expect_value(t, fiber_raw.status(fiber), fiber_raw.State.Dead)
+	testing.expect_value(t, fiber_raw.destroy(fiber), fiber_raw.Result.Success)
 }
 
 @(test)

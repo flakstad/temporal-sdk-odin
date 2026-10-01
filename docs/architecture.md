@@ -1427,6 +1427,9 @@ temporal_odin_fiber_resume
 temporal_odin_fiber_yield
 temporal_odin_fiber_status
 temporal_odin_fiber_stack_size
+temporal_odin_fiber_has_guard_page
+temporal_odin_fiber_guard_page_size
+temporal_odin_fiber_reserved_size
 temporal_odin_fiber_destroy
 temporal_odin_fiber_result_description
 ```
@@ -1437,8 +1440,12 @@ default is 128 KiB per fiber. `workflow.Stack_Options`, accepted by online and
 replay Worker creation, independently configures the three stack classes from
 32 KiB through 16 MiB and aligns values to 16 bytes before they cross the C
 ABI. The project-owned stack-size diagnostic proves that each value reaches the
-corresponding native coroutine. These are fully allocated fixed stacks; the
-policy bounds their memory but does not add guard pages or make overflow safe.
+corresponding native coroutine. On macOS and Linux the bridge allocates each
+coroutine from a private, demand-paged mapping and places one inaccessible OS
+page between minicoro metadata/storage and the downward-growing stack. The
+stack remains fixed-size. Crossing its lower bound faults the process instead
+of silently overwriting coroutine metadata; it is detection/containment at the
+address-space boundary, not recoverable Workflow failure semantics.
 The instance is heap-stable because the C trampoline retains its address. The
 trampoline restores a captured Odin `runtime.Context`, with the instance arena
 as allocator, before calling user code. Inputs, Activity request payloads,
@@ -2946,11 +2953,11 @@ runtime. It does not yet answer scheduling at scale. A coroutine object is not
 thread-safe, fixed stacks can overflow, and minicoro cautions against migrating
 coroutines that use thread-local state. The Worker now validates and propagates
 an explicit per-fiber resource policy, but the production runtime should still
-drive a Workflow instance from one deterministic executor thread at a time,
-prohibit concurrent resume/eviction, decide whether fixed or
-virtual-memory-backed guard-page stacks are preferable, and test sanitizers and
-all four target builds. Panics crossing the C trampoline also need an explicit
-containment policy.
+drive a Workflow instance from one deterministic executor thread at a time and
+prohibit concurrent resume/eviction. The chosen fixed, virtual-memory-backed
+guard-page stack must still be exercised by sanitizers and all four target
+builds, and stack sizing remains an operator concern because it does not grow.
+Panics crossing the C trampoline also need an explicit containment policy.
 
 The blocking wrapper now drains both enabled poll streams during shutdown.
 Core requires every enabled workflow/activity poll stream to observe shutdown
@@ -2999,7 +3006,8 @@ Workflows are enabled.
    deadlines, and replay. Client Update result waits are now bounded and locally
    cancellable without implying durable Update cancellation. It does not yet prove
    panic containment, replay-history JSON import,
-   richer nondeterminism diagnostics, guard-page/growable stack protection, or
+   richer nondeterminism diagnostics, growable stacks, recoverable stack
+   overflow, or
    a production deterministic scheduler.
 5. **Cross-platform artifacts.** macOS arm64 and a clean Ubuntu 24.04 arm64
    container are locally executed through unit/property tests, all example
@@ -3118,8 +3126,9 @@ is intentionally deprioritized: current language SDK handles generally treat
 it as an operator/CLI concern, and exposing a destructive call needs explicit
 chain/run targeting and safety semantics. Activity-only process
 crash/replacement is now live-proven with a real panic, Start-To-Close timeout,
-retry, and replacement Odin worker. The next higher-value hardening slice is a
-guard-page/growable Workflow stack experiment and an explicit
+retry, and replacement Odin worker. Fixed Workflow stacks now have a
+live-tested native guard page on macOS/Linux; they do not grow, and overflow is
+a process fault. The next higher-value hardening slice is an explicit
 uncooperative-callback shutdown policy. The capability inventory is now a
 public, tested runtime model plus the maintained evidence table below; it must
 grow whenever a new protocol surface is added.

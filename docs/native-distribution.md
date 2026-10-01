@@ -27,6 +27,13 @@ The Core bridge is dynamic; the fiber shim is static. macOS uses an `@rpath`
 install name. Linux packages currently target glibc, not musl. The package is
 host-targeted and is not a cross-compilation sysroot.
 
+On the packaged macOS and Linux targets, the fiber shim uses `mmap`/`mprotect`
+to reserve each fixed Workflow stack lazily and place an inaccessible page at
+its overflow edge. This is part of the native shim ABI and is exercised by
+`scripts/fiber-guard-test.sh`; it is not supplied by SDK Core. Overflow remains
+a fatal process signal, so deployment supervision and explicit stack sizing are
+still required.
+
 These are experimental CI artifacts, not final release bundles. Public binary
 distribution still needs an audited notice/SBOM for Core's transitive Rust
 dependencies, and macOS release artifacts need an explicit code-signing and
