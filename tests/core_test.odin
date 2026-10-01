@@ -23938,6 +23938,139 @@ workflow_fiber_answers_typed_queries_without_resuming_execution :: proc(t: ^test
 }
 
 @(test)
+workflow_fiber_rejects_mixed_legacy_query_before_mutating_state :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_legacy_query_guard_workflow",
+		"test-queue",
+		fiber_query_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("Odin")
+	testing.expect_value(t, workflow_input_error, codec.Error.None)
+	defer codec.payload_free(&workflow_input)
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_legacy_query_guard_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "legacy-query-guard-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, initial.error.message == nil)
+	testing.expect(t, initial.waiting_signal)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	query_input, query_input_error := codec.encode_json(Query_Test_Input{prefix = "Before "})
+	testing.expect_value(t, query_input_error, codec.Error.None)
+	defer codec.payload_free(&query_input)
+	query_input_proto := proto.encode_payload(codec.payload_view(&query_input))
+	defer delete(query_input_proto.metadata)
+	defer delete(query_input_proto.external_payloads)
+	legacy_query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = workflow.LEGACY_QUERY_ID,
+		query_type = "status",
+	}
+	defer delete(legacy_query.arguments)
+	defer delete(legacy_query.headers)
+	append(&legacy_query.arguments, query_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &legacy_query,
+			},
+		},
+	)
+	query_only := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, query_only.error.message == nil)
+	testing.expect_value(t, query_only.queries_answered, 1)
+	query_inspection := inspect_query_response(query_only.completion[:], workflow.LEGACY_QUERY_ID)
+	testing.expect(t, query_inspection.found && !query_inspection.failed)
+	testing.expect_value(t, query_inspection.command_count, 1)
+	codec.payload_free(&query_inspection.payload)
+	delete(query_inspection.failure_message)
+	delete(query_inspection.failure_type)
+	delete(query_only.completion)
+	workflow.error_free(&query_only.error)
+
+	signal_input, signal_input_error := codec.encode_json("Approved")
+	testing.expect_value(t, signal_input_error, codec.Error.None)
+	defer codec.payload_free(&signal_input)
+	signal_input_proto := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(signal_input_proto.metadata)
+	defer delete(signal_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, signal_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+				value = &legacy_query,
+			},
+		},
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	mixed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, mixed.activation_failed)
+	testing.expect(t, mixed.error.message != nil)
+	testing.expect(t, strings.contains(string(mixed.error.message), "legacy query"))
+	testing.expect(t, !mixed.received_signal && !mixed.completed)
+	testing.expect(t, len(mixed.completion) > 0)
+	delete(mixed.completion)
+	workflow.error_free(&mixed.error)
+
+	// The rejected activation must not consume the Signal or resume the fiber.
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish_signal,
+			},
+		},
+	)
+	completed := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(t, completed.error.message == nil, "post-rejection Signal failed: %s", string(completed.error.message))
+	testing.expect(t, completed.received_signal && completed.completed)
+	completion := inspect_workflow_completion(completed.completion[:])
+	testing.expect_value(t, string(completion.completion_result), `"Approved"`)
+	delete(completion.failure_message)
+	delete(completion.completion_result)
+	delete(completed.completion)
+	workflow.error_free(&completed.error)
+}
+
+@(test)
 workflow_fiber_replays_handled_activity_failure :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(

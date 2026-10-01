@@ -1960,10 +1960,15 @@ codec-neutral handler; a 500-case property varies 0–12 arguments while checkin
 order, metadata, external details, headers, and deterministic request bytes.
 
 Core reserves `legacy_query` as `LEGACY_QUERY_ID`: a legacy query completion
-may contain no other commands. The current runtime produces the correct
-query-only completion when Core sends such an activation, but it does not yet
-reject a malformed mixed legacy activation itself. Client-side reject-condition selection is exposed independently of
-Workflow delivery: Odin maps all four pinned conditions onto
+may contain no other commands. The runtime produces the required query-only
+completion and validates the matching activation shape before applying
+metadata, dispatching handlers, or resuming any fiber. An activation containing
+that reserved ID and any additional job becomes a failed activation completion;
+no job is observed and no Workflow state or activation accounting changes.
+Core itself defers legacy queries until it can issue exactly one query job, so
+this guard primarily protects offline replay, process isolation, and the
+language boundary from malformed input. Client-side reject-condition selection
+is exposed independently of Workflow delivery: Odin maps all four pinned conditions onto
 `QueryWorkflowRequest.query_reject_condition`. A `QueryRejected` response is a
 typed Client error that retains the rejecting Workflow execution status.
 

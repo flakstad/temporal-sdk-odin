@@ -5085,6 +5085,145 @@ destroy_process_result :: proc(result: ^workflow.Process_Result) {
 	result^ = {}
 }
 
+legacy_query_guard_workflow :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	return workflow.await_signal(ctx, "finish")
+}
+
+mixed_legacy_query_order_property :: proc(t: ^pbt.T) -> pbt.Result {
+	companion_count := pbt.draw(t, pbt.int_range(1, 12))
+	legacy_position := pbt.draw(t, pbt.int_range(0, companion_count))
+	replaying := pbt.draw(t, pbt.boolean())
+	pbt.cover(t, legacy_position == 0, 5.0, "legacy query first")
+	pbt.cover(t, legacy_position == companion_count, 5.0, "legacy query last")
+	pbt.cover(
+		t,
+		legacy_position > 0 && legacy_position < companion_count,
+		40.0,
+		"legacy query between jobs",
+	)
+	pbt.cover(t, companion_count >= 8, 25.0, "many companion jobs")
+	pbt.cover(t, replaying, 30.0, "malformed replay activation")
+
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"legacy_query_guard_property_workflow",
+		"property-queue",
+		legacy_query_guard_workflow,
+	)
+	defer workflow.error_free(&init_error)
+	if init_error.message != nil {
+		return pbt.error("could not initialize legacy-query guard Workflow")
+	}
+	defer workflow.fiber_runtime_close(&runtime)
+
+	workflow_input, workflow_input_error := codec.encode_json("start")
+	defer codec.payload_free(&workflow_input)
+	if workflow_input_error != .None {
+		return pbt.error("could not encode legacy-query guard Workflow input")
+	}
+	workflow_input_proto := proto.encode_payload(codec.payload_view(&workflow_input))
+	defer delete(workflow_input_proto.metadata)
+	defer delete(workflow_input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "legacy_query_guard_property_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, workflow_input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "legacy-query-guard-property-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_activation(&runtime, &activation)
+	defer destroy_process_result(&initial)
+	if initial.error.message != nil || !initial.waiting_signal {
+		return pbt.error("legacy-query guard Workflow did not wait for its Signal")
+	}
+
+	signal_input, signal_input_error := codec.encode_json("accepted")
+	defer codec.payload_free(&signal_input)
+	if signal_input_error != .None {
+		return pbt.error("could not encode legacy-query guard Signal")
+	}
+	signal_input_proto := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(signal_input_proto.metadata)
+	defer delete(signal_input_proto.external_payloads)
+	finish_signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{signal_name = "finish"}
+	defer delete(finish_signal.input)
+	append(&finish_signal.input, signal_input_proto)
+	legacy_query := proto.Coresdk_Workflow_Activation_QueryWorkflow{
+		query_id = workflow.LEGACY_QUERY_ID,
+		query_type = "generated",
+	}
+	defer delete(legacy_query.arguments)
+	defer delete(legacy_query.headers)
+	legacy_job := proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow{
+			value = &legacy_query,
+		},
+	}
+	signal_job := proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+			value = &finish_signal,
+		},
+	}
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = replaying
+	activation.history_length = 5
+	for index in 0..<companion_count {
+		if index == legacy_position {
+			append(&activation.jobs, legacy_job)
+		}
+		append(&activation.jobs, signal_job)
+	}
+	if legacy_position == companion_count {
+		append(&activation.jobs, legacy_job)
+	}
+	mixed := process_activation(&runtime, &activation)
+	if !mixed.activation_failed || mixed.error.message == nil ||
+	   !strings.contains(string(mixed.error.message), "legacy query") ||
+	   mixed.received_signal || mixed.completed || len(mixed.completion) == 0 {
+		destroy_process_result(&mixed)
+		return pbt.fail("mixed legacy query was not rejected before job dispatch")
+	}
+	destroy_process_result(&mixed)
+	if runtime.activations != 1 || runtime.replay_activations != 0 {
+		return pbt.fail("rejected legacy query changed runtime activation accounting")
+	}
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = false
+	append(&activation.jobs, signal_job)
+	completed := process_activation(&runtime, &activation)
+	defer destroy_process_result(&completed)
+	if completed.error.message != nil || !completed.received_signal || !completed.completed {
+		return pbt.fail("mixed legacy query mutated Workflow state before rejection")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_rejects_mixed_legacy_query_in_every_generated_job_order :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"mixed legacy queries are rejected before every generated job order",
+		mixed_legacy_query_order_property,
+		{num_tests = 500, seed = 0x4c45_4741_4359_5152},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 append_race_jobs :: proc(
 	jobs: ^[dynamic]proto.Coresdk_Workflow_Activation_WorkflowActivationJob,
 	event_case: int,

@@ -1527,6 +1527,14 @@ must be read-only, must not retain the input/state values, and cannot suspend.
 Unknown query names and codec failures become failed `RespondToQuery` commands
 without failing the Workflow Task.
 
+Core reserves the query ID `legacy_query` for its older query transport and
+requires that activation to contain exactly one Query job. Odin checks this
+shape immediately after protobuf decoding, before metadata application or
+fiber dispatch. A focused unit test proves a valid query-only completion and
+that a rejected mixed Query/Signal activation leaves the Signal available. A
+500-case property varies one to twelve companion jobs, first/middle/last query
+placement, and replay state while requiring identical pre-dispatch rejection.
+
 Updates use the same Workflow handle:
 
 ```odin

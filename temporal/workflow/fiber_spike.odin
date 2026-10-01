@@ -2867,9 +2867,27 @@ find_query_handler :: proc(
 }
 
 WORKFLOW_METADATA_QUERY_TYPE :: "__temporal_workflow_metadata"
+LEGACY_QUERY_ID :: "legacy_query"
 
 workflow_query_name_reserved :: proc(name: string) -> bool {
 	return name == WORKFLOW_METADATA_QUERY_TYPE
+}
+
+activation_has_mixed_legacy_query :: proc(
+	activation: ^proto.Coresdk_Workflow_Activation_WorkflowActivation,
+) -> bool {
+	if activation == nil || len(activation.jobs) <= 1 {
+		return false
+	}
+	for &job in activation.jobs {
+		#partial switch variant in job.variant {
+		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Query_Workflow:
+			if variant.value != nil && variant.value.query_id == LEGACY_QUERY_ID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 query_registration_failed :: proc(instance: ^Fiber_Instance, message: string) {
@@ -12396,6 +12414,14 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 	context.allocator = previous_allocator
 	if !decode_ok || len(activation.run_id) == 0 {
 		result.error = error_from_string("Core returned a malformed WorkflowActivation protobuf")
+		return
+	}
+	if activation_has_mixed_legacy_query(&activation) {
+		process_error(
+			&result,
+			activation.run_id,
+			"Workflow activation contains a legacy query with additional jobs",
+		)
 		return
 	}
 
