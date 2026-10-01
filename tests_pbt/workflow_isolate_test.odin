@@ -16,10 +16,13 @@ workflow_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if pbt.draw(t, pbt.boolean()) {
 		request_id |= u64(1) << 63
 	}
-	kind := workflow_isolate.Kind.Activation
-	if pbt.draw(t, pbt.boolean()) {
-		kind = .Completion
+	kinds := [?]workflow_isolate.Kind{
+		.Activation,
+		.Completion,
+		.Completion_Metadata,
+		.Diagnostic,
 	}
+	kind := kinds[pbt.draw(t, pbt.int_range(0, len(kinds) - 1))]
 	has_zero := false
 	for value in payload {
 		if value == 0 {
@@ -27,7 +30,8 @@ workflow_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 			break
 		}
 	}
-	pbt.cover(t, kind == .Completion, 35, "completion frame")
+	pbt.cover(t, kind == .Completion, 15, "completion frame")
+	pbt.cover(t, kind == .Diagnostic, 15, "diagnostic frame")
 	pbt.cover(t, request_id & (u64(1) << 63) != 0, 35, "high-bit correlation ID")
 	pbt.cover(t, len(payload) >= 4_096, 25, "large frame payload")
 	pbt.cover(t, has_zero, 35, "embedded zero payload byte")

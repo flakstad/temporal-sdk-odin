@@ -889,6 +889,16 @@ inbound-interceptor log records; zero-cache replay records are suppressed.
 They require exactly two counter records as well; zero-cache replay metrics are
 also suppressed.
 
+Protocol version 4 adds zero or more `Diagnostic` frames before metadata. Child
+code calls `executor_host_emit_diagnostic` with an application/log/metric kind
+and opaque non-empty payload. The host heap-clones it, avoiding the Workflow
+arena allocator active inside logger/metric callbacks. `Manager_Options` accepts
+a synchronous borrowed `diagnostic_observer`; the live proof requires two log
+and two metric events with non-zero generation IDs. Zero
+`maximum_diagnostics_per_activation` selects the bounded default of 256. One
+monotonic activation deadline spans all diagnostic, metadata, and completion
+reads rather than restarting per frame.
+
 The manager now has independent activation and shutdown deadlines. The latter
 bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity
 admission never waits because the same serial poll thread must receive the

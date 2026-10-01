@@ -174,6 +174,20 @@ workflow_isolation_protocol_roundtrips_binary_frames_and_pipes :: proc(t: ^testi
 	testing.expect_value(t, read_error.kind, workflow_isolate.Error_Kind.None)
 	testing.expect(t, bytes.equal(from_pipe.frame.run_id, run_id[:]))
 	testing.expect(t, bytes.equal(from_pipe.frame.payload, payload[:]))
+	diagnostic, diagnostic_ok := workflow_isolate.diagnostic_encode(
+		.Metric,
+		transmute([]u8)string("workflow_started"),
+	)
+	defer delete(diagnostic)
+	testing.expect(t, diagnostic_ok)
+	diagnostic_kind, diagnostic_payload, diagnostic_decode_ok := workflow_isolate.diagnostic_decode(
+		diagnostic,
+	)
+	testing.expect(t, diagnostic_decode_ok)
+	testing.expect_value(t, diagnostic_kind, workflow_isolate.Diagnostic_Kind.Metric)
+	testing.expect_value(t, string(diagnostic_payload), "workflow_started")
+	_, _, invalid_diagnostic_ok := workflow_isolate.diagnostic_decode([]u8{0xff, 1})
+	testing.expect(t, !invalid_diagnostic_ok)
 }
 
 @(test)
@@ -330,6 +344,13 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 	invalid_error = workflow_isolate.manager_init(&manager, {
 		command = command[:],
 		maximum_executors = 1,
+		maximum_diagnostics_per_activation = -1,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_error = workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
 		activation_timeout = -time.Millisecond,
 	})
 	testing.expect(t, invalid_error.message != nil)
@@ -358,6 +379,11 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 	command[0] = "mutated"
 	testing.expect_value(t, manager.command[0], "executor")
 	testing.expect_value(t, manager.maximum_executors, 1)
+	testing.expect_value(
+		t,
+		manager.maximum_diagnostics_per_activation,
+		workflow_isolate.DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION,
+	)
 	testing.expect(t, workflow_isolate.capacity_allows_start(0, 1))
 	testing.expect(t, !workflow_isolate.capacity_allows_start(1, 1))
 	allowed, reset := workflow_isolate.crash_loop_allows_start(2, 99 * time.Millisecond, {
@@ -793,6 +819,25 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	testing.expect_value(t, hook_state.metric_factories, 2)
 	testing.expect_value(t, hook_state.metrics, 1)
 	testing.expect(t, hook_state.saw_expected_metric)
+	diagnostic_queued := workflow_isolate.executor_host_emit_diagnostic(
+		&host,
+		.Application,
+		transmute([]u8)string("host-test"),
+	)
+	testing.expect(t, diagnostic_queued)
+	testing.expect_value(t, len(host.diagnostics), 1)
+	if len(host.diagnostics) == 1 {
+		diagnostic_kind, diagnostic_payload, diagnostic_ok := workflow_isolate.diagnostic_decode(
+			host.diagnostics[0],
+		)
+		testing.expect(t, diagnostic_ok)
+		testing.expect_value(
+			t,
+			diagnostic_kind,
+			workflow_isolate.Diagnostic_Kind.Application,
+		)
+		testing.expect_value(t, string(diagnostic_payload), "host-test")
+	}
 	workflow_isolate.host_error_free(&process_error)
 	workflow.error_free(&processed.error)
 	delete(processed.completion)

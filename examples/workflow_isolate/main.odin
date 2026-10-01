@@ -26,10 +26,16 @@ Child_Fault_Mode :: enum {
 	Metadata_Mismatch,
 }
 
-executor_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
+executor_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
 	if record == nil {
 		return
 	}
+	host := cast(^workflow_isolate.Executor_Host)user_data
+	_ = workflow_isolate.executor_host_emit_diagnostic(
+		host,
+		.Log,
+		transmute([]u8)record.message,
+	)
 	fmt.eprintf(
 		"isolated-executor workflow_log message=%q type=%s replay=%v replaying_history=%v history=%d\n",
 		record.message,
@@ -40,10 +46,16 @@ executor_log :: proc(_: rawptr, record: ^workflow.Log_Record) {
 	)
 }
 
-executor_metric_emit :: proc(_: rawptr, record: ^workflow.Metric_Record) {
+executor_metric_emit :: proc(user_data: rawptr, record: ^workflow.Metric_Record) {
 	if record == nil {
 		return
 	}
+	host := cast(^workflow_isolate.Executor_Host)user_data
+	_ = workflow_isolate.executor_host_emit_diagnostic(
+		host,
+		.Metric,
+		transmute([]u8)record.name,
+	)
 	fmt.eprintf(
 		"isolated-executor workflow_metric name=%s value=%d type=%s replay=%v replaying_history=%v\n",
 		record.name,
@@ -55,10 +67,13 @@ executor_metric_emit :: proc(_: rawptr, record: ^workflow.Metric_Record) {
 }
 
 executor_metric_emitter_factory :: proc(
-	_: rawptr,
+	user_data: rawptr,
 	_, _, _: string,
 ) -> (workflow.Metric_Emitter, bool) {
-	return workflow.Metric_Emitter{emit = executor_metric_emit}, true
+	return workflow.Metric_Emitter{
+		user_data = user_data,
+		emit = executor_metric_emit,
+	}, true
 }
 
 executor_execute_workflow_interceptor :: proc(
@@ -104,8 +119,9 @@ run_child :: proc(
 		execute_workflow = executor_execute_workflow_interceptor,
 	}}
 	host_options := workflow_isolate.executor_host_options_default()
-	host_options.logger = {emit = executor_log}
+	host_options.logger = {user_data = &host, emit = executor_log}
 	host_options.inbound_interceptors = inbound_interceptors[:]
+	host_options.metric_emitter_factory_data = &host
 	host_options.metric_emitter_factory = executor_metric_emitter_factory
 	host_init_error := workflow_isolate.executor_host_init_with_options(
 		&host,
@@ -294,7 +310,24 @@ exchange :: proc(
 		fmt.eprintf("Could not send activation %d: %v\n", request_id, write_error.kind)
 		return
 	}
-	metadata_frame, metadata_read_error := workflow_isolate.read(output)
+	metadata_frame: workflow_isolate.Owned_Frame
+	metadata_read_error: workflow_isolate.Error
+	for {
+		metadata_frame, metadata_read_error = workflow_isolate.read(output)
+		if metadata_read_error.kind != .None || metadata_frame.frame.kind != .Diagnostic {
+			break
+		}
+		_, _, diagnostic_ok := workflow_isolate.diagnostic_decode(
+			metadata_frame.frame.payload,
+		)
+		if !diagnostic_ok || metadata_frame.frame.request_id != request_id ||
+		   !bytes.equal(metadata_frame.frame.run_id, transmute([]u8)string(RUN_ID)) {
+			workflow_isolate.owned_frame_free(&metadata_frame)
+			fmt.eprintf("Executor returned a malformed diagnostic for activation %d\n", request_id)
+			return {}, false
+		}
+		workflow_isolate.owned_frame_free(&metadata_frame)
+	}
 	defer workflow_isolate.owned_frame_free(&metadata_frame)
 	if metadata_read_error.kind != .None {
 		fmt.eprintf("Could not read completion metadata %d: %v\n", request_id, metadata_read_error.kind)

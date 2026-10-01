@@ -105,6 +105,9 @@ else
   grep -q 'protocol_failures=0' <<<"$output"
 fi
 grep -q 'missing_timer_sequences=0' <<<"$output"
+grep -q 'diagnostic_logs=2' <<<"$output"
+grep -q 'diagnostic_metrics=2' <<<"$output"
+grep -q 'diagnostics_received=4' <<<"$output"
 if [[ "$first_mode" == "crash" ]]; then
   grep -q 'child_exits=1' <<<"$output"
   grep -q 'activation_timeouts=0' <<<"$output"

@@ -274,6 +274,14 @@ fields authoritative, and forwards the remaining child counters and wait state
 to Worker statistics and activation observers. Metadata is diagnostic and can
 never add, remove, or alter Temporal commands.
 
+Protocol v4 permits correlated `Diagnostic` frames before metadata.
+`executor_host_emit_diagnostic` heap-clones a non-empty codec-neutral payload
+with an application/log/metric discriminator. The manager validates request and
+run correlation and invokes its observer synchronously with borrowed data and
+the owning generation. Dropped diagnostics do not alter activation results.
+The default per-activation limit is 256, and all response frames share one
+activation deadline.
+
 The per-run isolation manager accepts independent `activation_timeout` and
 `shutdown_timeout` values. A positive shutdown deadline covers both the
 acknowledgement and final process exit and always reaps the child. Capacity

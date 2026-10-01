@@ -127,6 +127,13 @@ decode_activation_route :: proc(data: []u8) -> (route: Activation_Route, ok: boo
 	return
 }
 
+Manager_Diagnostic_Observer :: #type proc(
+	user_data: rawptr,
+	event: Diagnostic_Event_View,
+)
+
+DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION :: 256
+
 Manager_Options :: struct {
 	// command is copied by manager_init and executed for ordinary generations.
 	command: []string,
@@ -144,6 +151,11 @@ Manager_Options :: struct {
 	// acknowledgement and process exit; expiry kills and reaps the child.
 	shutdown_timeout: time.Duration,
 	crash_loop: Crash_Loop_Policy,
+	// Diagnostic payload and run_id are borrowed only for the synchronous call.
+	diagnostic_observer: Manager_Diagnostic_Observer,
+	diagnostic_observer_data: rawptr,
+	// Zero selects the default. This bounds untrusted child frame streams.
+	maximum_diagnostics_per_activation: int,
 }
 
 Crash_Loop_Policy :: struct {
@@ -177,6 +189,7 @@ Manager_Stats :: struct {
 	crash_loop_rejections: int,
 	crash_loop_recoveries: int,
 	incremental_activations: int,
+	diagnostics_received: int,
 }
 
 Child_Session :: struct {
@@ -210,6 +223,9 @@ Manager :: struct {
 	last_failure:         time.Tick,
 	report_run_id:      string,
 	report_cancellation_reason: string,
+	diagnostic_observer: Manager_Diagnostic_Observer,
+	diagnostic_observer_data: rawptr,
+	maximum_diagnostics_per_activation: int,
 	stats:              Manager_Stats,
 	initialized:        bool,
 }
@@ -253,6 +269,9 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	if options.maximum_executors <= 0 {
 		return manager_error("Workflow executor manager capacity must be positive")
 	}
+	if options.maximum_diagnostics_per_activation < 0 {
+		return manager_error("Workflow executor diagnostic limit must not be negative")
+	}
 	if options.activation_timeout < 0 || options.shutdown_timeout < 0 {
 		return manager_error("Workflow executor timeouts must not be negative")
 	}
@@ -290,6 +309,13 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	manager.activation_timeout = options.activation_timeout
 	manager.shutdown_timeout = options.shutdown_timeout
 	manager.crash_loop = options.crash_loop
+	manager.diagnostic_observer = options.diagnostic_observer
+	manager.diagnostic_observer_data = options.diagnostic_observer_data
+	manager.maximum_diagnostics_per_activation = options.maximum_diagnostics_per_activation
+	if manager.maximum_diagnostics_per_activation == 0 {
+		manager.maximum_diagnostics_per_activation =
+			DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION
+	}
 	manager.routes = make([dynamic]Executor_Route, 0, options.maximum_executors)
 	manager.initialized = true
 	return {}
@@ -639,6 +665,22 @@ read_with_timeout :: proc(
 	return read_with_deadline(session, manager.activation_timeout)
 }
 
+read_with_exchange_timeout :: proc(
+	manager: ^Manager,
+	session: ^Child_Session,
+	started: time.Tick,
+) -> (response: Owned_Frame, error: Error, failure: Exchange_Failure) {
+	if manager.activation_timeout <= 0 {
+		return read_with_deadline(session, 0)
+	}
+	elapsed := time.tick_diff(started, time.tick_now())
+	remaining := manager.activation_timeout - elapsed
+	if remaining <= 0 {
+		return {}, {}, .Timed_Out
+	}
+	return read_with_deadline(session, remaining)
+}
+
 session_manifest_handshake :: proc(
 	manager: ^Manager,
 	session: ^Child_Session,
@@ -727,17 +769,58 @@ session_exchange :: proc(
 		}
 		return nil, {}, .Protocol
 	}
-	metadata_response, read_error, read_failure := read_with_timeout(manager, &route.session)
-	if read_failure != .None {
-		owned_frame_free(&metadata_response)
-		return nil, {}, read_failure
-	}
-	if read_error.kind != .None {
-		owned_frame_free(&metadata_response)
-		if read_error.kind == .End_Of_Stream || read_error.kind == .IO {
-			return nil, {}, .Child_Exit
+	exchange_started := time.tick_now()
+	metadata_response: Owned_Frame
+	diagnostic_count := 0
+	for {
+		read_error: Error
+		read_failure: Exchange_Failure
+		metadata_response, read_error, read_failure = read_with_exchange_timeout(
+			manager,
+			&route.session,
+			exchange_started,
+		)
+		if read_failure != .None {
+			owned_frame_free(&metadata_response)
+			return nil, {}, read_failure
 		}
-		return nil, {}, .Protocol
+		if read_error.kind != .None {
+			owned_frame_free(&metadata_response)
+			if read_error.kind == .End_Of_Stream || read_error.kind == .IO {
+				return nil, {}, .Child_Exit
+			}
+			return nil, {}, .Protocol
+		}
+		if metadata_response.frame.kind != .Diagnostic {
+			break
+		}
+		diagnostic_count += 1
+		if diagnostic_count > manager.maximum_diagnostics_per_activation {
+			owned_frame_free(&metadata_response)
+			return nil, {}, .Protocol
+		}
+		if metadata_response.frame.request_id != request_id ||
+		   !bytes.equal(metadata_response.frame.run_id, transmute([]u8)route.run_id) {
+			owned_frame_free(&metadata_response)
+			return nil, {}, .Protocol
+		}
+		kind, payload, diagnostic_ok := diagnostic_decode(
+			metadata_response.frame.payload,
+		)
+		if !diagnostic_ok {
+			owned_frame_free(&metadata_response)
+			return nil, {}, .Protocol
+		}
+		manager.stats.diagnostics_received += 1
+		if manager.diagnostic_observer != nil {
+			manager.diagnostic_observer(manager.diagnostic_observer_data, {
+				kind = kind,
+				payload = payload,
+				run_id = route.run_id,
+				generation = route.generation,
+			})
+		}
+		owned_frame_free(&metadata_response)
 	}
 	if metadata_response.frame.kind != .Completion_Metadata ||
 	   metadata_response.frame.request_id != request_id ||
@@ -753,9 +836,10 @@ session_exchange :: proc(
 		return nil, {}, .Protocol
 	}
 	metadata = decoded_metadata
-	response, completion_read_error, completion_read_failure := read_with_timeout(
+	response, completion_read_error, completion_read_failure := read_with_exchange_timeout(
 		manager,
 		&route.session,
+		exchange_started,
 	)
 	defer owned_frame_free(&response)
 	if completion_read_failure != .None {

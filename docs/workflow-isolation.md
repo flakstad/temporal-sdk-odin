@@ -58,7 +58,7 @@ Every frame has this big-endian header:
 | Offset | Width | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `TOIS` |
-| 4 | 2 | protocol version, currently `3` |
+| 4 | 2 | protocol version, currently `4` |
 | 6 | 2 | message kind |
 | 8 | 8 | request/correlation ID |
 | 16 | 4 | run-ID byte length |
@@ -162,6 +162,22 @@ and owned error text to the ordinary Worker observer/statistics path. A
 metadata mismatch is a protocol failure; metadata can never change commands
 submitted to Core.
 
+Protocol version 4 permits zero or more correlated `Diagnostic` frames before
+`Completion_Metadata`. The first payload byte is a stable discriminator
+(`Application`, `Log`, or `Metric`); remaining bytes are codec-neutral and
+borrowed by the parent observer only for its synchronous callback. Diagnostic
+frames must match both request ID and run ID. They are never interpreted as
+commands and cannot replace completion metadata or the Core protobuf.
+The manager accepts at most 256 diagnostics per activation by default, and one
+activation deadline covers the complete diagnostic/metadata/completion stream;
+a child cannot keep resetting the deadline by sending observations.
+
+`executor_host_emit_diagnostic` clones payloads onto the process heap even when
+called from Workflow code with its arena allocator active. The host owns and
+frees those clones after synchronous frame writes. Invalid events are dropped
+and increment `diagnostics_dropped`; they cannot fail or change the Workflow
+activation.
+
 ## Core-integrated cache proofs
 
 The online Worker now has an experimental `workflow_activation_processor`
@@ -245,6 +261,10 @@ The two replay initializations in zero-cache emit none because Workflow logging
 and metrics suppress history replay by default. This proves that hooks run in
 the executor and observability survives the process boundary without changing
 commands.
+They also enqueue discriminated log/metric diagnostics. The manager's borrowed
+observer requires exactly two of each kind and `diagnostics_received=4` in both
+cache modes, proving structured child observations reach the parent separately
+from completion metadata.
 
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
@@ -350,12 +370,10 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- where stderr is insufficient, add structured diagnostic-event transport
-  without letting observations affect commands;
 - prove a real nondeterministic Workflow completion/replay mismatch through the
   isolated dev-server path;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is structured executor diagnostics.
-Cross-platform pipe/process validation and nondeterminism recovery remain part
-of the process hardening.
+The next discriminating vertical slice is a real nondeterministic Workflow
+completion/replay mismatch through this executor boundary. Cross-platform
+pipe/process validation also remains part of the process hardening.

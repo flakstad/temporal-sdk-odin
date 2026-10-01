@@ -1,5 +1,6 @@
 package workflow_isolate
 
+import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:mem/virtual"
 import "core:os"
@@ -42,9 +43,11 @@ Executor_Host :: struct {
 	runs:          [dynamic]Host_Run,
 	rejected_runs: [dynamic]Host_Rejected_Run,
 	manifest:      []u8,
+	diagnostics:   [dynamic][]u8,
 	initialized:   bool,
 	activations:   int,
 	evictions:     int,
+	diagnostics_dropped: int,
 }
 
 // Executor_Host_Options are copied into every process-local Workflow runtime
@@ -109,6 +112,7 @@ executor_host_init_with_options :: proc(
 	)
 	host.runs = make([dynamic]Host_Run)
 	host.rejected_runs = make([dynamic]Host_Rejected_Run)
+	host.diagnostics = make([dynamic][]u8)
 	host.manifest, _ = registry_manifest_encode(registry)
 	if host.manifest == nil {
 		executor_host_close(host)
@@ -238,6 +242,10 @@ executor_host_close :: proc(host: ^Executor_Host) {
 	delete(host.registrations)
 	delete(host.runs)
 	delete(host.rejected_runs)
+	for diagnostic in host.diagnostics {
+		delete(diagnostic, allocator_runtime.heap_allocator())
+	}
+	delete(host.diagnostics)
 	delete(host.manifest)
 	host^ = {}
 }
@@ -296,6 +304,41 @@ host_add_rejected_run :: proc(host: ^Executor_Host, run_id: string) -> bool {
 	return true
 }
 
+host_clear_diagnostics :: proc(host: ^Executor_Host) {
+	if host == nil {
+		return
+	}
+	for diagnostic in host.diagnostics {
+		delete(diagnostic, allocator_runtime.heap_allocator())
+	}
+	delete(host.diagnostics)
+	host.diagnostics = make([dynamic][]u8)
+}
+
+// executor_host_emit_diagnostic clones one codec-neutral event into the current
+// activation's diagnostic queue. Failure drops only the observation; it never
+// changes Workflow commands or the activation result.
+executor_host_emit_diagnostic :: proc(
+	host: ^Executor_Host,
+	kind: Diagnostic_Kind,
+	payload: []u8,
+) -> bool {
+	if host == nil || !host.initialized {
+		return false
+	}
+	encoded, ok := diagnostic_encode(
+		kind,
+		payload,
+		allocator_runtime.heap_allocator(),
+	)
+	if !ok {
+		host.diagnostics_dropped += 1
+		return false
+	}
+	append(&host.diagnostics, encoded)
+	return true
+}
+
 executor_host_process_activation :: proc(
 	host: ^Executor_Host,
 	data: []u8,
@@ -303,6 +346,7 @@ executor_host_process_activation :: proc(
 	if host == nil || !host.initialized {
 		return {}, host_error("Workflow executor host is not initialized")
 	}
+	host_clear_diagnostics(host)
 	route, route_ok := decode_activation_route(data)
 	if !route_ok {
 		return {}, host_error("Workflow executor host received a malformed activation")
@@ -485,6 +529,22 @@ executor_host_run :: proc(
 				owned_frame_free(&request)
 				return host_error("Workflow completion run ID does not match its executor route")
 			}
+			for diagnostic in host.diagnostics {
+				diagnostic_write_error := write(output, {
+					kind = .Diagnostic,
+					request_id = request.frame.request_id,
+					run_id = request.frame.run_id,
+					payload = diagnostic,
+				})
+				if diagnostic_write_error.kind != .None {
+					host_error_free(&process_error)
+					workflow.error_free(&processed.error)
+					delete(processed.completion)
+					owned_frame_free(&request)
+					return host_error("could not write Workflow executor diagnostic")
+				}
+			}
+			host_clear_diagnostics(host)
 			metadata, metadata_ok := process_result_metadata_encode(&processed)
 			if !metadata_ok {
 				host_write_executor_error(

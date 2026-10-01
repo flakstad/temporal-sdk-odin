@@ -23,6 +23,9 @@ Start_State :: struct {
 Observation_Stats :: struct {
 	timer_commands_with_sequence: int,
 	timer_commands_without_sequence: int,
+	diagnostic_logs: int,
+	diagnostic_metrics: int,
+	malformed_diagnostics: int,
 }
 
 observations: Observation_Stats
@@ -36,6 +39,29 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		return
 	}
 	observations.timer_commands_with_sequence += 1
+}
+
+observe_diagnostic :: proc(_: rawptr, event: workflow_isolate.Diagnostic_Event_View) {
+	if event.generation == 0 || len(event.run_id) == 0 {
+		observations.malformed_diagnostics += 1
+		return
+	}
+	switch event.kind {
+	case .Log:
+		if string(event.payload) == "workflow_started" {
+			observations.diagnostic_logs += 1
+		} else {
+			observations.malformed_diagnostics += 1
+		}
+	case .Metric:
+		if string(event.payload) == "workflow_started" {
+			observations.diagnostic_metrics += 1
+		} else {
+			observations.malformed_diagnostics += 1
+		}
+	case .Application:
+		observations.malformed_diagnostics += 1
+	}
 }
 
 start_when_ready :: proc(user_data: rawptr) -> bool {
@@ -216,6 +242,7 @@ run :: proc() -> int {
 			maximum_consecutive_failures = 5,
 			cooldown = 5 * time.Second,
 		},
+		diagnostic_observer = observe_diagnostic,
 	})
 	if manager_error.message != nil {
 		fmt.eprintf("Workflow executor manager initialization failed: %s\n", string(manager_error.message))
@@ -315,9 +342,12 @@ run :: proc() -> int {
 	   manager_stats.protocol_failures != expected_protocol_failures ||
 	   observations.timer_commands_with_sequence != expected_timer_sequences ||
 	   observations.timer_commands_without_sequence != 0 ||
+	   observations.diagnostic_logs != 2 || observations.diagnostic_metrics != 2 ||
+	   observations.malformed_diagnostics != 0 ||
+	   manager_stats.diagnostics_received != 4 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
@@ -343,12 +373,16 @@ run :: proc() -> int {
 			observations.timer_commands_with_sequence,
 			expected_timer_sequences,
 			observations.timer_commands_without_sequence,
+			observations.diagnostic_logs,
+			observations.diagnostic_metrics,
+			observations.malformed_diagnostics,
+			manager_stats.diagnostics_received,
 			workflow_isolate.manager_route_count(&executor_manager),
 		)
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d missing_timer_sequences=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d diagnostics_received=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
@@ -373,6 +407,9 @@ run :: proc() -> int {
 		manager_stats.protocol_failures,
 		observations.timer_commands_with_sequence,
 		observations.timer_commands_without_sequence,
+		observations.diagnostic_logs,
+		observations.diagnostic_metrics,
+		manager_stats.diagnostics_received,
 	)
 	return 0
 }

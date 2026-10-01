@@ -3288,18 +3288,21 @@ immediate rather than deadlocking the serial poll thread; and a cooldown circuit
 breaker bounds consecutive executor failures. Sticky per-run routing with a
 non-zero Core cache is now live-proven: two
 successful children retain two timer Workflows across incremental activations,
-while an initial crash or timeout still evicts and recovers. Protocol v3 now
+while an initial crash or timeout still evicts and recovers. Protocol v3
 carries the complete language `Process_Result` separately from the authoritative
 opaque Core completion, with live observer evidence for timer sequence fields.
 Child runtimes can now receive a replay-aware logger plus ordered inbound and
 outbound interceptors through explicit host options; the live proof requires
 replay-suppressed interceptor logs on child stderr. A factory now creates and
 transfers one runtime-owned metric emitter per registered Workflow type, and the
-live proof requires the same replay-suppressed metric count. The next step is
-structured diagnostics. A five-case dev-server matrix now proves containment of
-stale correlation IDs, malformed metadata/completions, terminal metadata
-mismatches, and responses delayed beyond the activation deadline. Production
-hardening remains process-boundary work. The
+live proof requires the same replay-suppressed metric count. Protocol v4 adds
+correlated, discriminated, codec-neutral diagnostic frames and a borrowed parent
+observer; live assertions require two log and two metric events. The next step
+is a real nondeterminism/replay failure through the process boundary. A
+five-case dev-server matrix now proves containment of stale correlation IDs,
+malformed metadata/completions, terminal metadata mismatches, and responses
+delayed beyond the activation deadline. Production hardening remains
+process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3925,7 +3928,8 @@ execution; hook `user_data` remains child-application-owned. The live host emits
 interceptor logs on inherited stderr, leaving framed stdout exclusive to the
 protocol, and zero-cache replay proves default log suppression. Protocol version
 2 adds an ordered, length-prefixed type manifest;
-version 3 adds the correlated observation-metadata frame.
+version 3 adds the correlated observation-metadata frame; version 4 adds
+zero-or-more discriminated diagnostics before that metadata.
 `manager_verify_host` compares it in a temporary child before polling, and every
 executor generation repeats the correlated handshake before activation. A
 mismatch is therefore rejected and reaped without running Workflow code.

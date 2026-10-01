@@ -522,9 +522,11 @@ child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's
 complete language `Process_Result` in a separate diagnostic frame, validates
 terminal flags against the unchanged Core completion, and restores normal
-Worker statistics/observer visibility. The live proof checks timer sequence
-fields that the parent cannot infer from the completion. It still lacks
-optional structured diagnostic transport and production pool hardening.
+Worker statistics/observer visibility. Protocol v4 additionally carries
+correlated, discriminated log/metric/application diagnostics to a borrowed
+parent observer. The live proof checks timer sequence fields that the parent
+cannot infer from the completion and exactly four structured diagnostic events.
+It still lacks production pool hardening.
 Replay-aware child logging, per-runtime metric-emitter creation, and
 inbound/outbound interceptor configuration are now explicit host options; the
 live proof requires exactly two non-replay interceptor logs and metrics in both
