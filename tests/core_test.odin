@@ -219,6 +219,67 @@ workflow_isolation_protocol_rejects_corruption_limits_and_invalid_contracts :: p
 	testing.expect_value(t, validation_error.kind, workflow_isolate.Error_Kind.Invalid_Argument)
 }
 
+@(test)
+workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T) {
+	command := [?]string{"executor", "--child"}
+	manager := workflow_isolate.Manager{}
+	invalid_error := workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 0,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_error = workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
+		activation_timeout = -time.Millisecond,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+
+	init_error := workflow_isolate.manager_init(
+		&manager,
+		workflow_isolate.manager_options_default(command[:]),
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	command[0] = "mutated"
+	testing.expect_value(t, manager.command[0], "executor")
+	testing.expect_value(t, manager.maximum_executors, 1)
+	testing.expect(t, workflow_isolate.capacity_allows_start(0, 1))
+	testing.expect(t, !workflow_isolate.capacity_allows_start(1, 1))
+	workflow_isolate.manager_close(&manager)
+	testing.expect(t, !manager.initialized)
+}
+
+@(test)
+workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testing.T) {
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "route-workflow",
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "route-run",
+		is_replaying = true,
+		history_length = 27,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+			value = &initialize,
+		},
+	})
+	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+	defer delete(encoded)
+	route, ok := workflow_isolate.decode_activation_route(encoded[:])
+	testing.expect(t, ok)
+	testing.expect_value(t, route.run_id, "route-run")
+	testing.expect_value(t, route.workflow_type, "route-workflow")
+	testing.expect(t, route.initializes)
+	testing.expect(t, route.is_replaying)
+	testing.expect_value(t, route.history_length, u32(27))
+	testing.expect_value(t, route.job_count, 1)
+}
+
 Workflow_Processor_Test_State :: struct {
 	called:             bool,
 	activation_length: int,

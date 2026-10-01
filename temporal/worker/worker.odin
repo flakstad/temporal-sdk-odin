@@ -16,6 +16,7 @@ import temporal_core "../core"
 import proto "../core/proto"
 import nexus "../nexus"
 import workflow "../workflow"
+import workflow_isolate "../workflow/isolate"
 
 String_Activity_Proc :: #type proc(ctx: ^activity.Context, input: string) -> string
 Payload_Activity_Proc :: #type proc(
@@ -2247,50 +2248,8 @@ activity_execution_start :: proc(
 	return execution, {}
 }
 
-Workflow_Activation_Route :: struct {
-	run_id:        string,
-	workflow_type: string,
-	initializes:   bool,
-	evicts:        bool,
-	is_replaying:  bool,
-	history_length: u32,
-	job_count:     int,
-}
-
-decode_workflow_activation_route :: proc(data: []u8) -> (route: Workflow_Activation_Route, ok: bool) {
-	decode_arena: virtual.Arena
-	if virtual.arena_init_growing(&decode_arena) != nil {
-		return
-	}
-	defer virtual.arena_destroy(&decode_arena)
-	previous_allocator := context.allocator
-	context.allocator = virtual.arena_allocator(&decode_arena)
-	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{}
-	ok = proto.decode_Coresdk_Workflow_Activation_WorkflowActivation(data, &activation)
-	context.allocator = previous_allocator
-	if !ok || len(activation.run_id) == 0 {
-		ok = false
-		return
-	}
-	route.run_id = activation.run_id
-	route.is_replaying = activation.is_replaying
-	route.history_length = activation.history_length
-	route.job_count = len(activation.jobs)
-	for job in activation.jobs {
-		#partial switch variant in job.variant {
-		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow:
-			if variant.value == nil || route.initializes {
-				ok = false
-				return
-			}
-			route.initializes = true
-			route.workflow_type = variant.value.workflow_type
-		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
-			route.evicts = variant.value != nil
-		}
-	}
-	return
-}
+Workflow_Activation_Route :: workflow_isolate.Activation_Route
+decode_workflow_activation_route :: workflow_isolate.decode_activation_route
 
 find_workflow_registration :: proc(worker: ^Worker, name: string) -> (int, bool) {
 	for registration, index in worker.workflow_registrations {

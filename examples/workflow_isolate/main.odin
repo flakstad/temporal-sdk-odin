@@ -28,8 +28,26 @@ write_executor_error :: proc(request_id: u64, run_id: []u8, message: string) {
 	})
 }
 
+completion_matches_run :: proc(data, expected_run_id: []u8) -> bool {
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	completion := proto.Coresdk_Workflow_Completion_WorkflowActivationCompletion{}
+	decoded := proto.decode_Coresdk_Workflow_Completion_WorkflowActivationCompletion(
+		data,
+		&completion,
+	)
+	context.allocator = previous_allocator
+	return decoded && bytes.equal(transmute([]u8)completion.run_id, expected_run_id)
+}
+
 run_child :: proc(
 	crash_on_first_activation := false,
+	hang_on_first_activation := false,
 	requested_task_queue := "",
 ) -> int {
 	task_queue_buffer: [256]u8
@@ -70,6 +88,11 @@ run_child :: proc(
 			if crash_on_first_activation {
 				os.exit(86)
 			}
+			if hang_on_first_activation {
+				for {
+					time.sleep(time.Hour)
+				}
+			}
 			processed := workflow.process_fiber_activation(&runtime, request.frame.payload)
 			if processed.completion == nil {
 				message := "Workflow activation produced no completion"
@@ -80,8 +103,7 @@ run_child :: proc(
 				workflow.error_free(&processed.error)
 				return 1
 			}
-			response_run_id := transmute([]u8)processed.run_id
-			if !bytes.equal(response_run_id, request.frame.run_id) {
+			if !completion_matches_run(processed.completion[:], request.frame.run_id) {
 				write_executor_error(
 					request.frame.request_id,
 					request.frame.run_id,
@@ -91,6 +113,7 @@ run_child :: proc(
 				workflow.error_free(&processed.error)
 				return 1
 			}
+			response_run_id := request.frame.run_id
 			write_error := workflow_isolate.write(os.stdout, {
 				kind = .Completion,
 				request_id = request.frame.request_id,
@@ -348,14 +371,21 @@ main :: proc() {
 		if len(os.args) >= 3 {
 			task_queue = os.args[2]
 		}
-		os.exit(run_child(false, task_queue))
+		os.exit(run_child(false, false, task_queue))
 	}
 	if len(os.args) >= 2 && os.args[1] == "--child-crash" {
 		task_queue := ""
 		if len(os.args) >= 3 {
 			task_queue = os.args[2]
 		}
-		os.exit(run_child(true, task_queue))
+		os.exit(run_child(true, false, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-hang" {
+		task_queue := ""
+		if len(os.args) >= 3 {
+			task_queue = os.args[2]
+		}
+		os.exit(run_child(false, true, task_queue))
 	}
 	os.exit(run_parent())
 }

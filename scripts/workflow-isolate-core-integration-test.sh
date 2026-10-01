@@ -52,13 +52,22 @@ elif [[ ! -x "$parent_binary" || ! -x "$child_binary" ]]; then
 fi
 
 unique_suffix="${RANDOM}-$(date +%s)"
+first_mode="${TEMPORAL_ODIN_ISOLATE_FIRST_MODE:-crash}"
 output="$(
   TEMPORAL_ODIN_TASK_QUEUE="odin-isolate-$unique_suffix" \
   TEMPORAL_ODIN_WORKFLOW_ID="odin-isolate-$unique_suffix" \
   TEMPORAL_ODIN_ISOLATE_CHILD_COMMAND="$child_binary" \
+  TEMPORAL_ODIN_ISOLATE_FIRST_MODE="$first_mode" \
   "$parent_binary" 2>&1
 )"
 echo "$output"
 grep -q 'Core process isolation completed' <<<"$output"
-grep -q 'crashes=1' <<<"$output"
-grep -q 'exited before completion; reporting activation failure' <<<"$output"
+grep -q "first_mode=$first_mode" <<<"$output"
+grep -q 'graceful_shutdowns=2' <<<"$output"
+if [[ "$first_mode" == "crash" ]]; then
+  grep -q 'child_exits=1' <<<"$output"
+  grep -q 'activation_timeouts=0' <<<"$output"
+elif [[ "$first_mode" == "hang" ]]; then
+  grep -q 'child_exits=0' <<<"$output"
+  grep -q 'activation_timeouts=1' <<<"$output"
+fi

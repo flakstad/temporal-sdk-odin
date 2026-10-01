@@ -503,8 +503,12 @@ to online Core polling in zero-cache mode. Its live test deliberately crashes
 the first per-Workflow executor, submits a failed activation completion,
 acknowledges Core eviction, replays in fresh children, and obtains the durable
 timer Workflow result from the CLI dev server. The current implementation is a
-single-session example without deadlines, generation fencing, registry
-transfer, or a bounded reusable process pool.
+reusable bounded zero-cache manager with owned run-ID/generation routes,
+failed-until-eviction fencing, correlated private pipes, and generated
+statechart/PBT lifecycle coverage. A live hung-child test proves the optional
+activation deadline kills/reaps the executor and recovers through Core replay.
+It still lacks shutdown/backpressure and crash-loop policy, generic registry
+transfer, and sticky-cache execution.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 

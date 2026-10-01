@@ -809,9 +809,26 @@ It starts `temporal server start-dev --headless` when needed, deliberately
 crashes the first Workflow executor, reports that as an activation failure,
 consumes Core eviction, and requires a fresh child to replay and ultimately
 complete the Workflow. `max_cached_workflows = 0` intentionally aligns every
-child lifetime with one Core Workflow Task/cache lifetime. This is a verified
-zero-cache mode, not yet the reusable bounded process pool needed for general
-SDK configuration.
+child lifetime with one Core Workflow Task/cache lifetime.
+
+The parent now uses the reusable `temporal/workflow/isolate.Manager`, not
+example-local process code. `manager_init` copies the ordinary and optional
+first-generation command vectors and sets a hard maximum for owned routes.
+Failed routes retain their generation and consume capacity until Core eviction;
+normal eviction exchanges the final activation, performs a correlated shutdown
+handshake, and reaps the child. `manager_close` aborts and reaps any remaining
+children. Generated `statecharts`/PBT traces cover lifecycle equivalence,
+capacity, and generation fencing. A positive `activation_timeout` adds a
+joinable pipe-reader thread; expiry kills and reaps the child before returning
+the activation failure. Run the real hung-child recovery path with:
+
+```bash
+TEMPORAL_ODIN_ISOLATE_FIRST_MODE=hang \
+  ./scripts/workflow-isolate-core-integration-test.sh
+```
+
+Generic Workflow registry transfer, shutdown deadlines, queue/backpressure,
+and crash-loop policy remain outstanding.
 
 Workflows have the corresponding registration levels:
 

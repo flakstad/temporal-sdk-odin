@@ -3272,14 +3272,17 @@ panicking Workflow execution at a process boundary while preserving Core's
 task/completion lifecycle. The SDK now provides the smaller whole-Worker
 supervisor itself, including readiness, bounded crash-loop backoff, thread-safe
 stop, TERM/grace/KILL, lifecycle events, unit tests, and a live abrupt-crash/
-replay proof. The first fine-grained IPC experiment now carries opaque
-activation/completion protobufs through bounded, versioned, correlated frames;
-one child demonstrably retains a suspended fiber across two activations. The
-next step is a real zero-cache Core path: one child per Workflow Task, explicit
-eviction acknowledgement, and child death translated into activation failure,
-eviction, and fresh-process replay. Sticky per-run child routing is the later
-performance mode. Infinite Workflow detection and the production process pool
-remain process-boundary work. The
+replay proof. The fine-grained IPC path now carries opaque
+activation/completion protobufs through bounded, versioned, correlated frames
+and is connected to Core through a reusable bounded zero-cache manager. Child
+death is live-proven as activation failure, eviction, and fresh-process replay;
+generated statechart traces check failed-generation fencing and multi-route
+capacity. A positive activation deadline now kills and reaps an unresponsive
+executor, joins its pipe reader, and drives the same failed-completion/eviction/
+replay path against the dev server. The next step is generic registry transfer,
+followed by shutdown/backpressure/crash-loop policy. Sticky per-run child
+routing is the later performance mode. Production hardening remains
+process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3903,11 +3906,18 @@ the old language cache entry live is invalid because the new process lacks the
 suspended fiber.
 
 The external processor itself is an Odin-only API seam and is still marked
-experimental. The single-session example lacks deadlines, bounded admission,
-generation fencing, generic registration transfer, and complete observation
-metadata. These are process-manager responsibilities, not additional Temporal
-protocol work. See `docs/workflow-isolation.md` for the executed recovery trace
-and remaining safety work.
+experimental. A reusable manager now provides bounded admission, owned run-ID
+routes, monotonically increasing generations, private per-generation pipes,
+correlated request IDs, failed-until-eviction state, and complete child reaping.
+Its transition function is checked against an independent statechart over
+generated traces, while a second generated model checks multi-route capacity
+and generation fencing. Activation deadlines use a joinable reader thread and
+kill/reap on expiry; the hung-child live path proves retry and replay.
+Shutdown deadlines, crash-loop/backpressure policy, generic registration
+transfer, and complete observation metadata remain process-manager
+responsibilities, not additional Temporal protocol work. See
+`docs/workflow-isolation.md` for the executed recovery trace and remaining
+safety work.
 
 ### Local Activity boundary
 

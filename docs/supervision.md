@@ -7,12 +7,13 @@ an optional `temporal/supervisor` package for launching and restarting a whole
 Worker executable. A platform supervisor such as systemd, launchd, Kubernetes,
 or another service manager should still supervise that top-level process.
 
-This is whole-Worker isolation. It is not yet a per-Workflow subprocess pool:
+This package is whole-Worker isolation, not the per-Workflow subprocess manager:
 one fatal callback can still terminate every registration in that child, after
 which Temporal retries unfinished tasks in the replacement process.
-The separate [`workflow-isolation.md`](workflow-isolation.md) spike now proves
-that a child can retain one suspended Workflow fiber across multiple framed
-Core activations, but that transport is not yet wired into `worker.run`.
+The separate experimental manager documented in
+[`workflow-isolation.md`](workflow-isolation.md) is wired into `worker.run` for
+zero-cache execution and contains a single Workflow route per child. It is not
+yet the default or production-ready containment mode.
 
 ## SDK supervisor
 

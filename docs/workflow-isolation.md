@@ -107,6 +107,19 @@ serial invocation and returns an ordinarily owned `workflow.Process_Result`.
 The existing in-process dispatcher remains the default, and offline replay
 deliberately remains in-process.
 
+`temporal/workflow/isolate.Manager` is the reusable zero-cache implementation
+of that callback. Initialization copies both child command vectors, requires a
+positive route capacity, and owns a dynamic run-ID table. Each accepted route
+gets a monotonically increasing generation and its own process and pipe pair.
+Capacity counts both live routes and failed routes awaiting eviction, so a
+crash cannot free a slot and permit an unsafe replacement before Core confirms
+`RemoveFromCache`. An optional first-generation command exists solely for
+fault-injection and bootstrap tests; ordinary generations use the main command.
+`activation_timeout` is zero for an unbounded wait or a positive monotonic
+deadline. The bounded path reads on one joinable helper thread; on expiry it
+kills the child, joins the reader after pipe EOF, reports exactly one activation
+failure, and retains the failed route until eviction.
+
 Run the complete proof with no pre-existing infrastructure:
 
 ```bash
@@ -129,11 +142,19 @@ creates a Worker with `max_cached_workflows = 0` and one Workflow poller, then:
 6. the public Odin Client obtains `"Hello from an isolated Workflow, Odin"`
    from the Temporal Service.
 
-The live assertion requires one activation failure, one child crash, one
-completed Workflow, no live child at return, and at least two child
+The live assertion requires one activation failure, one child exit, one
+completed Workflow, no owned route at return, and at least two child
 generations. The observed CLI-dev-server path currently has exactly three
-generations and three evictions. Those exact counts are diagnostic rather than
-an API promise; Core may legitimately change activation batching.
+generations, three evictions, two graceful shutdowns, one aborted crashed child,
+and zero protocol failures. Those exact counts are diagnostic rather than an
+API promise; Core may legitimately change activation batching.
+
+The same script accepts
+`TEMPORAL_ODIN_ISOLATE_FIRST_MODE=hang`. That child deliberately stops before
+answering its first activation. With a 250 ms activation deadline, the live
+path observes exactly one timeout, kills and reaps the child, submits the failed
+completion, consumes eviction, replays in later generations, and returns the
+same durable result. No pipe-reader thread remains at shutdown.
 
 This is evidence for the central recovery contract: the parent can survive a
 language executor crash, fail only that Workflow Task, and let Core/Server
@@ -143,8 +164,8 @@ history drive a fresh Odin runtime. Temporal remains the durable state owner.
 
 - Core's poll result owns the activation bytes. `worker.run` borrows them to the
   callback and frees them immediately after it returns.
-- Route strings decoded from an activation also borrow those bytes. The example
-  clones a run ID for every live child route and separately keeps a reporting
+- Route strings decoded from an activation also borrow those bytes. The manager
+  clones a run ID for every owned route and separately keeps a reporting
   copy alive until `worker.run` has consumed the returned result.
 - The child protocol decoder returns owned run-ID/payload buffers; callers use
   `owned_frame_free`.
@@ -154,18 +175,40 @@ history drive a fresh Odin runtime. Temporal remains the durable state owner.
   handshake; EOF/protocol failure closes pipes, kills only when necessary, and
   waits for the process.
 
+### Lifecycle model and generated traces
+
+The implementation exposes and uses one pure lifecycle transition function:
+
+```text
+Absent + Initialize       -> Live(g), StartExecutor
+Live + Success            -> Live(g), CompleteActivation
+Live + Failure/Initialize -> Failed(g), FailAndAbort
+Failed + non-eviction     -> Failed(g), FailAwaitingEviction
+Live/Failed + Eviction    -> Absent, shutdown-or-ack
+```
+
+A `statecharts` model independently declares the same transition graph. A
+1,000-case property test feeds up to 64 generated events through both and
+requires identical state and effects after every event. A second 1,000-case
+property generates up to 128 events across eight run slots and capacities from
+one through eight. It requires route count never to exceed capacity, every
+owned route to have a generation, and a failed generation never to change
+before eviction. The existing 500-case framing property remains independent.
+
+Generation fencing currently comes from route ownership as well as the model:
+each generation has private pipes and monotonically correlated request IDs.
+Closing and reaping an old session removes the only handles through which its
+response could be read; a new generation never reuses those pipes.
+
 ## Not implemented yet
 
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- move the single-session example into a reusable bounded process-pool package
-  with a run-ID/generation route table;
 - transfer Workflow registration metadata to independently launched executors
   instead of compiling a dedicated child executable for this one Workflow;
-- reject late responses from an old generation before they can complete a newer
-  activation;
-- bound child count, queueing, activation time, shutdown, and crash-loop rate;
+- add bounded waiting/queue policy, graceful-shutdown deadlines, and crash-loop
+  rate limiting;
 - carry replay-aware logs, metrics, interceptors, and diagnostics across the
   process boundary without letting them affect commands;
 - preserve the complete `Process_Result` observation metadata across the
@@ -175,9 +218,10 @@ still required:
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is the reusable bounded zero-cache
-executor manager: extract lifecycle/routing from the example, add activation
-deadlines and generation fencing, and model crash/eviction/shutdown traces with
-the pinned PBT/statecharts dependencies. Sticky per-run routing should follow
-only after that manager is correct; it can reuse the wire protocol while
-changing child lifetime to match Core's non-zero cache.
+The next discriminating vertical slice is generic registration transfer so one
+executor binary can host an application registry rather than this proof's
+dedicated Workflow. A separate shutdown deadline and crash-loop/backpressure
+policy should then harden manager teardown. Sticky per-run routing should
+follow only after those zero-cache failure paths are correct; it can reuse the
+manager and wire protocol while changing child lifetime to match Core's
+non-zero cache.
