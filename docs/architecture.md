@@ -1143,7 +1143,9 @@ The distribution plan, with its current status, is:
 2. Defined in CI: build four artifacts from source with the pinned toolchain;
    both arm64 targets have also been executed locally.
 3. Done: give each artifact a platform/architecture manifest and checksum.
-4. Pending: fetch/select exactly one matching dynamic library during SDK setup.
+4. Partial: a verified local archive installer selects the current host and
+   exact Core pin into an immutable revision/target path; remote release
+   discovery/download is still pending.
 5. Partial: set `@rpath` on macOS and supply an application rpath on Linux;
    complete `otool -L`/`readelf -d` policy checks on all hosted targets.
 6. Defined in CI: run ABI and init/shutdown smoke tests on every artifact;
@@ -1155,6 +1157,12 @@ version/checksum manifest. `scripts/verify-native-package.sh --smoke` extracts
 that archive and links the real Core runtime lifecycle test against its library
 directory. The four-platform GitHub Actions matrix performs the build, full
 unit/property suite, example compilation, packaging, and packaged-ABI smoke.
+`scripts/install-native-package.sh` refuses target/Core-pin/header skew and
+returns the installed `lib` directory. The package integration test consumes
+that directory through `TEMPORAL_ODIN_NATIVE_LIB_DIR`, runs the full
+unit/property suites, and relinks every example without a Core Cargo build; it
+also rejects a deliberately wrong revision. The four CI jobs run the same
+install/consume test.
 The explicit `native/sdk-core-revision.txt` pin also lets the build work from a
 complete source archive where Git submodule metadata is unavailable.
 

@@ -20,6 +20,10 @@ else
   echo "Native package contains an unsafe archive path" >&2
   exit 1
 fi
+if ! tar -tvzf "$archive" | awk '{ type = substr($1, 1, 1); if (type != "-" && type != "d") bad = 1 } END { exit bad }'; then
+  echo "Native package contains a link or special archive entry" >&2
+  exit 1
+fi
 
 stage_root="$(mktemp -d "${TMPDIR:-/tmp}/temporal-sdk-odin-verify.XXXXXX")"
 trap 'rm -rf "$stage_root"' EXIT
@@ -90,6 +94,11 @@ if [[ ! "$sdk_core_commit" =~ ^[0-9a-f]{40}$ ]]; then
   echo "Native package Core revision is not a full lowercase Git commit" >&2
   exit 1
 fi
+expected_sdk_core_commit="$(tr -d '[:space:]' <"$repo_root/native/sdk-core-revision.txt")"
+if [[ "$sdk_core_commit" != "$expected_sdk_core_commit" ]]; then
+  echo "Native package Core revision does not match this Odin SDK checkout" >&2
+  exit 1
+fi
 
 checksum() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -117,6 +126,13 @@ if [[ "$(checksum "$core_path")" != "$(manifest_value core_sha256)" ||
       "$(checksum "$fiber_path")" != "$(manifest_value fiber_sha256)" ||
       "$(checksum "$header_path")" != "$(manifest_value header_sha256)" ]]; then
   echo "Native package checksum verification failed" >&2
+  exit 1
+fi
+
+source_header="$repo_root/native/sdk-core/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h"
+if [[ -f "$source_header" &&
+      "$(checksum "$header_path")" != "$(checksum "$source_header")" ]]; then
+  echo "Native package C header does not match the pinned source checkout" >&2
   exit 1
 fi
 

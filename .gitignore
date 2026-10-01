@@ -1,3 +1,5 @@
 /bin/
 /native/target/
+/native/prebuilt/
+/dist/
 /.DS_Store

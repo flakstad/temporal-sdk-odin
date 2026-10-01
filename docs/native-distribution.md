@@ -51,3 +51,18 @@ Verify an archive from the source checkout before using it:
 The smoke mode links the repository's runtime lifecycle test against the
 unpacked libraries and exercises Core initialization and shutdown without a
 Temporal Server.
+
+Install a verified archive into an immutable, revision-addressed directory:
+
+```bash
+native_lib_dir="$(./scripts/install-native-package.sh path/to/archive.tar.gz)"
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$native_lib_dir" \
+  ./scripts/build-examples.sh
+```
+
+The installer first enforces the current host target and this checkout's exact
+`native/sdk-core-revision.txt`. It then installs under
+`native/prebuilt/<sdk-core-commit>/<target>/` by default. A repeated identical
+installation returns the same `lib` directory; existing different or corrupt
+contents are rejected rather than replaced. This prevents generated Odin
+protobuf/raw ABI code from silently linking a different Core bridge.

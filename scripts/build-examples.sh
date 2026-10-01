@@ -2,9 +2,23 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-"$repo_root/scripts/build-core.sh"
-
-lib_dir="$repo_root/native/target/release"
+output_dir="$repo_root/native/target/release"
+lib_dir="${TEMPORAL_ODIN_NATIVE_LIB_DIR:-$output_dir}"
+if [[ -z "${TEMPORAL_ODIN_NATIVE_LIB_DIR:-}" ]]; then
+  "$repo_root/scripts/build-core.sh"
+fi
+case "$(uname -s)" in
+  Darwin) core_library="libtemporalio_sdk_core_c_bridge.dylib" ;;
+  Linux) core_library="libtemporalio_sdk_core_c_bridge.so" ;;
+  *) echo "Unsupported example-build host: $(uname -s)" >&2; exit 1 ;;
+esac
+for required in "$lib_dir/$core_library" "$lib_dir/libtemporal_odin_fiber.a"; do
+  if [[ ! -f "$required" ]]; then
+    echo "Native library is missing: $required" >&2
+    exit 1
+  fi
+done
+mkdir -p "$output_dir"
 odin_thread_count="${ODIN_THREAD_COUNT:-1}"
 
 build_example() {
@@ -12,7 +26,7 @@ build_example() {
   local binary_name="$2"
   odin build "$repo_root/examples/$source_name" \
     -thread-count:"$odin_thread_count" \
-    -out:"$lib_dir/$binary_name" \
+    -out:"$output_dir/$binary_name" \
     -extra-linker-flags:"-L${lib_dir} -Wl,-rpath,${lib_dir}"
 }
 

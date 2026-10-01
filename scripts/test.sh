@@ -6,10 +6,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
   --package odin-proto-gen
-"$repo_root/scripts/build-core.sh"
-"$repo_root/scripts/fiber-guard-test.sh"
+lib_dir="${TEMPORAL_ODIN_NATIVE_LIB_DIR:-$repo_root/native/target/release}"
+if [[ -z "${TEMPORAL_ODIN_NATIVE_LIB_DIR:-}" ]]; then
+  "$repo_root/scripts/build-core.sh"
+fi
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" "$repo_root/scripts/fiber-guard-test.sh"
 
-lib_dir="$repo_root/native/target/release"
 odin_thread_count="${ODIN_THREAD_COUNT:-1}"
 odin test "$repo_root/tests" \
 	-thread-count:"$odin_thread_count" \

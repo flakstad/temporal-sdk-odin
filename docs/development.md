@@ -135,7 +135,26 @@ Verify both archive structure and the packaged ABI with:
 Use the archive name for the current host. Smoke mode links only the runtime
 init/shutdown test against the unpacked archive, rather than the build-tree
 libraries. Verification rejects target mismatch, unsafe archive paths, missing
-files, and checksum changes.
+files, checksum changes, a Core commit different from
+`native/sdk-core-revision.txt`, and—when the submodule is present—a mismatched C
+header.
+
+Install the verified package and consume it without compiling Rust Core:
+
+```bash
+native_lib_dir="$(./scripts/install-native-package.sh \
+  dist/temporal-sdk-odin-native-macos-arm64.tar.gz)"
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$native_lib_dir" \
+  ./scripts/build-examples.sh
+```
+
+The default immutable location is
+`native/prebuilt/<sdk-core-commit>/<target>/`; it is ignored by Git. Pass an
+explicit second argument to select another install root. The installer is
+idempotent for byte-identical content and refuses to overwrite an existing
+partial or different package. `scripts/native-package-integration-test.sh`
+proves install/reinstall, the full unit/property suites, all example links, and
+rejection of a deliberately wrong Core pin. CI runs it for every target.
 
 `.github/workflows/ci.yml` runs the full unit/property suite, builds all
 examples, packages, and smoke-tests on macOS arm64/x86_64 and Linux glibc

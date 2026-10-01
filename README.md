@@ -827,6 +827,21 @@ Use the archive matching the host: `macos-arm64`, `macos-x86_64`,
 [native distribution](docs/native-distribution.md) for archive contents and
 linking details. CI builds and smoke-tests all four target artifacts.
 
+Install a matching archive into the revision-addressed local package cache and
+build every example without rebuilding Rust Core:
+
+```bash
+native_lib_dir="$(./scripts/install-native-package.sh \
+  dist/temporal-sdk-odin-native-macos-arm64.tar.gz)"
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$native_lib_dir" \
+  ./scripts/build-examples.sh
+```
+
+Installation rejects another platform, another pinned Core revision, checksum
+changes, and a C header that differs from the checked-out bridge. Reinstalling
+the identical immutable package is idempotent; an incomplete or different
+package at the same revision/target path is never overwritten.
+
 In one terminal, start the recommended local development server:
 
 ```bash
