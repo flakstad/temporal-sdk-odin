@@ -6209,6 +6209,96 @@ child_handle_signal_cancel_test_workflow :: proc(
 	return "Child Workflow signaled and explicitly canceled"
 }
 
+Signal_Token_Cancellation_State :: struct {
+	token:     workflow.Cancellation_Token,
+	requested: bool,
+}
+
+request_signal_token_cancellation :: proc(
+	_: ^workflow.Fiber_Context,
+	state: ^Signal_Token_Cancellation_State,
+	_: string,
+) {
+	state.requested = workflow.cancellation_request(
+		state.token,
+		"Workflow Signal token canceled",
+	)
+}
+
+child_signal_start_wait_cancellation_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	state := Signal_Token_Cancellation_State{
+		token = workflow.cancellation_detached(ctx),
+	}
+	if state.token.id == 0 ||
+	   !workflow.set_signal_routine_json(
+		ctx,
+		"cancel-child-signal-token",
+		&state,
+		request_signal_token_cancellation,
+	   ) {
+		return "could not configure Child Workflow Signal cancellation"
+	}
+	future := workflow.start_child_workflow_json(
+		ctx,
+		"child_signal_cancellation_target",
+		input,
+		{
+			workflow_id = "child-signal-cancellation-target-id",
+			workflow_execution_timeout = time.Hour,
+		},
+	)
+	result := workflow.signal_child_workflow_json_with_options(
+		ctx,
+		future,
+		"approval",
+		input,
+		{cancellation_token = state.token},
+	)
+	if !state.requested || result.status != .Canceled ||
+	   result.failure_message != "Workflow Signal token canceled" {
+		return "Child Workflow Signal start wait ignored cancellation"
+	}
+	_ = workflow.await_signal(ctx, "finish-child-signal-cancellation")
+	return "Child Workflow Signal start wait canceled"
+}
+
+external_signal_token_cancellation_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	workflow_id: string,
+) -> string {
+	state := Signal_Token_Cancellation_State{
+		token = workflow.cancellation_detached(ctx),
+	}
+	if state.token.id == 0 ||
+	   !workflow.set_signal_routine_json(
+		ctx,
+		"cancel-external-signal-token",
+		&state,
+		request_signal_token_cancellation,
+	   ) {
+		return "could not configure external Workflow Signal cancellation"
+	}
+	result := workflow.signal_external_workflow_json_with_options(
+		ctx,
+		{
+			namespace = "default",
+			workflow_id = workflow_id,
+		},
+		"approval",
+		"approved",
+		{cancellation_token = state.token},
+	)
+	if !state.requested || result.status != .Canceled ||
+	   result.failure_message != "Workflow Signal token canceled" {
+		return "external Workflow Signal ignored cancellation"
+	}
+	_ = workflow.await_signal(ctx, "finish-external-signal-cancellation")
+	return "external Workflow Signal canceled"
+}
+
 child_signal_failure_test_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: string,
@@ -6762,6 +6852,41 @@ process_fiber_test_activation :: proc(
 	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(activation)
 	defer delete(encoded)
 	return workflow.process_fiber_activation(runtime, encoded[:])
+}
+
+Fiber_Test_Signal :: struct {
+	payload:       codec.Payload,
+	proto_payload: proto.Temporal_Api_Common_V1_Payload,
+	signal:        proto.Coresdk_Workflow_Activation_SignalWorkflow,
+}
+
+fiber_test_signal_init :: proc(
+	fixture: ^Fiber_Test_Signal,
+	name, input: string,
+) -> bool {
+	if fixture == nil {
+		return false
+	}
+	payload, encode_error := codec.encode_json(input)
+	if encode_error != .None {
+		return false
+	}
+	fixture.payload = payload
+	fixture.proto_payload = proto.encode_payload(codec.payload_view(&fixture.payload))
+	fixture.signal.signal_name = name
+	append(&fixture.signal.input, fixture.proto_payload)
+	return true
+}
+
+fiber_test_signal_free :: proc(fixture: ^Fiber_Test_Signal) {
+	if fixture == nil {
+		return
+	}
+	delete(fixture.signal.input)
+	delete(fixture.proto_payload.metadata)
+	delete(fixture.proto_payload.external_payloads)
+	codec.payload_free(&fixture.payload)
+	fixture^ = {}
 }
 
 drive_child_failure_test :: proc(
@@ -23441,6 +23566,316 @@ workflow_explicit_cancellation_tokens_are_run_local :: proc(t: ^testing.T) {
 	testing.expect(t, same_valid && same_id == 1)
 	testing.expect(t, !foreign_valid)
 	testing.expect(t, !stale_valid)
+}
+
+@(test)
+child_workflow_signal_token_cancels_the_internal_start_wait :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"child_signal_start_wait_cancellation_test_workflow",
+		"test-queue",
+		child_signal_start_wait_cancellation_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "child_signal_start_wait_cancellation_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "child-signal-start-wait-cancellation-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		initial.error.message == nil,
+		"Child Signal start-wait initialization failed: %s",
+		string(initial.error.message),
+	)
+	testing.expect(t, initial.started_child_workflow)
+	testing.expect_value(t, initial.waiting_child_workflow_start_seq, u32(1))
+	initial_inspection := inspect_workflow_completion(initial.completion[:])
+	testing.expect_value(t, initial_inspection.command_count, 1)
+	testing.expect_value(t, initial_inspection.started_child_workflow_seq, u32(1))
+	delete(initial_inspection.child_workflow_id)
+	delete(initial_inspection.child_workflow_type)
+	delete(initial_inspection.child_workflow_task_queue)
+	for value in initial_inspection.child_workflow_inputs {
+		delete(value)
+	}
+	delete(initial_inspection.child_workflow_input_marker)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	cancel_signal := Fiber_Test_Signal{}
+	testing.expect(
+		t,
+		fiber_test_signal_init(
+			&cancel_signal,
+			"cancel-child-signal-token",
+			"cancel",
+		),
+	)
+	defer fiber_test_signal_free(&cancel_signal)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal.signal,
+			},
+		},
+	)
+	canceled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		canceled.error.message == nil,
+		"Child Signal start-wait cancellation failed: %s",
+		string(canceled.error.message),
+	)
+	testing.expect(t, canceled.received_signal)
+	testing.expect(t, canceled.waiting_signal)
+	testing.expect(t, !canceled.signaled_child_workflow)
+	testing.expect(t, !canceled.completed)
+	cancel_inspection := inspect_workflow_completion(canceled.completion[:])
+	testing.expect(t, cancel_inspection.decoded)
+	testing.expect_value(t, cancel_inspection.command_count, 0)
+	testing.expect_value(t, cancel_inspection.child_workflow_signal_seq, u32(0))
+	if len(runtime.instances) == 1 {
+		instance := runtime.instances[0]
+		testing.expect_value(t, instance.waiting_child_signal_cancellation_token_id, u32(0))
+		testing.expect_value(t, len(instance.child_workflows), 1)
+		if len(instance.child_workflows) == 1 {
+			testing.expect(t, instance.child_workflows[0].start_state == .Pending)
+			testing.expect(t, instance.child_workflows[0].command_state == .Commanded)
+		}
+	}
+	cancel_completion := canceled.completion
+	workflow.error_free(&canceled.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal.signal,
+			},
+		},
+	)
+	replayed_cancel := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_cancel.error.message == nil)
+	testing.expect(t, bytes.equal(cancel_completion[:], replayed_cancel.completion[:]))
+	delete(cancel_completion)
+	delete(replayed_cancel.completion)
+	workflow.error_free(&replayed_cancel.error)
+}
+
+@(test)
+external_workflow_signal_token_cancels_the_commanded_signal :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"external_signal_token_cancellation_test_workflow",
+		"test-queue",
+		external_signal_token_cancellation_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("target-workflow")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "external_signal_token_cancellation_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "external-signal-token-cancellation-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		initial.error.message == nil,
+		"external Signal token initialization failed: %s",
+		string(initial.error.message),
+	)
+	testing.expect(t, initial.signaled_external_workflow)
+	initial_inspection := inspect_workflow_completion(initial.completion[:])
+	testing.expect_value(t, initial_inspection.command_count, 1)
+	testing.expect_value(t, initial_inspection.child_workflow_signal_seq, u32(1))
+	delete(initial_inspection.child_workflow_signal_name)
+	delete(initial_inspection.child_workflow_signal_input)
+	delete(initial_inspection.external_workflow_signal_namespace)
+	delete(initial_inspection.external_workflow_signal_id)
+	delete(initial_inspection.external_workflow_signal_run_id)
+	initial_completion := initial.completion
+	workflow.error_free(&initial.error)
+
+	cancel_signal := Fiber_Test_Signal{}
+	testing.expect(
+		t,
+		fiber_test_signal_init(
+			&cancel_signal,
+			"cancel-external-signal-token",
+			"cancel",
+		),
+	)
+	defer fiber_test_signal_free(&cancel_signal)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal.signal,
+			},
+		},
+	)
+	canceled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		canceled.error.message == nil,
+		"external Signal token cancellation failed: %s",
+		string(canceled.error.message),
+	)
+	testing.expect(t, canceled.received_signal)
+	testing.expect(t, canceled.canceled_external_workflow_signal)
+	testing.expect(t, canceled.waiting_signal)
+	testing.expect(t, !canceled.completed)
+	cancel_inspection := inspect_workflow_completion(canceled.completion[:])
+	testing.expect(t, cancel_inspection.decoded)
+	testing.expect_value(t, cancel_inspection.command_count, 1)
+	testing.expect_value(t, cancel_inspection.canceled_external_signal_seq, u32(1))
+	cancel_completion := canceled.completion
+	workflow.error_free(&canceled.error)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	delete(activation.jobs)
+	activation.jobs = nil
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	evicted := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, evicted.error.message == nil && evicted.evicted)
+	delete(evicted.completion)
+	workflow.error_free(&evicted.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.is_replaying = true
+	activation.history_length = 3
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	replayed_initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_initial.error.message == nil)
+	testing.expect(t, bytes.equal(initial_completion[:], replayed_initial.completion[:]))
+	delete(initial_completion)
+	delete(replayed_initial.completion)
+	workflow.error_free(&replayed_initial.error)
+
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 6
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &cancel_signal.signal,
+			},
+		},
+	)
+	replayed_cancel := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, replayed_cancel.error.message == nil)
+	testing.expect(t, bytes.equal(cancel_completion[:], replayed_cancel.completion[:]))
+	delete(cancel_completion)
+	delete(replayed_cancel.completion)
+	workflow.error_free(&replayed_cancel.error)
 }
 
 @(test)

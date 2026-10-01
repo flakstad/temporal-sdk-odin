@@ -1783,7 +1783,12 @@ cancellation tokens and select them directly through Activity, Local Activity,
 Child Workflow, Nexus, and child/external Signal options. A focused unit trace
 checks the stored token IDs, all four Core cancellation-command families,
 foreign/stale-token rejection, and terminal completion on the following
-activation. The external Workflow
+activation. A 240-case property varies whether Child start stays pending or
+resolves in the token-cancellation activation, covers both Core job orders,
+and requires zero Child Signal commands plus byte-identical fresh-stack replay.
+The direct Child-start waiter regression remains pending until Core supplies a
+start resolution, proving that only the Signal convenience gained this wakeup.
+The external Workflow
 property generates 500 namespace/Workflow ID/optional Run ID identities,
 signal names, summaries, JSON payloads, and cancellation reasons. It checks exact
 `NamespacedWorkflowExecution` targets for signal and cancellation commands and

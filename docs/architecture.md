@@ -2628,7 +2628,20 @@ families plus child and external Workflow Signals and require byte-identical
 fresh-stack replay. An already-canceled Signal token resolves locally without
 sending `SignalExternalWorkflowExecution`.
 
-A second acceptance trace starts a Signal routine waiting on an unhandled
+Pinned Rust exposes Child signaling only from `StartedChildWorkflow`; its
+`SignalWorkflowOptions` token therefore wraps a Signal command future that
+already has a Child handle. Odin also exposes a Future-based convenience that
+can be called before `ResolveChildWorkflowExecutionStart`. The runtime models
+that extra composition with a private waiter token ID. Token cancellation may
+wake this internal prerequisite wait without making the public
+`await_child_workflow_start` cancellation-sensitive. If cancellation and Child
+start resolution share an activation, cancellation wins and no Signal command
+is created. Once a Signal command exists, cancellation follows Rust/Core and
+emits `CancelSignalWorkflow(seq)`. The waiter ID is part of the per-fiber
+execution snapshot so main, Signal, and Update fibers remain isolated; it is
+never serialized.
+
+A separate acceptance trace starts a Signal routine waiting on an unhandled
 Signal and an Update routine waiting on a durable timer under the same child
 token. Main cancels that token only after both routines have already had their
 scheduler turn. One activation then cancels the timer, completes both handlers,

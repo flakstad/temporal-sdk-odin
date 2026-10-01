@@ -1947,6 +1947,14 @@ ended in LIFO order, normally with `defer workflow.cancellation_scope_end(&scope
 the Workflow Execution; only a server-delivered root cancellation is
 acknowledged with `CancelWorkflowExecution`.
 
+Odin's Child Signal convenience accepts a `Child_Workflow_Future`, so it may
+internally wait for the Child start before a signal command can exist. The
+Signal token covers that prerequisite wait as well: cancellation resumes only
+the Signal call and emits no `SignalExternalWorkflowExecution`. It does not
+change a direct `await_child_workflow_start`. Once either a Child or external
+Signal has been commanded, the same token emits Core's
+`CancelSignalWorkflow` and returns `.Canceled`.
+
 After applying every Core job, the Workflow scheduler drains ready Signal,
 Update, and main fibers to a deterministic fixed point. Cancellation in a
 later-scheduled fiber therefore wakes earlier Signal/timer waiters, completes

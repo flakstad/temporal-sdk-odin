@@ -1368,6 +1368,7 @@ Fiber_Signal_Routine :: struct {
 	waiting_activity_seq: u32,
 	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
+	waiting_child_signal_cancellation_token_id: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
@@ -1401,6 +1402,7 @@ Fiber_Update_Routine :: struct {
 	waiting_activity_seq: u32,
 	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
+	waiting_child_signal_cancellation_token_id: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
@@ -1458,6 +1460,7 @@ Fiber_Instance :: struct {
 	waiting_activity_seq: u32,
 	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
+	waiting_child_signal_cancellation_token_id: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
@@ -1826,6 +1829,7 @@ Fiber_Execution_State :: struct {
 	waiting_activity_seq: u32,
 	waiting_nexus_operation_seq: u32,
 	waiting_child_workflow_seq: u32,
+	waiting_child_signal_cancellation_token_id: u32,
 	waiting_external_signal_seq: u32,
 	waiting_external_cancel_seq: u32,
 	waiting_timer_seq:    u32,
@@ -1846,6 +1850,7 @@ capture_instance_execution :: proc(instance: ^Fiber_Instance) -> Fiber_Execution
 		waiting_activity_seq = instance.waiting_activity_seq,
 		waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = instance.waiting_child_workflow_seq,
+		waiting_child_signal_cancellation_token_id = instance.waiting_child_signal_cancellation_token_id,
 		waiting_external_signal_seq = instance.waiting_external_signal_seq,
 		waiting_external_cancel_seq = instance.waiting_external_cancel_seq,
 		waiting_timer_seq = instance.waiting_timer_seq,
@@ -1866,6 +1871,7 @@ apply_instance_execution :: proc(instance: ^Fiber_Instance, state: Fiber_Executi
 	instance.waiting_activity_seq = state.waiting_activity_seq
 	instance.waiting_nexus_operation_seq = state.waiting_nexus_operation_seq
 	instance.waiting_child_workflow_seq = state.waiting_child_workflow_seq
+	instance.waiting_child_signal_cancellation_token_id = state.waiting_child_signal_cancellation_token_id
 	instance.waiting_external_signal_seq = state.waiting_external_signal_seq
 	instance.waiting_external_cancel_seq = state.waiting_external_cancel_seq
 	instance.waiting_timer_seq = state.waiting_timer_seq
@@ -1886,6 +1892,7 @@ signal_routine_execution :: proc(routine: ^Fiber_Signal_Routine) -> Fiber_Execut
 		waiting_activity_seq = routine.waiting_activity_seq,
 		waiting_nexus_operation_seq = routine.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
+		waiting_child_signal_cancellation_token_id = routine.waiting_child_signal_cancellation_token_id,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
 		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
@@ -1909,6 +1916,7 @@ capture_signal_routine_execution :: proc(
 	routine.waiting_activity_seq = instance.waiting_activity_seq
 	routine.waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
+	routine.waiting_child_signal_cancellation_token_id = instance.waiting_child_signal_cancellation_token_id
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
 	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
@@ -2009,6 +2017,7 @@ update_routine_execution :: proc(routine: ^Fiber_Update_Routine) -> Fiber_Execut
 		waiting_activity_seq = routine.waiting_activity_seq,
 		waiting_nexus_operation_seq = routine.waiting_nexus_operation_seq,
 		waiting_child_workflow_seq = routine.waiting_child_workflow_seq,
+		waiting_child_signal_cancellation_token_id = routine.waiting_child_signal_cancellation_token_id,
 		waiting_external_signal_seq = routine.waiting_external_signal_seq,
 		waiting_external_cancel_seq = routine.waiting_external_cancel_seq,
 		waiting_timer_seq = routine.waiting_timer_seq,
@@ -2032,6 +2041,7 @@ capture_update_routine_execution :: proc(
 	routine.waiting_activity_seq = instance.waiting_activity_seq
 	routine.waiting_nexus_operation_seq = instance.waiting_nexus_operation_seq
 	routine.waiting_child_workflow_seq = instance.waiting_child_workflow_seq
+	routine.waiting_child_signal_cancellation_token_id = instance.waiting_child_signal_cancellation_token_id
 	routine.waiting_external_signal_seq = instance.waiting_external_signal_seq
 	routine.waiting_external_cancel_seq = instance.waiting_external_cancel_seq
 	routine.waiting_timer_seq = instance.waiting_timer_seq
@@ -6834,6 +6844,7 @@ await_child_workflow_start :: proc(
 	}
 	if operation.start_state == .Pending {
 		instance.waiting_child_workflow_seq = future.seq
+		instance.waiting_child_signal_cancellation_token_id = 0
 		instance.phase = .Waiting_Child_Workflow_Start
 		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
 			mark_child_workflow_failure(ctx, "could not resume Child Workflow start await", "OdinChildWorkflowRuntimeError")
@@ -6844,6 +6855,73 @@ await_child_workflow_start :: proc(
 	if !found || operation.start_state == .Pending {
 		mark_child_workflow_failure(ctx, "Child Workflow start resumed without a resolution", "OdinChildWorkflowRuntimeError")
 		return {status = .Failed, failure_message = "Child Workflow start resumed without a resolution"}
+	}
+	return child_workflow_start_result_from_operation(operation)
+}
+
+// await_child_workflow_start_for_signal is the Odin Future convenience layer
+// used before a Child Workflow handle exists. Rust exposes Signal only from a
+// StartedChildWorkflow handle, so its cancellable Signal future has no such
+// prerequisite wait. Keep the token-specific wakeup here rather than changing
+// the semantics of the public await_child_workflow_start operation.
+await_child_workflow_start_for_signal :: proc(
+	ctx: ^Fiber_Context,
+	future: Child_Workflow_Future,
+	cancellation_token_id: u32,
+) -> Child_Workflow_Start_Result {
+	if ctx == nil || ctx.instance == nil || ctx.instance.phase != .Ready ||
+	   future.seq == 0 || cancellation_token_id == 0 {
+		return {status = .Failed, failure_message = "invalid Child Workflow Signal start await"}
+	}
+	instance := ctx.instance
+	operation, found := find_child_workflow_operation(instance, future.seq)
+	if !found {
+		mark_child_workflow_failure(
+			ctx,
+			"Child Workflow operation was not found",
+			"OdinChildWorkflowRuntimeError",
+		)
+		return {status = .Failed, failure_message = "Child Workflow operation was not found"}
+	}
+	if cancellation_token_is_requested_id(instance, cancellation_token_id) {
+		return {
+			status = .Canceled,
+			failure_message = cancellation_token_reason_id(instance, cancellation_token_id),
+		}
+	}
+	if operation.start_state == .Pending {
+		instance.waiting_child_workflow_seq = future.seq
+		instance.waiting_child_signal_cancellation_token_id = cancellation_token_id
+		instance.phase = .Waiting_Child_Workflow_Start
+		if fiber_raw.yield(instance.fiber) != .Success || instance.phase != .Ready {
+			mark_child_workflow_failure(
+				ctx,
+				"could not resume Child Workflow Signal start await",
+				"OdinChildWorkflowRuntimeError",
+			)
+			return {
+				status = .Failed,
+				failure_message = "could not resume Child Workflow Signal start await",
+			}
+		}
+		operation, found = find_child_workflow_operation(instance, future.seq)
+	}
+	if cancellation_token_is_requested_id(instance, cancellation_token_id) {
+		return {
+			status = .Canceled,
+			failure_message = cancellation_token_reason_id(instance, cancellation_token_id),
+		}
+	}
+	if !found || operation.start_state == .Pending {
+		mark_child_workflow_failure(
+			ctx,
+			"Child Workflow Signal start await resumed without a resolution",
+			"OdinChildWorkflowRuntimeError",
+		)
+		return {
+			status = .Failed,
+			failure_message = "Child Workflow Signal start await resumed without a resolution",
+		}
 	}
 	return child_workflow_start_result_from_operation(operation)
 }
@@ -7159,7 +7237,7 @@ signal_child_workflow_payloads_owned :: proc(
 			failure_message = cancellation_token_reason_id(instance, token_id),
 		}
 	}
-	start_result := await_child_workflow_start(ctx, future)
+	start_result := await_child_workflow_start_for_signal(ctx, future, token_id)
 	if start_result.status != .Succeeded {
 		activity_inputs_free(&owned_inputs)
 		status := Child_Workflow_Signal_Status.Failed
@@ -10795,7 +10873,12 @@ signal_routine_should_resume :: proc(routine: ^Fiber_Signal_Routine) -> bool {
 		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
-		return found && operation.start_state != .Pending
+		return found && operation.start_state != .Pending ||
+		       routine.waiting_child_signal_cancellation_token_id != 0 &&
+		       cancellation_token_is_requested_id(
+				instance,
+				routine.waiting_child_signal_cancellation_token_id,
+		       )
 	case .Waiting_Child_Workflow:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.completion_state != .Pending
@@ -10834,6 +10917,7 @@ resume_ready_signal_routines :: proc(instance: ^Fiber_Instance) -> (resumed: boo
 		routine.waiting_activity_seq = 0
 		routine.waiting_nexus_operation_seq = 0
 		routine.waiting_child_workflow_seq = 0
+		routine.waiting_child_signal_cancellation_token_id = 0
 		routine.waiting_external_signal_seq = 0
 		routine.waiting_external_cancel_seq = 0
 		routine.waiting_timer_seq = 0
@@ -11177,7 +11261,12 @@ update_routine_should_resume :: proc(routine: ^Fiber_Update_Routine) -> bool {
 		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
-		return found && operation.start_state != .Pending
+		return found && operation.start_state != .Pending ||
+		       routine.waiting_child_signal_cancellation_token_id != 0 &&
+		       cancellation_token_is_requested_id(
+				instance,
+				routine.waiting_child_signal_cancellation_token_id,
+		       )
 	case .Waiting_Child_Workflow:
 		operation, found := find_child_workflow_operation(instance, routine.waiting_child_workflow_seq)
 		return found && operation.completion_state != .Pending
@@ -11216,6 +11305,7 @@ resume_ready_update_routines :: proc(instance: ^Fiber_Instance) -> (resumed: boo
 		routine.waiting_activity_seq = 0
 		routine.waiting_nexus_operation_seq = 0
 		routine.waiting_child_workflow_seq = 0
+		routine.waiting_child_signal_cancellation_token_id = 0
 		routine.waiting_external_signal_seq = 0
 		routine.waiting_external_cancel_seq = 0
 		routine.waiting_timer_seq = 0
@@ -11262,7 +11352,12 @@ resume_main_workflow_if_ready :: proc(
 		)
 	case .Waiting_Child_Workflow_Start:
 		operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
-		should_resume = found && operation.start_state != .Pending
+		should_resume = found && operation.start_state != .Pending ||
+		                instance.waiting_child_signal_cancellation_token_id != 0 &&
+		                cancellation_token_is_requested_id(
+					instance,
+					instance.waiting_child_signal_cancellation_token_id,
+		                )
 	case .Waiting_Child_Workflow:
 		operation, found := find_child_workflow_operation(instance, instance.waiting_child_workflow_seq)
 		should_resume = found && operation.completion_state != .Pending
@@ -11297,6 +11392,7 @@ resume_main_workflow_if_ready :: proc(
 	instance.waiting_activity_seq = 0
 	instance.waiting_nexus_operation_seq = 0
 	instance.waiting_child_workflow_seq = 0
+	instance.waiting_child_signal_cancellation_token_id = 0
 	instance.waiting_external_signal_seq = 0
 	instance.waiting_external_cancel_seq = 0
 	instance.waiting_timer_seq = 0
