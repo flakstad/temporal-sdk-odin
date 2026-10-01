@@ -41,6 +41,7 @@ Executor_Host :: struct {
 	registrations: [dynamic]Host_Registration,
 	runs:          [dynamic]Host_Run,
 	rejected_runs: [dynamic]Host_Rejected_Run,
+	manifest:      []u8,
 	initialized:   bool,
 	activations:   int,
 	evictions:     int,
@@ -68,6 +69,11 @@ executor_host_init :: proc(
 	)
 	host.runs = make([dynamic]Host_Run)
 	host.rejected_runs = make([dynamic]Host_Rejected_Run)
+	host.manifest, _ = registry_manifest_encode(registry)
+	if host.manifest == nil {
+		executor_host_close(host)
+		return host_error("could not encode Workflow executor registry manifest")
+	}
 	for index in 0 ..< workflow.registry_count(registry) {
 		name, name_ok := workflow.registry_name(registry, index)
 		if !name_ok {
@@ -122,7 +128,16 @@ executor_host_close :: proc(host: ^Executor_Host) {
 	delete(host.registrations)
 	delete(host.runs)
 	delete(host.rejected_runs)
+	delete(host.manifest)
 	host^ = {}
+}
+
+// executor_host_manifest borrows the canonical manifest until host close.
+executor_host_manifest :: proc(host: ^Executor_Host) -> []u8 {
+	if host == nil || !host.initialized {
+		return nil
+	}
+	return host.manifest
 }
 
 host_find_registration :: proc(host: ^Executor_Host, name: string) -> (int, bool) {
@@ -309,6 +324,16 @@ executor_host_run :: proc(
 			return host_error("could not read Workflow executor frame")
 		}
 		#partial switch request.frame.kind {
+		case .Manifest_Request:
+			write_error := write(output, {
+				kind = .Manifest,
+				request_id = request.frame.request_id,
+				payload = host.manifest,
+			})
+			owned_frame_free(&request)
+			if write_error.kind != .None {
+				return host_error("could not write Workflow executor manifest")
+			}
 		case .Activation:
 			processed, process_error := executor_host_process_activation(
 				host,

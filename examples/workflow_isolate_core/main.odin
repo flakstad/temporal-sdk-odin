@@ -152,6 +152,7 @@ run :: proc() -> int {
 	manager_error := workflow_isolate.manager_init(&executor_manager, {
 		command = child[:],
 		first_command = first_child[:],
+		expected_registry = &registry,
 		maximum_executors = 2,
 		activation_timeout = activation_timeout,
 	})
@@ -161,6 +162,12 @@ run :: proc() -> int {
 		return 1
 	}
 	defer workflow_isolate.manager_close(&executor_manager)
+	verify_error := workflow_isolate.manager_verify_host(&executor_manager)
+	if verify_error.message != nil {
+		fmt.eprintf("Workflow executor manifest verification failed: %s\n", string(verify_error.message))
+		workflow_isolate.manager_error_free(&verify_error)
+		return 1
+	}
 
 	start := Start_State{
 		client = &client,
@@ -224,11 +231,13 @@ run :: proc() -> int {
 	   run_stats.workflow_activation_failures != expected_activation_failures ||
 	   manager_stats.child_exits != expected_child_exits ||
 	   manager_stats.activation_timeouts != expected_timeouts ||
-	   manager_stats.generations_started < 4 || manager_stats.graceful_shutdowns < 4 ||
+	   manager_stats.generations_started < 4 || manager_stats.graceful_shutdowns < 5 ||
+	   manager_stats.manifest_handshakes != manager_stats.generations_started + 1 ||
+	   manager_stats.manifest_mismatches != 0 ||
 	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d handshakes=%d manifest_mismatches=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
 			greeting_result,
 			farewell_result.message,
 			farewell_result.code,
@@ -239,6 +248,8 @@ run :: proc() -> int {
 			manager_stats.generations_started,
 			manager_stats.evictions,
 			manager_stats.graceful_shutdowns,
+			manager_stats.manifest_handshakes,
+			manager_stats.manifest_mismatches,
 			manager_stats.capacity_rejections,
 			manager_stats.protocol_failures,
 			workflow_isolate.manager_route_count(&executor_manager),
@@ -246,7 +257,7 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
@@ -260,6 +271,8 @@ run :: proc() -> int {
 		manager_stats.evictions,
 		run_stats.workflow_replay_activations,
 		manager_stats.graceful_shutdowns,
+		manager_stats.manifest_handshakes,
+		manager_stats.manifest_mismatches,
 		manager_stats.aborted_children,
 		manager_stats.capacity_rejections,
 		manager_stats.protocol_failures,

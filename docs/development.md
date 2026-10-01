@@ -840,9 +840,13 @@ child crash or timeout.
 External and in-process Workflow registrations cannot be mixed on one Worker.
 Workflow loggers and interceptors for external registrations must be configured
 inside the executor host; the parent rejects them rather than silently applying
-them to runtimes that will never execute. A parent/child manifest handshake,
-executor-host hook configuration, shutdown deadlines, queue/backpressure, and
-crash-loop policy remain outstanding.
+them to runtimes that will never execute. Protocol version 2 encodes the ordered
+type-name manifest with explicit lengths. `manager_verify_host` verifies the
+ordinary child before `worker.run`, and every task child repeats the handshake
+before its first activation. The live crash and hang paths each require six
+successful handshakes and zero mismatches. Executor-host hook configuration,
+shutdown deadlines, queue/backpressure, and crash-loop policy remain
+outstanding.
 
 Workflows have the corresponding registration levels:
 

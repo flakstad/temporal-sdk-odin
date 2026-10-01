@@ -3281,7 +3281,8 @@ capacity. A positive activation deadline now kills and reaps an unresponsive
 executor, joins its pipe reader, and drives the same failed-completion/eviction/
 replay path against the dev server. Generic registry hosting is now proven with
 one shared parent/child registration function and two Workflow types, including
-a typed-JSON result. The next step is a startup manifest handshake, followed by
+a typed-JSON result. A canonical registry handshake is now checked once before
+polling and again for each child generation. The next step is
 shutdown/backpressure/crash-loop policy. Sticky per-run child routing is the
 later performance mode. Production hardening remains process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
@@ -3900,9 +3901,10 @@ External registrations are metadata-only in the parent and cannot be mixed
 with in-process registrations. An external activation processor is mandatory.
 Parent-side Workflow loggers and interceptors are rejected because the parent
 has no executing runtime; equivalent hooks must eventually be configured on the
-executor host. There is not yet a startup manifest handshake, so a mismatched
-child reports an unknown-type activation failure rather than failing before
-polling.
+executor host. Protocol version 2 adds an ordered, length-prefixed type manifest.
+`manager_verify_host` compares it in a temporary child before polling, and every
+executor generation repeats the correlated handshake before activation. A
+mismatch is therefore rejected and reaped without running Workflow code.
 
 The first verified mode sets `max_cached_workflows = 0`. A child therefore
 serves one Workflow Task and is shut down only after the corresponding
@@ -3934,11 +3936,11 @@ correlated request IDs, failed-until-eviction state, and complete child reaping.
 Its transition function is checked against an independent statechart over
 generated traces, while a second generated model checks multi-route capacity
 and generation fencing. Activation deadlines use a joinable reader thread and
-kill/reap on expiry; the hung-child live path proves retry and replay.
-Shutdown deadlines, crash-loop/backpressure policy, startup manifest
-verification, executor-host observability hooks, and complete observation
-metadata remain process-manager responsibilities, not additional Temporal
-protocol work. See
+kill/reap on expiry; the hung-child live path proves retry and replay. Startup
+and per-generation manifest verification now fence executable/registry skew.
+Shutdown deadlines, crash-loop/backpressure policy, executor-host observability
+hooks, and complete observation metadata remain process-manager
+responsibilities, not additional Temporal protocol work. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

@@ -28,20 +28,6 @@ run_child :: proc(
 	if len(task_queue) == 0 {
 		task_queue = TASK_QUEUE
 	}
-	if crash_on_first_activation || hang_on_first_activation {
-		request, read_error := workflow_isolate.read(os.stdin)
-		if read_error.kind != .None {
-			fmt.eprintf("Could not read fault-injection activation: %v\n", read_error.kind)
-			return 1
-		}
-		workflow_isolate.owned_frame_free(&request)
-		if crash_on_first_activation {
-			os.exit(86)
-		}
-		for {
-			time.sleep(time.Hour)
-		}
-	}
 	registry := workflow.Registry{}
 	registry_init_error := workflow.registry_init(&registry)
 	if registry_init_error.message != nil {
@@ -63,6 +49,37 @@ run_child :: proc(
 		return 1
 	}
 	defer workflow_isolate.executor_host_close(&host)
+	if crash_on_first_activation || hang_on_first_activation {
+		manifest_request, read_error := workflow_isolate.read(os.stdin)
+		if read_error.kind != .None ||
+		   manifest_request.frame.kind != .Manifest_Request {
+			fmt.eprintln("Could not read fault-injection manifest request")
+			workflow_isolate.owned_frame_free(&manifest_request)
+			return 1
+		}
+		write_error := workflow_isolate.write(os.stdout, {
+			kind = .Manifest,
+			request_id = manifest_request.frame.request_id,
+			payload = workflow_isolate.executor_host_manifest(&host),
+		})
+		workflow_isolate.owned_frame_free(&manifest_request)
+		if write_error.kind != .None {
+			return 1
+		}
+		request, activation_read_error := workflow_isolate.read(os.stdin)
+		if activation_read_error.kind != .None || request.frame.kind != .Activation {
+			fmt.eprintln("Could not read fault-injection activation")
+			workflow_isolate.owned_frame_free(&request)
+			return 1
+		}
+		workflow_isolate.owned_frame_free(&request)
+		if crash_on_first_activation {
+			os.exit(86)
+		}
+		for {
+			time.sleep(time.Hour)
+		}
+	}
 	run_error := workflow_isolate.executor_host_run(&host)
 	if run_error.message != nil {
 		fmt.eprintf("Workflow executor host failed: %s\n", string(run_error.message))

@@ -310,6 +310,10 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	workflow.error_free(&second_error)
 	workflow.error_free(&duplicate_error)
 	testing.expect_value(t, workflow.registry_count(&registry), 2)
+	manifest, manifest_ok := workflow_isolate.registry_manifest_encode(&registry)
+	testing.expect(t, manifest_ok)
+	testing.expect(t, workflow_isolate.registry_manifest_valid(manifest))
+	defer delete(manifest)
 
 	host := workflow_isolate.Executor_Host{}
 	host_init_error := workflow_isolate.executor_host_init(
@@ -326,6 +330,36 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	)
 	workflow_isolate.host_error_free(&host_init_error)
 	defer workflow_isolate.executor_host_close(&host)
+	testing.expect(
+		t,
+		bytes.equal(workflow_isolate.executor_host_manifest(&host), manifest),
+	)
+	manifest_frame_error := workflow_isolate.frame_validate({
+		kind = .Manifest,
+		request_id = 1,
+		payload = manifest,
+	})
+	testing.expect_value(t, manifest_frame_error.kind, workflow_isolate.Error_Kind.None)
+	invalid_manifest_error := workflow_isolate.frame_validate({
+		kind = .Manifest,
+		request_id = 1,
+		payload = []u8{0, 0, 0, 1},
+	})
+	testing.expect_value(
+		t,
+		invalid_manifest_error.kind,
+		workflow_isolate.Error_Kind.Invalid_Argument,
+	)
+	manifest_manager := workflow_isolate.Manager{}
+	manager_init_error := workflow_isolate.manager_init(&manifest_manager, {
+		command = []string{"unused-executor"},
+		expected_registry = &registry,
+		maximum_executors = 1,
+	})
+	testing.expect(t, manager_init_error.message == nil)
+	workflow_isolate.manager_error_free(&manager_init_error)
+	defer workflow_isolate.manager_close(&manifest_manager)
+	testing.expect(t, bytes.equal(manifest_manager.expected_manifest, manifest))
 
 	raw_runtime := raw.Runtime{}
 	runtime := temporal_core.Runtime{handle = &raw_runtime}
@@ -374,6 +408,7 @@ workflow_registry_instantiates_executor_host_and_external_worker_manifest :: pro
 	// Host runtimes own independent callback copies after the source manifest is
 	// released; procedure pointers are never serialized across the pipe.
 	workflow.registry_close(&registry)
+	testing.expect(t, bytes.equal(manifest_manager.expected_manifest, manifest))
 	input, input_error := codec.encode_json("Odin")
 	testing.expect_value(t, input_error, codec.Error.None)
 	defer codec.payload_free(&input)

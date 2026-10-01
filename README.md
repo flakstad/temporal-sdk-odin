@@ -512,9 +512,10 @@ copies its Workflow type manifest into Core, while a generic child
 `Executor_Host` independently instantiates and routes the registered callbacks.
 One live Worker completes both string and typed-JSON Workflow types through the
 same executor binary. Procedure pointers never cross the process boundary. It
-still lacks a preflight parent/child manifest handshake, executor-host
-log/metric/interceptor configuration, shutdown/backpressure and crash-loop
-policy, and sticky-cache execution.
+now verifies a canonical type manifest in a pre-poll child and again in every
+executor generation. It still lacks executor-host log/metric/interceptor
+configuration, shutdown/backpressure and crash-loop policy, and sticky-cache
+execution.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 

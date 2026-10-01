@@ -260,6 +260,12 @@ registration function independently. The parent copies only the type-name
 manifest into `worker.register_external_workflow_registry`; the child owns the
 actual runtimes and selects one from `InitializeWorkflow.workflow_type`.
 
+The isolation protocol encodes the ordered type names as a canonical,
+length-prefixed manifest. A manager configured with `expected_registry` can call
+`manager_verify_host` before Worker polling; each executor generation repeats
+the manifest exchange before its first activation. Registry ownership remains
+local to each process throughout the handshake.
+
 Once initialized, `Executor_Host` owns its runtimes independently of the source
 Registry. Per-run instances remain routed to the selected runtime until Core
 sends `RemoveFromCache`. Parent-side Workflow loggers and interceptors do not

@@ -57,7 +57,7 @@ Every frame has this big-endian header:
 | Offset | Width | Field |
 | ---: | ---: | --- |
 | 0 | 4 | magic `TOIS` |
-| 4 | 2 | protocol version, currently `1` |
+| 4 | 2 | protocol version, currently `2` |
 | 6 | 2 | message kind |
 | 8 | 8 | request/correlation ID |
 | 16 | 4 | run-ID byte length |
@@ -132,9 +132,15 @@ completions; they are never dispatched to an arbitrary callback.
 `examples/workflow_isolate_app` is the shared application package used by both
 parent and child. The live proof runs two types through one executor binary: a
 string Workflow and a typed-JSON Workflow. This proves the executable is an
-application host rather than a child hard-coded to one callback. A preflight
-manifest handshake is not implemented yet, so a parent/child build mismatch is
-currently discovered when the child rejects initialization.
+application host rather than a child hard-coded to one callback.
+
+Protocol version 2 adds a canonical registry-manifest handshake. The payload is
+an ordered count followed by length-prefixed UTF-8 type names. With
+`expected_registry` configured, `manager_verify_host` starts the ordinary child,
+compares its manifest, and shuts it down before `worker.run` begins polling.
+Every per-task child repeats the correlated handshake before receiving its first
+activation, covering a replaced or inconsistent executable after preflight.
+Malformed or mismatched manifests are protocol failures and the child is reaped.
 
 ## Core-integrated zero-cache proof
 
@@ -187,8 +193,9 @@ manifest, and then:
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
 capacity or protocol failures. The observed CLI-dev-server path currently has
-five generations, five evictions, four graceful shutdowns, and one aborted
-crashed child. Those exact counts are diagnostic rather than an API promise;
+five generations, five evictions, five graceful shutdowns (including preflight),
+six successful manifest handshakes, and one aborted crashed child. Those exact
+counts are diagnostic rather than an API promise;
 Core may legitimately change activation batching.
 
 The same script accepts
@@ -247,8 +254,6 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- add a preflight manifest/version handshake so parent/child registry mismatch
-  fails before polling or dispatch;
 - add bounded waiting/queue policy, graceful-shutdown deadlines, and crash-loop
   rate limiting;
 - configure replay-aware logs, metrics, interceptors, and diagnostics in the
@@ -261,9 +266,7 @@ still required:
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is a correlated startup handshake that
-compares the parent manifest with the child host before Core polling starts.
-Shutdown deadlines and crash-loop/backpressure policy should then harden manager
-teardown. Sticky per-run routing should follow only after those zero-cache
-failure paths are correct; it can reuse the manager and wire protocol while
-changing child lifetime to match Core's non-zero cache.
+The next discriminating vertical slice is a shutdown deadline plus bounded
+crash-loop/backpressure policy. Sticky per-run routing should follow only after
+those zero-cache failure paths are correct; it can reuse the manager and wire
+protocol while changing child lifetime to match Core's non-zero cache.

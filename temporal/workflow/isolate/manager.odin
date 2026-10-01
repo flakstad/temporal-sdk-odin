@@ -133,6 +133,9 @@ Manager_Options :: struct {
 	// first_command is an optional copied fault-injection/bootstrapping command
 	// used for the first generation only. Empty means command.
 	first_command: []string,
+	// expected_registry is borrowed only by manager_init. When present, every
+	// child must return the same canonical type manifest before activation.
+	expected_registry: ^workflow.Registry,
 	maximum_executors: int,
 	// Zero waits indefinitely. A positive deadline kills the child, waits for
 	// the pipe reader to observe EOF, and reports one activation failure.
@@ -156,6 +159,8 @@ Manager_Stats :: struct {
 	graceful_shutdowns:  int,
 	aborted_children:    int,
 	peak_routes:         int,
+	manifest_handshakes: int,
+	manifest_mismatches: int,
 }
 
 Child_Session :: struct {
@@ -178,9 +183,11 @@ Manager :: struct {
 	first_command:      [dynamic]string,
 	maximum_executors:  int,
 	activation_timeout: time.Duration,
+	expected_manifest:  []u8,
 	routes:             [dynamic]Executor_Route,
 	next_generation:    u64,
 	first_command_used: bool,
+	manifest_verified:  bool,
 	report_run_id:      string,
 	stats:              Manager_Stats,
 	initialized:        bool,
@@ -242,6 +249,16 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	}
 	manager.command = command
 	manager.first_command = first_command
+	if options.expected_registry != nil {
+		manager.expected_manifest, command_ok = registry_manifest_encode(
+			options.expected_registry,
+		)
+		if !command_ok {
+			free_command(&manager.command)
+			free_command(&manager.first_command)
+			return manager_error("Workflow executor registry manifest could not be encoded")
+		}
+	}
 	manager.maximum_executors = options.maximum_executors
 	manager.activation_timeout = options.activation_timeout
 	manager.routes = make([dynamic]Executor_Route, 0, options.maximum_executors)
@@ -308,6 +325,7 @@ manager_close :: proc(manager: ^Manager) {
 	delete(manager.routes)
 	free_command(&manager.command)
 	free_command(&manager.first_command)
+	delete(manager.expected_manifest)
 	delete(manager.report_run_id)
 	manager^ = {}
 }
@@ -330,16 +348,7 @@ remove_route :: proc(manager: ^Manager, index: int) {
 	ordered_remove(&manager.routes, index)
 }
 
-start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool) {
-	if !capacity_allows_start(len(manager.routes), manager.maximum_executors) {
-		manager.stats.capacity_rejections += 1
-		return
-	}
-	command := manager.command[:]
-	if !manager.first_command_used && len(manager.first_command) > 0 {
-		command = manager.first_command[:]
-	}
-	manager.first_command_used = true
+start_session :: proc(command: []string) -> (session: Child_Session, ok: bool) {
 	child_input, parent_input, input_error := os.pipe()
 	if input_error != nil {
 		return
@@ -365,12 +374,38 @@ start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool)
 		os.close(parent_output)
 		return
 	}
+	return Child_Session{
+		process = process,
+		input = parent_input,
+		output = parent_output,
+		active = true,
+	}, true
+}
+
+start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool) {
+	if !capacity_allows_start(len(manager.routes), manager.maximum_executors) {
+		manager.stats.capacity_rejections += 1
+		return
+	}
+	command := manager.command[:]
+	if !manager.first_command_used && len(manager.first_command) > 0 {
+		command = manager.first_command[:]
+	}
+	manager.first_command_used = true
+	session, session_ok := start_session(command)
+	if !session_ok {
+		return
+	}
+	if len(manager.expected_manifest) > 0 {
+		handshake_failure := session_manifest_handshake(manager, &session)
+		if handshake_failure != .None {
+			record_session_failure(manager, &session, handshake_failure)
+			return
+		}
+	}
 	owned_run_id, clone_error := strings.clone(run_id)
 	if clone_error != nil {
-		os.close(parent_input)
-		os.close(parent_output)
-		_ = os.process_kill(process)
-		_, _ = os.process_wait(process)
+		session_abort(manager, &session)
 		return
 	}
 	manager.next_generation += 1
@@ -380,12 +415,7 @@ start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool)
 		run_id = owned_run_id,
 		generation = manager.next_generation,
 		state = next_state,
-		session = {
-			process = process,
-			input = parent_input,
-			output = parent_output,
-			active = true,
-		},
+		session = session,
 	})
 	manager.stats.generations_started += 1
 	manager.stats.peak_routes = max(manager.stats.peak_routes, len(manager.routes))
@@ -416,20 +446,20 @@ exchange_read_main :: proc(state: ^Exchange_Read) {
 
 read_with_timeout :: proc(
 	manager: ^Manager,
-	route: ^Executor_Route,
+	session: ^Child_Session,
 ) -> (response: Owned_Frame, error: Error, failure: Exchange_Failure) {
 	if manager.activation_timeout <= 0 {
-		response, error = read(route.session.output)
+		response, error = read(session.output)
 		return
 	}
-	read_state := Exchange_Read{file = route.session.output}
+	read_state := Exchange_Read{file = session.output}
 	read_thread := thread.create_and_start_with_poly_data(&read_state, exchange_read_main)
 	if read_thread == nil {
 		return {}, {}, .Protocol
 	}
 	finished := sync.sema_wait_with_timeout(&read_state.done, manager.activation_timeout)
 	if !finished {
-		_ = os.process_kill(route.session.process)
+		_ = os.process_kill(session.process)
 	}
 	thread.join(read_thread)
 	thread.destroy(read_thread)
@@ -438,6 +468,71 @@ read_with_timeout :: proc(
 		return {}, {}, .Timed_Out
 	}
 	return read_state.response, read_state.error, .None
+}
+
+session_manifest_handshake :: proc(
+	manager: ^Manager,
+	session: ^Child_Session,
+) -> Exchange_Failure {
+	if len(manager.expected_manifest) == 0 {
+		return .None
+	}
+	session.request_id += 1
+	request_id := session.request_id
+	write_error := write(session.input, {
+		kind = .Manifest_Request,
+		request_id = request_id,
+	})
+	if write_error.kind != .None {
+		if write_error.kind == .IO || write_error.kind == .Truncated {
+			return .Child_Exit
+		}
+		return .Protocol
+	}
+	response, read_error, read_failure := read_with_timeout(manager, session)
+	defer owned_frame_free(&response)
+	if read_failure != .None {
+		return read_failure
+	}
+	if read_error.kind != .None {
+		if read_error.kind == .End_Of_Stream || read_error.kind == .IO {
+			return .Child_Exit
+		}
+		return .Protocol
+	}
+	if response.frame.kind != .Manifest ||
+	   response.frame.request_id != request_id ||
+	   !bytes.equal(response.frame.payload, manager.expected_manifest) {
+		manager.stats.manifest_mismatches += 1
+		return .Protocol
+	}
+	manager.stats.manifest_handshakes += 1
+	return .None
+}
+
+// manager_verify_host starts the ordinary executor command, verifies its
+// registry manifest, and shuts it down before the Worker begins polling.
+manager_verify_host :: proc(manager: ^Manager) -> Manager_Error {
+	if manager == nil || !manager.initialized || len(manager.expected_manifest) == 0 {
+		return manager_error("Workflow executor manager has no expected registry manifest")
+	}
+	if manager.manifest_verified {
+		return {}
+	}
+	session, start_ok := start_session(manager.command[:])
+	if !start_ok {
+		return manager_error("Workflow executor verification child could not start")
+	}
+	failure := session_manifest_handshake(manager, &session)
+	if failure != .None {
+		record_session_failure(manager, &session, failure)
+		return manager_error(exchange_failure_message(failure))
+	}
+	if !session_shutdown(manager, &session) {
+		return manager_error("Workflow executor verification child did not shut down cleanly")
+	}
+	manager.manifest_verified = true
+	return {}
 }
 
 session_exchange :: proc(
@@ -459,7 +554,7 @@ session_exchange :: proc(
 		}
 		return nil, .Protocol
 	}
-	response, read_error, read_failure := read_with_timeout(manager, route)
+	response, read_error, read_failure := read_with_timeout(manager, &route.session)
 	defer owned_frame_free(&response)
 	if read_failure != .None {
 		return nil, read_failure
@@ -546,6 +641,15 @@ record_exchange_failure :: proc(
 	route: ^Executor_Route,
 	failure: Exchange_Failure,
 ) {
+	record_session_failure(manager, &route.session, failure)
+	route.state, _ = lifecycle_step(route.state, .Activation_Failed)
+}
+
+record_session_failure :: proc(
+	manager: ^Manager,
+	session: ^Child_Session,
+	failure: Exchange_Failure,
+) {
 	if failure == .Child_Exit {
 		manager.stats.child_exits += 1
 	} else if failure == .Timed_Out {
@@ -553,8 +657,7 @@ record_exchange_failure :: proc(
 	} else {
 		manager.stats.protocol_failures += 1
 	}
-	session_abort(manager, &route.session)
-	route.state, _ = lifecycle_step(route.state, .Activation_Failed)
+	session_abort(manager, session)
 }
 
 exchange_failure_message :: proc(failure: Exchange_Failure) -> string {
