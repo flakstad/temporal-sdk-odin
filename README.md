@@ -329,6 +329,14 @@ the CPU and memory targets must match when both tuners are enabled. Workflow
 slots remain fixed. The identity and all other referenced strings are owned by
 the Odin Worker until `worker.close`.
 
+A running online Worker can move future polling and Worker heartbeats to a new
+Core connection with `worker.replace_client`. Both Client runtimes must remain
+open until `worker.close`; registrations, Workflow cache, task queue, and
+namespace remain attached to the same Core Worker. The two-server integration
+test proves the Worker polls one CLI dev server, survives that server stopping,
+and completes a Workflow from another after replacement. Replacement does not
+cancel a poll that is already in flight; that poll must return or fail first.
+
 The dev-server suite proves both cache modes: cache-disabled execution rebuilds
 the Workflow from history, while a cached sticky execution resumes the same
 suspended Odin fiber on a later Signal and evicts it cleanly at shutdown. It
@@ -2370,6 +2378,7 @@ temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/config_connect/  Core TOML profile -> public Client proof
+examples/worker_replace_client/ live Core Worker connection failover proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/update_with_start/ atomic create-or-attach Update proof

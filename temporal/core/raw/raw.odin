@@ -608,6 +608,7 @@ foreign temporal_core {
 	) -> Worker_Replay_Push_Result ---
 	worker_free :: proc(worker: ^Worker) ---
 	worker_validate :: proc(worker: ^Worker, user_data: rawptr, callback: Worker_Callback) ---
+	worker_replace_client :: proc(worker: ^Worker, new_connection: ^Connection) -> ^Byte_Array ---
 	worker_poll_activity_task :: proc(
 		worker: ^Worker,
 		user_data: rawptr,

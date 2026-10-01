@@ -139,6 +139,9 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/config-profile-integration-test.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/worker-replace-client-integration-test.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/update-with-start-integration-test.sh"
 
 forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \

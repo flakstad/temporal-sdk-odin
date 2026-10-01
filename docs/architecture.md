@@ -1286,6 +1286,7 @@ temporal_core_cancellation_token_free
 temporal_core_client_rpc_call
 temporal_core_worker_new
 temporal_core_worker_validate
+temporal_core_worker_replace_client
 temporal_core_worker_poll_activity_task
 temporal_core_worker_complete_activity_task
 temporal_core_worker_record_activity_heartbeat
@@ -3167,6 +3168,52 @@ retained across that call. Registration is limited to `Configuring`; a
 successful run is one-shot (`Running -> Stopped`) because Core shutdown and
 poll-stream state are not reusable. Closing before `run` releases only the
 language-owned configuration and is safe.
+
+### Live Worker client replacement
+
+The pinned bridge exposes synchronous
+`temporal_core_worker_replace_client(worker, new_connection)`. Core clones the
+new Rust connection, unregisters the Worker heartbeat/slot provider from the
+old connection, registers it on the new one, and causes future poll traffic and
+eager-start association to use the replacement. The Core Worker, language
+registrations, cached Workflow state, task queue, and namespace are not
+recreated. No protobuf crosses this boundary.
+
+Replacement does not interrupt a poll already issued on the old connection.
+That call must return or fail before the next poll observes the replacement.
+Failover latency can therefore include the outstanding long-poll timeout when
+the old endpoint remains reachable but unhealthy; stopping the old Service
+causes the poll to fail promptly.
+
+Core's replacement is not documented as transactional. It unregisters the
+Worker from the old Client before registering it with the new one, and upstream
+explicitly notes that a registration failure leaves Worker heartbeats
+unregistered. Odin therefore returns the bridge error without promising a
+rollback; callers should recreate the Worker if replacement fails.
+
+Odin exposes this as `worker.replace_client` while `worker.run` is active. It
+is intentionally rejected before Core Worker construction, after run, and for
+offline replay Workers. The top-level facade accepts a public `Client`; the
+lower-level worker package accepts its `core.Client`. The Worker namespace
+remains the namespace supplied at Worker creation—the replacement Client's
+language-level default namespace does not reconfigure it.
+
+There are two runtime lifetimes, even though Core clones the replacement
+connection. The C bridge's connection object owns the Runtime used to create
+its transport, while the Worker continues to use its original Runtime for Core
+tasks, callback buffers, and Odin metrics. Consequently both original and
+replacement Odin Clients must remain open until `worker.close` completes. A
+failure buffer from the replacement call is allocated by the Worker's original
+Runtime and is freed through that Runtime.
+
+The live acceptance test starts two independent CLI dev servers. It constructs
+and validates the Worker against `localhost:17233`, starts its polling loop,
+then stops that Service so the outstanding poll fails. A coordinating thread
+replaces the Client, starts a Workflow only on `localhost:7233`, and requires
+the same Worker to poll and complete that execution. If polling remained on the
+old Service the bounded run could not complete, so this proves endpoint
+movement and recovery rather than only symbol linkage or same-channel
+replacement.
 
 ### Activation failure is not worker failure
 

@@ -4000,6 +4000,28 @@ request_shutdown :: proc(worker: ^Worker) {
 	worker_initiate_shutdown(worker)
 }
 
+// replace_client moves subsequent Core polls and Worker heartbeats to the new
+// connection. An already-issued poll must return or fail before the next poll
+// observes the replacement. It is intended for recovery/failover and may be
+// called from the run on_ready callback or another coordinating thread while
+// run is active.
+// The original and replacement Clients must both remain open until Worker
+// close completes because the Worker retains its original Runtime and Core
+// retains a clone of the replacement connection.
+replace_client :: proc(worker: ^Worker, client: ^temporal_core.Client) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.mode != .Online {
+		return error_from_string("replay workers cannot replace their client")
+	}
+	if worker.lifecycle != .Running || worker.core.handle == nil {
+		return error_from_string("worker client can only be replaced while worker.run is active")
+	}
+	core_error := temporal_core.worker_replace_client(&worker.core, client)
+	return error_from_core(&core_error)
+}
+
 close :: proc(worker: ^Worker) -> Error {
 	if worker == nil {
 		return {}

@@ -537,6 +537,42 @@ cancellation, and lifecycle operations on servers that expose the newer RPCs.
 Together they prove that Core accepts the supplier and that the bounded Odin
 Nexus executor returns every completion.
 
+### Replacing a running Worker's Client
+
+Core can move an already constructed Worker to another connection without
+rebuilding its registrations or language runtime:
+
+```odin
+replace_error := worker.replace_client(
+    &sdk_worker,
+    client.core_client(&replacement_client),
+)
+```
+
+Call this from `Run_Options.on_ready` or from a coordinating thread while
+`worker.run` is active. It is rejected before run, after run, and on a replay
+Worker. Keep both the original and replacement Clients open until
+`worker.close` returns; the Worker retains its original Runtime while Core
+clones the replacement transport. The Worker's namespace and task queue do not
+change.
+
+The call does not cancel a Core long poll that is already in flight. The next
+poll uses the replacement connection after that outstanding call returns or
+fails. Treat a returned replacement error as requiring Worker recreation; Core
+does not promise to roll the old registration back.
+
+The focused integration test starts a second CLI dev server itself and expects
+the ordinary development server on `localhost:7233`:
+
+```bash
+temporal server start-dev --headless
+./scripts/worker-replace-client-integration-test.sh
+```
+
+It validates and starts polling against the temporary server on port 17233,
+stops that server to fail the outstanding poll, switches Core to the primary
+server, and completes a Workflow that exists only there.
+
 ### Runtime observability
 
 Use `core.runtime_options_default()` and pass the result to

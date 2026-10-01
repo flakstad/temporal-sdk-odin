@@ -89,3 +89,8 @@ worker_run :: temporal_worker.run
 worker_request_shutdown :: temporal_worker.request_shutdown
 worker_close :: temporal_worker.close
 worker_error_free :: temporal_worker.error_free
+
+// Both Clients must remain open until worker_close completes.
+worker_replace_client :: proc(worker: ^Worker, client: ^Client) -> Worker_Error {
+	return temporal_worker.replace_client(worker, temporal_client.core_client(client))
+}

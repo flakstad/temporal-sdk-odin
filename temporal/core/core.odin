@@ -1518,6 +1518,26 @@ worker_validate :: proc(worker: ^Worker) -> Error {
 	return worker_wait_call(worker, worker_validate_invoke)
 }
 
+// worker_replace_client synchronously asks Core to move future Worker traffic
+// to a new connection. Core clones the connection, but the caller must keep
+// both runtimes alive until the Worker is closed.
+worker_replace_client :: proc(worker: ^Worker, client: ^Client) -> Error {
+	if worker == nil || worker.handle == nil || worker.runtime == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("worker is not initialized"))}
+	}
+	if client == nil || client.handle == nil || client.runtime == nil {
+		return Error{message = bytes.clone(transmute([]u8)string("replacement client is not initialized"))}
+	}
+	fail := raw.worker_replace_client(worker.handle, client.handle)
+	if fail == nil {
+		return {}
+	}
+	error := Error{message = copy_core_bytes(fail)}
+	// The bridge allocates this failure through the Worker's original Runtime.
+	raw.byte_array_free(worker.runtime.handle, fail)
+	return error
+}
+
 Poll_Result :: struct {
 	protobuf: []u8,
 	error:    Error,
