@@ -412,7 +412,14 @@ nexus_selector_property_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	order: string,
 ) -> string {
-	options := workflow.Nexus_Operation_Options{schedule_to_close_timeout = time.Minute}
+	cancellation_token := workflow.cancellation_detached(ctx)
+	if cancellation_token.id == 0 {
+		return "invalid-token"
+	}
+	options := workflow.Nexus_Operation_Options{
+		schedule_to_close_timeout = time.Minute,
+		cancellation_token = cancellation_token,
+	}
 	first := workflow.start_nexus_operation(
 		ctx,
 		"pbt-endpoint",

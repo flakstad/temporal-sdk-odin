@@ -30,6 +30,8 @@ Nexus_Operation_Options :: struct {
 	start_to_close_timeout:    time.Duration,
 	cancellation_type:         Nexus_Operation_Cancellation_Type,
 	headers:                   []Nexus_Header,
+	// A zero token inherits the token selected by the current Workflow fiber.
+	cancellation_token:        Cancellation_Token,
 }
 
 Owned_Nexus_Operation_Options :: struct {
@@ -191,10 +193,22 @@ start_nexus_operation_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		codec.payload_free(&owned_input)
+		mark_nexus_operation_failure(
+			ctx,
+			"Nexus operation cancellation token does not belong to this Workflow run",
+			"OdinNexusOperationOptionsError",
+		)
+		return {}
+	}
 	instance.next_nexus_operation_seq += 1
 	seq := instance.next_nexus_operation_seq
-	token_id := current_cancellation_token_id(instance)
-	if current_cancellation_applies(instance) {
+	if cancellation_token_is_requested_id(instance, token_id) {
 		codec.payload_free(&owned_input)
 		append(
 			&instance.nexus_operations,

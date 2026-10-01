@@ -4528,19 +4528,48 @@ fiber_cancellation_tree_test_workflow :: proc(
 		return "outer scope did not restore the root token"
 	}
 
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
 	root_activity := workflow.start_activity(ctx, "root", name)
-	child_scope := workflow.cancellation_scope(ctx, child)
-	child_activity := workflow.start_activity(ctx, "child", name)
-	workflow.cancellation_scope_end(&child_scope)
-	grandchild_scope := workflow.cancellation_scope(ctx, grandchild)
-	grandchild_activity := workflow.start_activity(ctx, "grandchild", name)
-	workflow.cancellation_scope_end(&grandchild_scope)
-	sibling_scope := workflow.cancellation_scope(ctx, sibling)
-	sibling_activity := workflow.start_activity(ctx, "sibling", name)
-	workflow.cancellation_scope_end(&sibling_scope)
-	detached_scope := workflow.cancellation_scope(ctx, detached)
-	detached_activity := workflow.start_activity(ctx, "detached", name)
-	workflow.cancellation_scope_end(&detached_scope)
+	child_activity := workflow.start_activity_with_options(
+		ctx,
+		"child",
+		name,
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_token = child,
+		},
+	)
+	grandchild_activity := workflow.start_activity_with_options(
+		ctx,
+		"grandchild",
+		name,
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_token = grandchild,
+		},
+	)
+	sibling_activity := workflow.start_activity_with_options(
+		ctx,
+		"sibling",
+		name,
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_token = sibling,
+		},
+	)
+	detached_activity := workflow.start_activity_with_options(
+		ctx,
+		"detached",
+		name,
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_token = detached,
+		},
+	)
 
 	_ = workflow.await_signal(ctx, "cancel-child")
 	if !workflow.cancellation_request(child, "child deadline") ||
@@ -4561,15 +4590,23 @@ fiber_cancellation_tree_test_workflow :: proc(
 	   workflow.cancellation_token_reason(late_grandchild) != "child deadline" {
 		return "late child did not inherit cancellation"
 	}
-	child_scope = workflow.cancellation_scope(ctx, late_grandchild)
-	late_child_activity := workflow.start_activity(ctx, "late-child", name)
+	late_child_activity := workflow.start_activity_with_options(
+		ctx,
+		"late-child",
+		name,
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_token = late_grandchild,
+		},
+	)
 	late_child_workflow := workflow.start_child_workflow_json(
 		ctx,
 		"late-child-workflow",
 		name,
-		{},
+		{cancellation_token = late_grandchild},
 	)
-	late_signal := workflow.signal_external_workflow_json(
+	late_signal := workflow.signal_external_workflow_json_with_options(
 		ctx,
 		{
 			namespace = "default",
@@ -4577,9 +4614,8 @@ fiber_cancellation_tree_test_workflow :: proc(
 		},
 		"late-signal",
 		name,
+		{cancellation_token = late_grandchild},
 	)
-	workflow.sleep(ctx, time.Hour)
-	workflow.cancellation_scope_end(&child_scope)
 	child_result := workflow.await_activity_result(ctx, child_activity)
 	grandchild_result := workflow.await_activity_result(ctx, grandchild_activity)
 	late_child_result := workflow.await_activity_result(ctx, late_child_activity)
@@ -5840,6 +5876,75 @@ fiber_timer_options_test_workflow :: proc(
 	return "timer-options-ok"
 }
 
+fiber_explicit_operation_tokens_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	_: string,
+) -> string {
+	token := workflow.cancellation_detached(ctx)
+	if token.id == 0 {
+		return "could not create explicit operation token"
+	}
+	retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+	activity_future := workflow.start_activity_with_options(
+		ctx,
+		"explicit-token-activity",
+		"activity",
+		{
+			start_to_close_timeout = time.Minute,
+			retry_policy = &retry_policy,
+			cancellation_type = .Try_Cancel,
+			cancellation_token = token,
+		},
+	)
+	local_future := workflow.start_local_activity_with_options(
+		ctx,
+		"explicit-token-local-activity",
+		"local",
+		{
+			start_to_close_timeout = time.Minute,
+			cancellation_type = .Try_Cancel,
+			cancellation_token = token,
+		},
+	)
+	child_future := workflow.start_child_workflow_json(
+		ctx,
+		"explicit-token-child",
+		"child",
+		{
+			workflow_id = "explicit-token-child-id",
+			workflow_execution_timeout = time.Hour,
+			cancellation_type = .Try_Cancel,
+			cancellation_token = token,
+		},
+	)
+	nexus_future := workflow.start_nexus_operation(
+		ctx,
+		"explicit-token-endpoint",
+		"ExplicitTokenService",
+		"run",
+		"nexus",
+		{
+			schedule_to_close_timeout = time.Hour,
+			cancellation_type = .Try_Cancel,
+			cancellation_token = token,
+		},
+	)
+	_ = workflow.await_signal(ctx, "cancel-explicit-operation-token")
+	if !workflow.cancellation_request(token, "explicit operation token canceled") {
+		return "could not cancel explicit operation token"
+	}
+	activity_result := workflow.await_activity_result(ctx, activity_future)
+	local_result := workflow.await_activity_result(ctx, local_future)
+	child_result := workflow.await_child_workflow_start(ctx, child_future)
+	nexus_result := workflow.await_nexus_operation_result(ctx, nexus_future)
+	if activity_result.status != .Canceled || local_result.status != .Canceled ||
+	   child_result.status != .Canceled || nexus_result.status != .Canceled {
+		return "explicit token did not cancel every operation"
+	}
+	_ = workflow.await_signal(ctx, "finish-explicit-operation-token")
+	return "explicit-operation-tokens-ok"
+}
+
 fiber_signal_timeout_activity_test_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	_ = name
 	result := workflow.await_signal_or_timeout(ctx, "approval", 30 * time.Second)
@@ -6080,7 +6185,17 @@ child_handle_signal_cancel_test_workflow :: proc(
 		codec.payload_view(&count),
 		codec.payload_view(&enabled),
 	}
-	signal := workflow.signal_child_workflow_payloads(ctx, future, "approve", inputs[:])
+	signal_token := workflow.cancellation_child(workflow.cancellation_root(ctx))
+	if signal_token.id == 0 {
+		return "could not create Child Workflow signal token"
+	}
+	signal := workflow.signal_child_workflow_payloads_with_options(
+		ctx,
+		future,
+		"approve",
+		inputs[:],
+		{cancellation_token = signal_token},
+	)
 	if signal.status != .Succeeded {
 		return "Child Workflow signal failed"
 	}
@@ -6147,11 +6262,16 @@ external_signal_cancel_test_workflow :: proc(
 		workflow_id = workflow_id,
 		run_id = "target-run",
 	}
-	signal := workflow.signal_external_workflow_json(
+	signal_token := workflow.cancellation_child(workflow.cancellation_root(ctx))
+	if signal_token.id == 0 {
+		return "could not create external Workflow signal token"
+	}
+	signal := workflow.signal_external_workflow_json_with_options(
 		ctx,
 		execution,
 		"approve",
 		"approved-by-caller",
+		{cancellation_token = signal_token},
 	)
 	if signal.status != .Succeeded {
 		return "External Workflow signal failed"
@@ -23122,6 +23242,208 @@ workflow_timer_options_encode_summary_and_select_cancellation_token :: proc(t: ^
 }
 
 @(test)
+workflow_operation_options_select_explicit_cancellation_tokens :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"odin_explicit_operation_tokens_workflow",
+		"test-queue",
+		fiber_explicit_operation_tokens_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	defer workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "odin_explicit_operation_tokens_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input_proto)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "fiber-explicit-operation-tokens-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		initial.error.message == nil,
+		"explicit operation token initialization failed: %s",
+		string(initial.error.message),
+	)
+	testing.expect(t, initial.scheduled_activity)
+	testing.expect(t, initial.scheduled_local_activity)
+	testing.expect(t, initial.started_child_workflow)
+	testing.expect(t, initial.scheduled_nexus_operation)
+	testing.expect(t, initial.waiting_signal)
+	initial_inspection := inspect_workflow_completion(initial.completion[:])
+	testing.expect(t, initial_inspection.decoded)
+	testing.expect_value(t, initial_inspection.command_count, 4)
+	testing.expect_value(t, initial_inspection.scheduled_activity_seq, u32(1))
+	testing.expect_value(t, initial_inspection.started_child_workflow_seq, u32(1))
+	testing.expect_value(t, initial_inspection.scheduled_nexus_operation_seq, u32(1))
+	testing.expect_value(t, len(runtime.instances), 1)
+	if len(runtime.instances) == 1 {
+		instance := runtime.instances[0]
+		testing.expect_value(t, len(instance.cancellation_nodes), 2)
+		testing.expect_value(t, len(instance.activities), 2)
+		testing.expect_value(t, len(instance.child_workflows), 1)
+		testing.expect_value(t, len(instance.nexus_operations), 1)
+		if len(instance.activities) == 2 {
+			testing.expect_value(t, instance.activities[0].cancellation_token_id, u32(2))
+			testing.expect_value(t, instance.activities[1].cancellation_token_id, u32(2))
+			testing.expect(t, instance.activities[0].state == .Commanded)
+			testing.expect(t, instance.activities[1].state == .Commanded)
+		}
+		if len(instance.child_workflows) == 1 {
+			testing.expect_value(t, instance.child_workflows[0].cancellation_token_id, u32(2))
+			testing.expect(t, instance.child_workflows[0].command_state == .Commanded)
+		}
+		if len(instance.nexus_operations) == 1 {
+			testing.expect_value(t, instance.nexus_operations[0].cancellation_token_id, u32(2))
+			testing.expect(t, instance.nexus_operations[0].state == .Commanded)
+		}
+	}
+	delete(initial_inspection.nexus_endpoint)
+	delete(initial_inspection.nexus_service)
+	delete(initial_inspection.nexus_operation)
+	delete(initial_inspection.nexus_input)
+	delete(initial_inspection.nexus_header_key)
+	delete(initial_inspection.nexus_header_value)
+	delete(initial_inspection.child_workflow_id)
+	delete(initial_inspection.child_workflow_type)
+	delete(initial_inspection.child_workflow_task_queue)
+	for value in initial_inspection.child_workflow_inputs {
+		delete(value)
+	}
+	delete(initial_inspection.child_workflow_input_marker)
+	delete(initial.completion)
+	workflow.error_free(&initial.error)
+
+	signal_input, signal_input_error := codec.encode_json("cancel")
+	testing.expect(t, signal_input_error == .None)
+	defer codec.payload_free(&signal_input)
+	signal_input_proto := proto.encode_payload(codec.payload_view(&signal_input))
+	defer delete(signal_input_proto.metadata)
+	defer delete(signal_input_proto.external_payloads)
+	signal := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "cancel-explicit-operation-token",
+	}
+	defer delete(signal.input)
+	append(&signal.input, signal_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 9
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &signal,
+			},
+		},
+	)
+	canceled := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		canceled.error.message == nil,
+		"explicit operation token cancellation failed: %s",
+		string(canceled.error.message),
+	)
+	testing.expect(t, canceled.received_signal)
+	testing.expect_value(t, canceled.requested_activity_cancellation_count, 1)
+	testing.expect_value(t, canceled.requested_local_activity_cancellation_count, 1)
+	testing.expect_value(t, canceled.requested_child_workflow_cancellation_count, 1)
+	testing.expect_value(t, canceled.requested_nexus_operation_cancellation_count, 1)
+	testing.expect(t, canceled.waiting_signal)
+	testing.expect(t, !canceled.completed)
+	cancel_inspection := inspect_workflow_completion(canceled.completion[:])
+	testing.expect(t, cancel_inspection.decoded && !cancel_inspection.completed)
+	testing.expect_value(t, cancel_inspection.command_count, 4)
+	testing.expect_value(t, cancel_inspection.canceled_activity_seq, u32(1))
+	testing.expect_value(t, cancel_inspection.canceled_child_workflow_seq, u32(1))
+	testing.expect_value(t, cancel_inspection.canceled_nexus_operation_seq, u32(1))
+	delete(cancel_inspection.canceled_child_workflow_reason)
+	delete(canceled.completion)
+	workflow.error_free(&canceled.error)
+
+	finish := proto.Coresdk_Workflow_Activation_SignalWorkflow{
+		signal_name = "finish-explicit-operation-token",
+	}
+	defer delete(finish.input)
+	append(&finish.input, signal_input_proto)
+	delete(activation.jobs)
+	activation.jobs = nil
+	activation.history_length = 12
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Signal_Workflow{
+				value = &finish,
+			},
+		},
+	)
+	finished := process_fiber_test_activation(&runtime, &activation)
+	testing.expectf(
+		t,
+		finished.error.message == nil,
+		"explicit operation token completion failed: %s",
+		string(finished.error.message),
+	)
+	testing.expect(t, finished.received_signal && finished.completed)
+	terminal := inspect_workflow_completion(finished.completion[:])
+	testing.expect(t, terminal.decoded && terminal.completed)
+	testing.expect_value(t, terminal.command_count, 1)
+	testing.expect_value(t, string(terminal.completion_result), `"explicit-operation-tokens-ok"`)
+	delete(terminal.completion_result)
+	delete(finished.completion)
+	workflow.error_free(&finished.error)
+}
+
+@(test)
+workflow_explicit_cancellation_tokens_are_run_local :: proc(t: ^testing.T) {
+	first := workflow.Fiber_Instance{current_cancellation_token_id = 1}
+	second := workflow.Fiber_Instance{current_cancellation_token_id = 1}
+	first.cancellation_nodes = make([dynamic]workflow.Fiber_Cancellation_Node)
+	second.cancellation_nodes = make([dynamic]workflow.Fiber_Cancellation_Node)
+	defer delete(first.cancellation_nodes)
+	defer delete(second.cancellation_nodes)
+	append(&first.cancellation_nodes, workflow.Fiber_Cancellation_Node{id = 1, linked_to_root = true})
+	append(&second.cancellation_nodes, workflow.Fiber_Cancellation_Node{id = 1, linked_to_root = true})
+
+	inherited_id, inherited_valid := workflow.selected_cancellation_token_id(&first, {})
+	same_id, same_valid := workflow.selected_cancellation_token_id(
+		&first,
+		{instance = &first, id = 1},
+	)
+	_, foreign_valid := workflow.selected_cancellation_token_id(
+		&first,
+		{instance = &second, id = 1},
+	)
+	_, stale_valid := workflow.selected_cancellation_token_id(
+		&first,
+		{instance = &first, id = 99},
+	)
+	testing.expect(t, inherited_valid && inherited_id == 1)
+	testing.expect(t, same_valid && same_id == 1)
+	testing.expect(t, !foreign_valid)
+	testing.expect(t, !stale_valid)
+}
+
+@(test)
 workflow_fiber_signal_wins_same_activation_without_canceling_fired_timer :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -23968,6 +24290,11 @@ workflow_cancellation_tokens_propagate_downward_and_replay :: proc(t: ^testing.T
 	cancel_inspection := inspect_workflow_completion(processed.completion[:])
 	testing.expect(t, cancel_inspection.decoded)
 	testing.expect_value(t, cancel_inspection.command_count, 2)
+	testing.expect_value(t, cancel_inspection.scheduled_activity_seq, u32(0))
+	testing.expect_value(t, cancel_inspection.started_child_workflow_seq, u32(0))
+	testing.expect_value(t, cancel_inspection.child_workflow_signal_seq, u32(0))
+	testing.expect_value(t, cancel_inspection.canceled_external_signal_seq, u32(0))
+	testing.expect(t, !cancel_inspection.completed && !cancel_inspection.continued_as_new)
 	testing.expect_value(t, cancel_inspection.canceled_activity_count, 2)
 	testing.expect_value(t, cancel_inspection.canceled_activity_seqs[0], u32(2))
 	testing.expect_value(t, cancel_inspection.canceled_activity_seqs[1], u32(3))

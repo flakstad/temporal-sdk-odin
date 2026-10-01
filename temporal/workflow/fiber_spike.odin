@@ -417,7 +417,8 @@ Versioning_Intent :: enum {
 // only for the start call. Empty task_queue uses the parent's task queue. Nil
 // memo/search_attributes create no values; an initialized empty map is
 // equivalent because a new Child Workflow has no inherited values. Empty
-// static summary/details omit Temporal UserMetadata.
+// static summary/details omit Temporal UserMetadata. A zero cancellation token
+// inherits the token selected by the current Workflow fiber.
 Child_Workflow_Options :: struct {
 	workflow_id:               string,
 	task_queue:                string,
@@ -436,6 +437,7 @@ Child_Workflow_Options :: struct {
 	priority:                  ^Workflow_Priority,
 	static_summary:            string,
 	static_details:            string,
+	cancellation_token:        Cancellation_Token,
 }
 
 Owned_Child_Workflow_Options :: struct {
@@ -612,12 +614,15 @@ payload_map_add_search_attribute_json :: proc(
 	return temporal_headers.put_owned(payloads, key, payload) == .None
 }
 
-// Signal_Options borrows headers and summary only for the signal call. The
-// runtime copies them into the Workflow run arena before the signal suspends.
-// Empty summary omits the UI-facing command metadata.
+// Signal_Options borrows headers, summary, and cancellation token only for the
+// signal call. The runtime captures the token ID and copies retained values
+// into the Workflow run arena before the signal suspends. Empty summary omits
+// the UI-facing command metadata. A zero token inherits the token selected by
+// the current Workflow fiber.
 Signal_Options :: struct {
 	headers: ^Headers,
 	summary: string,
+	cancellation_token: Cancellation_Token,
 }
 
 // Timer_Options borrows summary only for the start call. A zero-value
@@ -633,7 +638,8 @@ Timer_Options :: struct {
 // start/execute call. The Workflow runtime copies them into the run arena before
 // it can suspend. A zero duration means "not specified". versioning_intent is
 // the legacy Build-ID routing control retained by Core; new deployments should
-// prefer Worker Deployment Versioning.
+// prefer Worker Deployment Versioning. A zero cancellation token inherits the
+// token selected by the current Workflow fiber.
 Activity_Options :: struct {
 	activity_id:               string,
 	task_queue:                string,
@@ -648,6 +654,7 @@ Activity_Options :: struct {
 	versioning_intent:         Versioning_Intent,
 	priority:                  ^Workflow_Priority,
 	summary:                   string,
+	cancellation_token:        Cancellation_Token,
 }
 
 Owned_Activity_Options :: struct {
@@ -683,6 +690,7 @@ Local_Activity_Options :: struct {
 	include_arguments_in_marker: bool,
 	headers:                   ^Headers,
 	summary:                   string,
+	cancellation_token:        Cancellation_Token,
 }
 
 Owned_Local_Activity_Options :: struct {
@@ -4232,6 +4240,26 @@ current_cancellation_token_id :: proc(instance: ^Fiber_Instance) -> u32 {
 	return instance.current_cancellation_token_id
 }
 
+selected_cancellation_token_id :: proc(
+	instance: ^Fiber_Instance,
+	token: Cancellation_Token,
+) -> (token_id: u32, valid: bool) {
+	if instance == nil {
+		return 0, false
+	}
+	if token.id == 0 {
+		return current_cancellation_token_id(instance), true
+	}
+	if token.instance != instance {
+		return 0, false
+	}
+	_, found := find_cancellation_node(instance, token.id)
+	if !found {
+		return 0, false
+	}
+	return token.id, true
+}
+
 cancellation_token_is_requested_id :: proc(instance: ^Fiber_Instance, token_id: u32) -> bool {
 	node, found := find_cancellation_node(instance, token_id)
 	return found && node.cancellation_requested
@@ -5910,7 +5938,16 @@ start_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
-	if current_cancellation_applies(instance) {
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		activity_inputs_free(&owned_inputs)
+		mark_activity_options_failure(ctx, "Activity cancellation token does not belong to this Workflow run")
+		return {}
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
 		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
@@ -5919,10 +5956,10 @@ start_activity_owned :: proc(
 				seq = instance.next_activity_seq,
 				command_seq = instance.next_activity_seq,
 				state = .Canceled,
-				cancellation_token_id = current_cancellation_token_id(instance),
+				cancellation_token_id = token_id,
 				failure_message = cancellation_token_reason_id(
 					instance,
-					current_cancellation_token_id(instance),
+					token_id,
 				),
 			},
 		)
@@ -5975,9 +6012,9 @@ start_activity_owned :: proc(
 		state = .Scheduled,
 		detached_from_root_cancellation = !cancellation_token_linked_to_root(
 			instance,
-			current_cancellation_token_id(instance),
+			token_id,
 		),
-		cancellation_token_id = current_cancellation_token_id(instance),
+		cancellation_token_id = token_id,
 	}
 	append(&instance.activities, operation)
 	return Activity_Future{seq = operation.seq}
@@ -6240,7 +6277,19 @@ start_local_activity_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
-	if current_cancellation_applies(instance) {
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		activity_inputs_free(&owned_inputs)
+		mark_activity_options_failure(
+			ctx,
+			"Local Activity cancellation token does not belong to this Workflow run",
+		)
+		return {}
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
 		activity_inputs_free(&owned_inputs)
 		instance.next_activity_seq += 1
 		append(
@@ -6251,10 +6300,10 @@ start_local_activity_owned :: proc(
 				is_local = true,
 				attempt = 1,
 				state = .Canceled,
-				cancellation_token_id = current_cancellation_token_id(instance),
+				cancellation_token_id = token_id,
 				failure_message = cancellation_token_reason_id(
 					instance,
-					current_cancellation_token_id(instance),
+					token_id,
 				),
 			},
 		)
@@ -6301,9 +6350,9 @@ start_local_activity_owned :: proc(
 		state = .Scheduled,
 		detached_from_root_cancellation = !cancellation_token_linked_to_root(
 			instance,
-			current_cancellation_token_id(instance),
+			token_id,
 		),
-		cancellation_token_id = current_cancellation_token_id(instance),
+		cancellation_token_id = token_id,
 	}
 	append(&instance.activities, operation)
 	return {seq = operation.seq}
@@ -6596,12 +6645,25 @@ start_child_workflow_owned :: proc(
 		return {}
 	}
 	instance := ctx.instance
-	if current_cancellation_applies(instance) {
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		activity_inputs_free(&owned_inputs)
+		mark_child_workflow_failure(
+			ctx,
+			"Child Workflow cancellation token does not belong to this Workflow run",
+			"OdinChildWorkflowOptionsError",
+		)
+		return {}
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
 		activity_inputs_free(&owned_inputs)
 		instance.next_child_workflow_seq += 1
 		reason := cancellation_token_reason_id(
 			instance,
-			current_cancellation_token_id(instance),
+			token_id,
 		)
 		append(
 			&instance.child_workflows,
@@ -6612,7 +6674,7 @@ start_child_workflow_owned :: proc(
 				completion_state = .Canceled,
 				cancellation_reason = reason,
 				failure_message = reason,
-				cancellation_token_id = current_cancellation_token_id(instance),
+				cancellation_token_id = token_id,
 			},
 		)
 		return {seq = instance.next_child_workflow_seq}
@@ -6643,9 +6705,9 @@ start_child_workflow_owned :: proc(
 		completion_state = .Pending,
 		detached_from_root_cancellation = !cancellation_token_linked_to_root(
 			instance,
-			current_cancellation_token_id(instance),
+			token_id,
 		),
-		cancellation_token_id = current_cancellation_token_id(instance),
+		cancellation_token_id = token_id,
 	}
 	append(&instance.child_workflows, operation)
 	return {seq = operation.seq}
@@ -7029,6 +7091,7 @@ workflow_signal_result_from_operation :: proc(
 schedule_external_signal_and_await :: proc(
 	ctx: ^Fiber_Context,
 	operation: Fiber_External_Signal_Operation,
+	cancellation_token_id: u32,
 ) -> Workflow_Signal_Result {
 	instance := ctx.instance
 	owned_operation := operation
@@ -7037,9 +7100,9 @@ schedule_external_signal_and_await :: proc(
 	owned_operation.state = .Scheduled
 	owned_operation.detached_from_root_cancellation = !cancellation_token_linked_to_root(
 		instance,
-		current_cancellation_token_id(instance),
+		cancellation_token_id,
 	)
-	owned_operation.cancellation_token_id = current_cancellation_token_id(instance)
+	owned_operation.cancellation_token_id = cancellation_token_id
 	append(&instance.external_signals, owned_operation)
 	instance.waiting_external_signal_seq = owned_operation.seq
 	instance.phase = .Waiting_External_Signal
@@ -7077,6 +7140,25 @@ signal_child_workflow_payloads_owned :: proc(
 		activity_inputs_free(&owned_inputs)
 		return {status = .Failed, failure_message = "invalid Child Workflow signal"}
 	}
+	instance := ctx.instance
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		activity_inputs_free(&owned_inputs)
+		return {
+			status = .Failed,
+			failure_message = "Child Workflow signal cancellation token does not belong to this Workflow run",
+		}
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
+		activity_inputs_free(&owned_inputs)
+		return {
+			status = .Canceled,
+			failure_message = cancellation_token_reason_id(instance, token_id),
+		}
+	}
 	start_result := await_child_workflow_start(ctx, future)
 	if start_result.status != .Succeeded {
 		activity_inputs_free(&owned_inputs)
@@ -7086,15 +7168,11 @@ signal_child_workflow_payloads_owned :: proc(
 		}
 		return {status = status, failure_message = start_result.failure_message}
 	}
-	instance := ctx.instance
-	if current_cancellation_applies(instance) {
+	if cancellation_token_is_requested_id(instance, token_id) {
 		activity_inputs_free(&owned_inputs)
 		return {
 			status = .Canceled,
-			failure_message = cancellation_token_reason_id(
-				instance,
-				current_cancellation_token_id(instance),
-			),
+			failure_message = cancellation_token_reason_id(instance, token_id),
 		}
 	}
 	child, found := find_child_workflow_operation(instance, future.seq)
@@ -7135,7 +7213,7 @@ signal_child_workflow_payloads_owned :: proc(
 		summary = owned_summary,
 		has_summary = has_summary,
 	}
-	return schedule_external_signal_and_await(ctx, operation)
+	return schedule_external_signal_and_await(ctx, operation, token_id)
 }
 
 signal_child_workflow_owned :: proc(
@@ -7258,14 +7336,22 @@ signal_external_workflow_payloads_owned :: proc(
 		return {status = .Failed, failure_message = "invalid external Workflow signal"}
 	}
 	instance := ctx.instance
-	if current_cancellation_applies(instance) {
+	token_id, token_valid := selected_cancellation_token_id(
+		instance,
+		options.cancellation_token,
+	)
+	if !token_valid {
+		activity_inputs_free(&owned_inputs)
+		return {
+			status = .Failed,
+			failure_message = "external Workflow signal cancellation token does not belong to this Workflow run",
+		}
+	}
+	if cancellation_token_is_requested_id(instance, token_id) {
 		activity_inputs_free(&owned_inputs)
 		return {
 			status = .Canceled,
-			failure_message = cancellation_token_reason_id(
-				instance,
-				current_cancellation_token_id(instance),
-			),
+			failure_message = cancellation_token_reason_id(instance, token_id),
 		}
 	}
 	owned_namespace, namespace_error := strings.clone(
@@ -7312,7 +7398,7 @@ signal_external_workflow_payloads_owned :: proc(
 		summary = owned_summary,
 		has_summary = has_summary,
 	}
-	return schedule_external_signal_and_await(ctx, operation)
+	return schedule_external_signal_and_await(ctx, operation, token_id)
 }
 
 signal_external_workflow_owned :: proc(

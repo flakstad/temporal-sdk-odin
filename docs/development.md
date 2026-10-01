@@ -1778,7 +1778,12 @@ checks every encoded `StartChildWorkflowExecution` field, including the
 enclosing command metadata,
 and every `SignalExternalWorkflowExecution` field and metadata summary, and
 requires both commands to be byte-identical after eviction and fresh-stack
-replay. The external Workflow
+replay. These generated Workflow-operation cases now also create run-local
+cancellation tokens and select them directly through Activity, Local Activity,
+Child Workflow, Nexus, and child/external Signal options. A focused unit trace
+checks the stored token IDs, all four Core cancellation-command families,
+foreign/stale-token rejection, and terminal completion on the following
+activation. The external Workflow
 property generates 500 namespace/Workflow ID/optional Run ID identities,
 signal names, summaries, JSON payloads, and cancellation reasons. It checks exact
 `NamespacedWorkflowExecution` targets for signal and cancellation commands and
@@ -1954,7 +1959,8 @@ closes the Workflow as canceled only after that Activity resolves.
 
 `TEMPORAL_ODIN_SCENARIO=cancellation-tree` exercises selective language-side
 cancellation instead of canceling the Workflow Execution. It starts child,
-sibling, and detached Activity branches, receives `cancel-child-token`, emits a
+sibling, and detached Activity branches by passing their tokens directly in
+`Activity_Options`, receives `cancel-child-token`, emits a
 Core Activity-cancellation command only for the child branch, and requires the
 sibling and detached branches to complete. The Workflow itself completes
 successfully and replay rebuilds the same token IDs and commands.

@@ -1749,6 +1749,10 @@ generated_activity_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Activity_Options_Input,
 ) -> string {
+	cancellation_token := workflow.cancellation_detached(ctx)
+	if cancellation_token.id == 0 {
+		return ""
+	}
 	headers := workflow.Headers{}
 	if !workflow.headers_init(&headers) {
 		return ""
@@ -1801,6 +1805,7 @@ generated_activity_options_workflow :: proc(
 			versioning_intent = versioning_intent,
 			priority = &priority,
 			summary = input.summary,
+			cancellation_token = cancellation_token,
 		},
 	)
 }
@@ -2068,6 +2073,10 @@ generated_local_activity_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Local_Activity_Options_Input,
 ) -> string {
+	cancellation_token := workflow.cancellation_detached(ctx)
+	if cancellation_token.id == 0 {
+		return ""
+	}
 	headers := workflow.Headers{}
 	if !workflow.headers_init(&headers) {
 		return ""
@@ -2105,6 +2114,7 @@ generated_local_activity_options_workflow :: proc(
 			cancellation_type = cancellation_type,
 			include_arguments_in_marker = input.include_arguments_in_marker,
 			summary = input.summary,
+			cancellation_token = cancellation_token,
 		},
 	)
 }
@@ -2640,6 +2650,10 @@ generated_child_options_workflow :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_Child_Options_Input,
 ) -> string {
+	cancellation_token := workflow.cancellation_detached(ctx)
+	if cancellation_token.id == 0 {
+		return ""
+	}
 	headers := workflow.Headers{}
 	if !workflow.headers_init(&headers) {
 		return ""
@@ -2761,6 +2775,7 @@ generated_child_options_workflow :: proc(
 			priority = &priority,
 			static_summary = input.static_summary,
 			static_details = input.static_details,
+			cancellation_token = cancellation_token,
 		},
 	)
 	start := workflow.await_child_workflow_start(ctx, future)
@@ -2772,7 +2787,11 @@ generated_child_options_workflow :: proc(
 		future,
 		input.signal_name,
 		argument_views[:],
-		{headers = &headers, summary = input.signal_summary},
+		{
+			headers = &headers,
+			summary = input.signal_summary,
+			cancellation_token = cancellation_token,
+		},
 	)
 	if result.status != .Succeeded {
 		return "signal failed"
@@ -3268,6 +3287,10 @@ generated_external_workflow_operations :: proc(
 	ctx: ^workflow.Fiber_Context,
 	input: Generated_External_Workflow_Input,
 ) -> string {
+	cancellation_token := workflow.cancellation_detached(ctx)
+	if cancellation_token.id == 0 {
+		return ""
+	}
 	headers := workflow.Headers{}
 	if !workflow.headers_init(&headers) {
 		return ""
@@ -3319,7 +3342,11 @@ generated_external_workflow_operations :: proc(
 		execution,
 		input.signal_name,
 		argument_views[:],
-		{headers = &headers, summary = input.signal_summary},
+		{
+			headers = &headers,
+			summary = input.signal_summary,
+			cancellation_token = cancellation_token,
+		},
 	)
 	if signal.status != .Succeeded {
 		return "signal failed"

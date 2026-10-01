@@ -2590,6 +2590,18 @@ Workflow run arena; public token values are borrowed IDs and become invalid at
 cache eviction. Scope state belongs to the currently running fiber and nested
 scopes must close in LIFO order.
 
+Every operation options record that corresponds to an upstream Rust
+`WorkflowCancellationToken` override now accepts an explicit token:
+`Activity_Options`, `Local_Activity_Options`, `Child_Workflow_Options`,
+`Nexus_Operation_Options`, `Signal_Options`, and `Timer_Options`. Zero inherits
+the current fiber token. A nonzero handle must reference a live node in the
+same Workflow instance; foreign and stale handles fail before a Core command is
+created. The selected numeric ID is stored beside the language-runtime
+operation, not inside the owned wire options: cancellation-token graphs are
+deterministic Odin scheduler state and never cross the C ABI or protobuf
+boundary. Operations continue to emit their existing Core cancellation
+commands.
+
 `cancellation_request` changes deterministic language-runtime state. It emits
 only the appropriate operation cancellation commands and never synthesizes
 `CancelWorkflowExecution`. Core's `CancelWorkflow` activation remains the sole
@@ -2606,6 +2618,15 @@ the initial and cancellation completion protobufs byte-for-byte. The live
 dev-server scenario schedules child/sibling/detached Activities, receives a
 public client Signal, observes one cooperative Activity cancellation, lets both
 unrelated branches finish, and completes the Workflow successfully.
+
+A second focused options trace binds one detached token directly to a remote
+Activity, Local Activity, Child Workflow, and Nexus operation. It asserts that
+all four commanded operations retain the same run-local ID, emit their normal
+Core cancellation requests, and complete on the following activation.
+Generated properties select explicit tokens for all of those operation
+families plus child and external Workflow Signals and require byte-identical
+fresh-stack replay. An already-canceled Signal token resolves locally without
+sending `SignalExternalWorkflowExecution`.
 
 A second acceptance trace starts a Signal routine waiting on an unhandled
 Signal and an Update routine waiting on a durable timer under the same child

@@ -1055,15 +1055,37 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 		if child.id == 0 || sibling.id == 0 || detached.id == 0 {
 			return "could not create cancellation tokens"
 		}
-		child_scope := workflow.cancellation_scope(ctx, child)
-		child_activity := workflow.start_activity(ctx, "hello", "cancel-activity")
-		workflow.cancellation_scope_end(&child_scope)
-		sibling_scope := workflow.cancellation_scope(ctx, sibling)
-		sibling_activity := workflow.start_activity(ctx, "hello", "Temporal-slow")
-		workflow.cancellation_scope_end(&sibling_scope)
-		detached_scope := workflow.cancellation_scope(ctx, detached)
-		detached_activity := workflow.start_activity(ctx, "hello", "detached")
-		workflow.cancellation_scope_end(&detached_scope)
+		retry_policy := workflow.Retry_Policy{maximum_attempts = 1}
+		child_activity := workflow.start_activity_with_options(
+			ctx,
+			"hello",
+			"cancel-activity",
+			{
+				start_to_close_timeout = 20 * time.Second,
+				retry_policy = &retry_policy,
+				cancellation_token = child,
+			},
+		)
+		sibling_activity := workflow.start_activity_with_options(
+			ctx,
+			"hello",
+			"Temporal-slow",
+			{
+				start_to_close_timeout = 20 * time.Second,
+				retry_policy = &retry_policy,
+				cancellation_token = sibling,
+			},
+		)
+		detached_activity := workflow.start_activity_with_options(
+			ctx,
+			"hello",
+			"detached",
+			{
+				start_to_close_timeout = 20 * time.Second,
+				retry_policy = &retry_policy,
+				cancellation_token = detached,
+			},
+		)
 		_ = workflow.await_signal(ctx, "cancel-child-token")
 		if !workflow.cancellation_request(child, "child deadline") ||
 		   workflow.cancellation_requested(root) ||

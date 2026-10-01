@@ -1493,6 +1493,7 @@ result := workflow.execute_activity_json_with_options(
         heartbeat_timeout = 2 * time.Second,
         retry_policy = &retry,
         cancellation_type = .Wait_Cancellation_Completed,
+        cancellation_token = workflow.cancellation_current(ctx),
         versioning_intent = .Default,
         priority = &priority,
         summary = "Create order greeting",
@@ -1500,10 +1501,11 @@ result := workflow.execute_activity_json_with_options(
 )
 ```
 
-`Activity_Options` borrows its strings, slices, Retry Policy, priority, and
-summary only for the call. The runtime copies them into Workflow-owned storage
-before it can suspend. Priority is carried on Core's `ScheduleActivity`; summary
-is encoded as `WorkflowCommand.user_metadata.summary`. `versioning_intent`
+`Activity_Options` borrows its strings, slices, Retry Policy, priority, summary,
+and cancellation token only for the call. The runtime copies retained values
+into Workflow-owned storage before it can suspend. Priority is carried on
+Core's `ScheduleActivity`; summary is encoded as
+`WorkflowCommand.user_metadata.summary`. `versioning_intent`
 retains Core's legacy Build-ID routing control, while new applications should
 prefer Worker Deployment Versioning. Local Activity options expose the same
 summary metadata on Core's persisted Local Activity marker. At least one of
@@ -1915,15 +1917,17 @@ if result.status == .Canceled {
 }
 ```
 
-For selective cancellation, create child or detached tokens and select one
-while starting operations:
+For selective cancellation, create child or detached tokens and pass one
+directly to an operation. A zero token inherits the token currently selected
+by the calling Workflow fiber:
 
 ```odin
 root := workflow.cancellation_root(ctx)
 branch := workflow.cancellation_child(root)
-scope := workflow.cancellation_scope(ctx, branch)
-future := workflow.start_activity(ctx, "charge", order_id)
-workflow.cancellation_scope_end(&scope)
+future := workflow.start_activity_with_options(ctx, "charge", order_id, {
+    start_to_close_timeout = 30 * time.Second,
+    cancellation_token = branch,
+})
 
 _ = workflow.cancellation_request(branch, "order superseded")
 result := workflow.await_activity_result(ctx, future)
@@ -1932,7 +1936,11 @@ result := workflow.await_activity_result(ctx, future)
 Tokens are borrowed run-local handles and must not survive Workflow eviction.
 Cancellation is downward-only, repeated requests preserve the first reason,
 and `cancellation_detached` creates a new root unrelated to Workflow
-cancellation. The older `detached_cancellation_scope` helper now creates and
+cancellation. `Activity_Options`, `Local_Activity_Options`,
+`Child_Workflow_Options`, `Nexus_Operation_Options`, `Signal_Options`, and
+`Timer_Options` all accept this explicit run-local selection. Foreign or stale
+tokens fail deterministically before emitting a command. The older
+`detached_cancellation_scope` helper creates and
 selects such a token as a compatibility convenience. Nested scopes must be
 ended in LIFO order, normally with `defer workflow.cancellation_scope_end(&scope)`.
 `cancellation_request` cancels associated operations but does not itself cancel
