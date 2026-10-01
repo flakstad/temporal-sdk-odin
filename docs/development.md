@@ -1190,6 +1190,20 @@ runtime_new -> client_connect -> GetSystemInfo RPC -> client_free -> runtime_fre
 The request protobuf is empty by definition. The response is intentionally kept
 opaque; receiving and freeing it proves the network and ABI path.
 
+The suite immediately follows that raw bridge proof with the public, typed
+Client path:
+
+```bash
+./scripts/system-info-integration-test.sh
+```
+
+It requires a non-empty live Server version and the advertised Schedule bit.
+The response is decoded in a temporary arena and copied into an owned
+`client.System_Info`; unit tests destroy the source bytes before reading the
+result, a 500-case property varies all thirteen capability bits, and the Client
+interceptor property includes the result-bearing operation. The live example
+also requires its interceptor to enter before and unwind after the Core RPC.
+
 The suite then repeats that executable with the Core-only Nexus lifecycle
 spike:
 
@@ -2032,7 +2046,7 @@ metadata, external details, headers, and deterministic request bytes.
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
 cancellation, termination, Workflow result waiting, Visibility list/count,
 standalone Nexus start/poll/describe/mutation/list/count, and Schedule
-Describe/List/Count/Matching-Times. Each operation has a dedicated
+Describe/List/Count/Matching-Times, plus System Info discovery. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time
@@ -2074,7 +2088,7 @@ application-level synchronization.
 The unit and 500-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
 Visibility queries, the complete standalone Nexus surface, and the complete
-Schedule surface. The generative chain now varies twenty-one operation
+Schedule surface. The generative chain now varies twenty-two operation
 families. The `workflow-properties` live scenario
 wraps both Visibility RPCs; the Schedule lifecycle wraps every read RPC and
 all seven create/mutation paths through Core. Every `client_start` live scenario

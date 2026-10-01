@@ -69,6 +69,7 @@ Client_Interceptor_Test_State :: struct {
 	get_result_input_seen:   bool,
 	list_query_seen:         bool,
 	count_query_seen:        bool,
+	system_info_seen:        bool,
 	nexus_start_seen:        bool,
 	nexus_poll_seen:         bool,
 	nexus_describe_seen:     bool,
@@ -410,6 +411,34 @@ client_interceptor_test_count_workflows :: proc(
 		result_error = temporal_client.error_from_string(.Rpc, "Workflow count short circuit")
 	} else {
 		result, result_error = temporal_client.client_count_workflows_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_system_info :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Get_System_Info_Input,
+	next: temporal_client.Client_Get_System_Info_Next,
+) -> (temporal_client.System_Info, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.allocator = allocator_runtime.heap_allocator()
+	} else {
+		node.state.system_info_seen = input.client != nil && input.allocator.procedure != nil
+	}
+	result: temporal_client.System_Info
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result = {
+			server_version = "intercepted-server",
+			capabilities = {supports_schedules = true},
+		}
+	} else {
+		result, result_error = temporal_client.client_get_system_info_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -9900,6 +9929,94 @@ client_signal_interceptors_nest_and_isolate_working_headers :: proc(t: ^testing.
 	// builder remains unchanged and can be reused safely.
 	testing.expect_value(t, len(headers.entries), 1)
 	testing.expect_value(t, headers.entries[0].key, "caller")
+}
+
+@(test)
+client_system_info_decodes_owned_server_capabilities :: proc(t: ^testing.T) {
+	capabilities := proto.Temporal_Api_Workflowservice_V1_GetSystemInfoResponse_Capabilities{
+		signal_and_query_header = true,
+		internal_error_differentiation = true,
+		activity_failure_include_heartbeat = true,
+		supports_schedules = true,
+		encoded_failure_attributes = true,
+		build_id_based_versioning = true,
+		upsert_memo = true,
+		eager_workflow_start = true,
+		sdk_metadata = true,
+		count_group_by_execution_status = true,
+		nexus = true,
+		server_scaled_deployments = true,
+		server_scaled_provider_cloud_run = true,
+	}
+	response := proto.Temporal_Api_Workflowservice_V1_GetSystemInfoResponse{
+		server_version = "1.32.0-test",
+		capabilities = &capabilities,
+	}
+	encoded := proto.encode_Temporal_Api_Workflowservice_V1_GetSystemInfoResponse(&response)
+	info, decode_error := temporal_client.decode_system_info(encoded[:])
+	delete(encoded)
+	defer temporal_client.system_info_free(&info)
+	defer temporal_client.error_free(&decode_error)
+	testing.expectf(t, decode_error.message == nil, "System Info decode failed: %s", string(decode_error.message))
+	testing.expect_value(t, info.server_version, "1.32.0-test")
+	testing.expect(t, info.allocator.procedure != nil)
+	testing.expect(t, info.capabilities.signal_and_query_header)
+	testing.expect(t, info.capabilities.internal_error_differentiation)
+	testing.expect(t, info.capabilities.activity_failure_include_heartbeat)
+	testing.expect(t, info.capabilities.supports_schedules)
+	testing.expect(t, info.capabilities.encoded_failure_attributes)
+	testing.expect(t, info.capabilities.build_id_based_versioning)
+	testing.expect(t, info.capabilities.upsert_memo)
+	testing.expect(t, info.capabilities.eager_workflow_start)
+	testing.expect(t, info.capabilities.sdk_metadata)
+	testing.expect(t, info.capabilities.count_group_by_execution_status)
+	testing.expect(t, info.capabilities.nexus)
+	testing.expect(t, info.capabilities.server_scaled_deployments)
+	testing.expect(t, info.capabilities.server_scaled_provider_cloud_run)
+
+	malformed := [?]u8{0x0a, 0x05, 0x41}
+	_, malformed_error := temporal_client.decode_system_info(malformed[:])
+	defer temporal_client.error_free(&malformed_error)
+	testing.expect_value(t, malformed_error.kind, temporal_client.Error_Kind.Malformed_Response)
+
+	_, invalid_error := temporal_client.get_system_info(nil)
+	defer temporal_client.error_free(&invalid_error)
+	testing.expect_value(t, invalid_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+}
+
+@(test)
+client_system_info_interceptors_nest_and_can_short_circuit :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	client := temporal_client.Client{
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			get_system_info = client_interceptor_test_system_info,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			get_system_info = client_interceptor_test_system_info,
+		},
+	)
+
+	info, info_error := temporal_client.get_system_info(&client)
+	defer temporal_client.system_info_free(&info)
+	defer temporal_client.error_free(&info_error)
+	testing.expect(t, info_error.message == nil)
+	testing.expect_value(t, info.server_version, "intercepted-server")
+	testing.expect(t, info.capabilities.supports_schedules)
+	testing.expect(t, state.system_info_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
 }
 
 @(test)

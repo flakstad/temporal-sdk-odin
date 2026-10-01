@@ -543,6 +543,27 @@ Client_Schedule_Mutation_Next_Proc :: #type proc(data: rawptr, input: ^Client_Sc
 Client_Schedule_Mutation_Next :: struct { data: rawptr, invoke: Client_Schedule_Mutation_Next_Proc }
 Client_Schedule_Mutation_Interceptor_Proc :: #type proc(user_data: rawptr, input: ^Client_Schedule_Mutation_Input, next: Client_Schedule_Mutation_Next) -> Error
 
+Client_Get_System_Info_Input :: struct {
+	client:    ^Client,
+	allocator: mem.Allocator,
+}
+
+Client_Get_System_Info_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Get_System_Info_Input,
+) -> (System_Info, Error)
+
+Client_Get_System_Info_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Get_System_Info_Next_Proc,
+}
+
+Client_Get_System_Info_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Get_System_Info_Input,
+	next: Client_Get_System_Info_Next,
+) -> (System_Info, Error)
+
 Connection_Mutation_Kind :: enum { RPC_Metadata, API_Key }
 Client_Connection_Mutation_Input :: struct {
 	client:           ^Client,
@@ -584,6 +605,7 @@ Client_Interceptor :: struct {
 	list_schedule_matching_times: Client_List_Schedule_Matching_Times_Interceptor_Proc,
 	create_schedule:     Client_Create_Schedule_Interceptor_Proc,
 	schedule_mutation:   Client_Schedule_Mutation_Interceptor_Proc,
+	get_system_info:     Client_Get_System_Info_Interceptor_Proc,
 	connection_mutation: Client_Connection_Mutation_Interceptor_Proc,
 }
 
@@ -824,6 +846,16 @@ client_create_schedule_next :: proc(next: Client_Create_Schedule_Next, input: ^C
 
 client_schedule_mutation_next :: proc(next: Client_Schedule_Mutation_Next, input: ^Client_Schedule_Mutation_Input) -> Error {
 	if next.invoke == nil || input == nil do return error_from_string(.Invalid_Argument, "invalid Schedule mutation interceptor continuation")
+	return next.invoke(next.data, input)
+}
+
+client_get_system_info_next :: proc(
+	next: Client_Get_System_Info_Next,
+	input: ^Client_Get_System_Info_Input,
+) -> (System_Info, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid System Info interceptor continuation")
+	}
 	return next.invoke(next.data, input)
 }
 
@@ -1392,6 +1424,27 @@ client_schedule_mutation_chain :: proc(data: rawptr, input: ^Client_Schedule_Mut
 		return entry.schedule_mutation(entry.user_data, input, {data = &next_state, invoke = client_schedule_mutation_chain})
 	}
 	return schedule_mutation_terminal(input)
+}
+
+client_get_system_info_chain :: proc(
+	data: rawptr,
+	input: ^Client_Get_System_Info_Input,
+) -> (System_Info, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid System Info interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.get_system_info == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.get_system_info(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_get_system_info_chain},
+		)
+	}
+	return get_system_info_terminal(input)
 }
 
 client_connection_mutation_chain :: proc(data: rawptr, input: ^Client_Connection_Mutation_Input) -> Error {

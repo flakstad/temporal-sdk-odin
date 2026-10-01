@@ -133,6 +133,9 @@ fi
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/system-info-integration-test.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/update-with-start-integration-test.sh"
 
 forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \

@@ -356,10 +356,28 @@ client_interceptor_property_count_nexus_operations :: proc(user_data: rawptr, in
 	return
 }
 
+client_interceptor_property_system_info :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Get_System_Info_Input,
+	next: temporal_client.Client_Get_System_Info_Next,
+) -> (result: temporal_client.System_Info, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = temporal_client.client_get_system_info_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 21))
+	operation := pbt.draw(t, pbt.int_range(0, 22))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -377,6 +395,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation >= 15 && operation <= 18, 12.0, "Nexus lifecycle operation")
 	pbt.cover(t, operation == 19 || operation == 20, 6.0, "Nexus Visibility operation")
 	pbt.cover(t, operation == 21, 3.0, "Update-With-Start operation")
+	pbt.cover(t, operation == 22, 3.0, "System Info operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -438,6 +457,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.count_nexus_operations = client_interceptor_property_count_nexus_operations
 		case 21:
 			interceptor.update_with_start = client_interceptor_property_update_with_start
+		case 22:
+			interceptor.get_system_info = client_interceptor_property_system_info
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -600,6 +621,10 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			},
 		)
 		temporal_client.update_with_start_result_free(&result)
+	case 22:
+		info: temporal_client.System_Info
+		info, operation_error = temporal_client.get_system_info(&client)
+		temporal_client.system_info_free(&info)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

@@ -17,6 +17,7 @@ build_example() {
 }
 
 build_example core_connect temporal-odin-core-connect
+build_example system_info temporal-odin-system-info
 build_example client_start temporal-odin-client-start
 build_example client_control temporal-odin-client-control
 build_example update_with_start temporal-odin-update-with-start

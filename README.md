@@ -52,7 +52,12 @@ options now expose Core's TLS/mTLS,
 API-key, ASCII/binary RPC metadata, retry, keepalive, HTTP CONNECT proxy, DNS
 load-balancing, compression, identity, and payload-warning controls. API-key
 connections enable TLS automatically, and metadata/API keys can be replaced on
-a live connection. It proves
+a live connection. The public Client now exposes `get_system_info`, returning
+an allocator-owned Server version plus all thirteen capability bits in the
+pinned Temporal API. This gives applications an authoritative baseline for
+Schedules, Nexus, eager Workflow start, SDK metadata, Build-ID versioning, and
+related features; experimental RPCs without a capability bit still require a
+focused probe. It proves
 Schedule lifecycle operations through the same Core RPC boundary: create a
 cron/interval/structured-calendar Schedule with exclusions and optional TZif
 data, replace it with an optimistic conflict token, describe/list/count it,
@@ -303,6 +308,23 @@ expires. The pinned callback has no `user_data`, so the SDK provides one
 synchronized process-wide route and rejects a second simultaneous forwarding
 Runtime. The live suite receives real records from arbitrary Core threads and
 the unit suite proves the route is reusable after shutdown.
+
+Server capability discovery uses the same public Client and generic Core RPC
+bridge:
+
+```odin
+info, err := temporal_client.get_system_info(&client)
+defer temporal_client.system_info_free(&info)
+
+fmt.println(info.server_version)
+fmt.println(info.capabilities.supports_schedules)
+fmt.println(info.capabilities.nexus)
+```
+
+`System_Info` owns the version string through the requested allocator. The
+capability booleans are the Service's `GetSystemInfo` response, not SDK guesses
+based on version parsing. Run `./scripts/system-info-integration-test.sh`
+against `temporal server start-dev` for the focused live proof.
 
 `activity.info(ctx)`
 now exposes the Core-delivered execution

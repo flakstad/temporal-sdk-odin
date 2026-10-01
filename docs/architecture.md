@@ -303,9 +303,14 @@ against CLI 1.5.1 / Server 1.29.1 with
 `frontend.enableExecuteMultiOperation=true`; current Temporal guidance
 recommends Server 1.28 or newer for Update-With-Start.
 
-The same generic RPC boundary now implements four read APIs without adding C
+The same generic RPC boundary now implements five read APIs without adding C
 symbols:
 
+- `GetSystemInfo` sends the empty pinned request through Core and returns an
+  allocator-owned Server version plus all thirteen advertised capability bits.
+  Odin does not infer support from version strings. A false bit may mean either
+  unsupported or disabled by dynamic configuration, while newer experimental
+  RPCs with no corresponding bit still need operation-specific probes.
 - `DescribeWorkflowExecution` decodes the API response in a temporary arena,
   then copies the public snapshot into the caller's allocator. The current
   typed surface owns Workflow identity/type/task queue, status and timing,
@@ -2918,11 +2923,12 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
-   Visibility list/count, Workflow execution-option updates, and feature-gated
+   Visibility list/count, System Info discovery, Workflow execution-option updates, and feature-gated
    Workflow Pause/Unpause are live-proven. Query reject conditions and static
    summary/details, query headers, and eager Workflow start are now wire- and
-   live-proven, but the public Client still lacks a supported-server matrix for
-   newer Schedule methods.
+   live-proven. The public Client now exposes the Server's official thirteen
+   `GetSystemInfo` capability bits, but a maintained supported-server matrix is
+   still needed for newer Schedule and experimental APIs that have no bit.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
