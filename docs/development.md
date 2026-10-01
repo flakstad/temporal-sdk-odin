@@ -919,6 +919,14 @@ reset, reset_error := temporal_client.reset_workflow(
     },
 )
 defer temporal_client.workflow_handle_free(&reset)
+
+priority := temporal_client.Priority{priority_key = 5}
+priority_path := [?]string{"priority"}
+updated_options, update_options_error := temporal_client.update_workflow_execution_options(
+    &existing,
+    {update_mask = priority_path[:], priority = &priority},
+)
+defer temporal_client.workflow_execution_options_free(&updated_options)
 ```
 
 Handle creation only clones identifiers; it does not contact the Service. An
@@ -949,6 +957,20 @@ other schema-present arm with `unsupported post reset operation:
 wire/unit/PBT coverage rather than a live capability claim. The 500-case reset
 property generates 0–12 ordered Signal/option operations and preserves their
 kind, order, names, masks, and priorities through protobuf encoding.
+
+Run the ordinary open-execution update proof with:
+
+```bash
+./scripts/workflow-options-integration-test.sh
+```
+
+It waits until the Workflow is durably suspended, sends priority 5 through the
+public intercepted Client API and Core's generic RPC bridge, checks the
+canonical response, reads priority 5 back through CLI Describe, then signals the
+Workflow to completion. CLI 1.9.1/Server 1.32.0 omits the response's newer
+`update_time` field, so the owned result models it as optional. The request and
+response have direct wire/ownership tests; the 500-case reset property exercises
+the shared option encoder across arbitrary ordered operations.
 
 Queries use the same borrowed handle and Core generic-RPC path:
 

@@ -60,6 +60,7 @@ Client_Interceptor_Test_State :: struct {
 	count:                   int,
 	cancel_reason_seen:      bool,
 	reset_options_seen:      bool,
+	workflow_options_seen:   bool,
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
 	signal_start_input_seen: bool,
@@ -222,6 +223,32 @@ client_interceptor_test_reset :: proc(
 		result_error = temporal_client.error_from_string(.Rpc, "reset short circuit")
 	} else {
 		result, result_error = temporal_client.client_reset_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result, result_error
+}
+
+client_interceptor_test_workflow_options :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Update_Workflow_Execution_Options_Input,
+	next: temporal_client.Client_Update_Workflow_Execution_Options_Next,
+) -> (temporal_client.Workflow_Execution_Options, temporal_client.Error) {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.update.update_mask = []string{"priority"}
+	} else {
+		node.state.workflow_options_seen = len(input.update.update_mask) == 1 &&
+		                                   input.update.update_mask[0] == "priority"
+	}
+	result: temporal_client.Workflow_Execution_Options
+	result_error: temporal_client.Error
+	if node.short_circuit {
+		result_error = temporal_client.error_from_string(.Rpc, "Workflow options short circuit")
+	} else {
+		result, result_error = temporal_client.client_update_workflow_execution_options_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -9960,6 +9987,144 @@ client_reset_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
 	for event, index in expected {
 		testing.expect_value(t, state.events[index], event)
 	}
+}
+
+@(test)
+client_workflow_options_interceptors_nest_and_propagate_mutations :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			update_workflow_execution_options = client_interceptor_test_workflow_options,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			update_workflow_execution_options = client_interceptor_test_workflow_options,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+	priority := temporal_client.Priority{priority_key = 2}
+	wrong_path := [?]string{"versioning_override"}
+	options, update_error := temporal_client.update_workflow_execution_options(
+		&handle,
+		{update_mask = wrong_path[:], priority = &priority},
+	)
+	defer temporal_client.workflow_execution_options_free(&options)
+	defer temporal_client.error_free(&update_error)
+	testing.expect_value(t, update_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(update_error.message), "Workflow options short circuit")
+	testing.expect(t, state.workflow_options_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_workflow_execution_options_request_and_response_are_exact_and_owned :: proc(t: ^testing.T) {
+	priority := temporal_client.Priority{
+		priority_key = 7,
+		fairness_key = "tenant-a",
+		fairness_weight = 2.5,
+	}
+	paths := [?]string{"priority"}
+	encoded, encode_error := temporal_client.encode_update_workflow_execution_options_request(
+		"orders",
+		"odin-client@test",
+		"workflow-id",
+		"run-id",
+		{update_mask = paths[:], priority = &priority},
+	)
+	defer delete(encoded)
+	defer temporal_client.error_free(&encode_error)
+	testing.expectf(t, encode_error.message == nil, "options encoding failed: %s", string(encode_error.message))
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	request := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionOptionsRequest{}
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionOptionsRequest(encoded[:], &request)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	if decoded {
+		testing.expect_value(t, request.namespace, "orders")
+		testing.expect_value(t, request.identity, "odin-client@test")
+		testing.expect_value(t, request.workflow_execution.workflow_id, "workflow-id")
+		testing.expect_value(t, request.workflow_execution.run_id, "run-id")
+		testing.expect_value(t, len(request.update_mask.paths), 1)
+		testing.expect_value(t, request.update_mask.paths[0], "priority")
+		testing.expect_value(t, request.workflow_execution_options.priority.priority_key, i32(7))
+		testing.expect_value(t, request.workflow_execution_options.priority.fairness_key, "tenant-a")
+	}
+	virtual.arena_destroy(&arena)
+
+	version := proto.Temporal_Api_Deployment_V1_WorkerDeploymentVersion{
+		deployment_name = "orders-deployment",
+		build_id = "repair-v2",
+	}
+	one_time := proto.Temporal_Api_Workflow_V1_VersioningOverride_OneTimeOverride{
+		target_deployment_version = &version,
+	}
+	override := proto.Temporal_Api_Workflow_V1_VersioningOverride{
+		override = proto.Temporal_Api_Workflow_V1_VersioningOverride_Override_One_Time{
+			value = &one_time,
+		},
+	}
+	response_priority := proto.Temporal_Api_Common_V1_Priority{
+		priority_key = 7,
+		fairness_key = "tenant-a",
+		fairness_weight = 2.5,
+	}
+	duration := proto.Google_Protobuf_Duration{seconds = 90}
+	fast_forward := proto.Temporal_Api_Common_V1_FastForwardConfig{
+		id = "repair-window",
+		duration = &duration,
+	}
+	time_skipping := proto.Temporal_Api_Common_V1_TimeSkippingConfig{
+		enabled = true,
+		fast_forward_config = &fast_forward,
+		disable_propagation = true,
+		max_session_skip_count = 3,
+	}
+	response_options := proto.Temporal_Api_Workflow_V1_WorkflowExecutionOptions{
+		versioning_override = &override,
+		priority = &response_priority,
+		time_skipping_config = &time_skipping,
+	}
+	update_time := proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000, nanos = 42}
+	response := proto.Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionOptionsResponse{
+		workflow_execution_options = &response_options,
+		update_time = &update_time,
+	}
+	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_UpdateWorkflowExecutionOptionsResponse(&response)
+	result, response_error := temporal_client.decode_workflow_execution_options_response(response_bytes[:])
+	delete(response_bytes)
+	defer temporal_client.workflow_execution_options_free(&result)
+	defer temporal_client.error_free(&response_error)
+	testing.expectf(t, response_error.message == nil, "options response failed: %s", string(response_error.message))
+	testing.expect(t, result.has_versioning_override)
+	testing.expect_value(t, result.versioning_override.kind, temporal_client.Workflow_Versioning_Override_Kind.One_Time)
+	testing.expect_value(t, result.versioning_override.deployment_name, "orders-deployment")
+	testing.expect_value(t, result.versioning_override.build_id, "repair-v2")
+	testing.expect(t, result.priority.present)
+	testing.expect_value(t, result.priority.priority_key, i32(7))
+	testing.expect_value(t, result.priority.fairness_key, "tenant-a")
+	testing.expect(t, result.time_skipping_config.present)
+	testing.expect(t, result.time_skipping_config.fast_forward.present)
+	testing.expect_value(t, result.time_skipping_config.fast_forward.id, "repair-window")
+	testing.expect_value(t, result.time_skipping_config.fast_forward.duration, 90 * time.Second)
+	testing.expect(t, result.update_time.present)
 }
 
 @(test)

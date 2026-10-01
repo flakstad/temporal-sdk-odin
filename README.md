@@ -8,7 +8,8 @@ fiber Workflow experiments. The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. The Client also
-sends typed signals, requests cancellation, and terminates executions. It now
+sends typed signals, requests cancellation, terminates executions, and updates
+versioning/priority/time-skipping execution options with explicit field masks. It now
 starts, polls, describes, requests cancellation of, terminates, and deletes
 standalone Nexus operations through an owned Odin handle. Describe owns status,
 pending/cancellation state, timing, input/outcome, headers, Search Attributes,
@@ -1038,6 +1039,15 @@ reset_handle, err := temporal_client.reset_workflow(
     },
 )
 defer temporal_client.workflow_handle_free(&reset_handle)
+
+updated_options, err := temporal_client.update_workflow_execution_options(
+    &handle,
+    {
+        update_mask = priority_path[:],
+        priority = &priority,
+    },
+)
+defer temporal_client.workflow_execution_options_free(&updated_options)
 ```
 
 `execute_update_json` remains the one-call convenience wrapper around
@@ -1088,6 +1098,15 @@ live-proves post-reset priority updates but rejects the schema-present Signal
 variant as unsupported; its wire contract is unit- and property-tested until
 the Service implements it. Termination has plain, Payload, and typed JSON
 detail variants.
+
+The same validated option model drives the ordinary
+`UpdateWorkflowExecutionOptions` RPC for an open execution. Its field mask can
+set or explicitly clear versioning override, priority, and time-skipping
+configuration. The returned snapshot owns deployment IDs, fairness key, and
+fast-forward ID and must be freed explicitly. It also exposes Server's optional
+update timestamp. Server 1.32 live-proves priority write, canonical response,
+history/Describe read-back, and the outbound interceptor path; that server does
+not yet populate the newer response timestamp.
 
 The combined example now uses the reusable registration boundary:
 

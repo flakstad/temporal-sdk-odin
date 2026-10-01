@@ -906,17 +906,20 @@ Workflow_Time_Skipping_Config :: struct {
 // update_mask uses the pinned proto field names: "versioning_override",
 // "priority", and "time_skipping_config". A masked field whose pointer is nil
 // is explicitly cleared by Server.
-Post_Reset_Update_Workflow_Options :: struct {
+Workflow_Execution_Options_Update :: struct {
 	update_mask:          []string,
 	versioning_override:  ^Workflow_Versioning_Override,
 	priority:             ^Priority,
 	time_skipping_config: ^Workflow_Time_Skipping_Config,
 }
 
+// Compatibility name for the same update contract when embedded in Reset.
+Post_Reset_Update_Workflow_Options :: Workflow_Execution_Options_Update
+
 Post_Reset_Operation :: struct {
 	kind:                    Post_Reset_Operation_Kind,
 	signal_workflow:         Post_Reset_Signal_Workflow,
-	update_workflow_options: Post_Reset_Update_Workflow_Options,
+	update_workflow_options: Workflow_Execution_Options_Update,
 }
 
 Reset_Workflow_Options :: struct {

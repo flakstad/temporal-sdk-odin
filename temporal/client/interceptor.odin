@@ -214,6 +214,27 @@ Client_Reset_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Reset_Workflow_Next,
 ) -> (Workflow_Handle, Error)
 
+Client_Update_Workflow_Execution_Options_Input :: struct {
+	handle: ^Workflow_Handle,
+	update: Workflow_Execution_Options_Update,
+}
+
+Client_Update_Workflow_Execution_Options_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Update_Workflow_Execution_Options_Input,
+) -> (Workflow_Execution_Options, Error)
+
+Client_Update_Workflow_Execution_Options_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Update_Workflow_Execution_Options_Next_Proc,
+}
+
+Client_Update_Workflow_Execution_Options_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Update_Workflow_Execution_Options_Input,
+	next: Client_Update_Workflow_Execution_Options_Next,
+) -> (Workflow_Execution_Options, Error)
+
 Client_Terminate_Workflow_Input :: struct {
 	handle:      ^Workflow_Handle,
 	reason:      string,
@@ -496,6 +517,7 @@ Client_Interceptor :: struct {
 	wait_update:        Client_Wait_Update_Interceptor_Proc,
 	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
 	reset_workflow:     Client_Reset_Workflow_Interceptor_Proc,
+	update_workflow_execution_options: Client_Update_Workflow_Execution_Options_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
 	count_workflows:    Client_Count_Workflows_Interceptor_Proc,
@@ -600,6 +622,16 @@ client_reset_workflow_next :: proc(
 ) -> (Workflow_Handle, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid reset Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_update_workflow_execution_options_next :: proc(
+	next: Client_Update_Workflow_Execution_Options_Next,
+	input: ^Client_Update_Workflow_Execution_Options_Input,
+) -> (Workflow_Execution_Options, Error) {
+	if next.invoke == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow options interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -965,6 +997,27 @@ client_reset_workflow_chain :: proc(
 		)
 	}
 	return reset_workflow_terminal(input)
+}
+
+client_update_workflow_execution_options_chain :: proc(
+	data: rawptr,
+	input: ^Client_Update_Workflow_Execution_Options_Input,
+) -> (Workflow_Execution_Options, Error) {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return {}, error_from_string(.Invalid_Argument, "invalid Workflow options interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.update_workflow_execution_options == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.update_workflow_execution_options(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_update_workflow_execution_options_chain},
+		)
+	}
+	return update_workflow_execution_options_terminal(input)
 }
 
 client_terminate_workflow_chain :: proc(

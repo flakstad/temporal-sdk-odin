@@ -112,6 +112,8 @@ cargo run --quiet \
   temporal.api.workflowservice.v1.RequestCancelWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.ResetWorkflowExecutionRequest \
   temporal.api.workflowservice.v1.ResetWorkflowExecutionResponse \
+  temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsRequest \
+  temporal.api.workflowservice.v1.UpdateWorkflowExecutionOptionsResponse \
   temporal.api.workflowservice.v1.TerminateWorkflowExecutionRequest
 
 if [[ "$mode" == "--check" ]]; then

@@ -392,6 +392,21 @@ rejects the schema-present Signal arm with `INVALID_ARGUMENT` and
 coverage but is not advertised as live-capable. No C ABI symbol was added: this is exact
 WorkflowService protobuf generation above Core's generic RPC dispatcher.
 
+The ordinary `UpdateWorkflowExecutionOptions` path reuses that exact validation
+and encoding model without manufacturing a reset. Odin sends namespace,
+Workflow/run identity, client identity, the complete `WorkflowExecutionOptions`
+message, and its explicit `FieldMask` through Core's generic WorkflowService
+dispatcher. A successful response becomes an owned
+`Workflow_Execution_Options` snapshot; callers explicitly free cloned
+deployment/build IDs, priority fairness key, and fast-forward ID. The update
+timestamp remains optional because Server 1.32 accepts and persists priority,
+returns the canonical priority, and exposes it through Describe while omitting
+that newer response field. The operation participates in the typed Client
+outbound-interceptor chain. The only generated-code expansion is adding the
+request/response pair to the existing deterministic proto roots; the C ABI is
+unchanged and Core already dispatches the `UpdateWorkflowExecutionOptions`
+symbol.
+
 `client.Client` heap-owns a stable Core runtime and connection because
 `core.Client` retains a pointer to its runtime. It also owns its namespace.
 `Workflow_Handle` owns Workflow/run ID strings and borrows the Client. Closing
@@ -2834,7 +2849,7 @@ Workflows are enabled.
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
-   Visibility list/count are live-proven. Query reject conditions and static
+   Visibility list/count plus Workflow execution-option updates are live-proven. Query reject conditions and static
    summary/details, query headers, and eager Workflow start are now wire- and
    live-proven, but the public Client still lacks a supported-server matrix for
    newer Schedule methods.
@@ -2899,10 +2914,11 @@ and terminal-token limitations above remain explicit. Core log forwarding is
 now exposed with copied callback-scoped records and a lifecycle-tested
 process-wide route. Workflow reset now exposes both `PostResetOperation` arms,
 with atomic priority update proven on Server 1.32 and the unsupported Signal arm
-called out explicitly. The next smallest Client completeness milestone is the
-ordinary `UpdateWorkflowExecutionOptions` RPC, reusing the same validated
-versioning/priority/time-skipping model outside Reset and verifying read-back
-through Describe.
+called out explicitly. Ordinary `UpdateWorkflowExecutionOptions` now reuses the
+same validated model, is intercepted, and is live-proven through canonical
+response plus Describe. The next smallest Client completeness milestone is a
+supported-server inventory of remaining WorkflowService control RPCs, followed
+by the smallest stable operation that closes a real language-SDK parity gap.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
 

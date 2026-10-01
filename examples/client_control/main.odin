@@ -118,6 +118,19 @@ reset_interceptor :: proc(
 	return result, result_error
 }
 
+workflow_options_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Update_Workflow_Execution_Options_Input,
+	next: temporal_client.Client_Update_Workflow_Execution_Options_Next,
+) -> (temporal_client.Workflow_Execution_Options, temporal_client.Error) {
+	fmt.printf("Client Workflow options interceptor entered paths=%d\n", len(input.update.update_mask))
+	result, result_error := temporal_client.client_update_workflow_execution_options_next(next, input)
+	if result_error.message == nil {
+		fmt.println("Client Workflow options interceptor exited after Core")
+	}
+	return result, result_error
+}
+
 terminate_interceptor :: proc(
 	_: rawptr,
 	input: ^temporal_client.Client_Terminate_Workflow_Input,
@@ -158,6 +171,7 @@ run :: proc() -> int {
 		start_update = update_interceptor,
 		cancel_workflow = cancel_interceptor,
 		reset_workflow = reset_interceptor,
+		update_workflow_execution_options = workflow_options_interceptor,
 		terminate_workflow = terminate_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
@@ -271,6 +285,32 @@ run :: proc() -> int {
 			reset_handle.run_id,
 			event_id,
 			len(post_reset_operations),
+		)
+		return 0
+	case "update-options":
+		priority_value := env("TEMPORAL_CLIENT_PRIORITY_KEY", reset_priority_buffer[:])
+		parsed_priority, priority_ok := strconv.parse_i64(priority_value)
+		if !priority_ok || parsed_priority <= 0 || parsed_priority > i64(max(i32)) {
+			fmt.eprintln("TEMPORAL_CLIENT_PRIORITY_KEY must be a positive 32-bit integer")
+			return 2
+		}
+		priority := temporal_client.Priority{priority_key = i32(parsed_priority)}
+		priority_path := [?]string{"priority"}
+		options, options_error := temporal_client.update_workflow_execution_options(
+			&handle,
+			{update_mask = priority_path[:], priority = &priority},
+		)
+		if options_error.message != nil {
+			print_error(action, &options_error)
+			return 1
+		}
+		defer temporal_client.workflow_execution_options_free(&options)
+		fmt.printf(
+			"Odin client updated Workflow options workflow_id=%s priority=%d response_priority=%d update_time=%v\n",
+			workflow_id,
+			priority.priority_key,
+			options.priority.priority_key,
+			options.update_time.present,
 		)
 		return 0
 	case "query":
