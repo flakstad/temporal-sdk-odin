@@ -1252,6 +1252,11 @@ typed_workflow :: proc(
 		maximum_attempts = 3,
 		non_retryable_error_types = non_retryable_types[:],
 	}
+	priority := workflow.Workflow_Priority{
+		priority_key = 3,
+		fairness_key = "odin-typed-activity",
+		fairness_weight = 1.25,
+	}
 	return workflow.execute_activity_json_with_options(
 		ctx,
 		"typed_greeting",
@@ -1267,6 +1272,9 @@ typed_workflow :: proc(
 			retry_policy = &retry_policy,
 			cancellation_type = .Wait_Cancellation_Completed,
 			disable_eager_execution = true,
+			versioning_intent = .Default,
+			priority = &priority,
+			summary = "Create typed Odin greeting",
 		},
 	)
 }
@@ -1288,6 +1296,7 @@ local_activity_workflow :: proc(
 			local_retry_threshold = 2 * time.Second,
 			cancellation_type = .Wait_Cancellation_Completed,
 			include_arguments_in_marker = true,
+			summary = "Create local Odin greeting",
 		},
 	)
 }

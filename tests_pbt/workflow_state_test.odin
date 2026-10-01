@@ -1738,6 +1738,11 @@ Generated_Activity_Options_Input :: struct {
 	retry_maximum_attempts:   int,
 	cancellation_type:        int,
 	disable_eager_execution:  bool,
+	versioning_intent:        int,
+	priority_key:             int,
+	fairness_key:             string,
+	fairness_weight_quarters: int,
+	summary:                  string,
 }
 
 generated_activity_options_workflow :: proc(
@@ -1767,6 +1772,16 @@ generated_activity_options_workflow :: proc(
 		maximum_attempts = i32(input.retry_maximum_attempts),
 		non_retryable_error_types = non_retryable_types[:],
 	}
+	versioning_intent := workflow.Versioning_Intent.Unspecified
+	switch input.versioning_intent {
+	case 1: versioning_intent = .Compatible
+	case 2: versioning_intent = .Default
+	}
+	priority := workflow.Workflow_Priority{
+		priority_key = i32(input.priority_key),
+		fairness_key = input.fairness_key,
+		fairness_weight = f32(input.fairness_weight_quarters) / 4,
+	}
 	return workflow.execute_activity_json_with_options(
 		ctx,
 		"generated_options_activity",
@@ -1783,6 +1798,9 @@ generated_activity_options_workflow :: proc(
 			retry_policy = &retry_policy,
 			cancellation_type = cancellation_type,
 			disable_eager_execution = input.disable_eager_execution,
+			versioning_intent = versioning_intent,
+			priority = &priority,
+			summary = input.summary,
 		},
 	)
 }
@@ -1818,7 +1836,9 @@ generated_activity_options_match :: proc(
 		}
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity:
-			if variant.value == nil || variant.value.retry_policy == nil {
+			if variant.value == nil || variant.value.retry_policy == nil ||
+			   variant.value.priority == nil || status.value.commands[0].user_metadata == nil ||
+			   status.value.commands[0].user_metadata.summary == nil {
 				return false
 			}
 			schedule := variant.value
@@ -1836,6 +1856,18 @@ generated_activity_options_match :: proc(
 				return false
 			}
 			defer delete(decoded_header)
+			owned_summary, summary_clone_error := proto.clone_payload(
+				status.value.commands[0].user_metadata.summary,
+			)
+			if summary_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			decoded_summary: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None {
+				return false
+			}
+			defer delete(decoded_summary)
 			policy := schedule.retry_policy
 			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.TRY_CANCEL
 			switch expected.cancellation_type {
@@ -1844,7 +1876,12 @@ generated_activity_options_match :: proc(
 			case 2:
 				expected_cancellation = .ABANDON
 			}
-			return decoded_header == expected.header_value &&
+			expected_versioning := proto.Coresdk_Common_VersioningIntent.UNSPECIFIED
+			switch expected.versioning_intent {
+			case 1: expected_versioning = .COMPATIBLE
+			case 2: expected_versioning = .DEFAULT
+			}
+			return decoded_header == expected.header_value && decoded_summary == expected.summary &&
 				schedule.activity_id == expected.activity_id &&
 				schedule.activity_type == "generated_options_activity" &&
 				schedule.task_queue == expected.task_queue &&
@@ -1859,7 +1896,11 @@ generated_activity_options_match :: proc(
 				len(policy.non_retryable_error_types) == 1 &&
 				policy.non_retryable_error_types[0] == "GeneratedPermanentFailure" &&
 				schedule.cancellation_type == expected_cancellation &&
-				schedule.do_not_eagerly_execute == expected.disable_eager_execution
+				schedule.do_not_eagerly_execute == expected.disable_eager_execution &&
+				schedule.versioning_intent == expected_versioning &&
+				schedule.priority.priority_key == i32(expected.priority_key) &&
+				schedule.priority.fairness_key == expected.fairness_key &&
+				schedule.priority.fairness_weight == f32(expected.fairness_weight_quarters) / 4
 		}
 	}
 	return false
@@ -1885,12 +1926,20 @@ activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_maximum_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		cancellation_type = pbt.draw(t, pbt.int_range(0, 2)),
 		disable_eager_execution = pbt.draw(t, pbt.boolean()),
+		versioning_intent = pbt.draw(t, pbt.int_range(0, 2)),
+		priority_key = pbt.draw(t, pbt.int_range(0, 10)),
+		fairness_key = pbt.draw(t, pbt.string_ascii(0, 64)),
+		fairness_weight_quarters = pbt.draw(t, pbt.int_range(0, 40)),
+		summary = pbt.draw(t, pbt.string_ascii(1, 80)),
 	}
 	pbt.cover(t, input_value.cancellation_type == 0, 20.0, "try cancel")
 	pbt.cover(t, input_value.cancellation_type == 1, 20.0, "wait for cancellation")
 	pbt.cover(t, input_value.cancellation_type == 2, 20.0, "abandon")
 	pbt.cover(t, input_value.retry_maximum_attempts == 0, 2.0, "unlimited attempts")
 	pbt.cover(t, input_value.disable_eager_execution, 30.0, "eager disabled")
+	pbt.cover(t, input_value.versioning_intent == 2, 20.0, "default Activity versioning intent")
+	pbt.cover(t, len(input_value.fairness_key) == 64, 0.1, "maximum Activity fairness key")
+	pbt.cover(t, input_value.fairness_weight_quarters == 0, 1.0, "zero Activity fairness weight")
 
 	owned_queue, queue_error := strings.clone("pbt-workflow-queue")
 	if queue_error != nil {
@@ -2012,6 +2061,7 @@ Generated_Local_Activity_Options_Input :: struct {
 	local_retry_threshold_ms:   int,
 	cancellation_type:          int,
 	include_arguments_in_marker: bool,
+	summary:                    string,
 }
 
 generated_local_activity_options_workflow :: proc(
@@ -2054,6 +2104,7 @@ generated_local_activity_options_workflow :: proc(
 			local_retry_threshold = time.Duration(input.local_retry_threshold_ms) * time.Millisecond,
 			cancellation_type = cancellation_type,
 			include_arguments_in_marker = input.include_arguments_in_marker,
+			summary = input.summary,
 		},
 	)
 }
@@ -2083,7 +2134,9 @@ generated_local_activity_options_match :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity:
 			if variant.value == nil || variant.value.retry_policy == nil ||
-			   len(variant.value.arguments) != 1 {
+			   len(variant.value.arguments) != 1 ||
+			   status.value.commands[0].user_metadata == nil ||
+			   status.value.commands[0].user_metadata.summary == nil {
 				return false
 			}
 			schedule := variant.value
@@ -2101,6 +2154,18 @@ generated_local_activity_options_match :: proc(
 				return false
 			}
 			defer delete(decoded_header)
+			owned_summary, summary_clone_error := proto.clone_payload(
+				status.value.commands[0].user_metadata.summary,
+			)
+			if summary_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			decoded_summary: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None {
+				return false
+			}
+			defer delete(decoded_summary)
 			expected_cancellation := proto.Coresdk_Workflow_Commands_ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
 			switch expected.cancellation_type {
 			case 1:
@@ -2108,7 +2173,7 @@ generated_local_activity_options_match :: proc(
 			case 2:
 				expected_cancellation = .ABANDON
 			}
-			return decoded_header == expected.header_value &&
+			return decoded_header == expected.header_value && decoded_summary == expected.summary &&
 				schedule.seq == 1 && schedule.activity_id == expected.activity_id &&
 				schedule.activity_type == "generated_local_activity" && schedule.attempt == 1 &&
 				pbt_proto_duration(schedule.schedule_to_close_timeout) == time.Duration(expected.schedule_to_close_ms) * time.Millisecond &&
@@ -2139,6 +2204,7 @@ local_activity_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_maximum_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		cancellation_type = pbt.draw(t, pbt.int_range(0, 2)),
 		include_arguments_in_marker = pbt.draw(t, pbt.boolean()),
+		summary = pbt.draw(t, pbt.string_ascii(1, 80)),
 	}
 	input_value.retry_maximum_ms = pbt.draw(
 		t,
@@ -2280,6 +2346,7 @@ generated_local_activity_backoff_workflow :: proc(
 			start_to_close_timeout = time.Minute,
 			retry_policy = &retry_policy,
 			local_retry_threshold = time.Millisecond,
+			summary = "Generated Local Activity retry",
 		},
 	)
 }
@@ -2342,7 +2409,22 @@ generated_local_activity_retry_matches :: proc(
 		#partial switch variant in status.value.commands[0].variant {
 		case proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity:
 			schedule := variant.value
-			return schedule != nil && schedule.seq == 2 && schedule.attempt == attempt &&
+			metadata := status.value.commands[0].user_metadata
+			if schedule == nil || metadata == nil || metadata.summary == nil {
+				return false
+			}
+			owned_summary, clone_error := proto.clone_payload(metadata.summary)
+			if clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			decoded_summary: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None {
+				return false
+			}
+			defer delete(decoded_summary)
+			return decoded_summary == "Generated Local Activity retry" &&
+				schedule.seq == 2 && schedule.attempt == attempt &&
 				schedule.original_schedule_time != nil &&
 				schedule.original_schedule_time.seconds == original_seconds &&
 				schedule.original_schedule_time.nanos == original_nanos

@@ -1719,12 +1719,16 @@ credentials.
 The Workflow Payload property adds another 500 generated structs, creates and
 evicts a typed fiber for each, and requires byte-identical completion after
 fresh-stack replay. The Activity-options property generates 500 valid timeout,
-retry, queue, ID, cancellation, and eager-execution combinations. It checks
-every encoded `ScheduleActivity` field and requires byte-identical commands
-after eviction and fresh-stack replay. A separate 500-case Local Activity
-options property covers
+retry, queue, ID, cancellation, eager-execution, versioning-intent, priority,
+and summary combinations. It checks every encoded `ScheduleActivity` field plus
+the command metadata envelope and requires byte-identical commands after
+eviction and fresh-stack replay. A separate 500-case Local Activity options
+property covers
 all three cancellation modes, timeouts, retry fields, local retry threshold,
-marker-input inclusion, `ScheduleLocalActivity` encoding, and exact replay. The
+marker-input inclusion, summary metadata, `ScheduleLocalActivity` encoding, and
+exact replay. Live CLI-devserver cases additionally require remote Activity
+priority/summary on `ActivityTaskScheduled` and Local Activity summary on the
+persisted `core_local_activity` marker. The
 Workflow-properties property generates 500 memo/Search Attribute keys and
 values, Keyword/Text types, and independent removals. Each case verifies local
 read-after-write, command counts, eviction, and byte-identical fresh-stack

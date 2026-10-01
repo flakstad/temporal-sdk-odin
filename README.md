@@ -1476,6 +1476,11 @@ retry := workflow.Retry_Policy{
     backoff_coefficient = 2,
     maximum_attempts = 3,
 }
+priority := workflow.Workflow_Priority{
+    priority_key = 3,
+    fairness_key = "orders",
+    fairness_weight = 1.25,
+}
 result := workflow.execute_activity_json_with_options(
     ctx,
     "typed_greeting",
@@ -1487,13 +1492,21 @@ result := workflow.execute_activity_json_with_options(
         heartbeat_timeout = 2 * time.Second,
         retry_policy = &retry,
         cancellation_type = .Wait_Cancellation_Completed,
+        versioning_intent = .Default,
+        priority = &priority,
+        summary = "Create order greeting",
     },
 )
 ```
 
-`Activity_Options` borrows its strings, slices, and Retry Policy only for the
-call. The runtime copies them into Workflow-owned storage before it can
-suspend. At least one of Start-to-Close or Schedule-to-Close must be positive.
+`Activity_Options` borrows its strings, slices, Retry Policy, priority, and
+summary only for the call. The runtime copies them into Workflow-owned storage
+before it can suspend. Priority is carried on Core's `ScheduleActivity`; summary
+is encoded as `WorkflowCommand.user_metadata.summary`. `versioning_intent`
+retains Core's legacy Build-ID routing control, while new applications should
+prefer Worker Deployment Versioning. Local Activity options expose the same
+summary metadata on Core's persisted Local Activity marker. At least one of
+Start-to-Close or Schedule-to-Close must be positive.
 The compatibility helpers retain their experimental 20-second
 Start-to-Close/one-attempt behavior.
 

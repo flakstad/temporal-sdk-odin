@@ -1145,6 +1145,18 @@ grep -q '"backoffCoefficient": 2' "$typed_history_file"
 grep -q '"maximumInterval": "1s"' "$typed_history_file"
 grep -q '"maximumAttempts": 3' "$typed_history_file"
 grep -q '"InvalidGreeting"' "$typed_history_file"
+jq -e '
+  [.events[]
+    | select(.eventType == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED")
+    | select(
+        .activityTaskScheduledEventAttributes.activityId == "typed-greeting-options" and
+        .activityTaskScheduledEventAttributes.priority.priorityKey == 3 and
+        .activityTaskScheduledEventAttributes.priority.fairnessKey == "odin-typed-activity" and
+        .activityTaskScheduledEventAttributes.priority.fairnessWeight == 1.25 and
+        (.userMetadata.summary.data | @base64d | fromjson) == "Create typed Odin greeting"
+      )]
+  | length == 1
+' "$typed_history_file" >/dev/null
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"
@@ -1184,6 +1196,15 @@ temporal workflow show \
   --output json >"$typed_history_file"
 grep -q 'core_local_activity' "$typed_history_file"
 grep -q '"input"' "$typed_history_file"
+jq -e '
+  [.events[]
+    | select(.eventType == "EVENT_TYPE_MARKER_RECORDED")
+    | select(
+        .markerRecordedEventAttributes.markerName == "core_local_activity" and
+        (.userMetadata.summary.data | @base64d | fromjson) == "Create local Odin greeting"
+      )]
+  | length == 1
+' "$typed_history_file" >/dev/null
 wait "$worker_pid"
 worker_pid=""
 cat "$worker_log"

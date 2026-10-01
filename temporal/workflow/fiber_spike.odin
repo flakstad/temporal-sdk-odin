@@ -625,9 +625,11 @@ Timer_Options :: struct {
 	summary:            string,
 }
 
-// Activity_Options borrows its strings, slices, and retry_policy only for the
+// Activity_Options borrows its strings, slices, retry_policy, and priority only for the
 // start/execute call. The Workflow runtime copies them into the run arena before
-// it can suspend. A zero duration means "not specified".
+// it can suspend. A zero duration means "not specified". versioning_intent is
+// the legacy Build-ID routing control retained by Core; new deployments should
+// prefer Worker Deployment Versioning.
 Activity_Options :: struct {
 	activity_id:               string,
 	task_queue:                string,
@@ -639,6 +641,9 @@ Activity_Options :: struct {
 	cancellation_type:         Activity_Cancellation_Type,
 	disable_eager_execution:   bool,
 	headers:                   ^Headers,
+	versioning_intent:         Versioning_Intent,
+	priority:                  ^Workflow_Priority,
+	summary:                   string,
 }
 
 Owned_Activity_Options :: struct {
@@ -652,6 +657,11 @@ Owned_Activity_Options :: struct {
 	cancellation_type:         Activity_Cancellation_Type,
 	disable_eager_execution:   bool,
 	headers:                   [dynamic]Fiber_Named_Payload,
+	versioning_intent:         Versioning_Intent,
+	priority:                  Workflow_Priority,
+	has_priority:              bool,
+	summary:                   codec.Payload,
+	has_summary:               bool,
 }
 
 // Local Activities execute in the same Worker process as the Workflow but are
@@ -668,6 +678,7 @@ Local_Activity_Options :: struct {
 	cancellation_type:         Local_Activity_Cancellation_Type,
 	include_arguments_in_marker: bool,
 	headers:                   ^Headers,
+	summary:                   string,
 }
 
 Owned_Local_Activity_Options :: struct {
@@ -680,6 +691,8 @@ Owned_Local_Activity_Options :: struct {
 	cancellation_type:         Local_Activity_Cancellation_Type,
 	include_arguments_in_marker: bool,
 	headers:                   [dynamic]Fiber_Named_Payload,
+	summary:                   codec.Payload,
+	has_summary:               bool,
 }
 
 Continue_As_New_Versioning_Intent :: Versioning_Intent
@@ -5753,6 +5766,23 @@ activity_options_error :: proc(activity_type: string, options: Activity_Options)
 	if options.headers != nil && options.headers.allocator.procedure == nil {
 		return "Activity headers are not initialized"
 	}
+	if int(options.versioning_intent) < int(Versioning_Intent.Unspecified) ||
+	   int(options.versioning_intent) > int(Versioning_Intent.Default) {
+		return "Activity versioning intent is invalid"
+	}
+	if options.priority != nil {
+		priority := options.priority
+		if priority.priority_key < 0 {
+			return "Activity priority key must not be negative"
+		}
+		if len(priority.fairness_key) > 64 {
+			return "Activity priority fairness key must not exceed 64 bytes"
+		}
+		if math.is_nan(priority.fairness_weight) || math.is_inf(priority.fairness_weight) ||
+		   priority.fairness_weight < 0 {
+			return "Activity priority fairness weight must be finite and non-negative"
+		}
+	}
 	return ""
 }
 
@@ -5783,8 +5813,30 @@ clone_activity_options :: proc(
 	owned.heartbeat_timeout = options.heartbeat_timeout
 	owned.cancellation_type = options.cancellation_type
 	owned.disable_eager_execution = options.disable_eager_execution
+	owned.versioning_intent = options.versioning_intent
 	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
 		return {}, false
+	}
+	if options.priority != nil {
+		owned.has_priority = true
+		owned.priority = options.priority^
+		if len(options.priority.fairness_key) > 0 {
+			owned.priority.fairness_key, _ = strings.clone(
+				options.priority.fairness_key,
+				allocator,
+			)
+			if owned.priority.fairness_key == "" {
+				return {}, false
+			}
+		}
+	}
+	owned.has_summary = len(options.summary) > 0
+	if owned.has_summary {
+		encode_error: codec.Error
+		owned.summary, encode_error = codec.encode_json(options.summary, allocator)
+		if encode_error != .None {
+			return {}, false
+		}
 	}
 	if options.retry_policy != nil {
 		owned.has_retry_policy = true
@@ -6138,6 +6190,14 @@ clone_local_activity_options :: proc(
 	owned.has_retry_policy = true
 	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
 		return {}, false
+	}
+	owned.has_summary = len(options.summary) > 0
+	if owned.has_summary {
+		encode_error: codec.Error
+		owned.summary, encode_error = codec.encode_json(options.summary, allocator)
+		if encode_error != .None {
+			return {}, false
+		}
 	}
 	if options.retry_policy == nil {
 		owned.retry_policy.maximum_attempts = 1
@@ -9631,6 +9691,19 @@ continue_as_new_versioning_behavior_to_proto :: proc(
 	return .CONTINUE_AS_NEW_VERSIONING_BEHAVIOR_UNSPECIFIED
 }
 
+workflow_command_set_summary :: proc(
+	command: ^proto.Coresdk_Workflow_Commands_WorkflowCommand,
+	summary: ^codec.Payload,
+) {
+	if command == nil || summary == nil {
+		return
+	}
+	metadata := new(proto.Temporal_Api_Sdk_V1_UserMetadata)
+	metadata.summary = new(proto.Temporal_Api_Common_V1_Payload)
+	metadata.summary^ = proto.encode_payload(codec.payload_view(summary))
+	command.user_metadata = metadata
+}
+
 append_fiber_start_child_workflow_command :: proc(
 	result: ^Process_Result,
 	commands: ^[dynamic]proto.Coresdk_Workflow_Commands_WorkflowCommand,
@@ -9784,14 +9857,15 @@ append_fiber_schedule_command :: proc(
 		for &input in operation.inputs {
 			append(&schedule.arguments, proto.encode_payload(codec.payload_view(&input)))
 		}
-		append(
-			commands,
-			proto.Coresdk_Workflow_Commands_WorkflowCommand{
-				variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity{
-					value = schedule,
-				},
+		command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Local_Activity{
+				value = schedule,
 			},
-		)
+		}
+		if options.has_summary {
+			workflow_command_set_summary(&command, &options.summary)
+		}
+		append(commands, command)
 		operation.state = .Commanded
 		result.scheduled_local_activity = true
 		result.scheduled_local_activity_count += 1
@@ -9819,6 +9893,15 @@ append_fiber_schedule_command :: proc(
 		retry_policy = retry_policy,
 		cancellation_type = activity_cancellation_type_to_proto(operation.options.cancellation_type),
 		do_not_eagerly_execute = operation.options.disable_eager_execution,
+		versioning_intent = versioning_intent_to_proto(operation.options.versioning_intent),
+	}
+	if operation.options.has_priority {
+		schedule.priority = new(proto.Temporal_Api_Common_V1_Priority)
+		schedule.priority^ = {
+			priority_key = operation.options.priority.priority_key,
+			fairness_key = operation.options.priority.fairness_key,
+			fairness_weight = operation.options.priority.fairness_weight,
+		}
 	}
 	for &entry in operation.options.headers {
 		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
@@ -9834,14 +9917,15 @@ append_fiber_schedule_command :: proc(
 	for &input in operation.inputs {
 		append(&schedule.arguments, proto.encode_payload(codec.payload_view(&input)))
 	}
-	append(
-		commands,
-		proto.Coresdk_Workflow_Commands_WorkflowCommand{
-			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity{
-				value = schedule,
-			},
+	command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+		variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Schedule_Activity{
+			value = schedule,
 		},
-	)
+	}
+	if operation.options.has_summary {
+		workflow_command_set_summary(&command, &operation.options.summary)
+	}
+	append(commands, command)
 	operation.state = .Commanded
 	result.scheduled_activity = true
 	result.scheduled_activity_count += 1

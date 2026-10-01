@@ -1630,23 +1630,35 @@ read-after-write, eviction, and replay. The Odin Client/devserver test observes 
 Activity scheduling is no longer hardcoded. `Activity_Options` maps directly
 onto the pinned Core `ScheduleActivity` command: Activity ID, task queue,
 Schedule-to-Close, Schedule-to-Start, Start-to-Close, heartbeat timeout, Retry
-Policy, cancellation type, and eager-execution control. Options are borrowed at
-the author-facing call and copied into the fiber instance arena before the
-Workflow can yield. This includes each non-retryable error type in a Retry
-Policy. Empty task queue and Activity ID select the Workflow queue and the
-deterministic sequence-derived ID respectively.
+Policy, cancellation type, eager-execution control, legacy Build-ID versioning
+intent, and priority. The enclosing `WorkflowCommand.user_metadata.summary`
+carries the UI-facing summary. Options are borrowed at the author-facing call
+and copied into the fiber instance arena before the Workflow can yield. This
+includes each non-retryable error type, the priority fairness key, and an
+encoded owned summary Payload. Empty task queue and Activity ID select the
+Workflow queue and the deterministic sequence-derived ID respectively.
+
+`Local_Activity_Options.summary` uses the same command metadata envelope. Core
+persists it on the resulting `core_local_activity` marker, including after a
+timer-backed local retry. Local Activities have no server task-queue priority or
+versioning intent, so those fields remain remote-Activity-only. Versioning
+intent is retained for cross-SDK and pinned-Core parity but represents legacy
+Build-ID routing; Worker Deployment Versioning is preferred for new systems.
 
 The options API validates that at least one close timeout is positive, rejects
-negative durations/attempt counts and invalid retry coefficients, and rejects
-Start-to-Close or Schedule-to-Start values larger than an explicit
-Schedule-to-Close value. Invalid options become a non-retryable
+negative durations/attempt counts, invalid retry coefficients, invalid
+versioning values, negative/non-finite priority values, and fairness keys over
+64 bytes, and rejects Start-to-Close or Schedule-to-Start values larger than an
+explicit Schedule-to-Close value. Invalid options become a non-retryable
 `OdinActivityOptionsError` Workflow failure rather than a malformed Core
 command. The original convenience functions remain compatibility wrappers with
 the spike's 20-second Start-to-Close timeout, one attempt, and disabled eager
 execution. Options-specific offline and 500-case PBT tests require exact
-command fields and byte-identical fresh-stack replay. The live test additionally
+command fields, priority and metadata envelopes, and byte-identical fresh-stack
+replay. The live test additionally
 reads Service history and checks the Activity ID, all four timeouts, retry
-intervals/coefficient/attempt limit, and non-retryable type.
+intervals/coefficient/attempt limit, non-retryable type, priority, and summary.
+The Local Activity live path checks the marker summary separately.
 
 `execute_activity` and `sleep` each record a typed operation and yield from
 inside the nested Odin call. Activity and timer sequence counters are separate;
