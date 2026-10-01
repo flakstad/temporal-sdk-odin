@@ -3280,8 +3280,8 @@ generated statechart traces check failed-generation fencing and multi-route
 capacity. A positive activation deadline now kills and reaps an unresponsive
 executor, joins its pipe reader, and drives the same failed-completion/eviction/
 replay path against the dev server. Generic registry hosting is now proven with
-one shared parent/child registration function and two Workflow types, including
-a typed-JSON result. A canonical registry handshake is now checked once before
+one shared parent/child registration function and three Workflow types,
+including a typed-JSON result. A canonical registry handshake is now checked once before
 polling and again for each child generation. Shutdown response and process exit
 are now bounded independently from activation execution; capacity admission is
 immediate rather than deadlocking the serial poll thread; and a cooldown circuit
@@ -3297,9 +3297,11 @@ replay-suppressed interceptor logs on child stderr. A factory now creates and
 transfers one runtime-owned metric emitter per registered Workflow type, and the
 live proof requires the same replay-suppressed metric count. Protocol v4 adds
 correlated, discriminated, codec-neutral diagnostic frames and a borrowed parent
-observer; live assertions require two log and two metric events. The next step
-is a real nondeterminism/replay failure through the process boundary. A
-five-case dev-server matrix now proves containment of stale correlation IDs,
+observer; live assertions require two log and two metric events. A real
+dev-server history mismatch is now proven through the process boundary: the
+same type manifest replays with incompatible code, Core emits
+`NONDETERMINISM`, and its per-type policy records terminal `[TMPRL1100]`
+failure. A five-case dev-server matrix also proves containment of stale correlation IDs,
 malformed metadata/completions, terminal metadata mismatches, and responses
 delayed beyond the activation deadline. Production hardening remains
 process-boundary work. The
@@ -3952,6 +3954,18 @@ those existing run routes. The live path therefore uses three generations and
 three evictions rather than zero-cache's five, with three graceful shutdowns
 including preflight. Both exact results and all failure-containment assertions
 remain unchanged.
+
+A separate sticky-cache dev-server proof now establishes actual
+nondeterminism across this boundary. One normal executor records a one-hour
+Timer in server history before its parent stops and reaps it. A new Worker replays that execution in
+a child with the same canonical type manifest but incompatible code that emits
+`CompleteWorkflow` instead of `StartTimer`. Core, rather than the parent
+protocol, detects the mismatch and sends `RemoveFromCache(NONDETERMINISM)`.
+The manager counts that semantic reason, while Core's per-type nondeterminism
+policy converts the mismatch into terminal failure. The CLI independently
+requires failed execution status and `[TMPRL1100]`/nondeterminism in durable
+history. Sticky cache is intentional: a zero-sized cache can make its own cache
+eviction the externally observed reason and obscure this diagnostic.
 
 The cache/language-lifetime invariant is strict:
 

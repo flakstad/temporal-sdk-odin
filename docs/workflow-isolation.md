@@ -313,6 +313,31 @@ This is evidence for the central recovery contract: the parent can survive a
 language executor crash, fail only that Workflow Task, and let Core/Server
 history drive a fresh Odin runtime. Temporal remains the durable state owner.
 
+### Real nondeterminism across the process boundary
+
+Run the incompatible-replay proof with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-nondeterminism-integration-test.sh
+```
+
+The seed Worker runs the ordinary executor until Core and the CLI dev server
+have recorded a one-hour Timer, then stops and reaps its child. A second Worker uses
+the same Workflow type manifest but starts one deliberately incompatible child
+whose implementation completes immediately instead of scheduling that Timer.
+The activation is a real replay activation built from server history; no Core
+protobuf bytes are forged by the test.
+
+The replay Worker uses a sticky Core cache so the semantic eviction reason is
+observable. Core rejects the incompatible command with
+`RemoveFromCache(NONDETERMINISM)`, and the manager records exactly one
+`nondeterminism_evictions` event. The type-scoped Core policy converts that
+mismatch into a terminal Workflow failure. The test independently requires
+`WORKFLOW_EXECUTION_STATUS_FAILED` and `[TMPRL1100]`/nondeterminism evidence in
+the server history. With a zero-sized cache, Core may emit the cache-lifecycle
+eviction first, so that mode is deliberately not used for this diagnostic.
+
 ### Ownership at the experimental callback
 
 - Core's poll result owns the activation bytes. `worker.run` borrows them to the
@@ -370,10 +395,9 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- prove a real nondeterministic Workflow completion/replay mismatch through the
-  isolated dev-server path;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is a real nondeterministic Workflow
-completion/replay mismatch through this executor boundary. Cross-platform
-pipe/process validation also remains part of the process hardening.
+The next discriminating vertical slice is cross-platform pipe/process
+validation and packaging of the executor binary on the four supported target
+triples. Production isolation also still needs a policy for fixed-stack
+overflow and other fatal child exits.

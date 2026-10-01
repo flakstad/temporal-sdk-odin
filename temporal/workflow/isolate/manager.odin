@@ -87,6 +87,7 @@ Activation_Route :: struct {
 	workflow_type:  string,
 	initializes:    bool,
 	evicts:         bool,
+	eviction_reason: proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason,
 	is_replaying:   bool,
 	history_length: u32,
 	job_count:      int,
@@ -122,6 +123,9 @@ decode_activation_route :: proc(data: []u8) -> (route: Activation_Route, ok: boo
 			route.workflow_type = variant.value.workflow_type
 		case proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache:
 			route.evicts = variant.value != nil
+			if variant.value != nil {
+				route.eviction_reason = variant.value.reason
+			}
 		}
 	}
 	return
@@ -179,6 +183,9 @@ Manager_Stats :: struct {
 	activation_timeouts: int,
 	capacity_rejections: int,
 	evictions:           int,
+	nondeterminism_evictions: int,
+	language_failure_evictions: int,
+	workflow_ending_evictions: int,
 	graceful_shutdowns:  int,
 	aborted_children:    int,
 	peak_routes:         int,
@@ -1015,6 +1022,14 @@ manager_process_activation :: proc(
 
 	if route_info.evicts {
 		manager.stats.evictions += 1
+		#partial switch route_info.eviction_reason {
+		case .NONDETERMINISM:
+			manager.stats.nondeterminism_evictions += 1
+		case .LANG_FAIL:
+			manager.stats.language_failure_evictions += 1
+		case .WORKFLOW_EXECUTION_ENDING:
+			manager.stats.workflow_ending_evictions += 1
+		}
 		result := workflow.Process_Result{
 			completion = workflow.encode_empty_activation_success(route_info.run_id),
 			run_id = manager.report_run_id,

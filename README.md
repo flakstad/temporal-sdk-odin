@@ -526,6 +526,10 @@ Worker statistics/observer visibility. Protocol v4 additionally carries
 correlated, discriminated log/metric/application diagnostics to a borrowed
 parent observer. The live proof checks timer sequence fields that the parent
 cannot infer from the completion and exactly four structured diagnostic events.
+An additional sticky-cache proof records a durable Timer with the ordinary
+child, replays it with incompatible code behind the same type manifest, and
+requires both Core's `NONDETERMINISM` eviction and terminal `[TMPRL1100]`
+history from the CLI dev server.
 It still lacks production pool hardening.
 Replay-aware child logging, per-runtime metric-emitter creation, and
 inbound/outbound interceptor configuration are now explicit host options; the
@@ -2266,7 +2270,7 @@ examples/replay_history/  offline binary-history compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/workflow_isolate/ persistent per-run Workflow process spike
 examples/workflow_isolate_app/ shared parent/child Workflow registry
-examples/workflow_isolate_core/ Core-polled zero/sticky crash/replay proof
+examples/workflow_isolate_core/ Core-polled crash/replay/nondeterminism proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
 examples/hello_nexus/     synchronous Odin Nexus operation Worker

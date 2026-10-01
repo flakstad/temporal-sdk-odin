@@ -447,9 +447,12 @@ workflow_isolate_test_initialization :: proc(run_id: string) -> [dynamic]u8 {
 	return proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
 }
 
-workflow_isolate_test_eviction :: proc(run_id: string) -> [dynamic]u8 {
+workflow_isolate_test_eviction :: proc(
+	run_id: string,
+	reason := proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason.LANG_FAIL,
+) -> [dynamic]u8 {
 	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{
-		reason = .LANG_FAIL,
+		reason = reason,
 	}
 	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
 		run_id = run_id,
@@ -462,6 +465,42 @@ workflow_isolate_test_eviction :: proc(run_id: string) -> [dynamic]u8 {
 		},
 	})
 	return proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+}
+
+@(test)
+workflow_executor_manager_classifies_semantic_eviction_reasons :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/true"}
+	manager := workflow_isolate.Manager{}
+	init_error := workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.manager_close(&manager)
+
+	reasons := [?]proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason{
+		.NONDETERMINISM,
+		.LANG_FAIL,
+		.WORKFLOW_EXECUTION_ENDING,
+	}
+	for reason, index in reasons {
+		run_id := fmt.aprintf("semantic-eviction-%d", index)
+		eviction := workflow_isolate_test_eviction(run_id, reason)
+		processed := workflow_isolate.manager_process_activation(&manager, eviction[:])
+		delete(eviction)
+		delete(run_id)
+		testing.expect(t, processed.evicted)
+		testing.expect(t, !processed.activation_failed)
+		delete(processed.completion)
+		workflow.error_free(&processed.error)
+	}
+
+	stats := workflow_isolate.manager_stats(&manager)
+	testing.expect_value(t, stats.evictions, 3)
+	testing.expect_value(t, stats.nondeterminism_evictions, 1)
+	testing.expect_value(t, stats.language_failure_evictions, 1)
+	testing.expect_value(t, stats.workflow_ending_evictions, 1)
 }
 
 @(test)
@@ -549,6 +588,34 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 	testing.expect(t, route.is_replaying)
 	testing.expect_value(t, route.history_length, u32(27))
 	testing.expect_value(t, route.job_count, 1)
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{
+		reason = .NONDETERMINISM,
+		message = "incompatible timer command",
+	}
+	eviction_activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "route-run",
+	}
+	defer delete(eviction_activation.jobs)
+	append(&eviction_activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+			value = &eviction,
+		},
+	})
+	encoded_eviction := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(
+		&eviction_activation,
+	)
+	defer delete(encoded_eviction)
+	eviction_route, eviction_ok := workflow_isolate.decode_activation_route(
+		encoded_eviction[:],
+	)
+	testing.expect(t, eviction_ok)
+	testing.expect(t, eviction_route.evicts)
+	testing.expect_value(
+		t,
+		eviction_route.eviction_reason,
+		proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason.NONDETERMINISM,
+	)
 }
 
 Workflow_Host_Hook_Test_State :: struct {

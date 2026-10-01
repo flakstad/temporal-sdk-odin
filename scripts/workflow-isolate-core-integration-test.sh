@@ -74,7 +74,7 @@ if [[ "$workflow_metric_count" != "2" ]]; then
   exit 1
 fi
 grep -q 'Core registry isolation completed' <<<"$output"
-grep -q 'registry_types=2' <<<"$output"
+grep -q 'registry_types=3' <<<"$output"
 grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"
 grep -q 'farewell="Goodbye from the shared registry, Odin"' <<<"$output"
 grep -q "first_mode=$first_mode" <<<"$output"

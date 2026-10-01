@@ -29,6 +29,8 @@ Observation_Stats :: struct {
 }
 
 observations: Observation_Stats
+nondeterminism_seed_worker: ^worker.Worker
+nondeterminism_seed_timer_seen: bool
 
 observe_activation :: proc(processed: ^workflow.Process_Result) {
 	if processed == nil || !processed.started_timer {
@@ -39,6 +41,10 @@ observe_activation :: proc(processed: ^workflow.Process_Result) {
 		return
 	}
 	observations.timer_commands_with_sequence += 1
+	if nondeterminism_seed_worker != nil && !nondeterminism_seed_timer_seen {
+		nondeterminism_seed_timer_seen = true
+		worker.worker_initiate_shutdown(nondeterminism_seed_worker)
+	}
 }
 
 observe_diagnostic :: proc(_: rawptr, event: workflow_isolate.Diagnostic_Event_View) {
@@ -94,7 +100,50 @@ start_when_ready :: proc(user_data: rawptr) -> bool {
 	return state.farewell_error.message == nil
 }
 
+Nondeterminism_Start_State :: struct {
+	client:     ^temporal_client.Client,
+	workflow_id: string,
+	task_queue: string,
+	handle:     temporal_client.Workflow_Handle,
+	error:      temporal_client.Error,
+}
+
+start_nondeterminism_seed_when_ready :: proc(user_data: rawptr) -> bool {
+	state := cast(^Nondeterminism_Start_State)user_data
+	state.handle, state.error = temporal_client.start_workflow_json(
+		state.client,
+		workflow_app.NONDETERMINISM_WORKFLOW_TYPE,
+		"Odin",
+		{
+			id = state.workflow_id,
+			task_queue = state.task_queue,
+			workflow_execution_timeout = 2 * time.Hour,
+			workflow_run_timeout = 2 * time.Hour,
+			workflow_task_timeout = 10 * time.Second,
+		},
+	)
+	return state.error.message == nil
+}
+
+nondeterminism_replay_ready :: proc(_: rawptr) -> bool {
+	fmt.println("Nondeterminism replay Worker is polling")
+	return true
+}
+
 run :: proc() -> int {
+	scenario_buffer: [128]u8
+	scenario := os.get_env(
+		scenario_buffer[:],
+		"TEMPORAL_ODIN_ISOLATE_SCENARIO",
+	)
+	if len(scenario) == 0 {
+		scenario = "standard"
+	}
+	if scenario != "standard" && scenario != "nondeterminism-seed" &&
+	   scenario != "nondeterminism-fail" {
+		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_SCENARIO: %s\n", scenario)
+		return 1
+	}
 	child_buffer: [1024]u8
 	child_command := os.get_env(child_buffer[:], "TEMPORAL_ODIN_ISOLATE_CHILD_COMMAND")
 	if len(child_command) == 0 {
@@ -158,6 +207,11 @@ run :: proc() -> int {
 		return 1
 	}
 	worker_options.workflow_task_poller_behavior = worker.poller_simple_maximum(2)
+	if scenario == "nondeterminism-fail" {
+		worker_options.nondeterminism_policy = {
+			fail_workflow_types = []string{workflow_app.NONDETERMINISM_WORKFLOW_TYPE},
+		}
+	}
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
 		worker_options,
@@ -186,6 +240,11 @@ run :: proc() -> int {
 	)
 	if len(first_mode) == 0 {
 		first_mode = "crash"
+	}
+	if scenario == "nondeterminism-seed" {
+		first_mode = "normal"
+	} else if scenario == "nondeterminism-fail" {
+		first_mode = "nondeterministic"
 	}
 	first_argument := "--child-crash"
 	expected_child_exits := 1
@@ -225,6 +284,10 @@ run :: proc() -> int {
 		first_argument = "--child"
 		expected_child_exits = 0
 		expected_activation_failures = 0
+	case "nondeterministic":
+		first_argument = "--child-nondeterministic"
+		expected_child_exits = 0
+		expected_activation_failures = 0
 	case:
 		fmt.eprintf("Unsupported TEMPORAL_ODIN_ISOLATE_FIRST_MODE: %s\n", first_mode)
 		return 1
@@ -255,6 +318,106 @@ run :: proc() -> int {
 		fmt.eprintf("Workflow executor manifest verification failed: %s\n", string(verify_error.message))
 		workflow_isolate.manager_error_free(&verify_error)
 		return 1
+	}
+
+	if scenario == "nondeterminism-seed" {
+		seed := Nondeterminism_Start_State{
+			client = &client,
+			workflow_id = greeting_id,
+			task_queue = task_queue,
+		}
+		nondeterminism_seed_worker = &sdk_worker
+		run_stats, run_error := worker.run(&sdk_worker, {
+			workflow_activation_processor = workflow_isolate.manager_process_activation,
+			workflow_activation_processor_data = &executor_manager,
+			on_workflow_activation = observe_activation,
+			on_ready = start_nondeterminism_seed_when_ready,
+			on_ready_data = &seed,
+		})
+		nondeterminism_seed_worker = nil
+		if seed.error.message != nil {
+			fmt.eprintf(
+				"Nondeterminism seed Workflow start failed: %s\n",
+				string(seed.error.message),
+			)
+			temporal_client.error_free(&seed.error)
+			worker.error_free(&run_error)
+			return 1
+		}
+		defer temporal_client.workflow_handle_free(&seed.handle)
+		if run_error.message != nil {
+			fmt.eprintf("Nondeterminism seed Worker failed: %s\n", string(run_error.message))
+			worker.error_free(&run_error)
+			return 1
+		}
+		manager_stats := workflow_isolate.manager_stats(&executor_manager)
+		if !nondeterminism_seed_timer_seen ||
+		   observations.timer_commands_with_sequence != 1 ||
+		   run_stats.workflow_executions_completed != 0 ||
+		   manager_stats.nondeterminism_evictions != 0 {
+			fmt.eprintf(
+				"Unexpected nondeterminism seed state timer_seen=%v timer_sequences=%d completed=%d nondeterminism_evictions=%d\n",
+				nondeterminism_seed_timer_seen,
+				observations.timer_commands_with_sequence,
+				run_stats.workflow_executions_completed,
+				manager_stats.nondeterminism_evictions,
+			)
+			return 1
+		}
+		fmt.printf(
+			"Nondeterminism seed recorded workflow_id=%s timer_sequences=%d generations=%d evictions=%d\n",
+			greeting_id,
+			observations.timer_commands_with_sequence,
+			manager_stats.generations_started,
+			manager_stats.evictions,
+		)
+		return 0
+	}
+
+	if scenario == "nondeterminism-fail" {
+		run_stats, run_error := worker.run(&sdk_worker, {
+			max_workflow_executions = 1,
+			workflow_activation_processor = workflow_isolate.manager_process_activation,
+			workflow_activation_processor_data = &executor_manager,
+			on_workflow_activation = observe_activation,
+			on_ready = nondeterminism_replay_ready,
+		})
+		if run_error.message != nil {
+			fmt.eprintf("Nondeterminism replay Worker failed: %s\n", string(run_error.message))
+			worker.error_free(&run_error)
+			return 1
+		}
+		manager_stats := workflow_isolate.manager_stats(&executor_manager)
+		if run_stats.workflow_executions_completed != 1 ||
+		   run_stats.workflow_replay_activations < 1 ||
+		   manager_stats.nondeterminism_evictions != 1 ||
+		   manager_stats.language_failure_evictions != 0 ||
+		   manager_stats.workflow_ending_evictions != 0 ||
+		   manager_stats.generations_started != 1 ||
+		   manager_stats.evictions != 1 ||
+		   workflow_isolate.manager_route_count(&executor_manager) != 0 {
+			fmt.eprintf(
+				"Unexpected isolated nondeterminism result completed=%d replay_activations=%d nondeterminism_evictions=%d language_failure_evictions=%d workflow_ending_evictions=%d generations=%d evictions=%d routes=%d\n",
+				run_stats.workflow_executions_completed,
+				run_stats.workflow_replay_activations,
+				manager_stats.nondeterminism_evictions,
+				manager_stats.language_failure_evictions,
+				manager_stats.workflow_ending_evictions,
+				manager_stats.generations_started,
+				manager_stats.evictions,
+				workflow_isolate.manager_route_count(&executor_manager),
+			)
+			return 1
+		}
+		fmt.printf(
+			"Core detected and converted isolated Workflow nondeterminism workflow_id=%s replay_activations=%d nondeterminism_evictions=%d generations=%d evictions=%d\n",
+			greeting_id,
+			run_stats.workflow_replay_activations,
+			manager_stats.nondeterminism_evictions,
+			manager_stats.generations_started,
+			manager_stats.evictions,
+		)
+		return 0
 	}
 
 	start := Start_State{

@@ -840,6 +840,20 @@ one failed Workflow activation, complete child reaping, and successful durable
 results from replacement generations. A stale response never shares a pipe or
 route with its replacement generation.
 
+Run a real history/command mismatch through the executor boundary with:
+
+```bash
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  ./scripts/workflow-isolate-nondeterminism-integration-test.sh
+```
+
+This first records a durable one-hour Timer using the ordinary child, then
+replays the same execution using an incompatible implementation behind the
+same type manifest. The sticky-cache replay must produce exactly one Core
+`NONDETERMINISM` eviction; the type-scoped Core policy must then fail the
+Workflow, and the CLI history must contain `[TMPRL1100]` or equivalent
+nondeterminism diagnostics.
+
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
 `register_external_workflow_registry` copies only the Workflow type-name
