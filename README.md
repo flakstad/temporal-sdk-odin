@@ -386,6 +386,28 @@ capability booleans are the Service's `GetSystemInfo` response, not SDK guesses
 based on version parsing. Run `./scripts/system-info-integration-test.sh`
 against `temporal server start-dev` for the focused live proof.
 
+Newer operations are represented separately by `Server_Feature`. The safe
+probe API combines the Odin SDK surface with either authoritative System Info
+evidence or a non-mutating RPC probe:
+
+```odin
+observed, err := temporal_client.probe_server_feature(
+    &client,
+    .Standalone_Nexus,
+)
+fmt.println(observed.sdk_implemented)
+fmt.println(observed.support) // Supported, Unsupported, or Unknown
+fmt.println(observed.evidence)
+```
+
+Only gRPC status 12/`UNIMPLEMENTED` is classified as `Unsupported`. Permission,
+namespace, authentication, and transport failures remain `Unknown` and are
+returned to the caller. A false System Info bit is also `Unknown`, because the
+feature may merely be disabled. The default probes never mutate server state;
+Workflow Pause therefore remains unknown, and standalone Activity reports
+`sdk_implemented=false` until the complete Start/Poll/Describe lifecycle is in
+the public Odin API. No result is inferred from a parsed server version.
+
 `activity.info(ctx)`
 now exposes the Core-delivered execution
 identity, timestamps/timeouts, effective Retry Policy, priority, interceptor

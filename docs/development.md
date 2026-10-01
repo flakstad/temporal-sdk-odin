@@ -2320,6 +2320,35 @@ Workflow, Query wrapping across Core's Query activation path, validator
 entry/exit around rejection and acceptance, and Signal/Update handler unwind
 after real Activity round trips.
 
+## Server feature inventory
+
+Run the live, non-mutating inventory against the Temporal CLI dev server:
+
+```bash
+temporal server start-dev --headless --log-level error
+./scripts/system-info-integration-test.sh
+```
+
+The example first reads all official `GetSystemInfo` fields and then prints one
+machine-readable row per higher-level feature. On the pinned CLI 1.5.1 / Server
+1.29.1 baseline, the important rows are:
+
+```text
+feature=schedules sdk=true support=supported evidence=get-system-info status=0
+feature=schedule-count sdk=true support=unsupported evidence=safe-rpc-probe status=12
+feature=nexus sdk=true support=supported evidence=get-system-info status=0
+feature=standalone-nexus sdk=true support=unsupported evidence=safe-rpc-probe status=12
+feature=workflow-pause sdk=true support=unknown evidence=none status=0
+feature=standalone-activity sdk=false support=unknown evidence=none status=0
+```
+
+The count probes are read-only. Do not turn a failed authentication, namespace,
+or connection attempt into a support decision: only RPC status 12 is classified
+as unsupported. Workflow Pause has no read-only equivalent and is intentionally
+not probed. Unit tests cover every evidence branch, while a 500-case PBT varies
+status and error kind to require that only an RPC `UNIMPLEMENTED` result becomes
+conclusive negative evidence.
+
 ## Troubleshooting
 
 - `library not found for -ltemporalio_sdk_core_c_bridge`: run

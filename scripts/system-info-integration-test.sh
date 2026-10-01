@@ -22,3 +22,15 @@ echo "$output"
 grep -Eq '^Temporal Server [^ ]+ capabilities:' <<<"$output"
 grep -q 'schedules=true' <<<"$output"
 grep -q 'System Info interceptor surrounded the live Core RPC' <<<"$output"
+grep -q '^feature=schedules sdk=true support=supported evidence=get-system-info status=0$' <<<"$output"
+grep -q '^feature=nexus sdk=true support=supported evidence=get-system-info status=0$' <<<"$output"
+grep -q '^feature=workflow-pause sdk=true support=unknown evidence=none status=0$' <<<"$output"
+grep -q '^feature=standalone-activity sdk=false support=unknown evidence=none status=0$' <<<"$output"
+
+if grep -q '^Temporal Server 1\.29\.1 capabilities:' <<<"$output"; then
+  grep -q '^feature=schedule-count sdk=true support=unsupported evidence=safe-rpc-probe status=12$' <<<"$output"
+  grep -q '^feature=standalone-nexus sdk=true support=unsupported evidence=safe-rpc-probe status=12$' <<<"$output"
+else
+  grep -Eq '^feature=schedule-count sdk=true support=(supported|unsupported) evidence=safe-rpc-probe status=(0|12)$' <<<"$output"
+  grep -Eq '^feature=standalone-nexus sdk=true support=(supported|unsupported) evidence=safe-rpc-probe status=(0|12)$' <<<"$output"
+fi

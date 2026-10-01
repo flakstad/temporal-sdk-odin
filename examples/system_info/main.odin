@@ -67,4 +67,34 @@ main :: proc() {
 		info.capabilities.sdk_metadata,
 	)
 	fmt.println("System Info interceptor surrounded the live Core RPC")
+
+	features := [?]temporal_client.Server_Feature{
+		.Schedules,
+		.Schedule_Count,
+		.Nexus,
+		.Standalone_Nexus,
+		.Workflow_Pause,
+		.Standalone_Activity,
+	}
+	for feature in features {
+		observation, probe_error := temporal_client.probe_server_feature(&client, feature)
+		if probe_error.message != nil {
+			fmt.eprintf(
+				"Feature probe %s failed (status=%d): %s\n",
+				temporal_client.server_feature_name(feature),
+				probe_error.status_code,
+				string(probe_error.message),
+			)
+			temporal_client.error_free(&probe_error)
+			os.exit(1)
+		}
+		fmt.printf(
+			"feature=%s sdk=%v support=%s evidence=%s status=%d\n",
+			temporal_client.server_feature_name(feature),
+			observation.sdk_implemented,
+			temporal_client.server_feature_support_name(observation.support),
+			temporal_client.server_feature_evidence_name(observation.evidence),
+			observation.status_code,
+		)
+	}
 }

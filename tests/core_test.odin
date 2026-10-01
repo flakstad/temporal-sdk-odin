@@ -10619,6 +10619,84 @@ client_system_info_decodes_owned_server_capabilities :: proc(t: ^testing.T) {
 }
 
 @(test)
+client_server_feature_model_separates_sdk_surface_and_server_evidence :: proc(t: ^testing.T) {
+	capabilities := temporal_client.System_Capabilities{
+		supports_schedules = true,
+		nexus = false,
+	}
+	schedules := temporal_client.server_feature_from_system_info(
+		.Schedules,
+		capabilities,
+	)
+	testing.expect_value(t, schedules.feature, temporal_client.Server_Feature.Schedules)
+	testing.expect(t, schedules.sdk_implemented)
+	testing.expect_value(t, schedules.support, temporal_client.Server_Feature_Support.Supported)
+	testing.expect_value(t, schedules.evidence, temporal_client.Server_Feature_Evidence.Get_System_Info)
+
+	// A false advertised bit is not strong enough evidence for Unsupported.
+	nexus := temporal_client.server_feature_from_system_info(.Nexus, capabilities)
+	testing.expect(t, nexus.sdk_implemented)
+	testing.expect_value(t, nexus.support, temporal_client.Server_Feature_Support.Unknown)
+	testing.expect_value(t, nexus.evidence, temporal_client.Server_Feature_Evidence.Get_System_Info)
+
+	// Experimental APIs without a bit remain unobserved even when passed the
+	// same System Info response.
+	pause := temporal_client.server_feature_from_system_info(.Workflow_Pause, capabilities)
+	testing.expect(t, pause.sdk_implemented)
+	testing.expect_value(t, pause.support, temporal_client.Server_Feature_Support.Unknown)
+	testing.expect_value(t, pause.evidence, temporal_client.Server_Feature_Evidence.None)
+
+	standalone_activity := temporal_client.server_feature_from_system_info(
+		.Standalone_Activity,
+		capabilities,
+	)
+	testing.expect(t, !standalone_activity.sdk_implemented)
+	testing.expect_value(t, standalone_activity.support, temporal_client.Server_Feature_Support.Unknown)
+	testing.expect_value(t, temporal_client.server_feature_name(.Standalone_Activity), "standalone-activity")
+}
+
+@(test)
+client_server_feature_rpc_probe_classifies_only_unimplemented_as_unsupported :: proc(t: ^testing.T) {
+	success := temporal_client.server_feature_from_rpc_error(.Schedule_Count, nil)
+	testing.expect(t, success.sdk_implemented)
+	testing.expect_value(t, success.support, temporal_client.Server_Feature_Support.Supported)
+	testing.expect_value(t, success.evidence, temporal_client.Server_Feature_Evidence.Safe_Rpc_Probe)
+	testing.expect_value(t, success.status_code, u32(0))
+
+	unimplemented_error := temporal_client.Error{
+		kind = .Rpc,
+		message = transmute([]u8)string("unimplemented"),
+		status_code = temporal_client.GRPC_STATUS_UNIMPLEMENTED,
+	}
+	unimplemented := temporal_client.server_feature_from_rpc_error(
+		.Standalone_Nexus,
+		&unimplemented_error,
+	)
+	testing.expect_value(t, unimplemented.support, temporal_client.Server_Feature_Support.Unsupported)
+	testing.expect_value(t, unimplemented.status_code, u32(12))
+
+	permission_error := temporal_client.Error{
+		kind = .Rpc,
+		message = transmute([]u8)string("permission denied"),
+		status_code = 7,
+	}
+	inconclusive := temporal_client.server_feature_from_rpc_error(
+		.Standalone_Nexus,
+		&permission_error,
+	)
+	testing.expect_value(t, inconclusive.support, temporal_client.Server_Feature_Support.Unknown)
+	testing.expect_value(t, inconclusive.status_code, u32(7))
+
+	local_error := temporal_client.Error{
+		kind = .Invalid_Argument,
+		message = transmute([]u8)string("invalid"),
+		status_code = 12,
+	}
+	local_failure := temporal_client.server_feature_from_rpc_error(.Schedule_Count, &local_error)
+	testing.expect_value(t, local_failure.support, temporal_client.Server_Feature_Support.Unknown)
+}
+
+@(test)
 client_system_info_interceptors_nest_and_can_short_circuit :: proc(t: ^testing.T) {
 	state := Client_Interceptor_Test_State{}
 	first := Client_Interceptor_Test_Node{state = &state, id = 1}

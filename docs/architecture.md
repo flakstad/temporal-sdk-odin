@@ -3037,8 +3037,11 @@ Workflows are enabled.
    Workflow Pause/Unpause are live-proven. Query reject conditions and static
    summary/details, query headers, and eager Workflow start are now wire- and
    live-proven. The public Client now exposes the Server's official thirteen
-   `GetSystemInfo` capability bits, but a maintained supported-server matrix is
-   still needed for newer Schedule and experimental APIs that have no bit.
+   `GetSystemInfo` capability bits. `Server_Feature_Observation` now separates
+   whether the Odin API is implemented from tri-state server support and its
+   evidence source. Safe non-mutating probes cover `CountSchedules` and
+   standalone Nexus Visibility; only RPC `UNIMPLEMENTED` is conclusive
+   negative evidence. Experimental mutating APIs without a bit remain unknown.
    `CountSchedules` is not implemented by the current CLI dev Server 1.29.1
    despite being present in the pinned upstream protobuf schema. Start headers,
    memo, and typed Search Attributes are implemented through an explicitly owned
@@ -3116,11 +3119,31 @@ it as an operator/CLI concern, and exposing a destructive call needs explicit
 chain/run targeting and safety semantics. Activity-only process
 crash/replacement is now live-proven with a real panic, Start-To-Close timeout,
 retry, and replacement Odin worker. The next higher-value hardening slice is a
-maintained client/server capability matrix for newer Schedule, Nexus,
-standalone Activity, and Pause APIs, followed by guard-page/growable Workflow
-stacks and an explicit uncooperative-callback shutdown policy.
+guard-page/growable Workflow stack experiment and an explicit
+uncooperative-callback shutdown policy. The capability inventory is now a
+public, tested runtime model plus the maintained evidence table below; it must
+grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
 extensively live-tested.
+
+### Maintained client/server capability evidence
+
+This table records observed behavior; it is not a version-number heuristic in
+the runtime. `probe_server_feature` asks the connected Service directly wherever
+a non-mutating probe exists.
+
+| Feature | Odin surface | Discovery | CLI 1.5.1 / Server 1.29.1 | Server 1.32 evidence |
+| --- | --- | --- | --- | --- |
+| Schedules | Implemented | `GetSystemInfo.supports_schedules` | Advertised and lifecycle live-proven | Not separately regressed |
+| `CountSchedules` | Implemented | Safe count RPC | gRPC 12 `UNIMPLEMENTED` | Not yet recorded |
+| Nexus from Workflows | Implemented | `GetSystemInfo.nexus` | Advertised and live-proven | Live suite exposed a timeout behavior change still under classification |
+| Standalone Nexus | Implemented | Safe count RPC | gRPC 12 `UNIMPLEMENTED` | Live-proven on 1.32.0 when `nexusoperation.enableStandalone=true` |
+| Workflow Pause/Unpause | Implemented | No safe probe or System Info bit | Unknown; no mutation is attempted | Live-proven on 1.32.0 |
+| Standalone Activity lifecycle | Not implemented | None | Server start RPC observed as `UNIMPLEMENTED` in earlier spike | Unknown |
+
+The matrix deliberately distinguishes “SDK surface absent”, “server said
+UNIMPLEMENTED”, and “not safely observed”. Authentication or namespace errors
+never become unsupported-feature claims.
 
 The selector/join branch, async
 cancel-token handoff, and terminal-result idempotence are unit-, live-, replay-,
