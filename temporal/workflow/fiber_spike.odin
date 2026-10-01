@@ -399,6 +399,25 @@ Parent_Close_Policy :: enum {
 	Request_Cancel,
 }
 
+Workflow_Id_Reuse_Policy :: enum {
+	Unspecified,
+	Allow_Duplicate,
+	Allow_Duplicate_Failed_Only,
+	Reject_Duplicate,
+	Terminate_If_Running,
+}
+
+Versioning_Intent :: enum {
+	Unspecified,
+	Compatible,
+	Default,
+}
+
+// Child_Workflow_Options borrows all strings, maps, retry policy, and priority
+// only for the start call. Empty task_queue uses the parent's task queue. Nil
+// memo/search_attributes create no values; an initialized empty map is
+// equivalent because a new Child Workflow has no inherited values. Empty
+// static summary/details omit Temporal UserMetadata.
 Child_Workflow_Options :: struct {
 	workflow_id:               string,
 	task_queue:                string,
@@ -408,7 +427,15 @@ Child_Workflow_Options :: struct {
 	retry_policy:              ^Retry_Policy,
 	cancellation_type:         Child_Workflow_Cancellation_Type,
 	parent_close_policy:       Parent_Close_Policy,
+	id_reuse_policy:           Workflow_Id_Reuse_Policy,
+	cron_schedule:             string,
 	headers:                   ^Headers,
+	memo:                      ^Payload_Map,
+	search_attributes:         ^Payload_Map,
+	versioning_intent:         Versioning_Intent,
+	priority:                  ^Workflow_Priority,
+	static_summary:            string,
+	static_details:            string,
 }
 
 Owned_Child_Workflow_Options :: struct {
@@ -420,7 +447,19 @@ Owned_Child_Workflow_Options :: struct {
 	has_retry_policy:          bool,
 	cancellation_type:         Child_Workflow_Cancellation_Type,
 	parent_close_policy:       Parent_Close_Policy,
+	id_reuse_policy:           Workflow_Id_Reuse_Policy,
+	cron_schedule:             string,
 	headers:                   [dynamic]Fiber_Named_Payload,
+	memo:                      [dynamic]Fiber_Named_Payload,
+	search_attributes:         [dynamic]Fiber_Named_Payload,
+	has_search_attributes:     bool,
+	versioning_intent:         Versioning_Intent,
+	priority:                  Workflow_Priority,
+	has_priority:              bool,
+	static_summary:            codec.Payload,
+	has_static_summary:        bool,
+	static_details:            codec.Payload,
+	has_static_details:        bool,
 }
 
 Retry_Policy :: struct {
@@ -643,11 +682,7 @@ Owned_Local_Activity_Options :: struct {
 	headers:                   [dynamic]Fiber_Named_Payload,
 }
 
-Continue_As_New_Versioning_Intent :: enum {
-	Unspecified,
-	Compatible,
-	Default,
-}
+Continue_As_New_Versioning_Intent :: Versioning_Intent
 
 Continue_As_New_Versioning_Behavior :: enum {
 	Unspecified,
@@ -6349,9 +6384,41 @@ child_workflow_options_error :: proc(
 		   (policy.backoff_coefficient != 0 && policy.backoff_coefficient < 1) {
 			return "Child Workflow Retry Policy backoff coefficient must be zero or at least one"
 		}
+		if policy.maximum_interval > 0 && policy.initial_interval > 0 &&
+		   policy.maximum_interval < policy.initial_interval {
+			return "Child Workflow Retry Policy maximum interval must not be shorter than its initial interval"
+		}
 	}
 	if options.headers != nil && options.headers.allocator.procedure == nil {
 		return "Child Workflow headers are not initialized"
+	}
+	if options.memo != nil && options.memo.allocator.procedure == nil {
+		return "Child Workflow memo is not initialized"
+	}
+	if options.search_attributes != nil &&
+	   options.search_attributes.allocator.procedure == nil {
+		return "Child Workflow Search Attributes are not initialized"
+	}
+	if int(options.id_reuse_policy) < int(Workflow_Id_Reuse_Policy.Unspecified) ||
+	   int(options.id_reuse_policy) > int(Workflow_Id_Reuse_Policy.Terminate_If_Running) {
+		return "Child Workflow ID reuse policy is invalid"
+	}
+	if int(options.versioning_intent) < int(Versioning_Intent.Unspecified) ||
+	   int(options.versioning_intent) > int(Versioning_Intent.Default) {
+		return "Child Workflow versioning intent is invalid"
+	}
+	if options.priority != nil {
+		priority := options.priority
+		if priority.priority_key < 0 {
+			return "Child Workflow priority key must not be negative"
+		}
+		if len(priority.fairness_key) > 64 {
+			return "Child Workflow priority fairness key must not exceed 64 bytes"
+		}
+		if math.is_nan(priority.fairness_weight) || math.is_inf(priority.fairness_weight) ||
+		   priority.fairness_weight < 0 {
+			return "Child Workflow priority fairness weight must be finite and non-negative"
+		}
 	}
 	return ""
 }
@@ -6372,8 +6439,56 @@ clone_child_workflow_options :: proc(
 	owned.workflow_task_timeout = options.workflow_task_timeout
 	owned.cancellation_type = options.cancellation_type
 	owned.parent_close_policy = options.parent_close_policy
+	owned.id_reuse_policy = options.id_reuse_policy
+	owned.versioning_intent = options.versioning_intent
+	if len(options.cron_schedule) > 0 {
+		owned.cron_schedule, _ = strings.clone(options.cron_schedule, allocator)
+		if owned.cron_schedule == "" {
+			return {}, false
+		}
+	}
 	if !clone_workflow_headers(options.headers, &owned.headers, allocator) {
 		return {}, false
+	}
+	if !clone_workflow_payload_map(options.memo, &owned.memo, allocator) {
+		return {}, false
+	}
+	owned.has_search_attributes = options.search_attributes != nil
+	if !clone_workflow_payload_map(
+		options.search_attributes,
+		&owned.search_attributes,
+		allocator,
+	) {
+		return {}, false
+	}
+	if options.priority != nil {
+		owned.has_priority = true
+		owned.priority = options.priority^
+		if len(options.priority.fairness_key) > 0 {
+			owned.priority.fairness_key, _ = strings.clone(
+				options.priority.fairness_key,
+				allocator,
+			)
+			if owned.priority.fairness_key == "" {
+				return {}, false
+			}
+		}
+	}
+	owned.has_static_summary = len(options.static_summary) > 0
+	if owned.has_static_summary {
+		encode_error: codec.Error
+		owned.static_summary, encode_error = codec.encode_json(options.static_summary, allocator)
+		if encode_error != .None {
+			return {}, false
+		}
+	}
+	owned.has_static_details = len(options.static_details) > 0
+	if owned.has_static_details {
+		encode_error: codec.Error
+		owned.static_details, encode_error = codec.encode_json(options.static_details, allocator)
+		if encode_error != .None {
+			return {}, false
+		}
 	}
 	if options.retry_policy != nil {
 		owned.has_retry_policy = true
@@ -9451,6 +9566,24 @@ parent_close_policy_to_proto :: proc(
 	return .PARENT_CLOSE_POLICY_UNSPECIFIED
 }
 
+workflow_id_reuse_policy_to_proto :: proc(
+	policy: Workflow_Id_Reuse_Policy,
+) -> proto.Temporal_Api_Enums_V1_WorkflowIdReusePolicy {
+	switch policy {
+	case .Allow_Duplicate_Failed_Only:
+		return .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
+	case .Reject_Duplicate:
+		return .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+	case .Terminate_If_Running:
+		return .WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING
+	case .Unspecified, .Allow_Duplicate:
+		// Language SDKs normalize their zero-value option to Temporal's
+		// documented Child Workflow default before crossing into Core.
+		return .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE
+	}
+	return .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE
+}
+
 retry_policy_to_proto :: proc(
 	policy: ^Retry_Policy,
 ) -> ^proto.Temporal_Api_Common_V1_RetryPolicy {
@@ -9468,8 +9601,8 @@ retry_policy_to_proto :: proc(
 	return result
 }
 
-continue_as_new_versioning_intent_to_proto :: proc(
-	value: Continue_As_New_Versioning_Intent,
+versioning_intent_to_proto :: proc(
+	value: Versioning_Intent,
 ) -> proto.Coresdk_Common_VersioningIntent {
 	switch value {
 	case .Compatible: return .COMPATIBLE
@@ -9477,6 +9610,12 @@ continue_as_new_versioning_intent_to_proto :: proc(
 	case .Unspecified:
 	}
 	return .UNSPECIFIED
+}
+
+continue_as_new_versioning_intent_to_proto :: proc(
+	value: Continue_As_New_Versioning_Intent,
+) -> proto.Coresdk_Common_VersioningIntent {
+	return versioning_intent_to_proto(value)
 }
 
 continue_as_new_versioning_behavior_to_proto :: proc(
@@ -9516,8 +9655,21 @@ append_fiber_start_child_workflow_command :: proc(
 		workflow_run_timeout = duration_to_proto(operation.options.workflow_run_timeout),
 		workflow_task_timeout = duration_to_proto(operation.options.workflow_task_timeout),
 		parent_close_policy = parent_close_policy_to_proto(operation.options.parent_close_policy),
+		workflow_id_reuse_policy = workflow_id_reuse_policy_to_proto(
+			operation.options.id_reuse_policy,
+		),
 		retry_policy = retry_policy,
+		cron_schedule = operation.options.cron_schedule,
 		cancellation_type = child_workflow_cancellation_type_to_proto(operation.options.cancellation_type),
+		versioning_intent = versioning_intent_to_proto(operation.options.versioning_intent),
+	}
+	if operation.options.has_priority {
+		start.priority = new(proto.Temporal_Api_Common_V1_Priority)
+		start.priority^ = {
+			priority_key = operation.options.priority.priority_key,
+			fairness_key = operation.options.priority.fairness_key,
+			fairness_weight = operation.options.priority.fairness_weight,
+		}
 	}
 	for &entry in operation.options.headers {
 		header_payload := new(proto.Temporal_Api_Common_V1_Payload)
@@ -9530,16 +9682,58 @@ append_fiber_start_child_workflow_command :: proc(
 			},
 		)
 	}
+	for &entry in operation.options.memo {
+		memo_payload := new(proto.Temporal_Api_Common_V1_Payload)
+		memo_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+		append(
+			&start.memo,
+			proto.Coresdk_Workflow_Commands_StartChildWorkflowExecution_MemoEntry{
+				key = entry.key,
+				value = memo_payload,
+			},
+		)
+	}
+	if operation.options.has_search_attributes {
+		start.search_attributes = new(proto.Temporal_Api_Common_V1_SearchAttributes)
+		for &entry in operation.options.search_attributes {
+			attribute_payload := new(proto.Temporal_Api_Common_V1_Payload)
+			attribute_payload^ = proto.encode_payload(codec.payload_view(&entry.payload))
+			append(
+				&start.search_attributes.indexed_fields,
+				proto.Temporal_Api_Common_V1_SearchAttributes_IndexedFieldsEntry{
+					key = entry.key,
+					value = attribute_payload,
+				},
+			)
+		}
+	}
 	for &input in operation.inputs {
 		append(&start.input, proto.encode_payload(codec.payload_view(&input)))
 	}
+	command := proto.Coresdk_Workflow_Commands_WorkflowCommand{
+		variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Child_Workflow_Execution{
+			value = start,
+		},
+	}
+	if operation.options.has_static_summary || operation.options.has_static_details {
+		metadata := new(proto.Temporal_Api_Sdk_V1_UserMetadata)
+		if operation.options.has_static_summary {
+			metadata.summary = new(proto.Temporal_Api_Common_V1_Payload)
+			metadata.summary^ = proto.encode_payload(
+				codec.payload_view(&operation.options.static_summary),
+			)
+		}
+		if operation.options.has_static_details {
+			metadata.details = new(proto.Temporal_Api_Common_V1_Payload)
+			metadata.details^ = proto.encode_payload(
+				codec.payload_view(&operation.options.static_details),
+			)
+		}
+		command.user_metadata = metadata
+	}
 	append(
 		commands,
-		proto.Coresdk_Workflow_Commands_WorkflowCommand{
-			variant = proto.Coresdk_Workflow_Commands_WorkflowCommand_Variant_Start_Child_Workflow_Execution{
-				value = start,
-			},
-		},
+		command,
 	)
 	operation.command_state = .Commanded
 	result.started_child_workflow = true

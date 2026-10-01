@@ -2451,6 +2451,30 @@ child_output="$(<"$workflow_output_file")"
 echo "$child_output"
 grep -q '"status": "COMPLETED"' <<<"$child_output"
 grep -q "Hello from child, $child_input" <<<"$child_output"
+temporal workflow show \
+  --workflow-id "$child_parent_id" \
+  --command-timeout 10s \
+  --output json >"$typed_history_file"
+jq -e '
+  [.events[]
+    | select(.eventType == "EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED")
+    | select(
+        .startChildWorkflowExecutionInitiatedEventAttributes.workflowIdReusePolicy ==
+          "WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE" and
+        .startChildWorkflowExecutionInitiatedEventAttributes.priority.priorityKey == 4 and
+        .startChildWorkflowExecutionInitiatedEventAttributes.priority.fairnessKey ==
+          "odin-child-fairness" and
+        .startChildWorkflowExecutionInitiatedEventAttributes.priority.fairnessWeight == 1.5 and
+        (.startChildWorkflowExecutionInitiatedEventAttributes.memo.fields["odin-child-memo"].data |
+          @base64d | fromjson) == "child-options" and
+        (.startChildWorkflowExecutionInitiatedEventAttributes.searchAttributes.indexedFields.OdinSdkKeyword.data |
+          @base64d | fromjson) == "child-options" and
+        (.userMetadata.summary.data | @base64d | fromjson) == "Odin Child Workflow" and
+        (.userMetadata.details.data | @base64d | fromjson) ==
+          "Started by the Odin SDK Child Workflow integration example"
+      )]
+  | length == 1
+' "$typed_history_file" >/dev/null
 
 wait "$worker_pid"
 worker_pid=""

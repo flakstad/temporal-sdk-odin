@@ -1371,6 +1371,65 @@ child_workflow_start_completion_and_fresh_stack_replay :: proc(t: ^testing.T) {
 }
 
 @(test)
+child_workflow_invalid_priority_fails_with_options_error :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"child_invalid_options_test_workflow",
+		"child-options-task-queue",
+		child_invalid_options_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input, input_error := codec.encode_json("invalid")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	proto_input := proto.encode_payload(codec.payload_view(&input))
+	defer delete(proto_input.metadata)
+	defer delete(proto_input.external_payloads)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "child_invalid_options_test_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, proto_input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "child-invalid-options-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	defer {
+		delete(processed.completion)
+		workflow.error_free(&processed.error)
+	}
+	testing.expectf(
+		t,
+		processed.error.message == nil,
+		"invalid Child Workflow option handling failed: %s",
+		string(processed.error.message),
+	)
+	testing.expect(t, processed.completed)
+	inspection := inspect_workflow_failure_command(processed.completion[:])
+	defer {
+		delete(inspection.message)
+		delete(inspection.failure_type)
+	}
+	testing.expect(t, inspection.found)
+	testing.expect_value(t, string(inspection.failure_type), "OdinChildWorkflowOptionsError")
+	testing.expect_value(t, string(inspection.message), "Child Workflow priority key must not be negative")
+}
+
+@(test)
 child_workflow_cancellation_requests_core_and_waits_for_start_resolution :: proc(t: ^testing.T) {
 	runtime := workflow.Fiber_Runtime{}
 	init_error := workflow.fiber_runtime_init(
@@ -5957,6 +6016,24 @@ child_parent_test_workflow :: proc(ctx: ^workflow.Fiber_Context, input: string) 
 		},
 	)
 	return workflow.await_child_workflow_result(ctx, future).value
+}
+
+child_invalid_options_test_workflow :: proc(
+	ctx: ^workflow.Fiber_Context,
+	input: string,
+) -> string {
+	priority := workflow.Workflow_Priority{priority_key = -1}
+	_ = workflow.start_child_workflow_json(
+		ctx,
+		"child_invalid_options_workflow",
+		input,
+		{
+			workflow_id = "child-invalid-options-id",
+			workflow_execution_timeout = time.Minute,
+			priority = &priority,
+		},
+	)
+	return "invalid Child Workflow options unexpectedly returned"
 }
 
 child_handle_signal_cancel_test_workflow :: proc(

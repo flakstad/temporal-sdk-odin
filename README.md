@@ -129,10 +129,23 @@ child failures preserve Core's original Temporal Failure wrapper and cause
 chain when the parent fails. `start_child_workflow_payloads` preserves Core's
 repeated input field, including order, metadata, and external payload details;
 the singular Payload and typed JSON helpers are one-argument adapters. The
+start options now cover the language-SDK surface carried by the pinned Core
+command: task queue, execution/run/task timeouts, Retry Policy, cancellation
+and Parent Close policies, Workflow ID reuse, cron, headers, memo, typed Search
+Attributes, versioning intent, priority, and UI-facing static summary/details.
+Borrowed strings, maps, policies, priority, and metadata are copied into the
+Workflow run arena before suspension. The zero-value ID-reuse option is
+normalized to Temporal's `AllowDuplicate` Child Workflow default. Child
+Workflows remain in the parent's namespace, matching the other Core-based
+language SDKs; arbitrary cross-namespace operations use external Workflow
+handles instead. The
 CLI-devserver suite proves successful child
 completion, a caught server-generated child failure, duplicate-ID start failure,
 parent cancellation that waits for child cancellation before closing, and a
 three-argument parent-to-child call handled by a codec-neutral child registration.
+It also reads the parent history and verifies Child Workflow memo, typed Search
+Attributes, priority, ID-reuse policy, and static metadata as stored by the
+Temporal Service.
 Workflow code can also signal and request cancellation of arbitrary external
 Workflow executions by namespace/Workflow ID/optional Run ID, suspending until
 Core resolves each outbound operation. The live suite proves this against two

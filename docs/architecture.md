@@ -3387,8 +3387,11 @@ messages:
 
 - Odin emits `StartChildWorkflowExecution`, including one language-assigned
   `seq`, explicit Workflow ID/type, task queue, an ordered repeated input
-  Payload field, timeouts, Retry
-  Policy, Parent Close Policy, and Child Cancellation Type.
+  Payload field, timeouts, Retry Policy, Parent Close Policy, Child
+  Cancellation Type, Workflow ID reuse, cron schedule, headers, memo, typed
+  Search Attributes, versioning intent, and priority. Static summary/details
+  travel on the enclosing `WorkflowCommand.user_metadata`, not on the start
+  message itself.
 - Core later emits `ResolveChildWorkflowExecutionStart(seq, status)`. Success
   carries the child Run ID; failure carries Workflow ID/type and
   `WorkflowAlreadyExists`; cancellation carries a Failure.
@@ -3410,13 +3413,26 @@ the second. A completion delivered in the same activation as the start
 resolution is retained before either fiber resume, so activation ordering does
 not lose it.
 
-Owned Workflow ID/type/options/input Payloads, Run ID, output Payload, structured failure
-fields/details, and original encoded Failure bytes live in the Workflow instance
-arena. Activation decode values remain borrowed only for that callback and are
-cloned before the decode arena is destroyed.
+Owned Workflow ID/type/options/input Payloads, option strings, map keys and
+Payloads, Retry Policy strings, priority fairness key, encoded static metadata,
+Run ID, output Payload, structured failure fields/details, and original encoded
+Failure bytes live in the Workflow instance arena. Public options borrow their
+inputs only until the start call returns. Activation decode values remain
+borrowed only for that callback and are cloned before the decode arena is
+destroyed.
 Eviction destroys the entire operation table; replay recreates it by rerunning
 deterministic Odin code. The offline acceptance test evicts immediately after
 the start command and requires a byte-identical command from a fresh stack.
+
+The raw Core message retains a `namespace` string, but current TypeScript,
+Python, .NET, and Rust language surfaces do not offer cross-namespace Child
+Workflow starts. Odin therefore leaves it at Core's same-namespace default
+instead of exposing a misleading option. Cross-namespace signal/cancel remains
+available through `External_Workflow_Execution`. The zero-value Odin
+`Workflow_Id_Reuse_Policy` is normalized to `ALLOW_DUPLICATE`, matching Core's
+documented Child Workflow default and the normalization performed by upstream
+language runtimes. Nil and initialized-empty memo/Search Attribute maps both
+mean no starting values because a new child has no inherited map state.
 
 `start_child_workflow_payloads` is the codec-neutral public boundary. Its
 borrowed slice, Payload bytes, metadata entries, and external payload details

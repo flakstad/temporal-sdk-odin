@@ -2529,6 +2529,8 @@ Generated_Child_Options_Input :: struct {
 	workflow_id:          string,
 	task_queue:           string,
 	header_value:         string,
+	memo_value:           string,
+	search_value:         string,
 	argument_count:       int,
 	argument_prefix:      string,
 	execution_timeout_ms: int,
@@ -2539,6 +2541,14 @@ Generated_Child_Options_Input :: struct {
 	retry_attempts:       int,
 	cancellation_type:    int,
 	parent_close_policy:  int,
+	id_reuse_policy:      int,
+	cron_schedule:        string,
+	versioning_intent:    int,
+	priority_key:         int,
+	fairness_key:         string,
+	fairness_weight_quarters: int,
+	static_summary:       string,
+	static_details:       string,
 	signal_name:          string,
 	signal_value:         string,
 }
@@ -2553,6 +2563,21 @@ generated_child_options_workflow :: proc(
 	}
 	defer workflow.headers_free(&headers)
 	if !workflow.headers_add_json(&headers, "property-header", input.header_value) {
+		return ""
+	}
+	memo := workflow.Payload_Map{}
+	if !workflow.payload_map_init(&memo) ||
+	   !workflow.payload_map_add_json(&memo, "property-memo", input.memo_value) {
+		return ""
+	}
+	search_attributes := workflow.Payload_Map{}
+	if !workflow.payload_map_init(&search_attributes) ||
+	   !workflow.payload_map_add_search_attribute_json(
+		   &search_attributes,
+		   "PropertyKeyword",
+		   workflow.Search_Attribute_Type.Keyword,
+		   input.search_value,
+	   ) {
 		return ""
 	}
 	cancellation_type := workflow.Child_Workflow_Cancellation_Type.Wait_Cancellation_Completed
@@ -2572,6 +2597,23 @@ generated_child_options_workflow :: proc(
 		parent_close_policy = .Abandon
 	case 3:
 		parent_close_policy = .Request_Cancel
+	}
+	id_reuse_policy := workflow.Workflow_Id_Reuse_Policy.Unspecified
+	switch input.id_reuse_policy {
+	case 1: id_reuse_policy = .Allow_Duplicate
+	case 2: id_reuse_policy = .Allow_Duplicate_Failed_Only
+	case 3: id_reuse_policy = .Reject_Duplicate
+	case 4: id_reuse_policy = .Terminate_If_Running
+	}
+	versioning_intent := workflow.Versioning_Intent.Unspecified
+	switch input.versioning_intent {
+	case 1: versioning_intent = .Compatible
+	case 2: versioning_intent = .Default
+	}
+	priority := workflow.Workflow_Priority{
+		priority_key = i32(input.priority_key),
+		fairness_key = input.fairness_key,
+		fairness_weight = f32(input.fairness_weight_quarters) / 4,
 	}
 	non_retryable_types := [?]string{"GeneratedChildPermanentFailure"}
 	retry_policy := workflow.Retry_Policy{
@@ -2628,6 +2670,14 @@ generated_child_options_workflow :: proc(
 			retry_policy = &retry_policy,
 			cancellation_type = cancellation_type,
 			parent_close_policy = parent_close_policy,
+			id_reuse_policy = id_reuse_policy,
+			cron_schedule = input.cron_schedule,
+			memo = &memo,
+			search_attributes = &search_attributes,
+			versioning_intent = versioning_intent,
+			priority = &priority,
+			static_summary = input.static_summary,
+			static_details = input.static_details,
 		},
 	)
 	start := workflow.await_child_workflow_start(ctx, future)
@@ -2711,7 +2761,15 @@ generated_child_options_match :: proc(
 			}
 			start := variant.value
 			if len(start.headers) != 1 || start.headers[0].key != "property-header" ||
-			   start.headers[0].value == nil {
+			   start.headers[0].value == nil || len(start.memo) != 1 ||
+			   start.memo[0].key != "property-memo" || start.memo[0].value == nil ||
+			   start.search_attributes == nil ||
+			   len(start.search_attributes.indexed_fields) != 1 ||
+			   start.search_attributes.indexed_fields[0].key != "PropertyKeyword" ||
+			   start.search_attributes.indexed_fields[0].value == nil || start.priority == nil ||
+			   status.value.commands[0].user_metadata == nil ||
+			   status.value.commands[0].user_metadata.summary == nil ||
+			   status.value.commands[0].user_metadata.details == nil {
 				return false
 			}
 			owned_header, clone_error := proto.clone_payload(start.headers[0].value)
@@ -2724,6 +2782,47 @@ generated_child_options_match :: proc(
 				return false
 			}
 			defer delete(decoded_header)
+			owned_memo, memo_clone_error := proto.clone_payload(start.memo[0].value)
+			if memo_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_memo)
+			decoded_memo: string
+			if codec.decode_json(codec.payload_view(&owned_memo), &decoded_memo) != .None {
+				return false
+			}
+			defer delete(decoded_memo)
+			owned_search, search_clone_error := proto.clone_payload(
+				start.search_attributes.indexed_fields[0].value,
+			)
+			if search_clone_error != .None {
+				return false
+			}
+			defer codec.payload_free(&owned_search)
+			decoded_search: string
+			if codec.decode_json(codec.payload_view(&owned_search), &decoded_search) != .None {
+				return false
+			}
+			defer delete(decoded_search)
+			metadata := status.value.commands[0].user_metadata
+			owned_summary, summary_clone_error := proto.clone_payload(metadata.summary)
+			owned_details, details_clone_error := proto.clone_payload(metadata.details)
+			if summary_clone_error != .None || details_clone_error != .None {
+				codec.payload_free(&owned_summary)
+				codec.payload_free(&owned_details)
+				return false
+			}
+			defer codec.payload_free(&owned_summary)
+			defer codec.payload_free(&owned_details)
+			decoded_summary, decoded_details: string
+			if codec.decode_json(codec.payload_view(&owned_summary), &decoded_summary) != .None ||
+			   codec.decode_json(codec.payload_view(&owned_details), &decoded_details) != .None {
+				delete(decoded_summary)
+				delete(decoded_details)
+				return false
+			}
+			defer delete(decoded_summary)
+			defer delete(decoded_details)
 			cancellation_type := proto.Coresdk_Child_Workflow_ChildWorkflowCancellationType.WAIT_CANCELLATION_COMPLETED
 			switch expected.cancellation_type {
 			case 1:
@@ -2742,6 +2841,17 @@ generated_child_options_match :: proc(
 			case 3:
 				parent_close_policy = .PARENT_CLOSE_POLICY_REQUEST_CANCEL
 			}
+			id_reuse_policy := proto.Temporal_Api_Enums_V1_WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE
+			switch expected.id_reuse_policy {
+			case 2: id_reuse_policy = .WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
+			case 3: id_reuse_policy = .WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE
+			case 4: id_reuse_policy = .WORKFLOW_ID_REUSE_POLICY_TERMINATE_IF_RUNNING
+			}
+			versioning_intent := proto.Coresdk_Common_VersioningIntent.UNSPECIFIED
+			switch expected.versioning_intent {
+			case 1: versioning_intent = .COMPATIBLE
+			case 2: versioning_intent = .DEFAULT
+			}
 			policy := start.retry_policy
 			if !generated_workflow_arguments_match(
 				start.input[:],
@@ -2751,9 +2861,19 @@ generated_child_options_match :: proc(
 				return false
 			}
 			return decoded_header == expected.header_value &&
+				decoded_memo == expected.memo_value &&
+				decoded_search == expected.search_value &&
+				decoded_summary == expected.static_summary &&
+				decoded_details == expected.static_details &&
 				start.seq == 1 && start.workflow_id == expected.workflow_id &&
 				start.workflow_type == "generated_child_workflow" &&
 				start.task_queue == expected.task_queue &&
+				start.namespace == "" && start.cron_schedule == expected.cron_schedule &&
+				start.workflow_id_reuse_policy == id_reuse_policy &&
+				start.versioning_intent == versioning_intent &&
+				start.priority.priority_key == i32(expected.priority_key) &&
+				start.priority.fairness_key == expected.fairness_key &&
+				start.priority.fairness_weight == f32(expected.fairness_weight_quarters) / 4 &&
 				pbt_proto_duration(start.workflow_execution_timeout) == time.Duration(expected.execution_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(start.workflow_run_timeout) == time.Duration(expected.run_timeout_ms) * time.Millisecond &&
 				pbt_proto_duration(start.workflow_task_timeout) == time.Duration(expected.task_timeout_ms) * time.Millisecond &&
@@ -2841,6 +2961,8 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		workflow_id = pbt.draw(t, pbt.string_ascii(1, 32)),
 		task_queue = pbt.draw(t, pbt.string_ascii(1, 32)),
 		header_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		memo_value = pbt.draw(t, pbt.string_ascii(0, 64)),
+		search_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 		argument_count = pbt.draw(t, pbt.int_range(0, 12)),
 		argument_prefix = pbt.draw(t, pbt.string_ascii(0, 24)),
 		execution_timeout_ms = execution_timeout_ms,
@@ -2851,6 +2973,14 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 		retry_attempts = pbt.draw(t, pbt.int_range(0, 20)),
 		cancellation_type = pbt.draw(t, pbt.int_range(0, 3)),
 		parent_close_policy = pbt.draw(t, pbt.int_range(0, 3)),
+		id_reuse_policy = pbt.draw(t, pbt.int_range(0, 4)),
+		cron_schedule = pbt.draw(t, pbt.string_ascii(0, 48)),
+		versioning_intent = pbt.draw(t, pbt.int_range(0, 2)),
+		priority_key = pbt.draw(t, pbt.int_range(0, 10)),
+		fairness_key = pbt.draw(t, pbt.string_ascii(0, 64)),
+		fairness_weight_quarters = pbt.draw(t, pbt.int_range(0, 40)),
+		static_summary = pbt.draw(t, pbt.string_ascii(1, 80)),
+		static_details = pbt.draw(t, pbt.string_ascii(1, 256)),
 		signal_name = pbt.draw(t, pbt.string_ascii(1, 32)),
 		signal_value = pbt.draw(t, pbt.string_ascii(0, 64)),
 	}
@@ -2863,6 +2993,12 @@ child_options_replay_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, input_value.cancellation_type == 3, 15.0, "wait cancellation requested")
 	pbt.cover(t, input_value.parent_close_policy == 0, 15.0, "server parent-close default")
 	pbt.cover(t, input_value.parent_close_policy == 3, 15.0, "request cancel on parent close")
+	pbt.cover(t, input_value.id_reuse_policy == 0, 10.0, "default Child Workflow ID reuse")
+	pbt.cover(t, input_value.id_reuse_policy == 4, 10.0, "terminate running duplicate child")
+	pbt.cover(t, len(input_value.cron_schedule) == 0, 0.2, "no Child Workflow cron schedule")
+	pbt.cover(t, input_value.versioning_intent == 2, 20.0, "default versioning intent")
+	pbt.cover(t, len(input_value.fairness_key) == 64, 0.1, "maximum fairness key length")
+	pbt.cover(t, input_value.fairness_weight_quarters == 0, 1.0, "zero fairness weight")
 
 	owned_queue, queue_error := strings.clone("pbt-child-workflow-queue")
 	if queue_error != nil {

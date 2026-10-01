@@ -114,6 +114,24 @@ child_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if !header_found || header_error != .None || interceptor_header != "intercepted" {
 		return "Child Workflow interceptor header mismatch"
 	}
+	memo_value: string
+	memo_found, memo_error := workflow.memo_json(ctx, "odin-child-memo", &memo_value)
+	defer delete(memo_value)
+	search_value: string
+	search_found, search_error := workflow.search_attribute_json(
+		ctx,
+		"OdinSdkKeyword",
+		&search_value,
+	)
+	defer delete(search_value)
+	info, info_found := workflow.info(ctx)
+	if !memo_found || memo_error != .None || memo_value != "child-options" ||
+	   !search_found || search_error != .None || search_value != "child-options" ||
+	   !info_found || info.priority.priority_key != 4 ||
+	   info.priority.fairness_key != "odin-child-fairness" ||
+	   info.priority.fairness_weight != 1.5 {
+		return "Child Workflow metadata options mismatch"
+	}
 	if strings.has_prefix(name, "cancel-") {
 		workflow.sleep(ctx, time.Hour)
 		return "child cancellation was not delivered"
@@ -562,6 +580,26 @@ parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	if allocation_error != nil {
 		return ""
 	}
+	memo := workflow.Payload_Map{}
+	if !workflow.payload_map_init(&memo) ||
+	   !workflow.payload_map_add_json(&memo, "odin-child-memo", "child-options") {
+		return "could not build Child Workflow memo"
+	}
+	search_attributes := workflow.Payload_Map{}
+	if !workflow.payload_map_init(&search_attributes) ||
+	   !workflow.payload_map_add_search_attribute_json(
+		   &search_attributes,
+		   "OdinSdkKeyword",
+		   workflow.Search_Attribute_Type.Keyword,
+		   "child-options",
+	   ) {
+		return "could not build Child Workflow Search Attributes"
+	}
+	priority := workflow.Workflow_Priority{
+		priority_key = 4,
+		fairness_key = "odin-child-fairness",
+		fairness_weight = 1.5,
+	}
 	return workflow.execute_child_workflow(
 		ctx,
 		CHILD_WORKFLOW_TYPE,
@@ -571,6 +609,13 @@ parent_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 			workflow_execution_timeout = time.Minute,
 			workflow_run_timeout = time.Minute,
 			workflow_task_timeout = 10 * time.Second,
+			id_reuse_policy = .Reject_Duplicate,
+			memo = &memo,
+			search_attributes = &search_attributes,
+			versioning_intent = .Default,
+			priority = &priority,
+			static_summary = "Odin Child Workflow",
+			static_details = "Started by the Odin SDK Child Workflow integration example",
 		},
 	)
 }

@@ -1767,9 +1767,11 @@ requires the first terminal outcome to remain unchanged.
 The
 Child Workflow options property
 generates another 500 valid ID, queue, timeout, Retry Policy, cancellation-type,
-and Parent Close Policy combinations, plus generated signal names and JSON
-payloads. It checks every encoded `StartChildWorkflowExecution` and
-`SignalExternalWorkflowExecution` field and requires both commands to be
+Parent Close Policy, ID-reuse, cron, versioning-intent, priority, memo, typed
+Search Attribute, static summary, and static details combinations, plus generated
+signal names and zero to twelve decorated JSON Payloads. It checks every encoded
+`StartChildWorkflowExecution` field, including the enclosing command metadata,
+and every `SignalExternalWorkflowExecution` field and requires both commands to be
 byte-identical after eviction and fresh-stack replay. The external Workflow
 property generates 500 namespace/Workflow ID/optional Run ID identities,
 signal names, JSON payloads, and cancellation reasons. It checks exact
@@ -2025,9 +2027,12 @@ command, replays onto a fresh stack, compares the completions byte for byte,
 then applies separate start and completion resolutions. It verifies the exact
 cancellation reason, structured failure ownership after the activation decode
 arena is gone, and lossless propagation of an unhandled original Temporal
-Failure wrapper. The 500-case Child Workflow property varies start options,
-signal names, and zero to twelve ordered start/signal Payloads with metadata
-and external details, then requires exact fresh-stack replay of both commands.
+Failure wrapper. The 500-case Child Workflow property varies every public start
+option listed above, signal names, and zero to twelve ordered start/signal
+Payloads with metadata and external details, then requires exact fresh-stack
+replay of both commands. The CLI-devserver path additionally has the child read
+its memo, typed Search Attribute, and priority, then checks the parent's Service
+history for ID reuse, memo, Search Attributes, priority, and static UserMetadata.
 A cancellation unit test also requires an in-flight child signal
 to emit both `CancelSignalWorkflow` and `CancelChildWorkflowExecution` before
 the parent closes as canceled. External-operation unit tests inspect namespace,
