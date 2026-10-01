@@ -155,6 +155,11 @@ run :: proc() -> int {
 		expected_registry = &registry,
 		maximum_executors = 2,
 		activation_timeout = activation_timeout,
+		shutdown_timeout = 2 * time.Second,
+		crash_loop = {
+			maximum_consecutive_failures = 5,
+			cooldown = 5 * time.Second,
+		},
 	})
 	if manager_error.message != nil {
 		fmt.eprintf("Workflow executor manager initialization failed: %s\n", string(manager_error.message))
@@ -234,10 +239,12 @@ run :: proc() -> int {
 	   manager_stats.generations_started < 4 || manager_stats.graceful_shutdowns < 5 ||
 	   manager_stats.manifest_handshakes != manager_stats.generations_started + 1 ||
 	   manager_stats.manifest_mismatches != 0 ||
+	   manager_stats.shutdown_timeouts != 0 ||
+	   manager_stats.crash_loop_rejections != 0 ||
 	   manager_stats.capacity_rejections != 0 || manager_stats.protocol_failures != 0 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d handshakes=%d manifest_mismatches=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
+			"Unexpected registry isolation greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d timeouts=%d generations=%d evictions=%d graceful=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d routes=%d\n",
 			greeting_result,
 			farewell_result.message,
 			farewell_result.code,
@@ -250,6 +257,8 @@ run :: proc() -> int {
 			manager_stats.graceful_shutdowns,
 			manager_stats.manifest_handshakes,
 			manager_stats.manifest_mismatches,
+			manager_stats.shutdown_timeouts,
+			manager_stats.crash_loop_rejections,
 			manager_stats.capacity_rejections,
 			manager_stats.protocol_failures,
 			workflow_isolate.manager_route_count(&executor_manager),
@@ -257,7 +266,7 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d first_mode=%s generations=%d child_exits=%d activation_timeouts=%d evictions=%d replay_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d\n",
 		greeting_id,
 		farewell_id,
 		greeting_result,
@@ -273,6 +282,8 @@ run :: proc() -> int {
 		manager_stats.graceful_shutdowns,
 		manager_stats.manifest_handshakes,
 		manager_stats.manifest_mismatches,
+		manager_stats.shutdown_timeouts,
+		manager_stats.crash_loop_rejections,
 		manager_stats.aborted_children,
 		manager_stats.capacity_rejections,
 		manager_stats.protocol_failures,

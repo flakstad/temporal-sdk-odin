@@ -236,6 +236,20 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 	})
 	testing.expect(t, invalid_error.message != nil)
 	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_error = workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
+		shutdown_timeout = -time.Millisecond,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_error = workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
+		crash_loop = {maximum_consecutive_failures = 1},
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
 
 	init_error := workflow_isolate.manager_init(
 		&manager,
@@ -248,8 +262,141 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 	testing.expect_value(t, manager.maximum_executors, 1)
 	testing.expect(t, workflow_isolate.capacity_allows_start(0, 1))
 	testing.expect(t, !workflow_isolate.capacity_allows_start(1, 1))
+	allowed, reset := workflow_isolate.crash_loop_allows_start(2, 99 * time.Millisecond, {
+		maximum_consecutive_failures = 2,
+		cooldown = 100 * time.Millisecond,
+	})
+	testing.expect(t, !allowed && !reset)
+	allowed, reset = workflow_isolate.crash_loop_allows_start(2, 100 * time.Millisecond, {
+		maximum_consecutive_failures = 2,
+		cooldown = 100 * time.Millisecond,
+	})
+	testing.expect(t, allowed && reset)
 	workflow_isolate.manager_close(&manager)
 	testing.expect(t, !manager.initialized)
+}
+
+@(test)
+workflow_executor_shutdown_deadline_kills_and_reaps_unresponsive_child :: proc(
+	t: ^testing.T,
+) {
+	manager := workflow_isolate.Manager{}
+	placeholder := [?]string{"unused"}
+	init_error := workflow_isolate.manager_init(&manager, {
+		command = placeholder[:],
+		maximum_executors = 1,
+		shutdown_timeout = 20 * time.Millisecond,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.manager_close(&manager)
+	command := [?]string{"/bin/sh", "-c", "sleep 1"}
+	session, started := workflow_isolate.start_session(command[:])
+	testing.expect(t, started)
+	if !started {
+		return
+	}
+	started_at := time.tick_now()
+	shutdown_ok := workflow_isolate.session_shutdown(&manager, &session)
+	elapsed := time.tick_diff(started_at, time.tick_now())
+	testing.expect(t, !shutdown_ok)
+	testing.expect(t, !session.active)
+	testing.expect_value(t, manager.stats.shutdown_timeouts, 1)
+	testing.expect_value(t, manager.stats.aborted_children, 1)
+	testing.expect(t, elapsed < 500 * time.Millisecond)
+}
+
+workflow_isolate_test_initialization :: proc(run_id: string) -> [dynamic]u8 {
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "crash-loop-test",
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = run_id,
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+			value = &initialize,
+		},
+	})
+	return proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+}
+
+workflow_isolate_test_eviction :: proc(run_id: string) -> [dynamic]u8 {
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{
+		reason = .LANG_FAIL,
+	}
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = run_id,
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(&activation.jobs, proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+		variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+			value = &eviction,
+		},
+	})
+	return proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
+}
+
+@(test)
+workflow_executor_crash_loop_breaker_stops_process_respawn_until_cooldown :: proc(
+	t: ^testing.T,
+) {
+	command := [?]string{"/bin/sh", "-c", "exit 86"}
+	manager := workflow_isolate.Manager{}
+	init_error := workflow_isolate.manager_init(&manager, {
+		command = command[:],
+		maximum_executors = 1,
+		activation_timeout = 250 * time.Millisecond,
+		shutdown_timeout = 20 * time.Millisecond,
+		crash_loop = {
+			maximum_consecutive_failures = 2,
+			cooldown = time.Hour,
+		},
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.manager_close(&manager)
+
+	for run_index in 0 ..< 2 {
+		run_id := fmt.aprintf("crash-loop-run-%d", run_index)
+		initialization := workflow_isolate_test_initialization(run_id)
+		processed := workflow_isolate.manager_process_activation(&manager, initialization[:])
+		delete(initialization)
+		testing.expect(t, processed.activation_failed)
+		delete(processed.completion)
+		workflow.error_free(&processed.error)
+		eviction := workflow_isolate_test_eviction(run_id)
+		processed = workflow_isolate.manager_process_activation(&manager, eviction[:])
+		delete(eviction)
+		testing.expect(t, processed.evicted)
+		delete(processed.completion)
+		workflow.error_free(&processed.error)
+		delete(run_id)
+	}
+	testing.expect_value(t, manager.stats.generations_started, 2)
+	testing.expect_value(t, manager.consecutive_failures, 2)
+	testing.expect_value(t, manager.stats.child_exits, 2)
+	testing.expect_value(t, manager.stats.protocol_failures, 0)
+	testing.expect_value(t, manager.stats.aborted_children, 2)
+	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)
+
+	blocked := workflow_isolate_test_initialization("crash-loop-blocked")
+	processed := workflow_isolate.manager_process_activation(&manager, blocked[:])
+	delete(blocked)
+	testing.expect(t, processed.activation_failed)
+	testing.expect(t, strings.contains(string(processed.error.message), "breaker is open"))
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+	testing.expect_value(t, manager.stats.generations_started, 2)
+	testing.expect_value(t, manager.stats.crash_loop_rejections, 1)
+	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)
+	manager.last_failure = time.tick_add(time.tick_now(), -2 * time.Hour)
+	testing.expect(t, workflow_isolate.manager_allows_start(&manager))
+	testing.expect_value(t, manager.consecutive_failures, 0)
+	testing.expect_value(t, manager.stats.crash_loop_recoveries, 1)
 }
 
 @(test)

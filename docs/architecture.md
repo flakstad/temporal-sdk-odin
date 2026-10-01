@@ -3282,9 +3282,12 @@ executor, joins its pipe reader, and drives the same failed-completion/eviction/
 replay path against the dev server. Generic registry hosting is now proven with
 one shared parent/child registration function and two Workflow types, including
 a typed-JSON result. A canonical registry handshake is now checked once before
-polling and again for each child generation. The next step is
-shutdown/backpressure/crash-loop policy. Sticky per-run child routing is the
-later performance mode. Production hardening remains process-boundary work. The
+polling and again for each child generation. Shutdown response and process exit
+are now bounded independently from activation execution; capacity admission is
+immediate rather than deadlocking the serial poll thread; and a cooldown circuit
+breaker bounds consecutive executor failures. The next step is sticky per-run
+child routing with a non-zero Core cache. Production hardening remains
+process-boundary work. The
 capability inventory is now a public, tested runtime model plus the maintained
 evidence table below; it must grow whenever a new protocol surface is added.
 Activity Worker is not the next milestone: it is already implemented and
@@ -3938,9 +3941,13 @@ generated traces, while a second generated model checks multi-route capacity
 and generation fencing. Activation deadlines use a joinable reader thread and
 kill/reap on expiry; the hung-child live path proves retry and replay. Startup
 and per-generation manifest verification now fence executable/registry skew.
-Shutdown deadlines, crash-loop/backpressure policy, executor-host observability
-hooks, and complete observation metadata remain process-manager
-responsibilities, not additional Temporal protocol work. See
+Shutdown deadlines now kill/reap both missing acknowledgements and processes
+that acknowledge but do not exit. Capacity exhaustion fails immediately because
+waiting on the serial activation thread would prevent eviction from releasing a
+slot. A configurable consecutive-failure breaker prevents unbounded respawn and
+admits a trial after cooldown. Executor-host observability hooks and complete
+observation metadata remain process-manager responsibilities, not additional
+Temporal protocol work. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

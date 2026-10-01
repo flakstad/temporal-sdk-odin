@@ -513,9 +513,11 @@ copies its Workflow type manifest into Core, while a generic child
 One live Worker completes both string and typed-JSON Workflow types through the
 same executor binary. Procedure pointers never cross the process boundary. It
 now verifies a canonical type manifest in a pre-poll child and again in every
-executor generation. It still lacks executor-host log/metric/interceptor
-configuration, shutdown/backpressure and crash-loop policy, and sticky-cache
-execution.
+executor generation. Shutdown acknowledgement and process exit have an optional
+deadline, full capacity rejects without blocking the serial Core poll thread,
+and an optional cooldown circuit breaker bounds consecutive executor failures.
+It still lacks executor-host log/metric/interceptor configuration and
+sticky-cache execution.
 Canceling a Client wait does not cancel an already accepted durable Update; the
 current Temporal Service exposes no such operation.
 

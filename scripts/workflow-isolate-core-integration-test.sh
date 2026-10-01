@@ -69,6 +69,8 @@ grep -q "first_mode=$first_mode" <<<"$output"
 grep -q 'graceful_shutdowns=5' <<<"$output"
 grep -q 'manifest_handshakes=6' <<<"$output"
 grep -q 'manifest_mismatches=0' <<<"$output"
+grep -q 'shutdown_timeouts=0' <<<"$output"
+grep -q 'crash_loop_rejections=0' <<<"$output"
 grep -q 'capacity_rejections=0' <<<"$output"
 grep -q 'protocol_failures=0' <<<"$output"
 if [[ "$first_mode" == "crash" ]]; then

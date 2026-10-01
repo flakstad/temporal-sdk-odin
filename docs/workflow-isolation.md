@@ -165,6 +165,26 @@ deadline. The bounded path reads on one joinable helper thread; on expiry it
 kills the child, joins the reader after pipe EOF, reports exactly one activation
 failure, and retains the failed route until eviction.
 
+`shutdown_timeout` independently bounds both the correlated shutdown response
+and the child's exit after acknowledgement. Expiry kills and reaps the process;
+no reader thread or zombie is left behind. A real-process unit test starts a
+child that never reads the request and proves the 20 ms deadline returns well
+before that child would exit naturally.
+
+Admission is deliberately non-waiting. Workflow activations are processed on
+one serial Core poll thread, including the evictions that release capacity, so
+waiting there for a slot would deadlock. When `maximum_executors` is full, the
+manager returns a failed activation immediately and increments
+`capacity_rejections`; Core remains responsible for eviction and retry.
+
+An optional global consecutive-failure circuit breaker prevents unlimited
+process respawn when the executable repeatedly exits, times out, or violates
+the protocol. `maximum_consecutive_failures` opens the breaker and `cooldown`
+admits one new trial after a monotonic deadline. Any successful activation
+resets the streak. Rejected activations start no process. This is containment,
+not a per-Workflow-type error budget: healthy activations on the same manager
+reset the global consecutive count.
+
 Run the complete proof with no pre-existing infrastructure:
 
 ```bash
@@ -192,7 +212,8 @@ manifest, and then:
 
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
-capacity or protocol failures. The observed CLI-dev-server path currently has
+capacity, shutdown, crash-loop, or protocol failures. The observed
+CLI-dev-server path currently has
 five generations, five evictions, five graceful shutdowns (including preflight),
 six successful manifest handshakes, and one aborted crashed child. Those exact
 counts are diagnostic rather than an API promise;
@@ -242,7 +263,12 @@ requires identical state and effects after every event. A second 1,000-case
 property generates up to 128 events across eight run slots and capacities from
 one through eight. It requires route count never to exceed capacity, every
 owned route to have a generation, and a failed generation never to change
-before eviction. The existing 500-case framing property remains independent.
+before eviction. A third 1,000-case property varies breaker threshold, failure
+count, cooldown, and elapsed time; it requires rejection before cooldown and
+exactly one reset/admission decision at or after the boundary. The existing
+500-case framing property remains independent. A process-backed unit test then
+proves two real child exits open the breaker and the third initialization starts
+no process.
 
 Generation fencing currently comes from route ownership as well as the model:
 each generation has private pipes and monotonically correlated request IDs.
@@ -254,8 +280,6 @@ response could be read; a new generation never reuses those pipes.
 This slice deliberately does not claim production isolation. The following are
 still required:
 
-- add bounded waiting/queue policy, graceful-shutdown deadlines, and crash-loop
-  rate limiting;
 - configure replay-aware logs, metrics, interceptors, and diagnostics in the
   executor host and carry observations back without letting them affect
   commands;
@@ -266,7 +290,8 @@ still required:
   `temporal server start-dev`;
 - validate macOS/Linux arm64/x86_64 pipe and process behavior.
 
-The next discriminating vertical slice is a shutdown deadline plus bounded
-crash-loop/backpressure policy. Sticky per-run routing should follow only after
-those zero-cache failure paths are correct; it can reuse the manager and wire
-protocol while changing child lifetime to match Core's non-zero cache.
+The next discriminating vertical slice is sticky per-run routing with a non-zero
+Core cache. It can reuse the manager, registry handshake, bounded shutdown, and
+wire protocol, but must prove that every incremental activation stays on the
+same generation until Core eviction. Executor-host observability should follow
+without changing command determinism.

@@ -2,6 +2,7 @@ package workflow_pbt_test
 
 import "core:bytes"
 import "core:testing"
+import "core:time"
 import pbt "pbt:pbt"
 import sc "statecharts:statecharts"
 import workflow_isolate "../temporal/workflow/isolate"
@@ -298,6 +299,51 @@ workflow_executor_routes_remain_bounded_and_generation_fenced :: proc(t: ^testin
 		"Workflow executor routes remain bounded and generation fenced",
 		workflow_isolation_capacity_property,
 		{num_tests = 1000, seed = 0x4953_4f4c_4341_5041},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+workflow_executor_crash_loop_breaker_property :: proc(t: ^pbt.T) -> pbt.Result {
+	maximum := pbt.draw(t, pbt.int_range(0, 16))
+	failures := pbt.draw(t, pbt.int_range(0, 24))
+	cooldown_millis := pbt.draw(t, pbt.int_range(1, 10_000))
+	elapsed_millis := pbt.draw(t, pbt.int_range(0, 20_000))
+	policy := workflow_isolate.Crash_Loop_Policy{
+		maximum_consecutive_failures = maximum,
+		cooldown = time.Duration(cooldown_millis) * time.Millisecond,
+	}
+	elapsed := time.Duration(elapsed_millis) * time.Millisecond
+	allowed, reset := workflow_isolate.crash_loop_allows_start(
+		failures,
+		elapsed,
+		policy,
+	)
+	pbt.cover(t, maximum == 0, 5, "breaker disabled")
+	pbt.cover(t, maximum > 0 && failures >= maximum && elapsed < policy.cooldown, 15, "breaker open")
+	pbt.cover(t, maximum > 0 && failures >= maximum && elapsed >= policy.cooldown, 15, "cooldown trial")
+	if maximum == 0 || failures < maximum {
+		if !allowed || reset {
+			return pbt.fail("crash-loop breaker rejected below its threshold")
+		}
+	} else if elapsed < policy.cooldown {
+		if allowed || reset {
+			return pbt.fail("crash-loop breaker admitted a child before cooldown")
+		}
+	} else if !allowed || !reset {
+		return pbt.fail("crash-loop breaker did not admit one post-cooldown trial")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_executor_crash_loop_breaker_obeys_threshold_and_cooldown :: proc(
+	t: ^testing.T,
+) {
+	result := pbt.check(
+		"Workflow executor crash-loop breaker obeys threshold and cooldown",
+		workflow_executor_crash_loop_breaker_property,
+		{num_tests = 1000, seed = 0x4953_4f4c_4352_4153},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

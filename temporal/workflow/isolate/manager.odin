@@ -140,6 +140,17 @@ Manager_Options :: struct {
 	// Zero waits indefinitely. A positive deadline kills the child, waits for
 	// the pipe reader to observe EOF, and reports one activation failure.
 	activation_timeout: time.Duration,
+	// Zero waits indefinitely. A positive deadline bounds both the shutdown
+	// acknowledgement and process exit; expiry kills and reaps the child.
+	shutdown_timeout: time.Duration,
+	crash_loop: Crash_Loop_Policy,
+}
+
+Crash_Loop_Policy :: struct {
+	// Zero disables the breaker. After this many consecutive executor/session
+	// failures, new children are rejected until cooldown has elapsed.
+	maximum_consecutive_failures: int,
+	cooldown:                     time.Duration,
 }
 
 manager_options_default :: proc(command: []string) -> Manager_Options {
@@ -161,6 +172,10 @@ Manager_Stats :: struct {
 	peak_routes:         int,
 	manifest_handshakes: int,
 	manifest_mismatches: int,
+	shutdown_timeouts:   int,
+	start_failures:      int,
+	crash_loop_rejections: int,
+	crash_loop_recoveries: int,
 }
 
 Child_Session :: struct {
@@ -183,11 +198,15 @@ Manager :: struct {
 	first_command:      [dynamic]string,
 	maximum_executors:  int,
 	activation_timeout: time.Duration,
+	shutdown_timeout:   time.Duration,
+	crash_loop:         Crash_Loop_Policy,
 	expected_manifest:  []u8,
 	routes:             [dynamic]Executor_Route,
 	next_generation:    u64,
 	first_command_used: bool,
 	manifest_verified:  bool,
+	consecutive_failures: int,
+	last_failure:         time.Tick,
 	report_run_id:      string,
 	stats:              Manager_Stats,
 	initialized:        bool,
@@ -232,8 +251,14 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	if options.maximum_executors <= 0 {
 		return manager_error("Workflow executor manager capacity must be positive")
 	}
-	if options.activation_timeout < 0 {
-		return manager_error("Workflow executor activation timeout must not be negative")
+	if options.activation_timeout < 0 || options.shutdown_timeout < 0 {
+		return manager_error("Workflow executor timeouts must not be negative")
+	}
+	if options.crash_loop.maximum_consecutive_failures < 0 ||
+	   options.crash_loop.cooldown < 0 ||
+	   (options.crash_loop.maximum_consecutive_failures > 0 &&
+	    options.crash_loop.cooldown <= 0) {
+		return manager_error("Workflow executor crash-loop policy is invalid")
 	}
 	command, command_ok := clone_command(options.command)
 	if !command_ok {
@@ -261,6 +286,8 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	}
 	manager.maximum_executors = options.maximum_executors
 	manager.activation_timeout = options.activation_timeout
+	manager.shutdown_timeout = options.shutdown_timeout
+	manager.crash_loop = options.crash_loop
 	manager.routes = make([dynamic]Executor_Route, 0, options.maximum_executors)
 	manager.initialized = true
 	return {}
@@ -270,8 +297,14 @@ session_abort :: proc(manager: ^Manager, session: ^Child_Session) {
 	if session == nil || !session.active {
 		return
 	}
-	os.close(session.input)
-	os.close(session.output)
+	if session.input != nil {
+		os.close(session.input)
+		session.input = nil
+	}
+	if session.output != nil {
+		os.close(session.output)
+		session.output = nil
+	}
 	process_state, _ := os.process_wait(session.process, 0)
 	if !process_state.exited {
 		_ = os.process_kill(session.process)
@@ -291,21 +324,65 @@ session_shutdown :: proc(manager: ^Manager, session: ^Child_Session) -> bool {
 		request_id = session.request_id,
 	})
 	if write_error.kind != .None {
+		failure := Exchange_Failure.Protocol
+		if write_error.kind == .IO || write_error.kind == .Truncated {
+			failure = .Child_Exit
+		}
+		record_session_failure(manager, session, failure)
+		return false
+	}
+	response, read_error, read_failure := read_with_deadline(
+		session,
+		manager.shutdown_timeout,
+	)
+	defer owned_frame_free(&response)
+	if read_failure == .Timed_Out {
+		manager.stats.shutdown_timeouts += 1
+		manager_record_failure(manager)
 		session_abort(manager, session)
 		return false
 	}
-	response, read_error := read(session.output)
-	defer owned_frame_free(&response)
-	if read_error.kind != .None ||
+	if read_failure != .None || read_error.kind != .None ||
 	   response.frame.kind != .Shutdown_Acknowledged ||
 	   response.frame.request_id != session.request_id {
-		session_abort(manager, session)
+		failure := Exchange_Failure.Protocol
+		if read_failure == .Child_Exit || read_error.kind == .End_Of_Stream ||
+		   read_error.kind == .IO {
+			failure = .Child_Exit
+		}
+		record_session_failure(manager, session, failure)
 		return false
 	}
 	os.close(session.input)
+	session.input = nil
 	os.close(session.output)
-	process_state, wait_error := os.process_wait(session.process)
+	session.output = nil
+	process_state: os.Process_State
+	wait_error: os.Error
+	if manager.shutdown_timeout > 0 {
+		process_state, wait_error = os.process_wait(
+			session.process,
+			manager.shutdown_timeout,
+		)
+	} else {
+		process_state, wait_error = os.process_wait(session.process)
+	}
+	if manager.shutdown_timeout > 0 && !process_state.exited {
+		manager.stats.shutdown_timeouts += 1
+		manager_record_failure(manager)
+		_ = os.process_kill(session.process)
+		_, _ = os.process_wait(session.process)
+		manager.stats.aborted_children += 1
+		session^ = {}
+		return false
+	}
 	if wait_error != nil || !process_state.success {
+		if wait_error != nil {
+			manager.stats.protocol_failures += 1
+		} else {
+			manager.stats.child_exits += 1
+		}
+		manager_record_failure(manager)
 		session^ = {}
 		return false
 	}
@@ -343,9 +420,69 @@ capacity_allows_start :: proc(route_count, maximum_executors: int) -> bool {
 	return route_count >= 0 && maximum_executors > 0 && route_count < maximum_executors
 }
 
+// crash_loop_allows_start is pure so generated tests can check the breaker
+// independently of the process clock. reset is true for the first trial after
+// cooldown.
+crash_loop_allows_start :: proc(
+	consecutive_failures: int,
+	elapsed_since_failure: time.Duration,
+	policy: Crash_Loop_Policy,
+) -> (allowed, reset: bool) {
+	if policy.maximum_consecutive_failures == 0 ||
+	   consecutive_failures < policy.maximum_consecutive_failures {
+		return true, false
+	}
+	if elapsed_since_failure >= policy.cooldown {
+		return true, true
+	}
+	return false, false
+}
+
+manager_allows_start :: proc(manager: ^Manager) -> bool {
+	if manager.crash_loop.maximum_consecutive_failures == 0 {
+		return true
+	}
+	elapsed := time.Duration(0)
+	if manager.last_failure._nsec != 0 {
+		elapsed = time.tick_diff(manager.last_failure, time.tick_now())
+	}
+	allowed, reset := crash_loop_allows_start(
+		manager.consecutive_failures,
+		elapsed,
+		manager.crash_loop,
+	)
+	if !allowed {
+		manager.stats.crash_loop_rejections += 1
+		return false
+	}
+	if reset {
+		manager.consecutive_failures = 0
+		manager.last_failure = {}
+		manager.stats.crash_loop_recoveries += 1
+	}
+	return true
+}
+
+manager_record_success :: proc(manager: ^Manager) {
+	manager.consecutive_failures = 0
+	manager.last_failure = {}
+}
+
+manager_record_failure :: proc(manager: ^Manager) {
+	manager.consecutive_failures += 1
+	manager.last_failure = time.tick_now()
+}
+
 remove_route :: proc(manager: ^Manager, index: int) {
 	delete(manager.routes[index].run_id)
 	ordered_remove(&manager.routes, index)
+}
+
+Route_Start_Failure :: enum {
+	None,
+	Capacity,
+	Crash_Loop,
+	Process,
 }
 
 start_session :: proc(command: []string) -> (session: Child_Session, ok: bool) {
@@ -382,10 +519,16 @@ start_session :: proc(command: []string) -> (session: Child_Session, ok: bool) {
 	}, true
 }
 
-start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool) {
+start_route :: proc(
+	manager: ^Manager,
+	run_id: string,
+) -> (index: int, failure: Route_Start_Failure) {
 	if !capacity_allows_start(len(manager.routes), manager.maximum_executors) {
 		manager.stats.capacity_rejections += 1
-		return
+		return 0, .Capacity
+	}
+	if !manager_allows_start(manager) {
+		return 0, .Crash_Loop
 	}
 	command := manager.command[:]
 	if !manager.first_command_used && len(manager.first_command) > 0 {
@@ -394,19 +537,21 @@ start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool)
 	manager.first_command_used = true
 	session, session_ok := start_session(command)
 	if !session_ok {
-		return
+		manager.stats.start_failures += 1
+		manager_record_failure(manager)
+		return 0, .Process
 	}
 	if len(manager.expected_manifest) > 0 {
 		handshake_failure := session_manifest_handshake(manager, &session)
 		if handshake_failure != .None {
 			record_session_failure(manager, &session, handshake_failure)
-			return
+			return 0, .Process
 		}
 	}
 	owned_run_id, clone_error := strings.clone(run_id)
 	if clone_error != nil {
 		session_abort(manager, &session)
-		return
+		return 0, .Process
 	}
 	manager.next_generation += 1
 	next_state, effect := lifecycle_step(.Absent, .Initialize)
@@ -419,7 +564,21 @@ start_route :: proc(manager: ^Manager, run_id: string) -> (index: int, ok: bool)
 	})
 	manager.stats.generations_started += 1
 	manager.stats.peak_routes = max(manager.stats.peak_routes, len(manager.routes))
-	return len(manager.routes) - 1, true
+	return len(manager.routes) - 1, .None
+}
+
+route_start_failure_message :: proc(failure: Route_Start_Failure) -> string {
+	switch failure {
+	case .Capacity:
+		return "Workflow executor capacity is exhausted; activation was rejected without waiting"
+	case .Crash_Loop:
+		return "Workflow executor crash-loop breaker is open"
+	case .Process:
+		return "Workflow executor child could not start or complete its handshake"
+	case .None:
+		return ""
+	}
+	return "Workflow executor could not start"
 }
 
 Exchange_Failure :: enum {
@@ -444,11 +603,11 @@ exchange_read_main :: proc(state: ^Exchange_Read) {
 	sync.sema_post(&state.done)
 }
 
-read_with_timeout :: proc(
-	manager: ^Manager,
+read_with_deadline :: proc(
 	session: ^Child_Session,
+	deadline: time.Duration,
 ) -> (response: Owned_Frame, error: Error, failure: Exchange_Failure) {
-	if manager.activation_timeout <= 0 {
+	if deadline <= 0 {
 		response, error = read(session.output)
 		return
 	}
@@ -457,7 +616,7 @@ read_with_timeout :: proc(
 	if read_thread == nil {
 		return {}, {}, .Protocol
 	}
-	finished := sync.sema_wait_with_timeout(&read_state.done, manager.activation_timeout)
+	finished := sync.sema_wait_with_timeout(&read_state.done, deadline)
 	if !finished {
 		_ = os.process_kill(session.process)
 	}
@@ -468,6 +627,13 @@ read_with_timeout :: proc(
 		return {}, {}, .Timed_Out
 	}
 	return read_state.response, read_state.error, .None
+}
+
+read_with_timeout :: proc(
+	manager: ^Manager,
+	session: ^Child_Session,
+) -> (response: Owned_Frame, error: Error, failure: Exchange_Failure) {
+	return read_with_deadline(session, manager.activation_timeout)
 }
 
 session_manifest_handshake :: proc(
@@ -657,6 +823,7 @@ record_session_failure :: proc(
 	} else {
 		manager.stats.protocol_failures += 1
 	}
+	manager_record_failure(manager)
 	session_abort(manager, session)
 }
 
@@ -705,6 +872,7 @@ manager_process_activation :: proc(
 		if route.state == .Live {
 			completion, exchange_failure := session_exchange(manager, route, activation)
 			if exchange_failure == .None && inspect_completion(completion[:], &result) {
+				manager_record_success(manager)
 				delete(result.completion)
 				result.completion = completion
 			} else {
@@ -713,6 +881,7 @@ manager_process_activation :: proc(
 					record_exchange_failure(manager, route, exchange_failure)
 				} else {
 					manager.stats.protocol_failures += 1
+					manager_record_failure(manager)
 					session_abort(manager, &route.session)
 					route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 				}
@@ -755,13 +924,13 @@ manager_process_activation :: proc(
 				"Workflow activation has no live executor route",
 			)
 		}
-		start_ok: bool
-		route_index, start_ok = start_route(manager, route_info.run_id)
-		if !start_ok {
+		start_failure: Route_Start_Failure
+		route_index, start_failure = start_route(manager, route_info.run_id)
+		if start_failure != .None {
 			return failure_result(
 				manager,
 				route_info.run_id,
-				"Workflow executor capacity is exhausted or the child could not start",
+				route_start_failure_message(start_failure),
 			)
 		}
 	}
@@ -785,6 +954,7 @@ manager_process_activation :: proc(
 	if !inspect_completion(completion[:], &result) {
 		delete(result.completion)
 		manager.stats.protocol_failures += 1
+		manager_record_failure(manager)
 		session_abort(manager, &route.session)
 		route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 		return failure_result(
@@ -793,6 +963,7 @@ manager_process_activation :: proc(
 			"isolated Workflow executor returned a malformed completion",
 		)
 	}
+	manager_record_success(manager)
 	route.state, _ = lifecycle_step(route.state, .Activation_Succeeded)
 	return result
 }

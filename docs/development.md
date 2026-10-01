@@ -845,8 +845,18 @@ type-name manifest with explicit lengths. `manager_verify_host` verifies the
 ordinary child before `worker.run`, and every task child repeats the handshake
 before its first activation. The live crash and hang paths each require six
 successful handshakes and zero mismatches. Executor-host hook configuration,
-shutdown deadlines, queue/backpressure, and crash-loop policy remain
-outstanding.
+and sticky-cache routing remain outstanding.
+
+The manager now has independent activation and shutdown deadlines. The latter
+bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity
+admission never waits because the same serial poll thread must receive the
+eviction that frees a route; exhaustion returns a failed activation immediately.
+An optional consecutive-failure circuit breaker opens after a configured number
+of child/session failures and admits one new trial after a monotonic cooldown.
+Unit tests use real sleeping/exiting subprocesses for shutdown and breaker
+behavior, while a 1,000-case property test checks the breaker boundary. The
+CLI-dev-server crash and hang paths enable these policies and require zero
+shutdown timeouts or breaker rejections during successful recovery.
 
 Workflows have the corresponding registration levels:
 
