@@ -6,7 +6,7 @@ Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
 spikes covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
-Activity/Workflow/Nexus worker registry and poll loop, updated 2026-10-01. The
+Activity/Workflow/Nexus worker registry and poll loop, updated 2026-10-02. The
 Activity slice now also has a generic Temporal Payload boundary, typed JSON Activity registration, and
 structured Application Failures proven through a live retry. The Workflow fiber
 now preserves generic Payloads across initialization, Activity
@@ -2954,10 +2954,11 @@ worker.create -> language configuration + registries only
 worker.run -> derive Core task types -> worker_new + worker_validate
     |-- Workflow poll thread
     |      decode route
-    |      Workflow type --initialization--> registered Fiber_Runtime
-    |      run ID --------subsequent-------> same Fiber_Runtime
-    |      process activation -> complete activation
-    |      RemoveFromCache -> destroy fiber and route
+    |      run ID -> fixed executor shard
+    |                  Workflow type --initialization--> shard Fiber_Runtime
+    |                  run ID --------subsequent-------> same shard/runtime
+    |                  process activation -> complete activation concurrently
+    |                  RemoveFromCache -> destroy fiber/route on owner thread
     |
     `-- Activity poll thread
            decode task -> task-token route -> bounded callback thread
@@ -2966,16 +2967,18 @@ worker.run -> derive Core task types -> worker_new + worker_validate
 ```
 
 The blocking C calls can run concurrently against the same Core worker. The
-Workflow registry itself is frozen while `run` is active, and only the Workflow
-poll thread accesses its fiber runtimes and run-ID table. This preserves
-single-threaded fiber affinity while allowing a Workflow-produced Activity to
-execute without stopping Workflow polling. The invariant is enforced inside
-each `Fiber_Runtime`, not only by the current loop shape: a non-blocking guard
-rejects overlapping activation/eviction processing, the first activation binds
-the runtime to its executor thread, and later processing on another thread is a
-fatal language-runtime boundary error. When the poll loop ends, it destroys
-every still-cached fiber on that same thread before releasing affinity;
-`worker.close` therefore only frees inert runtime ownership on its caller.
+Workflow registry itself is frozen while `run` is active. At concurrency one,
+the poll thread accesses the base runtimes and run-ID table. At higher
+concurrency, each fixed executor exclusively accesses its own runtimes and
+routes. Both shapes preserve single-threaded fiber affinity while allowing a
+Workflow-produced Activity to execute without stopping Workflow polling. The
+invariant is enforced inside each `Fiber_Runtime`, not only by the scheduler: a
+non-blocking guard rejects overlapping activation/eviction processing, the
+first activation binds the runtime to its executor thread, and later processing
+on another thread is a fatal language-runtime boundary error. When an executor
+ends, it destroys every still-cached fiber on that same thread before releasing
+affinity; `worker.close` therefore only frees inert runtime ownership on its
+caller.
 A two-thread unit test blocks inside Workflow code and proves both concurrent
 and sequential cross-thread rejection, followed by owner-thread eviction and
 shutdown. A second test destroys a cached terminal fiber during executor
@@ -3332,20 +3335,21 @@ that exact eviction without weakening routing checks for arbitrary unknown run
 IDs. The live suite verifies the server history event, eviction, and subsequent
 execution of a registered Workflow on the same worker.
 
-This answers the narrow feasibility question: stackful suspension and
-history-driven reconstruction work across the Odin/C boundary without a large
-runtime. It does not yet answer scheduling at scale. A coroutine object is not
-thread-safe, fixed stacks can overflow, and minicoro cautions against migrating
-coroutines that use thread-local state. The in-process Worker now drives all
-Workflow runtimes from one deterministic poll/executor thread, rejects
-concurrent access and thread migration, and performs cached-fiber destruction
-there before the thread exits. This establishes the safety invariant; it does
-not yet provide a complete scalable in-process scheduler. The process-isolation
-path now has stable, property-tested run partitioning through independently
-locked `Concurrent_Manager` shards and a bounded language executor pool. Core
-polling intentionally remains single-threaded per its contract, while
-independent activations and their Core completions overlap on those executor
-threads. The chosen
+This answers both the narrow feasibility question and the first scheduling
+question: stackful suspension and history-driven reconstruction work across the
+Odin/C boundary without a large runtime, and independent runs can execute in
+parallel without moving a coroutine. A coroutine object is not thread-safe,
+fixed stacks can overflow, and minicoro cautions against migrating coroutines
+that use thread-local state. The in-process Worker therefore keeps one Core
+poller and hashes run IDs onto fixed executor threads. Each shard exclusively
+owns its runtimes and destroys cached fibers before that thread exits. Runtime
+guards still reject concurrent access and thread migration. The
+process-isolation path has the same stable, property-tested partitioning through
+independently locked `Concurrent_Manager` shards and a bounded language
+executor pool. In both paths, Core polling intentionally remains single-threaded
+while independent activations and their Core completions overlap. Remaining
+scheduler work is failure/replay/cancellation stress, fairness/backpressure
+measurement, and all-target validation. The chosen
 fixed, virtual-memory-backed guard-page stack must
 still be exercised by sanitizers and all four target builds, and stack sizing
 remains an operator concern because it does not grow. Panics crossing the C
@@ -3500,7 +3504,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and enforced single-executor affinity on macOS arm64 | Partition multiple Workflow runs across stable executor threads without ever moving a live fiber |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and fixed run-affine concurrent executors on macOS arm64 | Stress replay, failure, cancellation, and handler-rich histories across many shards without moving a live fiber |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -3509,6 +3513,16 @@ evidence to continue with fibers while retaining the explicit state machine as
 a comparison point; it is not yet enough to freeze the public API.
 
 ## Recommended next vertical milestone
+
+The current next milestone is production hardening of the run-affine
+in-process scheduler. Exercise replay-driven reconstruction, nondeterminism,
+cancellation, handler-rich histories, and shutdown faults concurrently across
+many shards; add queue-depth/fairness observations; and run the guard-page plus
+affinity suite on all four distribution targets. The live two-run timer proof
+establishes the architecture, but it is not yet the soak/fault evidence needed
+to call concurrent fibers production-ready. Process-isolated execution remains
+the containment option for panicking, overflowing, or uncooperative Workflow
+code.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core,
@@ -3536,10 +3550,9 @@ deadline. Standalone Activity Start/Poll/Describe/result,
 cancel/terminate/delete, Visibility List/Count, Pause/Unpause/Reset, and
 masked execution-option updates are now implemented, intercepted,
 wire-tested, and live-proven against Server 1.32. This completes the pinned
-standalone Activity client family. The next vertical milestone should continue
-production hardening of the Workflow runtime: isolate an uncooperative or
-panicking Workflow execution at a process boundary while preserving Core's
-task/completion lifecycle. The SDK now provides the smaller whole-Worker
+standalone Activity client family. Fine-grained process isolation now preserves
+Core's task/completion lifecycle for uncooperative or panicking Workflow
+execution. The SDK also provides the smaller whole-Worker
 supervisor itself, including readiness, bounded crash-loop backoff, thread-safe
 stop, TERM/grace/KILL, lifecycle events, unit tests, and a live abrupt-crash/
 replay proof. The fine-grained IPC path now carries opaque
@@ -4150,6 +4163,39 @@ replay classification, and byte-identical fresh-stack replay. The live
 properties Workflow queries `currentDetails` before a Signal permits it to
 close; the deployment acceptance Workflow also requires a non-empty version
 delivered by Core.
+
+## Run-affine in-process Workflow executors
+
+Core Workflow polling remains single-threaded because the pinned Rust API
+explicitly forbids concurrent `poll_workflow_activation` calls. Completion is a
+different boundary: Core documents concurrent activation completion as valid
+and desirable. When `Options.max_concurrent_workflow_tasks` is greater than one,
+the Odin poller therefore transfers each owned activation buffer to exactly one
+fixed executor thread and that executor calls Core completion directly.
+
+The routing key is `WorkflowActivation.run_id`, hashed with the same portable
+FNV-1a function used by process isolation. A shard owns an independent runtime
+for every registered Workflow type plus all active and rejected run routes on
+that shard. These runtimes are instantiated from the Worker's immutable
+process-local `workflow.Registry`; callback values, runtime allocators, run
+arenas, and minicoro stacks are never shared between shards. All activations for
+one run—including initialization, timer/activity resolution, replay, and
+`RemoveFromCache`—therefore execute on the same OS thread.
+
+Shutdown stops admission, drains already queued activations, destroys cached
+fibers on their executor threads with `fiber_runtime_executor_shutdown`, joins
+the shards, and only then releases their runtimes. The original registration
+runtimes remain the serial path and are inert while sharding is enabled. Worker
+close releases those base runtimes before the reusable factory registry.
+
+This makes concurrency visible above the Workflow-code boundary. Different
+Workflow runs can execute simultaneously, so logger, metric-emitter factory,
+interceptor, and activation-observer `user_data` must be concurrency-safe.
+Individual Workflow state remains run-local and deterministic. The live
+`workflow_in_process_concurrency` proof suspends two runs on real Core timers,
+requires them to resume on their original executor threads, measures overlap,
+and requires final eviction for each run. Its brief wall-clock block is test
+instrumentation and is not an allowed Workflow programming primitive.
 
 ## Core-connected Workflow process isolation
 

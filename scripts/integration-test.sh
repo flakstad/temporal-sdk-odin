@@ -1299,6 +1299,9 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/workflow-concurrency-integration-test.sh"
 
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/workflow-in-process-concurrency-integration-test.sh"
+
 ACTIVITY_EXPECT_CONCURRENT=1 \
   TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &

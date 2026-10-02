@@ -1537,6 +1537,27 @@ worker_workflow_registration_retains_a_reusable_runtime_factory :: proc(t: ^test
 		t,
 		fresh.callback_data != sdk_worker.workflow_registrations[0].runtime.callback_data,
 	)
+
+	executor_set := worker.Workflow_Runtime_Set{}
+	executor_init_error := worker.workflow_runtime_set_init(&sdk_worker, &executor_set)
+	testing.expect(t, executor_init_error.message == nil)
+	worker.error_free(&executor_init_error)
+	testing.expect_value(t, len(executor_set.registrations), 1)
+	if len(executor_set.registrations) == 1 {
+		testing.expect_value(t, executor_set.registrations[0].name, "factory-test")
+		testing.expect(
+			t,
+			executor_set.registrations[0].runtime.callback_data !=
+				sdk_worker.workflow_registrations[0].runtime.callback_data,
+		)
+		testing.expect(
+			t,
+			executor_set.registrations[0].runtime.callback_data != fresh.callback_data,
+		)
+	}
+	executor_close_error := worker.workflow_runtime_set_close_on_executor(&executor_set)
+	testing.expect(t, executor_close_error.message == nil)
+	worker.error_free(&executor_close_error)
 }
 
 @(test)

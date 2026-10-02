@@ -337,6 +337,9 @@ Run_Options :: struct {
 	// interleavings are still being hardened. It requires both Workflow and
 	// Activity registrations on this Worker.
 	enable_local_activities:  bool,
+	// Called on the owning Workflow executor after Core completion. This can be
+	// concurrent across runs when max_concurrent_workflow_tasks is greater than
+	// one; user_data reachable by the callback must be synchronized.
 	on_workflow_activation:  Workflow_Activation_Observer,
 	workflow_activation_processor: Workflow_Activation_Processor_Proc,
 	workflow_activation_processor_data: rawptr,
@@ -427,9 +430,9 @@ Options :: struct {
 	identity_override:                               string,
 	max_concurrent_activities:                       int,
 	max_concurrent_nexus_tasks:                      int,
-	// More than one is currently supported only for external/process-isolated
-	// Workflows. Core is polled by exactly one thread; activations are dispatched
-	// to this many language executor threads and completed concurrently.
+	// Core is polled by exactly one thread. More than one completes activations
+	// concurrently. In-process runs are hashed onto fixed executor threads;
+	// external processors must preserve their own per-run affinity.
 	max_concurrent_workflow_tasks:                   int,
 	// Core Workflow Task admission. Zero safely derives one slot without a
 	// cache and two with a cache; this does not change Odin executor threading.
@@ -2336,8 +2339,20 @@ activity_execution_start :: proc(
 Workflow_Activation_Route :: workflow_isolate.Activation_Route
 decode_workflow_activation_route :: workflow_isolate.decode_activation_route
 
-find_workflow_registration :: proc(worker: ^Worker, name: string) -> (int, bool) {
-	for registration, index in worker.workflow_registrations {
+// Workflow_Runtime_Set is confined to one language executor. Its runtimes,
+// run routes, and rejected-run routes must never be accessed by another
+// thread while activations are being processed.
+Workflow_Runtime_Set :: struct {
+	registrations: [dynamic]Workflow_Registration,
+	runs:          [dynamic]Workflow_Run,
+	rejected_runs: [dynamic]Rejected_Workflow_Run,
+}
+
+find_workflow_registration :: proc(
+	registrations: []Workflow_Registration,
+	name: string,
+) -> (int, bool) {
+	for registration, index in registrations {
 		if registration.name == name {
 			return index, true
 		}
@@ -2345,8 +2360,8 @@ find_workflow_registration :: proc(worker: ^Worker, name: string) -> (int, bool)
 	return 0, false
 }
 
-find_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, bool) {
-	for workflow_run, index in worker.workflow_runs {
+find_workflow_run :: proc(runs: []Workflow_Run, run_id: string) -> (int, bool) {
+	for workflow_run, index in runs {
 		if workflow_run.run_id == run_id {
 			return index, true
 		}
@@ -2354,13 +2369,16 @@ find_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, bool) {
 	return 0, false
 }
 
-remove_workflow_run :: proc(worker: ^Worker, index: int) {
-	delete(worker.workflow_runs[index].run_id)
-	ordered_remove(&worker.workflow_runs, index)
+remove_workflow_run :: proc(runs: ^[dynamic]Workflow_Run, index: int) {
+	delete(runs^[index].run_id)
+	ordered_remove(runs, index)
 }
 
-find_rejected_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, bool) {
-	for rejected_run, index in worker.rejected_workflow_runs {
+find_rejected_workflow_run :: proc(
+	rejected_runs: []Rejected_Workflow_Run,
+	run_id: string,
+) -> (int, bool) {
+	for rejected_run, index in rejected_runs {
 		if rejected_run.run_id == run_id {
 			return index, true
 		}
@@ -2368,30 +2386,42 @@ find_rejected_workflow_run :: proc(worker: ^Worker, run_id: string) -> (int, boo
 	return 0, false
 }
 
-remove_rejected_workflow_run :: proc(worker: ^Worker, index: int) {
-	delete(worker.rejected_workflow_runs[index].run_id)
-	ordered_remove(&worker.rejected_workflow_runs, index)
+remove_rejected_workflow_run :: proc(
+	rejected_runs: ^[dynamic]Rejected_Workflow_Run,
+	index: int,
+) {
+	delete(rejected_runs^[index].run_id)
+	ordered_remove(rejected_runs, index)
 }
 
-process_workflow_activation :: proc(
-	worker: ^Worker,
+process_workflow_activation_in_set :: proc(
+	runtime_set: ^Workflow_Runtime_Set,
 	data: []u8,
 ) -> (processed: workflow.Process_Result, error: Error) {
+	if runtime_set == nil {
+		return {}, error_from_string("Workflow runtime set is missing")
+	}
 	route, route_ok := decode_workflow_activation_route(data)
 	if !route_ok {
 		return {}, error_from_string("Core returned a malformed WorkflowActivation protobuf")
 	}
 
 	registration_index := 0
-	run_index, run_found := find_workflow_run(worker, route.run_id)
-	rejected_index, rejected_found := find_rejected_workflow_run(worker, route.run_id)
+	run_index, run_found := find_workflow_run(runtime_set.runs[:], route.run_id)
+	rejected_index, rejected_found := find_rejected_workflow_run(
+		runtime_set.rejected_runs[:],
+		route.run_id,
+	)
 	owned_run_id := ""
 	if route.initializes {
 		if run_found {
 			return {}, error_from_string("Workflow run was initialized more than once without eviction")
 		}
 		registration_found: bool
-		registration_index, registration_found = find_workflow_registration(worker, route.workflow_type)
+		registration_index, registration_found = find_workflow_registration(
+			runtime_set.registrations[:],
+			route.workflow_type,
+		)
 		if !registration_found {
 			message := fmt.aprintf("Workflow type %s not found", route.workflow_type)
 			defer delete(message)
@@ -2401,7 +2431,7 @@ process_workflow_activation :: proc(
 					return {}, error_from_string("could not allocate rejected Workflow run route")
 				}
 				append(
-					&worker.rejected_workflow_runs,
+					&runtime_set.rejected_runs,
 					Rejected_Workflow_Run{run_id = cloned_run_id},
 				)
 			}
@@ -2419,7 +2449,7 @@ process_workflow_activation :: proc(
 				"rejected Workflow run received a non-eviction activation",
 			), {}
 		}
-		remove_rejected_workflow_run(worker, rejected_index)
+		remove_rejected_workflow_run(&runtime_set.rejected_runs, rejected_index)
 		processed.completion = workflow.encode_empty_activation_success(route.run_id)
 		processed.evicted = true
 		return processed, {}
@@ -2427,10 +2457,10 @@ process_workflow_activation :: proc(
 		if !run_found {
 			return {}, error_from_string("Workflow activation does not match a registered run")
 		}
-		registration_index = worker.workflow_runs[run_index].registration_index
+		registration_index = runtime_set.runs[run_index].registration_index
 	}
 
-	registration := &worker.workflow_registrations[registration_index]
+	registration := &runtime_set.registrations[registration_index]
 	if registration.external {
 		return {}, error_from_string(
 			"external Workflow activation reached the in-process dispatcher",
@@ -2440,7 +2470,7 @@ process_workflow_activation :: proc(
 	if route.initializes {
 		if workflow.fiber_runtime_has_run(&registration.runtime, route.run_id) {
 			append(
-				&worker.workflow_runs,
+				&runtime_set.runs,
 				Workflow_Run{
 					run_id = owned_run_id,
 					registration_index = registration_index,
@@ -2449,7 +2479,7 @@ process_workflow_activation :: proc(
 			owned_run_id = ""
 		} else if processed.activation_failed {
 			append(
-				&worker.rejected_workflow_runs,
+				&runtime_set.rejected_runs,
 				Rejected_Workflow_Run{run_id = owned_run_id},
 			)
 			owned_run_id = ""
@@ -2457,11 +2487,29 @@ process_workflow_activation :: proc(
 		delete(owned_run_id)
 	}
 	if processed.evicted {
-		run_index, run_found = find_workflow_run(worker, route.run_id)
+		run_index, run_found = find_workflow_run(runtime_set.runs[:], route.run_id)
 		if run_found {
-			remove_workflow_run(worker, run_index)
+			remove_workflow_run(&runtime_set.runs, run_index)
 		}
 	}
+	return
+}
+
+process_workflow_activation :: proc(
+	worker: ^Worker,
+	data: []u8,
+) -> (processed: workflow.Process_Result, error: Error) {
+	if worker == nil {
+		return {}, error_from_string("Worker is missing")
+	}
+	runtime_set := Workflow_Runtime_Set{
+		registrations = worker.workflow_registrations,
+		runs = worker.workflow_runs,
+		rejected_runs = worker.rejected_workflow_runs,
+	}
+	processed, error = process_workflow_activation_in_set(&runtime_set, data)
+	worker.workflow_runs = runtime_set.runs
+	worker.rejected_workflow_runs = runtime_set.rejected_runs
 	return
 }
 
@@ -3642,7 +3690,14 @@ run_workflow_loop :: proc(
 	options: Run_Options,
 ) -> (stats: Run_Stats, error: Error) {
 	if worker.max_concurrent_workflow_tasks > 1 {
-		return run_external_workflow_executor_loop(
+		if options.workflow_activation_processor != nil {
+			return run_external_workflow_executor_loop(
+				worker,
+				options,
+				worker.max_concurrent_workflow_tasks,
+			)
+		}
+		return run_in_process_workflow_executor_loop(
 			worker,
 			options,
 			worker.max_concurrent_workflow_tasks,
@@ -4014,21 +4069,16 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 			"external Workflow registrations require a Workflow activation processor",
 		)
 	}
-	if has_in_process_workflows && worker.max_concurrent_workflow_tasks > 1 {
-		return {}, error_from_string(
-			"concurrent Workflow tasks currently require external Workflow executors",
-		)
-	}
 	if has_external_workflows && worker.max_concurrent_workflow_tasks > 1 &&
 	   worker.core_options.max_cached_workflows == 0 {
 		return {}, error_from_string(
 			"concurrent Workflow execution requires a positive Workflow cache size",
 		)
 	}
-	if has_external_workflows && worker.max_concurrent_workflow_tasks > 1 &&
+	if worker.max_concurrent_workflow_tasks > 1 &&
 	   options.max_workflow_executions > 0 {
 		return {}, error_from_string(
-			"bounded Workflow execution counts are not supported by concurrent external executors",
+			"bounded Workflow execution counts are not supported by concurrent Workflow executors",
 		)
 	}
 	if has_external_workflows &&

@@ -283,10 +283,10 @@ it is closed.
 `registry_instantiate` creates an independent `Fiber_Runtime` and transfers its
 callback copy to the caller. This is the primitive used by
 `workflow/isolate.Executor_Host`. Direct `worker.register_workflow`, Payload,
-repeated-Payload, and typed-JSON registrations now also retain this Registry as
-their callback/factory source while materializing the current single-threaded
-runtime. A future fixed executor shard can therefore instantiate a fresh set of
-runtimes without copying a live fiber or migrating its stack between threads.
+repeated-Payload, and typed-JSON registrations also retain this Registry as
+their callback/factory source. Each fixed in-process executor shard instantiates
+a fresh runtime set without copying a live fiber or migrating its stack between
+threads.
 Registration is transactional: if initial runtime construction or hook
 configuration fails, the just-added factory record is removed and destroyed.
 

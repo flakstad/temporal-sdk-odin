@@ -304,7 +304,7 @@ options := worker.options_default("orders")
 options.identity_override = "orders-worker-1"
 options.max_concurrent_activities = 32
 options.max_cached_workflows = 1_000
-options.max_concurrent_workflow_tasks = 4 // external/process-isolated only
+options.max_concurrent_workflow_tasks = 4 // fixed run-affine executors
 options.max_workflow_task_slots = 8
 options.sticky_queue_schedule_to_start_timeout = 10 * time.Second
 options.max_worker_activities_per_second = 50
@@ -326,12 +326,16 @@ Zero rate limits mean unset. Default poller behavior leaves both C pointers
 null so SDK Core can use its default and accept server-directed poller
 autoscaling. Durations are rounded upward to whole milliseconds at the C ABI;
 zero Workflow Task slots safely derives one without caching or two with caching.
-Larger explicit values raise Core admission capacity. The in-process fiber
-runtime remains single-threaded, but an external/process-isolated processor can
-set `max_concurrent_workflow_tasks` and use a bounded Odin executor pool. Core
-is still polled by exactly one thread, as upstream requires; activation
-callbacks and completion calls run concurrently. This mode requires a positive
-Workflow cache and at least as many task slots as executor threads.
+Larger explicit values raise Core admission capacity. Setting
+`max_concurrent_workflow_tasks` above one enables concurrent language execution
+for both in-process and external/process-isolated Workflows. Core is still
+polled by exactly one thread, as upstream requires; activation callbacks and
+completion calls run concurrently. Each in-process executor owns an independent
+runtime set, and stable run-ID hashing keeps every suspended fiber on one OS
+thread through timers, replay, and eviction. External processors receive a
+bounded callback pool and must preserve their own per-run affinity. At least as
+many Core task slots as executor threads are required. External concurrency
+additionally requires a positive Workflow cache.
 invalid rates, poller ranges, cache/poller combinations, resource targets/slot
 ranges, and negative durations are rejected before `worker_new`. A
 resource-based Activity tuner supersedes `max_concurrent_activities` and uses
@@ -572,6 +576,11 @@ proof: four language executor threads process slow independent Workflow runs on
 distinct shards, the measured activation peak must reach at least two, and all
 results and routes must drain cleanly. It also guards the upstream contract
 that Workflow polling itself is never concurrent.
+`./scripts/workflow-in-process-concurrency-integration-test.sh` proves the same
+boundary without child processes: two typed Odin Workflows suspend on Temporal
+timers, resume on their original executor threads, overlap after resumption,
+complete through concurrent Core calls, and receive final eviction on those
+same threads.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's
@@ -2320,17 +2329,15 @@ If Core includes `InitializeWorkflow` and `CancelWorkflow` in one initial
 activation, the root cancellation is installed before Odin first resumes the
 new stackful fiber, so the same rule holds even for an immediately returning
 procedure.
-The in-process Workflow Worker executes activations on one deterministic poll
-thread. Every `Fiber_Runtime` now enforces that contract independently: it
-rejects overlapping calls and later calls from another OS thread, then destroys
-any cached fibers on the owning executor before the poll loop exits. This keeps
-minicoro stacks from being resumed, evicted, or destroyed after thread
-migration even if the dispatcher is refactored later.
-Direct in-process registrations also retain a reusable process-local runtime
-factory. The currently used runtime and every later executor-shard runtime own
-separate callback storage; Worker shutdown destroys runtimes before the factory
-registry. Parallel in-process dispatch is not enabled yet—the retained factory
-is the prerequisite that makes fixed, run-affine executor shards possible.
+The in-process Workflow Worker always has one deterministic Core poll thread.
+With the default concurrency of one, that thread also executes Workflows. With
+a larger value, it hashes each run ID onto a fixed executor thread. Every shard
+owns independent `Fiber_Runtime` instances created from the process-local
+registration factories, plus its own active/rejected run routes. A runtime
+rejects overlapping or cross-thread entry, and shard shutdown destroys cached
+fibers on the owning executor before releasing callback factories. Logger,
+metric-emitter, interceptor, and activation-observer user data can be invoked
+concurrently in this mode and must be synchronized by the application.
 Detached scope state is local to the currently running main or Update fiber.
 To let a detached handler finish, the main Workflow must itself use a detached
 scope around `workflow.await_all_handlers_finished(ctx)` after observing
@@ -2444,6 +2451,7 @@ examples/worker_replace_client/ live Core Worker connection failover proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/workflow_concurrency/ single-Core-poller/external-executor overlap proof
+examples/workflow_in_process_concurrency/ run-affine fiber overlap/migration proof
 examples/update_with_start/ atomic create-or-attach Update proof
 examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof

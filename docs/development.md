@@ -475,17 +475,20 @@ caching raises the automatic fixed Workflow slot supplier from one to two; an
 explicitly configured simple Workflow poller must likewise be at least two.
 `max_workflow_task_slots` can override the automatic count and maps exactly to
 Core's fixed Workflow slot supplier. A cached worker rejects the unsafe value
-one. This configures Core admission only—the current in-process dispatcher is
-still single-threaded until run-affine executor sharding lands.
+one. Core admission and Odin execution remain distinct: Core still has one
+Workflow activation poller, while `max_concurrent_workflow_tasks > 1` enables
+fixed run-affine Odin executor shards.
 
 Every direct in-process Workflow registration is retained twice with distinct
 ownership: the Worker's `workflow_registry` owns a reusable callback factory,
-and `workflow_registrations` owns the runtime materialized for the current
-single executor. `registry_instantiate` has a focused test proving that the same
+and `workflow_registrations` owns the runtime materialized for the serial
+executor path. `registry_instantiate` has a focused test proving that the same
 factory creates a second runtime with independent callback storage. Worker
-shutdown closes materialized runtimes before their factories. This is the
-construction boundary for the next scheduler slice: each fixed executor thread
-can own its own runtime set, and no live minicoro stack needs to migrate.
+shutdown closes materialized runtimes before their factories. Each fixed
+executor thread now instantiates and owns one complete runtime set from that
+registry. The poller uses the same portable FNV-1a run hash as process isolation
+to route all later activations, including timer resolution and eviction, back
+to the owner thread. No live minicoro stack migrates.
 
 Activity capacity may instead use Core's resource-based supplier:
 
@@ -1187,6 +1190,21 @@ positive Workflow cache, and slow child executors. It requires two independent
 runs to overlap, concurrent completion through Core, clean shutdown, and zero
 remaining routes. Cacheless concurrency is rejected because Core's immediate
 uncached eviction sequence makes this activation stream effectively serial.
+
+The in-process counterpart is:
+
+```bash
+./scripts/workflow-in-process-concurrency-integration-test.sh
+```
+
+It starts runs whose server-assigned run IDs map to distinct fixed shards. Each
+Workflow suspends on a real Temporal timer, verifies its OS thread before and
+after resumption, and uses a short test-only blocking probe to require measured
+overlap. The test also requires terminal results and one Core eviction per run.
+The blocking probe is instrumentation only; application Workflow code must not
+read wall time or block an executor thread. In concurrent mode, Workflow
+logger/interceptor/metric factory state and the activation observer can be
+called from several shard threads and must be concurrency-safe.
 
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.
