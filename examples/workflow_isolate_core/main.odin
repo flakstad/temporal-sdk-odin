@@ -27,6 +27,8 @@ Observation_Stats :: struct {
 	diagnostic_logs: int,
 	diagnostic_metrics: int,
 	malformed_diagnostics: int,
+	evictions_observed: int,
+	nondeterminism_details: int,
 }
 
 observations: Observation_Stats
@@ -68,6 +70,26 @@ observe_diagnostic :: proc(_: rawptr, event: workflow_isolate.Diagnostic_Event_V
 		}
 	case .Application:
 		observations.malformed_diagnostics += 1
+	}
+}
+
+observe_eviction :: proc(_: rawptr, event: ^workflow_isolate.Eviction_Event_View) {
+	if event == nil || len(event.run_id) == 0 {
+		observations.malformed_diagnostics += 1
+		return
+	}
+	observations.evictions_observed += 1
+	if event.reason == .NONDETERMINISM && len(event.message) > 0 {
+		observations.nondeterminism_details += 1
+	}
+	if len(event.message) > 0 {
+		fmt.eprintf(
+			"Workflow executor eviction run_id=%s generation=%d reason=%v message=%q\n",
+			event.run_id,
+			event.generation,
+			event.reason,
+			event.message,
+		)
 	}
 }
 
@@ -328,6 +350,7 @@ run :: proc() -> int {
 			cooldown = 5 * time.Second,
 		},
 		diagnostic_observer = observe_diagnostic,
+		eviction_observer = observe_eviction,
 		maximum_diagnostic_payload_bytes_per_activation =
 			first_mode == "diagnostic-budget" ? 40 : 0,
 	})
@@ -419,9 +442,11 @@ run :: proc() -> int {
 		   manager_stats.workflow_ending_evictions != 0 ||
 		   manager_stats.generations_started != 1 ||
 		   manager_stats.evictions != 1 ||
+		   observations.evictions_observed != 1 ||
+		   observations.nondeterminism_details != 1 ||
 		   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 			fmt.eprintf(
-				"Unexpected isolated nondeterminism result completed=%d replay_activations=%d nondeterminism_evictions=%d language_failure_evictions=%d workflow_ending_evictions=%d generations=%d evictions=%d routes=%d\n",
+				"Unexpected isolated nondeterminism result completed=%d replay_activations=%d nondeterminism_evictions=%d language_failure_evictions=%d workflow_ending_evictions=%d generations=%d evictions=%d observed_evictions=%d nondeterminism_details=%d routes=%d\n",
 				run_stats.workflow_executions_completed,
 				run_stats.workflow_replay_activations,
 				manager_stats.nondeterminism_evictions,
@@ -429,6 +454,8 @@ run :: proc() -> int {
 				manager_stats.workflow_ending_evictions,
 				manager_stats.generations_started,
 				manager_stats.evictions,
+				observations.evictions_observed,
+				observations.nondeterminism_details,
 				workflow_isolate.manager_route_count(&executor_manager),
 			)
 			return 1
@@ -538,6 +565,7 @@ run :: proc() -> int {
 	   observations.timer_commands_without_sequence != 0 ||
 	   observations.diagnostic_logs != 2 || observations.diagnostic_metrics != 2 ||
 	   observations.malformed_diagnostics != 0 ||
+	   observations.evictions_observed != manager_stats.evictions ||
 	   manager_stats.diagnostics_received != 4 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(

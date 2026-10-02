@@ -299,6 +299,15 @@ observer requires exactly two of each kind and `diagnostics_received=4` in both
 cache modes, proving structured child observations reach the parent separately
 from completion metadata.
 
+Core's `RemoveFromCache` is also observable without decoding logs. Optional
+`Manager_Options.eviction_observer` receives a synchronous borrowed view of the
+run ID, Core eviction reason and message, whether an Odin route existed, and
+that route's generation. In particular, Core's nondeterminism explanation is no
+longer discarded by the process manager. The live example prints non-empty
+messages and requires one callback for every counted eviction; unit coverage
+preserves an exact nondeterminism message from protobuf decode through the
+observer.
+
 The live assertion requires one activation failure, one child exit, two
 completed Workflows, no owned route at return, both exact results, and no
 capacity, shutdown, crash-loop, or protocol failures. The observed

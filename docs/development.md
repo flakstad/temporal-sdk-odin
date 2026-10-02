@@ -1150,6 +1150,13 @@ idempotence, post-shutdown activation rejection, and complete route release.
 Capacity admission never waits because the same serial poll thread must receive
 the eviction that frees a route; exhaustion returns a failed activation
 immediately.
+
+`Manager_Options.eviction_observer` exposes Core's complete borrowed eviction
+diagnostic at the parent boundary: run ID, reason, message, route presence, and
+generation. The callback is synchronous and must copy data it retains. This
+keeps nondeterminism explanations visible even when the affected executor has
+already crashed or been killed.
+
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.
 Unit tests use real sleeping/exiting subprocesses for shutdown and breaker

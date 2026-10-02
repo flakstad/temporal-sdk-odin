@@ -88,6 +88,7 @@ Activation_Route :: struct {
 	initializes:    bool,
 	evicts:         bool,
 	eviction_reason: proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason,
+	eviction_message: string,
 	is_replaying:   bool,
 	history_length: u32,
 	job_count:      int,
@@ -125,6 +126,7 @@ decode_activation_route :: proc(data: []u8) -> (route: Activation_Route, ok: boo
 			route.evicts = variant.value != nil
 			if variant.value != nil {
 				route.eviction_reason = variant.value.reason
+				route.eviction_message = variant.value.message
 			}
 		}
 	}
@@ -134,6 +136,19 @@ decode_activation_route :: proc(data: []u8) -> (route: Activation_Route, ok: boo
 Manager_Diagnostic_Observer :: #type proc(
 	user_data: rawptr,
 	event: Diagnostic_Event_View,
+)
+
+Eviction_Event_View :: struct {
+	run_id:     string,
+	message:    string,
+	reason:     proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason,
+	generation: u64,
+	had_route:  bool,
+}
+
+Manager_Eviction_Observer :: #type proc(
+	user_data: rawptr,
+	event: ^Eviction_Event_View,
 )
 
 DEFAULT_MAXIMUM_DIAGNOSTICS_PER_ACTIVATION :: 256
@@ -159,6 +174,10 @@ Manager_Options :: struct {
 	// Diagnostic payload and run_id are borrowed only for the synchronous call.
 	diagnostic_observer: Manager_Diagnostic_Observer,
 	diagnostic_observer_data: rawptr,
+	// Eviction fields are borrowed only for the synchronous callback. Core's
+	// message often contains the useful nondeterminism/fatal-failure detail.
+	eviction_observer: Manager_Eviction_Observer,
+	eviction_observer_data: rawptr,
 	// Zero selects the default. This bounds untrusted child frame streams.
 	maximum_diagnostics_per_activation: int,
 	// Counts the complete encoded Diagnostic payload, including its one-byte
@@ -238,6 +257,8 @@ Manager :: struct {
 	report_cancellation_reason: string,
 	diagnostic_observer: Manager_Diagnostic_Observer,
 	diagnostic_observer_data: rawptr,
+	eviction_observer: Manager_Eviction_Observer,
+	eviction_observer_data: rawptr,
 	maximum_diagnostics_per_activation: int,
 	maximum_diagnostic_payload_bytes_per_activation: int,
 	stats:              Manager_Stats,
@@ -330,6 +351,8 @@ manager_init :: proc(manager: ^Manager, options: Manager_Options) -> Manager_Err
 	manager.crash_loop = options.crash_loop
 	manager.diagnostic_observer = options.diagnostic_observer
 	manager.diagnostic_observer_data = options.diagnostic_observer_data
+	manager.eviction_observer = options.eviction_observer
+	manager.eviction_observer_data = options.eviction_observer_data
 	manager.maximum_diagnostics_per_activation = options.maximum_diagnostics_per_activation
 	if manager.maximum_diagnostics_per_activation == 0 {
 		manager.maximum_diagnostics_per_activation =
@@ -1192,6 +1215,20 @@ manager_process_activation :: proc(
 			manager.stats.language_failure_evictions += 1
 		case .WORKFLOW_EXECUTION_ENDING:
 			manager.stats.workflow_ending_evictions += 1
+		}
+		if manager.eviction_observer != nil {
+			generation: u64
+			if route_found {
+				generation = manager.routes[route_index].generation
+			}
+			event := Eviction_Event_View{
+				run_id = route_info.run_id,
+				message = route_info.eviction_message,
+				reason = route_info.eviction_reason,
+				generation = generation,
+				had_route = route_found,
+			}
+			manager.eviction_observer(manager.eviction_observer_data, &event)
 		}
 		result := workflow.Process_Result{
 			completion = workflow.encode_empty_activation_success(route_info.run_id),

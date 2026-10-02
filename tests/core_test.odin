@@ -675,9 +675,11 @@ workflow_isolate_test_initialization :: proc(run_id: string) -> [dynamic]u8 {
 workflow_isolate_test_eviction :: proc(
 	run_id: string,
 	reason := proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason.LANG_FAIL,
+	message := "",
 ) -> [dynamic]u8 {
 	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{
 		reason = reason,
+		message = message,
 	}
 	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
 		run_id = run_id,
@@ -692,13 +694,40 @@ workflow_isolate_test_eviction :: proc(
 	return proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
 }
 
+Workflow_Isolate_Eviction_Observer_State :: struct {
+	calls:                      int,
+	saw_nondeterminism_detail:  bool,
+	all_routes_absent:          bool,
+}
+
+workflow_isolate_test_observe_eviction :: proc(
+	user_data: rawptr,
+	event: ^workflow_isolate.Eviction_Event_View,
+) {
+	state := cast(^Workflow_Isolate_Eviction_Observer_State)user_data
+	if state == nil || event == nil {
+		return
+	}
+	state.calls += 1
+	state.all_routes_absent = state.all_routes_absent &&
+		!event.had_route && event.generation == 0
+	if event.reason == .NONDETERMINISM &&
+	   event.run_id == "semantic-eviction-0" &&
+	   event.message == "Core nondeterminism detail" {
+		state.saw_nondeterminism_detail = true
+	}
+}
+
 @(test)
 workflow_executor_manager_classifies_semantic_eviction_reasons :: proc(t: ^testing.T) {
 	command := [?]string{"/bin/true"}
 	manager := workflow_isolate.Manager{}
+	observer_state := Workflow_Isolate_Eviction_Observer_State{all_routes_absent = true}
 	init_error := workflow_isolate.manager_init(&manager, {
 		command = command[:],
 		maximum_executors = 1,
+		eviction_observer = workflow_isolate_test_observe_eviction,
+		eviction_observer_data = &observer_state,
 	})
 	testing.expect(t, init_error.message == nil)
 	workflow_isolate.manager_error_free(&init_error)
@@ -711,7 +740,8 @@ workflow_executor_manager_classifies_semantic_eviction_reasons :: proc(t: ^testi
 	}
 	for reason, index in reasons {
 		run_id := fmt.aprintf("semantic-eviction-%d", index)
-		eviction := workflow_isolate_test_eviction(run_id, reason)
+		message := index == 0 ? "Core nondeterminism detail" : ""
+		eviction := workflow_isolate_test_eviction(run_id, reason, message)
 		processed := workflow_isolate.manager_process_activation(&manager, eviction[:])
 		delete(eviction)
 		delete(run_id)
@@ -726,6 +756,9 @@ workflow_executor_manager_classifies_semantic_eviction_reasons :: proc(t: ^testi
 	testing.expect_value(t, stats.nondeterminism_evictions, 1)
 	testing.expect_value(t, stats.language_failure_evictions, 1)
 	testing.expect_value(t, stats.workflow_ending_evictions, 1)
+	testing.expect_value(t, observer_state.calls, 3)
+	testing.expect(t, observer_state.saw_nondeterminism_detail)
+	testing.expect(t, observer_state.all_routes_absent)
 }
 
 @(test)
@@ -842,6 +875,7 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 		eviction_route.eviction_reason,
 		proto.Coresdk_Workflow_Activation_RemoveFromCache_EvictionReason.NONDETERMINISM,
 	)
+	testing.expect_value(t, eviction_route.eviction_message, "incompatible timer command")
 }
 
 Workflow_Host_Hook_Test_State :: struct {

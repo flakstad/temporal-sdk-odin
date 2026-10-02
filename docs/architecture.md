@@ -3386,9 +3386,10 @@ Workflows are enabled.
    and fresh-process replay. A real Odin panic is contained by the same process
    boundary without unwinding through C/minicoro. A real non-yielding Workflow
    loop is killed at the configured activation deadline and recovered through
-   eviction/replay. It does not yet prove
-   replay-history JSON import, richer nondeterminism diagnostics, growable
-   stacks, or a production deterministic scheduler.
+   eviction/replay. Canonical Temporal CLI history JSON now feeds the offline
+   Core replayer, and the isolated manager exposes Core's exact eviction reason
+   and message for nondeterminism diagnosis. Growable stacks and a production
+   deterministic scheduler remain unresolved.
 5. **Cross-platform artifacts.** macOS arm64 and a clean Ubuntu 24.04 arm64
    container are locally executed through unit/property tests, all example
    builds, packaging, and packaged-runtime smoke. The repository defines the
@@ -4253,13 +4254,15 @@ retains cleanup-safe best-effort semantics. Capacity exhaustion fails
 immediately because waiting on the serial activation thread would prevent
 eviction from releasing a slot. A configurable consecutive-failure breaker
 prevents unbounded respawn and admits a trial after cooldown. Complete
-observation metadata is now preserved
-through the process manager and fed to ordinary Worker statistics/observers;
+observation metadata is now preserved through the process manager and fed to
+ordinary Worker statistics/observers;
 the live proof checks child-only timer sequence values in zero- and sticky-cache
-modes. Executor-host log, metric, and interceptor hooks remain language-runtime
-work, not additional Temporal protocol work. Logger and interceptor
-configuration and per-runtime metric-emitter creation are implemented; optional
-structured event transport remains. See
+modes. Core eviction reason/message plus route generation are delivered through
+a synchronous parent observer, so nondeterminism detail survives child loss.
+Executor-host log, metric, and interceptor hooks remain language-runtime work,
+not additional Temporal protocol work. Logger and interceptor configuration and
+per-runtime metric-emitter creation are implemented; optional structured event
+transport remains. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
 

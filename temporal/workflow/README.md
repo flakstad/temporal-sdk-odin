@@ -325,6 +325,11 @@ second call is a no-op. `manager_close` performs the drain automatically but
 discards its returned diagnostic, so use the explicit call when teardown
 failure must be surfaced.
 
+Set `Manager_Options.eviction_observer` to receive Core's borrowed
+`RemoveFromCache` reason/message together with the run ID and executor
+generation. This is the primary process-manager diagnostic for nondeterminism;
+copy any fields that must outlive the synchronous callback.
+
 With a non-zero Core Workflow cache, the same route and child remain alive for
 incremental activations until `RemoveFromCache`. The live sticky test keeps two
 timer Workflows on two successful generations across suspension/resolution;
