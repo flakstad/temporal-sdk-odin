@@ -593,6 +593,10 @@ and overlap again after timer resolution. That pass requires a positive
 `worker.request_workflow_eviction` helper exposes Core's asynchronous
 language-requested eviction for diagnostics and tests; ordinary applications
 should leave cache management to Core.
+The replay pass also runs one deliberately incompatible Workflow: its first
+activation records a Timer, while its reconstructed fiber emits completion.
+The type-scoped Core policy must turn the mismatch into terminal
+`[TMPRL1100]` nondeterminism while the valid shards continue to completion.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one

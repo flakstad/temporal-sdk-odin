@@ -3504,7 +3504,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and replay reconstruction on fixed run-affine concurrent executors on macOS arm64 | Stress nondeterminism and handler-rich histories across many shards without moving a live fiber |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and replay/nondeterminism isolation on fixed run-affine concurrent executors on macOS arm64 | Stress handler-rich histories and shutdown faults across many shards without moving a live fiber |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -3516,10 +3516,11 @@ a comparison point; it is not yet enough to freeze the public API.
 
 The current next milestone is production hardening of the run-affine
 in-process scheduler. Replay reconstruction, concurrent activation failure,
-and cancellation are now live-proven on affine shards. Next, exercise
-nondeterminism, handler-rich histories, and shutdown faults concurrently across
-many shards; add queue-depth/fairness observations; and run the guard-page plus
-affinity suite on all four distribution targets. The live proofs establish the
+cancellation, and Core-detected nondeterminism are now live-proven on affine
+shards. Next, exercise handler-rich histories and shutdown faults concurrently
+across many shards; add queue-depth/fairness observations; and run the
+guard-page plus affinity suite on all four distribution targets. The live
+proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
 containment option for panicking, overflowing, or uncooperative Workflow code.
@@ -4207,6 +4208,12 @@ shards. The replay pass requires positive replay statistics, overlapping
 post-timer callbacks, and no thread migration. `worker.request_workflow_eviction`
 is an asynchronous operational/test hook over the existing C bridge symbol;
 normal cache pressure and terminal eviction remain Core-owned.
+The replay pass also changes one reconstructed Workflow from `StartTimer` to
+`CompleteWorkflow`. Its type-scoped nondeterminism policy must produce a
+terminal Client failure containing Core's `[TMPRL1100]` diagnostic, while the
+valid replaying shards continue and return their expected values. This proves
+that command mismatch is contained to one execution rather than promoted to a
+scheduler error.
 Its brief wall-clock block is test instrumentation and is not an allowed
 Workflow programming primitive.
 

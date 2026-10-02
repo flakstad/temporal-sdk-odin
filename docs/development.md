@@ -1216,6 +1216,12 @@ activations as replay. The pass requires a positive replay count, same-shard
 fiber reconstruction, callback overlap after timer resolution, and zero thread
 migrations. The helper is asynchronous: success means Core accepted the
 request, while the ordinary activation stream proves completion.
+That same pass starts a deliberately incompatible Workflow under a type-scoped
+terminal nondeterminism policy. Its initial activation records a Timer, but the
+fresh replay fiber emits `CompleteWorkflow`. The Client result must be
+`.Workflow_Failed` and contain Core's `[TMPRL1100]` diagnostic, while all valid
+Workflow results still succeed. This is test-only code that intentionally
+breaks the determinism rules.
 The example also requires
 `Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
 `workflow_executor_queue_peak`. The former counts all activation buffers owned

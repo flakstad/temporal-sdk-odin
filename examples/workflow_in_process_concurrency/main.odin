@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -14,6 +15,7 @@ EXECUTOR_THREADS :: 4
 WORKFLOW_TYPE :: "in_process_concurrency_probe"
 UNKNOWN_WORKFLOW_TYPE :: "in_process_unknown_probe"
 CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
+NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
 
 Probe_State :: struct {
@@ -26,6 +28,7 @@ Probe_State :: struct {
 	cancellation_started:  bool,
 	cancellation_observed: bool,
 	cancellation_reason_ok: bool,
+	nondeterminism_replay: bool,
 }
 
 probe_state: Probe_State
@@ -82,6 +85,20 @@ cancellation_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> strin
 	return value
 }
 
+// This intentionally violates determinism for the live fault-containment
+// proof. The initial execution records a Timer. After explicit eviction, the
+// fresh replay fiber emits CompleteWorkflow instead, which Core must reject.
+nondeterminism_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
+	sync.mutex_lock(&probe_state.mutex)
+	replay := probe_state.nondeterminism_replay
+	sync.mutex_unlock(&probe_state.mutex)
+	if replay {
+		return value
+	}
+	workflow.sleep(ctx, 2 * time.Second)
+	return value
+}
+
 Concurrency_State :: struct {
 	client:                  ^temporal_client.Client,
 	sdk_worker:              ^worker.Worker,
@@ -94,6 +111,9 @@ Concurrency_State :: struct {
 	cancellation_handle:     temporal_client.Workflow_Handle,
 	has_cancellation_handle: bool,
 	cancellation_closed:     bool,
+	nondeterminism_handle:   temporal_client.Workflow_Handle,
+	has_nondeterminism_handle: bool,
+	nondeterminism_closed:   bool,
 	watcher:                 ^thread.Thread,
 	start_error:             temporal_client.Error,
 	result_error:            temporal_client.Error,
@@ -101,6 +121,7 @@ Concurrency_State :: struct {
 	eviction_error:          worker.Error,
 	results_ok:              bool,
 	cancellation_ok:         bool,
+	nondeterminism_ok:       bool,
 	force_replay:            bool,
 }
 
@@ -109,6 +130,10 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 	started := false
 	valid_started := 0
 	timer_activations_completed := 0
+	expected_timer_activations := len(state.handles) + 1
+	if state.force_replay {
+		expected_timer_activations += 1
+	}
 	for _ in 0 ..< 500 {
 		sync.mutex_lock(&probe_state.mutex)
 		started = probe_state.cancellation_started
@@ -116,13 +141,13 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 		timer_activations_completed = probe_state.timer_activations_completed
 		sync.mutex_unlock(&probe_state.mutex)
 		if started && valid_started >= len(state.handles) &&
-		   timer_activations_completed >= len(state.handles) + 1 {
+		   timer_activations_completed >= expected_timer_activations {
 			break
 		}
 		time.sleep(10 * time.Millisecond)
 	}
 	if !started || valid_started < len(state.handles) ||
-	   timer_activations_completed < len(state.handles) + 1 {
+	   timer_activations_completed < expected_timer_activations {
 		state.results_ok = false
 		worker.request_shutdown(state.sdk_worker)
 		return
@@ -132,6 +157,9 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 		// internal Workflow stream a short window to install the sticky cache
 		// entry before requesting eviction from this coordinating thread.
 		time.sleep(200 * time.Millisecond)
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.nondeterminism_replay = true
+		sync.mutex_unlock(&probe_state.mutex)
 		for &handle in state.handles {
 			state.eviction_error = worker.request_workflow_eviction(
 				state.sdk_worker,
@@ -142,6 +170,15 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 				worker.request_shutdown(state.sdk_worker)
 				return
 			}
+		}
+		state.eviction_error = worker.request_workflow_eviction(
+			state.sdk_worker,
+			state.nondeterminism_handle.run_id,
+		)
+		if state.eviction_error.message != nil {
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
 		}
 	}
 	state.cancel_error = temporal_client.cancel_workflow(
@@ -168,6 +205,27 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 		state.results_ok = false
 		worker.request_shutdown(state.sdk_worker)
 		return
+	}
+	if state.force_replay {
+		nondeterminism_result: string
+		nondeterminism_error := temporal_client.get_result_json(
+			&state.nondeterminism_handle,
+			&nondeterminism_result,
+		)
+		delete(nondeterminism_result)
+		has_diagnostic :=
+			strings.contains(string(nondeterminism_error.message), "[TMPRL1100]") ||
+			strings.contains(string(nondeterminism_error.details), "[TMPRL1100]")
+		if nondeterminism_error.kind == .Workflow_Failed && has_diagnostic {
+			state.nondeterminism_ok = true
+			state.nondeterminism_closed = true
+			temporal_client.error_free(&nondeterminism_error)
+		} else {
+			state.result_error = nondeterminism_error
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
 	}
 	for &handle in state.handles {
 		result: string
@@ -272,6 +330,28 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	if !found_distinct_shard {
 		return false
 	}
+	if state.force_replay {
+		nondeterminism_id := fmt.aprintf("%s-nondeterminism", state.id_prefix)
+		nondeterminism_handle, nondeterminism_start_error := temporal_client.start_workflow_json(
+			state.client,
+			NONDETERMINISM_WORKFLOW_TYPE,
+			"intentionally incompatible replay",
+			{
+				id = nondeterminism_id,
+				task_queue = state.task_queue,
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		delete(nondeterminism_id)
+		if nondeterminism_start_error.message != nil {
+			state.start_error = nondeterminism_start_error
+			return false
+		}
+		state.nondeterminism_handle = nondeterminism_handle
+		state.has_nondeterminism_handle = true
+	}
 	state.watcher = thread.create_and_start_with_poly_data(state, wait_for_results)
 	return state.watcher != nil
 }
@@ -308,6 +388,9 @@ run :: proc() -> int {
 	options.max_concurrent_workflow_tasks = EXECUTOR_THREADS
 	options.max_workflow_task_slots = EXECUTOR_THREADS
 	options.max_cached_workflows = 16
+	options.nondeterminism_policy = {
+		fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
+	}
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(EXECUTOR_THREADS)
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
@@ -339,6 +422,16 @@ run :: proc() -> int {
 	)
 	if register_error.message != nil {
 		fmt.eprintf("Cancellation Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
+		NONDETERMINISM_WORKFLOW_TYPE,
+		nondeterminism_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Nondeterminism Workflow registration failed: %s\n", string(register_error.message))
 		worker.error_free(&register_error)
 		return 1
 	}
@@ -383,6 +476,16 @@ run :: proc() -> int {
 				temporal_client.error_free(&cleanup_error)
 			}
 			temporal_client.workflow_handle_free(&state.cancellation_handle)
+		}
+		if state.has_nondeterminism_handle {
+			if !state.nondeterminism_closed {
+				cleanup_error := temporal_client.terminate_workflow(
+					&state.nondeterminism_handle,
+					"in-process nondeterminism cleanup",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
+			temporal_client.workflow_handle_free(&state.nondeterminism_handle)
 		}
 	}
 	if state.start_error.message != nil {
@@ -436,7 +539,8 @@ run :: proc() -> int {
 	sync.mutex_unlock(&probe_state.mutex)
 	if !state.results_ok || len(state.handles) < 2 ||
 	   !state.cancellation_ok || !cancellation_observed || !cancellation_reason_ok ||
-	   run_stats.workflow_executions_completed != len(state.handles) + 1 ||
+	   (force_replay && !state.nondeterminism_ok) ||
+	   run_stats.workflow_executions_completed != len(state.handles) + 1 + int(force_replay) ||
 	   run_stats.workflow_activation_failures < 1 ||
 	   run_stats.workflow_evictions < len(state.handles) + 2 ||
 	   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
@@ -444,7 +548,7 @@ run :: proc() -> int {
 	   run_stats.workflow_activations_peak_owned < 2 ||
 	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v nondeterminism_ok=%v\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
@@ -458,11 +562,12 @@ run :: proc() -> int {
 			migrations,
 			state.cancellation_ok && cancellation_observed,
 			cancellation_reason_ok,
+			state.nondeterminism_ok,
 		)
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d nondeterminism=%v\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
@@ -474,6 +579,7 @@ run :: proc() -> int {
 		run_stats.workflow_executor_queue_peak,
 		peak,
 		migrations,
+		state.nondeterminism_ok,
 	)
 	return 0
 }
