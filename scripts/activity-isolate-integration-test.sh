@@ -194,6 +194,51 @@ parent_pid=""
 
 grep -q 'uncooperative isolated Activity cancellation reached the bounded forced-kill fallback' "$parent_log"
 
+manifest_task_queue="odin-activity-isolate-manifest-${RANDOM}-$(date +%s)"
+manifest_workflow_id="odin-activity-isolate-manifest-${RANDOM}-$(date +%s)"
+ACTIVITY_ISOLATE_MULTI=manifest \
+  TEMPORAL_ODIN_TASK_QUEUE="$manifest_task_queue" \
+  "$binary" >>"$parent_log" 2>&1 &
+parent_pid=$!
+for _ in {1..100}; do
+  if grep -q "external Activity parent is polling task queue $manifest_task_queue" "$parent_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "Manifest Activity parent exited before polling" >&2
+    cat "$parent_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+ACTIVITY_ISOLATED_MANIFEST=1 \
+  ACTIVITY_WORKFLOW_ID="$manifest_workflow_id" \
+  TEMPORAL_TASK_QUEUE="$manifest_task_queue" \
+  cargo run --quiet \
+    --manifest-path "$repo_root/native/Cargo.toml" \
+    --package activity-test-driver >>"$driver_log" 2>&1 &
+driver_pid=$!
+
+if ! wait "$driver_pid"; then
+  driver_pid=""
+  echo "Workflow did not dispatch both isolated Activity types" >&2
+  cat "$driver_log" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+driver_pid=""
+if ! wait "$parent_pid"; then
+  parent_pid=""
+  echo "Manifest Activity parent did not shut down cleanly" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+parent_pid=""
+
+grep -q 'isolated Activity host dispatched two Activity types from one explicit manifest' "$parent_log"
+grep -q 'Workflow dispatched through the isolated Activity manifest: Recovered on Activity attempt 1; Goodbye Odin' "$driver_log"
+
 cat "$parent_log"
 cat "$driver_log"
-echo "Per-invocation Activity crash/retry, heartbeat forwarding, cooperative cancellation, and forced-kill fallback passed through the Core-owning parent."
+echo "Per-invocation Activity crash/retry, heartbeat forwarding, cancellation, and multi-type manifest dispatch passed through the Core-owning parent."

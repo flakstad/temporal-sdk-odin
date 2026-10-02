@@ -3,6 +3,7 @@ package activity_isolate
 import "core:bytes"
 import "core:os"
 import "core:mem/virtual"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import activity ".."
@@ -10,13 +11,31 @@ import codec "../../codec"
 import proto "../../core/proto"
 import worker "../../worker"
 
+Host_Activity :: struct {
+	name:          string,
+	callback_data: rawptr,
+	invoke:        worker.Activity_Invoke_Proc,
+}
+
 Host_Options :: struct {
+	// activities is the multi-Activity manifest used by persistent or shared
+	// executor binaries. The singular fields remain as a source-compatible
+	// convenience for one-Activity hosts.
+	activities:    []Host_Activity,
 	activity_name: string,
 	callback_data: rawptr,
 	invoke:        worker.Activity_Invoke_Proc,
 	namespace:     string,
 	task_queue:    string,
 	maximum_payload_bytes: u32,
+}
+
+host_activity :: proc(
+	name: string,
+	callback_data: rawptr,
+	invoke: worker.Activity_Invoke_Proc,
+) -> Host_Activity {
+	return {name = name, callback_data = callback_data, invoke = invoke}
 }
 
 host_options :: proc(
@@ -32,6 +51,77 @@ host_options :: proc(
 		task_queue = "external-activity",
 		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
 	}
+}
+
+host_options_many :: proc(activities: []Host_Activity) -> Host_Options {
+	return {
+		activities = activities,
+		namespace = "default",
+		task_queue = "external-activity",
+		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
+	}
+}
+
+host_options_valid :: proc(options: Host_Options) -> bool {
+	if options.maximum_payload_bytes == 0 || len(options.namespace) == 0 ||
+	   len(options.task_queue) == 0 {
+		return false
+	}
+	if len(options.activities) == 0 {
+		return len(options.activity_name) > 0 && options.callback_data != nil &&
+		       options.invoke != nil
+	}
+	for activity_registration, index in options.activities {
+		if len(activity_registration.name) == 0 || activity_registration.callback_data == nil ||
+		   activity_registration.invoke == nil {
+			return false
+		}
+		for previous in options.activities[:index] {
+			if previous.name == activity_registration.name {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+host_activity_find :: proc(options: Host_Options, name: string) -> (Host_Activity, bool) {
+	if len(options.activities) == 0 {
+		if options.activity_name == name {
+			return {
+				name = options.activity_name,
+				callback_data = options.callback_data,
+				invoke = options.invoke,
+			}, true
+		}
+		return {}, false
+	}
+	for activity_registration in options.activities {
+		if activity_registration.name == name {
+			return activity_registration, true
+		}
+	}
+	return {}, false
+}
+
+decode_activity_type :: proc(task: []u8) -> (activity_type: string, ok: bool) {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	previous := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded, decode_error := proto.decode_activity_task(task)
+	context.allocator = previous
+	if decode_error != .None || decoded.kind != .Start || len(decoded.activity_type) == 0 {
+		return
+	}
+	owned, allocation_error := strings.clone(decoded.activity_type)
+	if allocation_error != nil {
+		return
+	}
+	return owned, true
 }
 
 Host_Control_State :: struct {
@@ -188,6 +278,9 @@ host_heartbeat_recorder :: proc(
 // invocation makes fatal Odin panics/native faults containable; Temporal's
 // retry policy remains authoritative in the Core-owning parent.
 host_run :: proc(options: Host_Options) -> Error {
+	if !host_options_valid(options) {
+		return {kind = .Invalid_Argument}
+	}
 	request, read_error := read(os.stdin, options.maximum_payload_bytes)
 	defer owned_frame_free(&request)
 	if read_error.kind != .None {
@@ -205,6 +298,23 @@ host_run :: proc(options: Host_Options) -> Error {
 		}, options.maximum_payload_bytes)
 	}
 	defer delete(task_token)
+	activity_type, activity_type_ok := decode_activity_type(request.frame.payload)
+	if !activity_type_ok {
+		return write(os.stdout, {
+			kind = .Executor_Error,
+			request_id = request.frame.request_id,
+			payload = transmute([]u8)string("Activity executor received a malformed start task"),
+		}, options.maximum_payload_bytes)
+	}
+	defer delete(activity_type)
+	activity_registration, activity_found := host_activity_find(options, activity_type)
+	if !activity_found {
+		return write(os.stdout, {
+			kind = .Executor_Error,
+			request_id = request.frame.request_id,
+			payload = transmute([]u8)string("Activity executor has no callback for the requested type"),
+		}, options.maximum_payload_bytes)
+	}
 	control_state := Host_Control_State{
 		input = os.stdin,
 		output = os.stdout,
@@ -213,9 +323,9 @@ host_run :: proc(options: Host_Options) -> Error {
 		maximum_payload_bytes = options.maximum_payload_bytes,
 	}
 	processed := worker.execute_activity_task_callback(
-		options.activity_name,
-		options.callback_data,
-		options.invoke,
+		activity_registration.name,
+		activity_registration.callback_data,
+		activity_registration.invoke,
 		request.frame.payload,
 		options.namespace,
 		options.task_queue,

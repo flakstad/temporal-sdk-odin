@@ -24,6 +24,17 @@ impl ActivityDefinition for HelloActivity {
     }
 }
 
+struct GoodbyeActivity;
+
+impl ActivityDefinition for GoodbyeActivity {
+    type Input = String;
+    type Output = String;
+
+    fn name(&self) -> &str {
+        "goodbye"
+    }
+}
+
 struct MissingActivity;
 
 impl ActivityDefinition for MissingActivity {
@@ -305,6 +316,32 @@ impl IsolatedActivityCancellationDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct IsolatedActivityManifestDriverWorkflow;
+
+#[workflow_methods]
+impl IsolatedActivityManifestDriverWorkflow {
+    #[run(name = "odin_isolated_activity_manifest_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let hello = ctx
+            .execute_activity(
+                HelloActivity,
+                "Odin".to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+            .await?;
+        let goodbye = ctx
+            .execute_activity(
+                GoodbyeActivity,
+                "Odin".to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+            .await?;
+        Ok(format!("{hello}; {goodbye}"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -322,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let isolated_cancellation = std::env::var_os("ACTIVITY_ISOLATED_CANCELLATION").is_some();
     let isolated_cancellation_uncooperative =
         std::env::var_os("ACTIVITY_ISOLATED_CANCELLATION_UNCOOPERATIVE").is_some();
+    let isolated_manifest = std::env::var_os("ACTIVITY_ISOLATED_MANIFEST").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
     let expected = if shutdown_case {
         "Workflow observed Worker shutdown Activity failure".to_string()
@@ -348,6 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<AsyncActivityDriverWorkflow>()?
         .register_workflow::<ActivityPanicRecoveryDriverWorkflow>()?
         .register_workflow::<IsolatedActivityCancellationDriverWorkflow>()?
+        .register_workflow::<IsolatedActivityManifestDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -356,6 +395,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow_id = std::env::var("ACTIVITY_WORKFLOW_ID")
         .unwrap_or_else(|_| format!("odin-sdk-activity-spike-{}-{unique}", std::process::id()));
     let driver = async move {
+        if isolated_manifest {
+            let handle = client
+                .start_workflow(
+                    IsolatedActivityManifestDriverWorkflow::run,
+                    (),
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != "Recovered on Activity attempt 1; Goodbye Odin" {
+                return Err(format!("unexpected isolated manifest result: {result}").into());
+            }
+            println!("Workflow dispatched through the isolated Activity manifest: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if isolated_cancellation || isolated_cancellation_uncooperative {
             let activity_input = if isolated_cancellation_uncooperative {
                 "cancel-uncooperative"

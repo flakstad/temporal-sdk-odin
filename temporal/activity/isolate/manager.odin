@@ -109,6 +109,34 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	return {}
 }
 
+// register_external_activity_manifest copies only the manifest's Activity type
+// names into the Core-owning Worker. Callback data and procedure pointers stay
+// process-local and are used only when the same application manifest is built
+// inside the executor child.
+register_external_activity_manifest :: proc(
+	sdk_worker: ^worker.Worker,
+	manager: ^Manager,
+	activities: []Host_Activity,
+) -> worker.Error {
+	if manager == nil || !manager.initialized ||
+	   !host_options_valid(host_options_many(activities)) {
+		return worker.error_from_string("Activity executor manifest is invalid")
+	}
+	for activity_registration in activities {
+		registration_error := worker.register_external_activity_processor(
+			sdk_worker,
+			activity_registration.name,
+			manager,
+			process_task,
+			cancel_task,
+		)
+		if registration_error.message != nil {
+			return registration_error
+		}
+	}
+	return {}
+}
+
 manager_close :: proc(manager: ^Manager) {
 	if manager == nil {
 		return

@@ -907,9 +907,12 @@ requires Temporal retry attempt 2 to complete in a fresh child. Protocol v3
 also requires attempt 2's heartbeat to traverse the parent Activity context and
 Core before completion. A second pass delivers cancellation into a cooperative
 child without killing it; a third lets the same callback ignore cancellation
-and requires the configured grace deadline to kill only that child. The manager
-still starts one process per attempt; use it as crash-containment evidence, not
-yet as the default production executor. See
+and requires the configured grace deadline to kill only that child. A fourth
+pass schedules `hello` and `goodbye` sequentially and requires the child host to
+dispatch both from one explicit process-local callback manifest. Parent and
+child build that manifest through the same Odin function; the parent copies
+only its names into Core. The manager still starts one process per attempt; use
+it as crash-containment evidence, not yet as the default production executor. See
 [`activity-isolation.md`](activity-isolation.md).
 
 The supported containment pattern is now exercised end-to-end:

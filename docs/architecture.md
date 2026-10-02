@@ -4498,12 +4498,17 @@ Core. No new C ABI or direct Server RPC is involved.
 
 Protocol v3 in `temporal/activity/isolate` uses a fixed magic/version/kind/
 request-ID header plus a bounded stream record. A fresh process and private
-pipes are created for each attempt. `execute_activity_task_callback` rebuilds
-the same owned Activity metadata used by in-process callbacks and shares the
-ordinary completion encoder for success, Application Failure, cancellation,
-and async-completion contracts. Child exit, timeout, malformed framing, stale
-request ID, or mismatched completion becomes a retryable Activity failure;
-only a failure in the parent's Core completion call shuts the Worker down.
+pipes are created for each attempt. Parent and child construct the same
+application manifest; `register_external_activity_manifest` copies only its
+type names into the Core Worker, while the child retains the process-local
+callbacks. It decodes the requested type and dispatches without transferring
+procedure pointers. Duplicate names are rejected.
+`execute_activity_task_callback` rebuilds the same owned Activity
+metadata used by in-process callbacks and shares the ordinary completion
+encoder for success, Application Failure, cancellation, and async-completion
+contracts. Child exit, timeout, malformed framing, stale request ID, or
+mismatched completion becomes a retryable Activity failure; only a failure in
+the parent's Core completion call shuts the Worker down.
 
 This boundary is not yet operationally complete for a warm pool. Heartbeats use
 a duplex child-event/parent-ack exchange and re-enter the parent's ordinary
@@ -4513,7 +4518,9 @@ per-execution grace timer kills only a child that ignores it. Parent-side execut
 interceptors are rejected for external registrations because they cannot
 truthfully wrap code executing in another process; heartbeat interceptors still
 wrap forwarded heartbeat events. Child-side execute interceptors and metrics,
-then bounded warm-process reuse are the remaining order of work. See
+then bounded warm-process reuse are the remaining order of work. The live
+matrix now also proves sequential `hello`/`goodbye` dispatch from one child
+manifest. See
 `docs/activity-isolation.md` for the live crash/retry proof and ownership rules.
 
 ### Local Activity boundary

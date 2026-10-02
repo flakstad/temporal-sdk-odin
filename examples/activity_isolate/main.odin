@@ -130,13 +130,49 @@ isolated_hello_invoke :: proc(
 	return isolated_hello(ctx, inputs)
 }
 
+isolated_goodbye :: proc(_: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
+	if len(inputs) != 1 {
+		return activity.payload_fail(
+			"isolated goodbye expected one input",
+			failure_type = "OdinActivityArgumentCountError",
+		)
+	}
+	name: string
+	if codec.decode_json(inputs[0], &name) != .None {
+		return activity.payload_fail(
+			"isolated goodbye input was not json/plain",
+			failure_type = "OdinPayloadConversionError",
+		)
+	}
+	defer delete(name)
+	message := fmt.aprintf("Goodbye %s", name)
+	defer delete(message)
+	payload, encode_error := codec.encode_json(message)
+	if encode_error != .None {
+		return activity.payload_fail("could not encode isolated goodbye result")
+	}
+	return activity.payload_complete(payload)
+}
+
+isolated_goodbye_invoke :: proc(
+	_: rawptr,
+	ctx: ^activity.Context,
+	inputs: []codec.Payload_View,
+) -> activity.Payload_Result {
+	return isolated_goodbye(ctx, inputs)
+}
+
+isolated_activity_manifest :: proc(marker: ^bool) -> [2]activity_isolate.Host_Activity {
+	return {
+		activity_isolate.host_activity("hello", marker, isolated_hello_invoke),
+		activity_isolate.host_activity("goodbye", marker, isolated_goodbye_invoke),
+	}
+}
+
 run_child :: proc() {
 	marker := true
-	options := activity_isolate.host_options(
-		"hello",
-		&marker,
-		isolated_hello_invoke,
-	)
+	activities := isolated_activity_manifest(&marker)
+	options := activity_isolate.host_options_many(activities[:])
 	host_error := activity_isolate.host_run(options)
 	if host_error.kind != .None {
 		fmt.eprintf("Activity executor host failed: %v\n", host_error.kind)
@@ -193,15 +229,15 @@ run_parent :: proc() {
 		_ = worker.close(&activity_worker)
 		os.exit(1)
 	}
-	register_error := worker.register_external_activity_processor(
+	manifest_marker := true
+	activities := isolated_activity_manifest(&manifest_marker)
+	register_error := activity_isolate.register_external_activity_manifest(
 		&activity_worker,
-		"hello",
 		&manager,
-		activity_isolate.process_task,
-		activity_isolate.cancel_task,
+		activities[:],
 	)
 	if register_error.message != nil {
-		fmt.eprintf("External Activity registration failed: %s\n", string(register_error.message))
+		fmt.eprintf("External Activity manifest registration failed: %s\n", string(register_error.message))
 		worker.error_free(&register_error)
 		_ = worker.close(&activity_worker)
 		os.exit(1)
@@ -210,7 +246,14 @@ run_parent :: proc() {
 	cancel_mode := os.get_env(cancel_buffer[:], "ACTIVITY_ISOLATE_CANCEL")
 	cancel_case := cancel_mode == "cooperative" || cancel_mode == "forced"
 	forced_cancel_case := cancel_mode == "forced"
-	fmt.printf("Odin external Activity parent is polling task queue %s\n", task_queue)
+	multi_buffer: [32]u8
+	multi_mode := os.get_env(multi_buffer[:], "ACTIVITY_ISOLATE_MULTI")
+	multi_case := multi_mode == "manifest"
+	fmt.printf(
+		"Odin external Activity parent is polling task queue %s (manifest=%v)\n",
+		task_queue,
+		multi_case,
+	)
 	max_tasks := cancel_case ? 0 : 2
 	cancel_shutdown_state := Cancellation_Shutdown_State{
 		manager = &manager,
@@ -272,10 +315,13 @@ run_parent :: proc() {
 		}
 		return
 	}
+	expected_completed := multi_case ? 2 : 1
+	expected_failures := multi_case ? 0 : 1
 	if stats.activity_tasks_completed != 2 || executor_stats.children_started != 2 ||
-	   executor_stats.children_completed != 1 || executor_stats.child_failures != 1 ||
-	   executor_stats.heartbeats_forwarded != 1 ||
-	   sync.atomic_load_explicit(&parent_heartbeat_interceptor_calls, .Acquire) != 1 ||
+	   executor_stats.children_completed != expected_completed ||
+	   executor_stats.child_failures != expected_failures ||
+	   executor_stats.heartbeats_forwarded != (multi_case ? 0 : 1) ||
+	   sync.atomic_load_explicit(&parent_heartbeat_interceptor_calls, .Acquire) != (multi_case ? 0 : 1) ||
 	   activity_isolate.manager_in_flight(&manager) != 0 {
 		fmt.eprintf(
 			"unexpected isolation stats: tasks=%d started=%d completed=%d failures=%d heartbeats=%d intercepted=%d in_flight=%d\n",
@@ -288,6 +334,10 @@ run_parent :: proc() {
 			activity_isolate.manager_in_flight(&manager),
 		)
 		os.exit(1)
+	}
+	if multi_case {
+		fmt.println("isolated Activity host dispatched two Activity types from one explicit manifest")
+		return
 	}
 	fmt.println("isolated Activity panic was contained, heartbeat forwarded, and retry completed")
 }

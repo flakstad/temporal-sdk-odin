@@ -1758,6 +1758,72 @@ activity_isolation_protocol_rejects_corruption_and_round_trips_binary_tasks :: p
 }
 
 @(test)
+activity_isolation_host_manifest_validates_and_dispatches_exact_names :: proc(t: ^testing.T) {
+	hello_marker, goodbye_marker := true, false
+	activities := [?]activity_isolate.Host_Activity{
+		activity_isolate.host_activity(
+			"hello",
+			&hello_marker,
+			external_activity_test_invoke,
+		),
+		activity_isolate.host_activity(
+			"goodbye",
+			&goodbye_marker,
+			external_activity_test_invoke,
+		),
+	}
+	options := activity_isolate.host_options_many(activities[:])
+	testing.expect(t, activity_isolate.host_options_valid(options))
+	hello, hello_found := activity_isolate.host_activity_find(options, "hello")
+	testing.expect(t, hello_found)
+	testing.expect(t, hello.callback_data == &hello_marker)
+	goodbye, goodbye_found := activity_isolate.host_activity_find(options, "goodbye")
+	testing.expect(t, goodbye_found)
+	testing.expect(t, goodbye.callback_data == &goodbye_marker)
+	_, missing_found := activity_isolate.host_activity_find(options, "missing")
+	testing.expect(t, !missing_found)
+
+	duplicate := [?]activity_isolate.Host_Activity{activities[0], activities[0]}
+	testing.expect(
+		t,
+		!activity_isolate.host_options_valid(activity_isolate.host_options_many(duplicate[:])),
+	)
+	legacy := activity_isolate.host_options(
+		"legacy",
+		&hello_marker,
+		external_activity_test_invoke,
+	)
+	testing.expect(t, activity_isolate.host_options_valid(legacy))
+	_, legacy_found := activity_isolate.host_activity_find(legacy, "legacy")
+	testing.expect(t, legacy_found)
+
+	sdk_worker := worker.Worker{
+		lifecycle = .Configuring,
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+	}
+	defer {
+		for registration in sdk_worker.activity_registrations {
+			delete(registration.name)
+		}
+		delete(sdk_worker.activity_registrations)
+	}
+	manager := activity_isolate.Manager{initialized = true}
+	registration_error := activity_isolate.register_external_activity_manifest(
+		&sdk_worker,
+		&manager,
+		activities[:],
+	)
+	defer worker.error_free(&registration_error)
+	testing.expect(t, registration_error.message == nil)
+	testing.expect_value(t, len(sdk_worker.activity_registrations), 2)
+	if len(sdk_worker.activity_registrations) == 2 {
+		testing.expect_value(t, sdk_worker.activity_registrations[0].name, "hello")
+		testing.expect_value(t, sdk_worker.activity_registrations[1].name, "goodbye")
+		testing.expect(t, sdk_worker.activity_registrations[0].processor_data == &manager)
+	}
+}
+
+@(test)
 external_activity_registration_borrows_processor_state :: proc(t: ^testing.T) {
 	sdk_worker := worker.Worker{
 		lifecycle = .Configuring,
@@ -1820,6 +1886,10 @@ external_activity_child_helper_preserves_core_task_and_completion_contract :: pr
 	}
 	encoded := proto.encode_Coresdk_Activity_Task_ActivityTask(&raw)
 	defer delete(encoded)
+	decoded_activity_type, activity_type_ok := activity_isolate.decode_activity_type(encoded[:])
+	defer delete(decoded_activity_type)
+	testing.expect(t, activity_type_ok)
+	testing.expect_value(t, decoded_activity_type, "isolated_test")
 	marker := true
 	processed := worker.execute_activity_task_callback(
 		"isolated_test",

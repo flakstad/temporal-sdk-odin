@@ -23,8 +23,11 @@ whose opaque task token differs from the start task.
 
 ## Current API and ownership
 
-The parent creates an `activity_isolate.Manager`, then registers each external
-type with `worker.register_external_activity_processor`. The command and its
+The parent creates an `activity_isolate.Manager`, then passes its application
+manifest to `register_external_activity_manifest`. That helper copies only each
+type name into the Core Worker; callback data and procedure pointers remain
+process-local. The same ordinary Odin function can construct the manifest in
+the child, where the callbacks are actually invoked. The command and its
 arguments are copied by `manager_init`; the manager pointer is borrowed by the
 Worker until polling stops. `manager_close` must run only after `worker.run`
 returns. External registration data is never freed by `worker.close`.
@@ -32,9 +35,13 @@ returns. External registration data is never freed by `worker.close`.
 exchanges. `cancellation_grace` defaults to five seconds and bounds the interval
 between a forwarded Core cancel task and termination of an unresponsive child.
 
-The child calls `activity_isolate.host_run` with one activity name and one
-ordinary `worker.Activity_Invoke_Proc`. `worker.execute_activity_task_callback`
-decodes the Core task, reconstructs the complete callback-visible
+The child calls `activity_isolate.host_run` with either the single-callback
+`host_options` convenience or an explicit `host_options_many` manifest of
+`Host_Activity` values. The host decodes the requested Activity type and
+dispatches its process-local `worker.Activity_Invoke_Proc`; procedure pointers
+never cross the pipe. Empty names, nil callbacks, and duplicate manifest names
+are rejected before the host reads a task. `worker.execute_activity_task_callback`
+then decodes the Core task and reconstructs the complete callback-visible
 `activity.Info` (including attempt, workflow identity, headers, retry policy,
 timeouts, priority, and previous heartbeat details), runs the callback in an
 Activity-local arena, and encodes the standard completion variants.
@@ -78,7 +85,8 @@ attempt 2`; the parent then shuts Core down cleanly. Exact manager statistics
 require two children, one failed child, one valid completion, one attempt-2
 heartbeat acknowledged by Core, and a fully drained route set. Two additional
 queues prove cooperative cancellation with zero kills and ignored cancellation
-with exactly one grace-deadline kill.
+with exactly one grace-deadline kill. A fourth queue runs `hello` followed by
+`goodbye` and proves exact type dispatch from one two-entry child manifest.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -107,7 +115,6 @@ runtime:
 - CPU/memory sandboxing, warm-pool admission, crash-loop policy, release
   signing, and all-target fault evidence remain production work.
 
-The next increment can now address persistent warm children and multi-activity
-manifests without weakening heartbeat or cancellation semantics. Pool
-admission, idle-child health, crash-loop fencing, and shutdown must remain
-bounded.
+The next increment can now address persistent warm children without weakening
+manifest dispatch, heartbeat, or cancellation semantics. Pool admission,
+idle-child health, crash-loop fencing, and shutdown must remain bounded.
