@@ -1,6 +1,10 @@
 package activity_isolate
 
+import "core:bytes"
 import "core:os"
+import "core:mem/virtual"
+import "core:sync"
+import "core:thread"
 import activity ".."
 import codec "../../codec"
 import proto "../../core/proto"
@@ -30,21 +34,135 @@ host_options :: proc(
 	}
 }
 
-Host_Heartbeat_State :: struct {
+Host_Control_State :: struct {
 	input:      ^os.File,
 	output:     ^os.File,
 	request_id: u64,
 	task_token: []u8,
 	maximum_payload_bytes: u32,
 	protocol_failed: bool,
+	ctx:        ^activity.Context,
+	reader:     ^thread.Thread,
+	heartbeat_ack: sync.Sema,
+	heartbeat_status: int,
+}
+
+host_control_fail :: proc(state: ^Host_Control_State) {
+	if state == nil {
+		return
+	}
+	sync.atomic_store_explicit(&state.protocol_failed, true, .Release)
+	sync.sema_post(&state.heartbeat_ack)
+}
+
+host_apply_cancel :: proc(state: ^Host_Control_State, payload: []u8) -> bool {
+	if state == nil || state.ctx == nil {
+		return false
+	}
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	task, decode_error := proto.decode_activity_task(payload)
+	context.allocator = previous
+	if decode_error != .None || task.kind != .Cancel ||
+	   !bytes.equal(task.task_token, state.task_token) {
+		return false
+	}
+	activity.context_request_cancellation(
+		state.ctx,
+		worker.activity_cancel_reason(task.cancel_reason),
+		worker.activity_cancel_details(task.cancel_details),
+	)
+	return true
+}
+
+host_control_reader :: proc(state: ^Host_Control_State) {
+	for {
+		response, read_error := read(state.input, state.maximum_payload_bytes)
+		if read_error.kind != .None {
+			owned_frame_free(&response)
+			host_control_fail(state)
+			return
+		}
+		if response.frame.request_id != state.request_id {
+			owned_frame_free(&response)
+			host_control_fail(state)
+			return
+		}
+		#partial switch response.frame.kind {
+		case .Heartbeat_Ack:
+			if len(response.frame.payload) != 1 ||
+			   response.frame.payload[0] > u8(activity.Heartbeat_Status.Core_Error) {
+				owned_frame_free(&response)
+				host_control_fail(state)
+				return
+			}
+			sync.atomic_store_explicit(
+				&state.heartbeat_status,
+				int(response.frame.payload[0]),
+				.Release,
+			)
+			owned_frame_free(&response)
+			sync.sema_post(&state.heartbeat_ack)
+		case .Cancel:
+			cancel_ok := host_apply_cancel(state, response.frame.payload)
+			owned_frame_free(&response)
+			if !cancel_ok {
+				host_control_fail(state)
+				return
+			}
+		case .Control_Stop:
+			owned_frame_free(&response)
+			return
+		case:
+			owned_frame_free(&response)
+			host_control_fail(state)
+			return
+		}
+	}
+}
+
+host_context_ready :: proc(user_data: rawptr, ctx: ^activity.Context) {
+	state := cast(^Host_Control_State)user_data
+	if state == nil || ctx == nil {
+		return
+	}
+	state.ctx = ctx
+	state.reader = thread.create_and_start_with_poly_data(state, host_control_reader)
+	if state.reader == nil {
+		host_control_fail(state)
+	}
+}
+
+host_context_done :: proc(user_data: rawptr, _: ^activity.Context) {
+	state := cast(^Host_Control_State)user_data
+	if state == nil || state.reader == nil {
+		return
+	}
+	done_payload := [1]u8{0}
+	write_error := write(state.output, {
+		kind = .Control_Done,
+		request_id = state.request_id,
+		payload = done_payload[:],
+	}, state.maximum_payload_bytes)
+	if write_error.kind != .None {
+		os.exit(1)
+	}
+	thread.join(state.reader)
+	thread.destroy(state.reader)
+	state.reader = nil
 }
 
 host_heartbeat_recorder :: proc(
 	user_data: rawptr,
 	details: codec.Payload_View,
 ) -> activity.Heartbeat_Status {
-	state := cast(^Host_Heartbeat_State)user_data
-	if state == nil || state.protocol_failed {
+	state := cast(^Host_Control_State)user_data
+	if state == nil || sync.atomic_load_explicit(&state.protocol_failed, .Acquire) {
 		return .Core_Error
 	}
 	heartbeat := proto.encode_activity_heartbeat_payload(state.task_token, details)
@@ -55,21 +173,14 @@ host_heartbeat_recorder :: proc(
 		payload = heartbeat[:],
 	}, state.maximum_payload_bytes)
 	if write_error.kind != .None {
-		state.protocol_failed = true
+		host_control_fail(state)
 		return .Core_Error
 	}
-	response, read_error := read(state.input, state.maximum_payload_bytes)
-	defer owned_frame_free(&response)
-	if read_error.kind != .None || response.frame.kind != .Heartbeat_Ack ||
-	   response.frame.request_id != state.request_id || len(response.frame.payload) != 1 {
-		state.protocol_failed = true
+	sync.sema_wait(&state.heartbeat_ack)
+	if sync.atomic_load_explicit(&state.protocol_failed, .Acquire) {
 		return .Core_Error
 	}
-	status_value := response.frame.payload[0]
-	if status_value > u8(activity.Heartbeat_Status.Core_Error) {
-		state.protocol_failed = true
-		return .Core_Error
-	}
+	status_value := sync.atomic_load_explicit(&state.heartbeat_status, .Acquire)
 	return activity.Heartbeat_Status(status_value)
 }
 
@@ -94,7 +205,7 @@ host_run :: proc(options: Host_Options) -> Error {
 		}, options.maximum_payload_bytes)
 	}
 	defer delete(task_token)
-	heartbeat_state := Host_Heartbeat_State{
+	control_state := Host_Control_State{
 		input = os.stdin,
 		output = os.stdout,
 		request_id = request.frame.request_id,
@@ -108,11 +219,14 @@ host_run :: proc(options: Host_Options) -> Error {
 		request.frame.payload,
 		options.namespace,
 		options.task_queue,
-		&heartbeat_state,
+		&control_state,
 		host_heartbeat_recorder,
+		&control_state,
+		host_context_ready,
+		host_context_done,
 	)
 	defer worker.activity_task_process_result_free(&processed)
-	if heartbeat_state.protocol_failed {
+	if sync.atomic_load_explicit(&control_state.protocol_failed, .Acquire) {
 		return {kind = .IO}
 	}
 	if processed.error.message != nil {

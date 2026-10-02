@@ -30,12 +30,14 @@ manager_error_free :: proc(error: ^Manager_Error) {
 Options :: struct {
 	command:               []string,
 	execution_timeout:     time.Duration,
+	cancellation_grace:    time.Duration,
 	maximum_payload_bytes: u32,
 }
 
 options_default :: proc(command: []string) -> Options {
 	return {
 		command = command,
+		cancellation_grace = 5 * time.Second,
 		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
 	}
 }
@@ -47,18 +49,31 @@ Stats :: struct {
 	protocol_failures: int,
 	timeouts: int,
 	cancellations_forwarded: int,
+	forced_cancellation_kills: int,
 	heartbeats_forwarded: int,
 	peak_in_flight: int,
 }
 
+Session :: struct {
+	manager:         ^Manager,
+	process:         os.Process,
+	input:           ^os.File,
+	write_mutex:     sync.Mutex,
+	cancel_sent:     bool,
+	finished:        bool,
+	done:            sync.Sema,
+	fallback_thread: ^thread.Thread,
+}
+
 Route :: struct {
 	task_token: []u8,
-	process:    os.Process,
+	session:    ^Session,
 }
 
 Manager :: struct {
 	command:               [dynamic]string,
 	execution_timeout:     time.Duration,
+	cancellation_grace:    time.Duration,
 	maximum_payload_bytes: u32,
 	routes:                [dynamic]Route,
 	mutex:                 sync.Mutex,
@@ -70,8 +85,8 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	if manager == nil || len(options.command) == 0 || len(options.command[0]) == 0 {
 		return manager_error("Activity executor command must not be empty")
 	}
-	if options.execution_timeout < 0 {
-		return manager_error("Activity executor timeout must not be negative")
+	if options.execution_timeout < 0 || options.cancellation_grace < 0 {
+		return manager_error("Activity executor timeouts must not be negative")
 	}
 	if options.maximum_payload_bytes == 0 {
 		return manager_error("Activity executor payload limit must be positive")
@@ -88,6 +103,7 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	}
 	manager.routes = make([dynamic]Route)
 	manager.execution_timeout = options.execution_timeout
+	manager.cancellation_grace = options.cancellation_grace
 	manager.maximum_payload_bytes = options.maximum_payload_bytes
 	manager.initialized = true
 	return {}
@@ -99,7 +115,7 @@ manager_close :: proc(manager: ^Manager) {
 	}
 	sync.mutex_lock(&manager.mutex)
 	for route in manager.routes {
-		_ = os.process_kill(route.process)
+		_ = os.process_kill(route.session.process)
 		delete(route.task_token)
 	}
 	delete(manager.routes)
@@ -149,7 +165,7 @@ decode_task_token :: proc(task: []u8) -> (token: []u8, ok: bool) {
 	return
 }
 
-route_add :: proc(manager: ^Manager, token: []u8, process: os.Process) -> bool {
+route_add :: proc(manager: ^Manager, token: []u8, session: ^Session) -> bool {
 	sync.mutex_lock(&manager.mutex)
 	defer sync.mutex_unlock(&manager.mutex)
 	for route in manager.routes {
@@ -157,10 +173,51 @@ route_add :: proc(manager: ^Manager, token: []u8, process: os.Process) -> bool {
 			return false
 		}
 	}
-	append(&manager.routes, Route{task_token = token, process = process})
+	append(&manager.routes, Route{task_token = token, session = session})
 	manager.stats.children_started += 1
 	manager.stats.peak_in_flight = max(manager.stats.peak_in_flight, len(manager.routes))
 	return true
+}
+
+session_write :: proc(session: ^Session, frame: Frame, maximum_payload_bytes: u32) -> Error {
+	if session == nil || session.input == nil {
+		return {kind = .Invalid_Argument}
+	}
+	sync.mutex_lock(&session.write_mutex)
+	defer sync.mutex_unlock(&session.write_mutex)
+	return write(session.input, frame, maximum_payload_bytes)
+}
+
+cancellation_fallback_main :: proc(session: ^Session) {
+	if session == nil || session.manager == nil {
+		return
+	}
+	finished := sync.sema_wait_with_timeout(
+		&session.done,
+		session.manager.cancellation_grace,
+	)
+	if finished || sync.atomic_load_explicit(&session.finished, .Acquire) {
+		return
+	}
+	_ = os.process_kill(session.process)
+	sync.mutex_lock(&session.manager.mutex)
+	session.manager.stats.forced_cancellation_kills += 1
+	sync.mutex_unlock(&session.manager.mutex)
+}
+
+session_finish :: proc(manager: ^Manager, session: ^Session) {
+	if manager == nil || session == nil {
+		return
+	}
+	sync.mutex_lock(&manager.mutex)
+	sync.atomic_store_explicit(&session.finished, true, .Release)
+	fallback_thread := session.fallback_thread
+	sync.mutex_unlock(&manager.mutex)
+	if fallback_thread != nil {
+		sync.sema_post(&session.done)
+		thread.join(fallback_thread)
+		thread.destroy(fallback_thread)
+	}
 }
 
 route_remove :: proc(manager: ^Manager, token: []u8) {
@@ -284,7 +341,12 @@ process_task :: proc(
 		sync.mutex_unlock(&manager.mutex)
 		return {error = worker.error_from_string("could not start Activity executor child")}
 	}
-	if !route_add(manager, token, process) {
+	session := Session{
+		manager = manager,
+		process = process,
+		input = parent_input,
+	}
+	if !route_add(manager, token, &session) {
 		_ = os.process_kill(process)
 		_, _ = os.process_wait(process)
 		os.close(parent_input)
@@ -292,11 +354,12 @@ process_task :: proc(
 		delete(token)
 		return {error = worker.error_from_string("duplicate Activity executor task token")}
 	}
-	defer route_remove(manager, token)
 	defer os.close(parent_input)
 	defer os.close(parent_output)
+	defer session_finish(manager, &session)
+	defer route_remove(manager, token)
 
-	write_error := write(parent_input, {
+	write_error := session_write(&session, {
 		kind = .Execute,
 		request_id = 1,
 		payload = task,
@@ -371,7 +434,7 @@ process_task :: proc(
 				return {error = worker.error_from_string("Activity executor returned an invalid heartbeat")}
 			}
 			ack := [1]u8{u8(heartbeat_status)}
-			ack_error := write(parent_input, {
+			ack_error := session_write(&session, {
 				kind = .Heartbeat_Ack,
 				request_id = 1,
 				payload = ack[:],
@@ -384,6 +447,21 @@ process_task :: proc(
 			sync.mutex_lock(&manager.mutex)
 			manager.stats.heartbeats_forwarded += 1
 			sync.mutex_unlock(&manager.mutex)
+			continue
+		}
+		if response.frame.kind == .Control_Done {
+			owned_frame_free(&response)
+			stop_payload := [1]u8{0}
+			stop_error := session_write(&session, {
+				kind = .Control_Stop,
+				request_id = 1,
+				payload = stop_payload[:],
+			}, manager.maximum_payload_bytes)
+			if stop_error.kind != .None {
+				_ = os.process_kill(process)
+				_, _ = os.process_wait(process)
+				return {error = worker.error_from_string("could not stop Activity child control loop")}
+			}
 			continue
 		}
 		if response.frame.kind == .Executor_Error {
@@ -438,8 +516,30 @@ cancel_task :: proc(processor_data: rawptr, task: []u8) {
 	defer sync.mutex_unlock(&manager.mutex)
 	for route in manager.routes {
 		if bytes.equal(route.task_token, token) {
-			_ = os.process_kill(route.process)
+			session := route.session
+			if session == nil || session.cancel_sent {
+				return
+			}
+			session.cancel_sent = true
+			cancel_error := session_write(session, {
+				kind = .Cancel,
+				request_id = 1,
+				payload = task,
+			}, manager.maximum_payload_bytes)
+			if cancel_error.kind != .None {
+				_ = os.process_kill(session.process)
+				manager.stats.forced_cancellation_kills += 1
+				return
+			}
 			manager.stats.cancellations_forwarded += 1
+			session.fallback_thread = thread.create_and_start_with_poly_data(
+				session,
+				cancellation_fallback_main,
+			)
+			if session.fallback_thread == nil {
+				_ = os.process_kill(session.process)
+				manager.stats.forced_cancellation_kills += 1
+			}
 			return
 		}
 	}

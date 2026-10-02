@@ -28,6 +28,9 @@ type with `worker.register_external_activity_processor`. The command and its
 arguments are copied by `manager_init`; the manager pointer is borrowed by the
 Worker until polling stops. `manager_close` must run only after `worker.run`
 returns. External registration data is never freed by `worker.close`.
+`execution_timeout` bounds the complete invocation, including heartbeat
+exchanges. `cancellation_grace` defaults to five seconds and bounds the interval
+between a forwarded Core cancel task and termination of an unresponsive child.
 
 The child calls `activity_isolate.host_run` with one activity name and one
 ordinary `worker.Activity_Invoke_Proc`. `worker.execute_activity_task_callback`
@@ -49,6 +52,14 @@ retryable `OdinExternalActivityExecutorError`/`OdinExternalActivityProtocolError
 completion. It does not stop the parent Worker or unrelated Activities.
 Temporal Retry Policy remains authoritative; applications must retain normal
 Activity idempotency because a child can fail after an external side effect.
+When a cooperative callback returns an encoded canceled completion, the parent
+preserves it—including callback-authored details—instead of replacing it with a
+generic cancellation.
+
+As with ordinary remote Temporal Activities, server-requested cancellation is
+observed through heartbeat traffic. A long-running isolated Activity must
+heartbeat for the Service/Core cancel task to reach the parent; protocol v3 then
+delivers it independently of any subsequent child heartbeat.
 
 ## Verified path
 
@@ -65,7 +76,9 @@ dies, the parent converts that loss into a retryable Activity failure, and
 Temporal delivers attempt 2. A fresh child returns `Recovered on Activity
 attempt 2`; the parent then shuts Core down cleanly. Exact manager statistics
 require two children, one failed child, one valid completion, one attempt-2
-heartbeat acknowledged by Core, and a fully drained route set.
+heartbeat acknowledged by Core, and a fully drained route set. Two additional
+queues prove cooperative cancellation with zero kills and ignored cancellation
+with exactly one grace-deadline kill.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -78,22 +91,23 @@ This is a correctness and crash-containment slice, not yet the default Activity
 runtime:
 
 - a fresh process is started per attempt; there is no warm bounded pool;
-- child heartbeats use protocol v2 `Heartbeat`/`Heartbeat_Ack` frames and run
+- child heartbeats use protocol v3 `Heartbeat`/`Heartbeat_Ack` frames and run
   through the parent's ordinary heartbeat/interceptor/Core chain;
-- a Core cancel task kills the matching child and the parent returns a canceled
-  completion, rather than first offering cooperative child cancellation;
+- Core cancel tasks use a serialized `Cancel` control frame and update the same
+  child `activity.Context` observed by the callback. The manager starts a
+  per-execution grace timer and kills only a child that does not return;
 - parent Activity execute interceptors are rejected for external registrations
   because callback execution occurs in the child. Parent heartbeat interceptors
   still wrap forwarded heartbeats; child-side execute interceptor registration
   is not yet exposed by `Host_Options`;
 - child metrics use a no-op meter; structured log/metric forwarding is not yet
-  part of protocol v2;
+  part of protocol v3;
 - shutdown currently assumes `worker.run` has drained all invocations before
   `manager_close`; forced manager teardown is best-effort;
 - CPU/memory sandboxing, warm-pool admission, crash-loop policy, release
   signing, and all-target fault evidence remain production work.
 
-The next increment should use the now-duplex protocol for cancellation: the
-parent sends a cooperative cancel frame while the callback is live, followed by
-a bounded TERM/KILL fallback. Only then should persistent warm children and
-multi-activity manifests be added.
+The next increment can now address persistent warm children and multi-activity
+manifests without weakening heartbeat or cancellation semantics. Pool
+admission, idle-child health, crash-loop fencing, and shutdown must remain
+bounded.

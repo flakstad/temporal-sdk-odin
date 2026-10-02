@@ -564,8 +564,9 @@ converts child loss into a retryable Activity failure.
 `./scripts/activity-isolate-integration-test.sh` proves a real Odin panic on
 attempt 1 while the parent remains alive and Temporal completes attempt 2.
 Child heartbeats now round-trip through the parent's ordinary heartbeat/
-interceptor/Core path; cooperative child cancellation is the next protocol
-increment. See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
+interceptor/Core path. Core cancel tasks are delivered into the child Context,
+with a bounded forced-kill fallback for callbacks that ignore cancellation.
+See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test
 deliberately crashes

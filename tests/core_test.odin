@@ -1893,6 +1893,41 @@ external_activity_heartbeat_reenters_the_parent_context :: proc(t: ^testing.T) {
 	testing.expect_value(t, capture.calls, 1)
 }
 
+@(test)
+isolated_activity_cancel_frame_updates_the_child_context :: proc(t: ^testing.T) {
+	token := [?]u8{0, 0xff, 9, 0}
+	details := proto.Coresdk_Activity_Task_ActivityCancellationDetails{
+		is_cancelled = true,
+		is_paused = true,
+	}
+	cancel := proto.Coresdk_Activity_Task_Cancel{
+		reason = .PAUSED,
+		details = &details,
+	}
+	task := proto.Coresdk_Activity_Task_ActivityTask{
+		task_token = token[:],
+		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Cancel{value = &cancel},
+	}
+	encoded := proto.encode_Coresdk_Activity_Task_ActivityTask(&task)
+	defer delete(encoded)
+	ctx := activity.Context{}
+	activity.context_init(&ctx, "isolated", 1, nil, nil)
+	state := activity_isolate.Host_Control_State{
+		task_token = token[:],
+		ctx = &ctx,
+	}
+	testing.expect(t, activity_isolate.host_apply_cancel(&state, encoded[:]))
+	testing.expect(t, activity.is_cancellation_requested(&ctx))
+	testing.expect(t, activity.cancellation_reason(&ctx) == .Paused)
+	cancel_details, present := activity.cancellation_details(&ctx)
+	testing.expect(t, present)
+	testing.expect(t, cancel_details.is_cancelled)
+	testing.expect(t, cancel_details.is_paused)
+	wrong_token := [?]u8{1, 2, 3}
+	state.task_token = wrong_token[:]
+	testing.expect(t, !activity_isolate.host_apply_cancel(&state, encoded[:]))
+}
+
 Heartbeat_Capture :: struct {
 	calls:   int,
 	details: string,
@@ -19316,6 +19351,20 @@ activity_cancel_and_heartbeat_protobuf_round_trip :: proc(t: ^testing.T) {
 
 	completion := proto.encode_activity_cancellation(transmute([]u8)string("cancel-token"))
 	defer delete(completion)
+	testing.expect(
+		t,
+		proto.activity_completion_is_cancellation_for_task(
+			completion[:],
+			transmute([]u8)string("cancel-token"),
+		),
+	)
+	testing.expect(
+		t,
+		!proto.activity_completion_is_cancellation_for_task(
+			completion[:],
+			transmute([]u8)string("wrong-token"),
+		),
+	)
 	decoded_completion := proto.Coresdk_ActivityTaskCompletion{}
 	context.allocator = virtual.arena_allocator(&decode_arena)
 	completion_ok := proto.decode_Coresdk_ActivityTaskCompletion(completion[:], &decoded_completion)

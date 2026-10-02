@@ -76,6 +76,11 @@ Activity_Task_Processor_Proc :: #type proc(
 // subprocess manager can use the task token to signal or terminate the child.
 Activity_Task_Cancel_Proc :: #type proc(processor_data: rawptr, task: []u8)
 
+Activity_Context_Lifecycle_Proc :: #type proc(
+	user_data: rawptr,
+	ctx: ^activity.Context,
+)
+
 Payload_Nexus_Operation_Proc :: #type proc(
 	ctx: ^nexus.Context,
 	input: codec.Payload_View,
@@ -2313,7 +2318,21 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 
 		completion := processed.completion
 		fallback: [dynamic]u8
-		if activity.is_cancellation_requested(&execution.ctx) {
+		completion_valid := false
+		if processed.error.message == nil {
+			completion_valid = proto.activity_completion_matches_task(
+				completion[:],
+				execution.task_token,
+			)
+		}
+		completion_is_cancellation := false
+		if completion_valid {
+			completion_is_cancellation = proto.activity_completion_is_cancellation_for_task(
+				completion[:],
+				execution.task_token,
+			)
+		}
+		if activity.is_cancellation_requested(&execution.ctx) && !completion_is_cancellation {
 			fallback = proto.encode_activity_cancellation(
 				execution.task_token,
 				"Activity canceled while running in an external executor",
@@ -2327,23 +2346,14 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 				false,
 			)
 			completion = fallback[:]
-		} else {
-			validation_allocator := context.allocator
-			context.allocator = virtual.arena_allocator(&arena)
-			completion_valid := proto.activity_completion_matches_task(
-				completion[:],
+		} else if !completion_valid {
+			fallback = proto.encode_activity_failure(
 				execution.task_token,
+				"external Activity processor returned a malformed or mismatched completion",
+				"OdinExternalActivityProtocolError",
+				false,
 			)
-			context.allocator = validation_allocator
-			if !completion_valid {
-				fallback = proto.encode_activity_failure(
-					execution.task_token,
-					"external Activity processor returned a malformed or mismatched completion",
-					"OdinExternalActivityProtocolError",
-					false,
-				)
-				completion = fallback[:]
-			}
+			completion = fallback[:]
 		}
 		defer delete(fallback)
 		core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
@@ -2459,6 +2469,9 @@ execute_activity_task_callback :: proc(
 	task_queue := "external-activity",
 	heartbeat_user_data: rawptr = nil,
 	heartbeat_recorder: activity.Heartbeat_Recorder = nil,
+	context_lifecycle_data: rawptr = nil,
+	context_ready: Activity_Context_Lifecycle_Proc = nil,
+	context_done: Activity_Context_Lifecycle_Proc = nil,
 ) -> Activity_Task_Process_Result {
 	if len(expected_name) == 0 || callback_data == nil || invoke == nil {
 		return {error = error_from_string("external Activity callback is not configured")}
@@ -2522,6 +2535,9 @@ execute_activity_task_callback :: proc(
 		heartbeat_recorder,
 		&metric_meter,
 	)
+	if context_ready != nil {
+		context_ready(context_lifecycle_data, &ctx)
+	}
 
 	callback_arena: virtual.Arena
 	if virtual.arena_init_growing(&callback_arena) != nil {
@@ -2531,6 +2547,9 @@ execute_activity_task_callback :: proc(
 	context.allocator = virtual.arena_allocator(&callback_arena)
 	result := invoke(callback_data, &ctx, input_views[:])
 	context.allocator = previous_allocator
+	if context_done != nil {
+		context_done(context_lifecycle_data, &ctx)
+	}
 	defer codec.payload_free(&result.payload)
 	defer activity.application_failure_free(&result.failure)
 	defer activity.cancellation_free(&result.cancellation)

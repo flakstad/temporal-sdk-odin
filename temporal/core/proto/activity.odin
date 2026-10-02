@@ -313,6 +313,33 @@ activity_completion_matches_task :: proc(data, task_token: []u8) -> bool {
 	return true
 }
 
+activity_completion_is_cancellation_for_task :: proc(data, task_token: []u8) -> bool {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	completion := Coresdk_ActivityTaskCompletion{}
+	decoded := decode_Coresdk_ActivityTaskCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded || completion.result == nil || len(completion.task_token) != len(task_token) {
+		return false
+	}
+	for value, index in task_token {
+		if completion.task_token[index] != value {
+			return false
+		}
+	}
+	#partial switch status in completion.result.status {
+	case Coresdk_Activity_Result_ActivityExecutionResult_Status_Cancelled:
+		return status.value != nil
+	case:
+	}
+	return false
+}
+
 encode_payload :: proc(view: codec.Payload_View) -> Temporal_Api_Common_V1_Payload {
 	payload := Temporal_Api_Common_V1_Payload{data = view.data}
 	for entry in view.metadata {

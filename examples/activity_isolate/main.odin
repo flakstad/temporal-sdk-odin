@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:sync"
+import "core:thread"
 import "core:time"
 import activity "../../temporal/activity"
 import activity_isolate "../../temporal/activity/isolate"
@@ -21,6 +22,23 @@ parent_heartbeat_interceptor :: proc(
 	return worker.activity_heartbeat_next(next, input)
 }
 
+Cancellation_Shutdown_State :: struct {
+	manager:    ^activity_isolate.Manager,
+	sdk_worker: ^worker.Worker,
+}
+
+shutdown_after_cancellation :: proc(state: ^Cancellation_Shutdown_State) {
+	for _ in 0 ..< 6_000 {
+		stats := activity_isolate.manager_stats(state.manager)
+		if stats.children_completed >= 1 || stats.child_failures > 0 {
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	worker.request_shutdown(state.sdk_worker)
+}
+
 isolated_hello :: proc(ctx: ^activity.Context, inputs: []codec.Payload_View) -> activity.Payload_Result {
 	if len(inputs) != 1 {
 		return activity.payload_fail(
@@ -37,6 +55,48 @@ isolated_hello :: proc(ctx: ^activity.Context, inputs: []codec.Payload_View) -> 
 	}
 	defer delete(name)
 	attempt := activity.attempt(ctx)
+	if name == "cancel-uncooperative" {
+		// Heartbeat until Core delivers cancellation, then deliberately ignore
+		// the child Context so the manager's bounded fallback must terminate
+		// this one invocation.
+		for !activity.is_cancellation_requested(ctx) {
+			_ = activity.heartbeat(ctx, "waiting before ignoring cancellation")
+			time.sleep(10 * time.Millisecond)
+		}
+		time.sleep(2 * time.Second)
+		payload, encode_error := codec.encode_json("unexpected uncooperative success")
+		if encode_error != .None {
+			return activity.payload_fail("could not encode uncooperative result")
+		}
+		return activity.payload_complete(payload)
+	}
+	if name == "cancel-isolated" {
+		for !activity.is_cancellation_requested(ctx) {
+			status := activity.heartbeat(ctx, "waiting for cooperative cancellation")
+			if status == .Cancellation_Requested {
+				break
+			}
+			if status != .Recorded {
+				return activity.payload_fail(
+					"isolated Activity cancellation heartbeat failed",
+					failure_type = "OdinIsolatedActivityHeartbeatError",
+				)
+			}
+			time.sleep(10 * time.Millisecond)
+		}
+		reason := activity.cancellation_reason(ctx)
+		details, present := activity.cancellation_details(ctx)
+		if reason != .Cancelled || !present || !details.is_cancelled {
+			return activity.payload_fail(
+				"isolated Activity received incomplete cancellation metadata",
+				failure_type = "OdinIsolatedActivityCancellationError",
+			)
+		}
+		return activity.payload_cancel_json(
+			"child acknowledged cooperative cancellation",
+			"isolated Activity canceled",
+		)
+	}
 	if name == "panic-recovery" && attempt == 1 {
 		fmt.eprintln("isolated Activity executor forcing panic on attempt 1")
 		panic("intentional per-invocation Activity executor panic")
@@ -109,6 +169,7 @@ run_parent :: proc() {
 	manager := activity_isolate.Manager{}
 	manager_options := activity_isolate.options_default(command[:])
 	manager_options.execution_timeout = 10 * time.Second
+	manager_options.cancellation_grace = 500 * time.Millisecond
 	manager_error := activity_isolate.manager_init(&manager, manager_options)
 	if manager_error.message != nil {
 		fmt.eprintf("Activity executor manager failed: %s\n", string(manager_error.message))
@@ -145,8 +206,33 @@ run_parent :: proc() {
 		_ = worker.close(&activity_worker)
 		os.exit(1)
 	}
+	cancel_buffer: [32]u8
+	cancel_mode := os.get_env(cancel_buffer[:], "ACTIVITY_ISOLATE_CANCEL")
+	cancel_case := cancel_mode == "cooperative" || cancel_mode == "forced"
+	forced_cancel_case := cancel_mode == "forced"
 	fmt.printf("Odin external Activity parent is polling task queue %s\n", task_queue)
-	stats, run_error := worker.run(&activity_worker, {max_activity_tasks = 2})
+	max_tasks := cancel_case ? 0 : 2
+	cancel_shutdown_state := Cancellation_Shutdown_State{
+		manager = &manager,
+		sdk_worker = &activity_worker,
+	}
+	cancel_shutdown_thread: ^thread.Thread
+	if cancel_case {
+		cancel_shutdown_thread = thread.create_and_start_with_poly_data(
+			&cancel_shutdown_state,
+			shutdown_after_cancellation,
+		)
+		if cancel_shutdown_thread == nil {
+			fmt.eprintln("could not start isolated Activity cancellation shutdown coordinator")
+			_ = worker.close(&activity_worker)
+			os.exit(1)
+		}
+	}
+	stats, run_error := worker.run(&activity_worker, {max_activity_tasks = max_tasks})
+	if cancel_shutdown_thread != nil {
+		thread.join(cancel_shutdown_thread)
+		thread.destroy(cancel_shutdown_thread)
+	}
 	close_error := worker.close(&activity_worker)
 	if run_error.message != nil || close_error.message != nil {
 		if run_error.message != nil {
@@ -157,6 +243,35 @@ run_parent :: proc() {
 		os.exit(1)
 	}
 	executor_stats := activity_isolate.manager_stats(&manager)
+	if cancel_case {
+		expected_completed := forced_cancel_case ? 0 : 1
+		expected_failures := forced_cancel_case ? 1 : 0
+		expected_kills := forced_cancel_case ? 1 : 0
+		if stats.activity_tasks_completed != 1 || executor_stats.children_started != 1 ||
+		   executor_stats.children_completed != expected_completed ||
+		   executor_stats.child_failures != expected_failures ||
+		   executor_stats.cancellations_forwarded != 1 ||
+		   executor_stats.forced_cancellation_kills != expected_kills ||
+		   activity_isolate.manager_in_flight(&manager) != 0 {
+			fmt.eprintf(
+				"unexpected cancellation stats: tasks=%d started=%d completed=%d failures=%d cancellations=%d kills=%d in_flight=%d\n",
+				stats.activity_tasks_completed,
+				executor_stats.children_started,
+				executor_stats.children_completed,
+				executor_stats.child_failures,
+				executor_stats.cancellations_forwarded,
+				executor_stats.forced_cancellation_kills,
+				activity_isolate.manager_in_flight(&manager),
+			)
+			os.exit(1)
+		}
+		if forced_cancel_case {
+			fmt.println("uncooperative isolated Activity cancellation reached the bounded forced-kill fallback")
+		} else {
+			fmt.println("isolated Activity cancellation was delivered cooperatively without a forced kill")
+		}
+		return
+	}
 	if stats.activity_tasks_completed != 2 || executor_stats.children_started != 2 ||
 	   executor_stats.children_completed != 1 || executor_stats.child_failures != 1 ||
 	   executor_stats.heartbeats_forwarded != 1 ||

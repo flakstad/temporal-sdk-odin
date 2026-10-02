@@ -277,6 +277,34 @@ impl ActivityPanicRecoveryDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct IsolatedActivityCancellationDriverWorkflow;
+
+#[workflow_methods]
+impl IsolatedActivityCancellationDriverWorkflow {
+    #[run(name = "odin_isolated_activity_cancellation_driver")]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        activity_input: String,
+    ) -> WorkflowResult<String> {
+        let activity = ctx.execute_activity(
+            HelloActivity,
+            activity_input,
+            ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                .cancellation_type(ActivityCancellationType::WaitCancellationCompleted)
+                .retry_policy(RetryPolicy::builder().maximum_attempts(1).build())
+                .build(),
+        );
+        ctx.timer(Duration::from_millis(100)).await;
+        activity.cancel();
+        match activity.await {
+            Ok(value) => Ok(format!("unexpected isolated Activity success: {value}")),
+            Err(_) => Ok("Workflow observed isolated Activity cancellation".to_string()),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -291,6 +319,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let typed = std::env::var_os("ACTIVITY_TYPED").is_some();
     let retry = std::env::var_os("ACTIVITY_RETRY").is_some();
     let panic_recovery = std::env::var_os("ACTIVITY_PANIC_RECOVERY").is_some();
+    let isolated_cancellation = std::env::var_os("ACTIVITY_ISOLATED_CANCELLATION").is_some();
+    let isolated_cancellation_uncooperative =
+        std::env::var_os("ACTIVITY_ISOLATED_CANCELLATION_UNCOOPERATIVE").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
     let expected = if shutdown_case {
         "Workflow observed Worker shutdown Activity failure".to_string()
@@ -316,6 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<RetryActivityDriverWorkflow>()?
         .register_workflow::<AsyncActivityDriverWorkflow>()?
         .register_workflow::<ActivityPanicRecoveryDriverWorkflow>()?
+        .register_workflow::<IsolatedActivityCancellationDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -324,6 +356,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow_id = std::env::var("ACTIVITY_WORKFLOW_ID")
         .unwrap_or_else(|_| format!("odin-sdk-activity-spike-{}-{unique}", std::process::id()));
     let driver = async move {
+        if isolated_cancellation || isolated_cancellation_uncooperative {
+            let activity_input = if isolated_cancellation_uncooperative {
+                "cancel-uncooperative"
+            } else {
+                "cancel-isolated"
+            };
+            let handle = client
+                .start_workflow(
+                    IsolatedActivityCancellationDriverWorkflow::run,
+                    activity_input.to_string(),
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            if result != "Workflow observed isolated Activity cancellation" {
+                return Err(format!("unexpected isolated cancellation result: {result}").into());
+            }
+            println!("{result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if let Some(async_mode) = async_mode {
             let activity_input = if async_mode == "id-cancel" {
                 "__cancel__".to_string()

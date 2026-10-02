@@ -105,6 +105,95 @@ grep -q 'isolated Activity executor forcing panic on attempt 1' "$parent_log"
 grep -q 'isolated Activity panic was contained, heartbeat forwarded, and retry completed' "$parent_log"
 grep -q 'Workflow survived the Activity process crash: Recovered on Activity attempt 2' "$driver_log"
 
+cancel_task_queue="odin-activity-isolate-cancel-${RANDOM}-$(date +%s)"
+cancel_workflow_id="odin-activity-isolate-cancel-${RANDOM}-$(date +%s)"
+ACTIVITY_ISOLATE_CANCEL=cooperative \
+  TEMPORAL_ODIN_TASK_QUEUE="$cancel_task_queue" \
+  "$binary" >>"$parent_log" 2>&1 &
+parent_pid=$!
+for _ in {1..100}; do
+  if grep -q "external Activity parent is polling task queue $cancel_task_queue" "$parent_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "Cancellation Activity parent exited before polling" >&2
+    cat "$parent_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+ACTIVITY_ISOLATED_CANCELLATION=1 \
+  ACTIVITY_WORKFLOW_ID="$cancel_workflow_id" \
+  TEMPORAL_TASK_QUEUE="$cancel_task_queue" \
+  cargo run --quiet \
+    --manifest-path "$repo_root/native/Cargo.toml" \
+    --package activity-test-driver >>"$driver_log" 2>&1 &
+driver_pid=$!
+
+if ! wait "$driver_pid"; then
+  driver_pid=""
+  echo "Workflow did not observe cooperative isolated Activity cancellation" >&2
+  cat "$driver_log" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+driver_pid=""
+if ! wait "$parent_pid"; then
+  parent_pid=""
+  echo "Cancellation Activity parent did not shut down cleanly" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+parent_pid=""
+
+grep -q 'isolated Activity cancellation was delivered cooperatively without a forced kill' "$parent_log"
+grep -q 'Workflow observed isolated Activity cancellation' "$driver_log"
+
+forced_task_queue="odin-activity-isolate-forced-${RANDOM}-$(date +%s)"
+forced_workflow_id="odin-activity-isolate-forced-${RANDOM}-$(date +%s)"
+ACTIVITY_ISOLATE_CANCEL=forced \
+  TEMPORAL_ODIN_TASK_QUEUE="$forced_task_queue" \
+  "$binary" >>"$parent_log" 2>&1 &
+parent_pid=$!
+for _ in {1..100}; do
+  if grep -q "external Activity parent is polling task queue $forced_task_queue" "$parent_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "Forced-cancellation Activity parent exited before polling" >&2
+    cat "$parent_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+ACTIVITY_ISOLATED_CANCELLATION_UNCOOPERATIVE=1 \
+  ACTIVITY_WORKFLOW_ID="$forced_workflow_id" \
+  TEMPORAL_TASK_QUEUE="$forced_task_queue" \
+  cargo run --quiet \
+    --manifest-path "$repo_root/native/Cargo.toml" \
+    --package activity-test-driver >>"$driver_log" 2>&1 &
+driver_pid=$!
+
+if ! wait "$driver_pid"; then
+  driver_pid=""
+  echo "Workflow did not observe forced isolated Activity cancellation" >&2
+  cat "$driver_log" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+driver_pid=""
+if ! wait "$parent_pid"; then
+  parent_pid=""
+  echo "Forced-cancellation Activity parent did not shut down cleanly" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+parent_pid=""
+
+grep -q 'uncooperative isolated Activity cancellation reached the bounded forced-kill fallback' "$parent_log"
+
 cat "$parent_log"
 cat "$driver_log"
-echo "A per-invocation Odin Activity child crashed; the Core-owning parent stayed alive and completed Temporal retry attempt 2."
+echo "Per-invocation Activity crash/retry, heartbeat forwarding, cooperative cancellation, and forced-kill fallback passed through the Core-owning parent."
