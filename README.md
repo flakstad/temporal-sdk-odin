@@ -1027,8 +1027,10 @@ assert(run_error.message == nil)
 ```
 
 The facade keeps Client and Worker errors distinct and does not hide cleanup.
-See `examples/sdk_hello_activity` for checked error handling and a bounded live
-run against the Temporal CLI dev server.
+See `examples/sdk_hello_activity` for the Activity-only lifecycle and
+`examples/sdk_hello_workflow` for the smallest complete Client → Worker →
+Workflow → Activity → result path against the Temporal CLI dev server. Run the
+latter with `./scripts/core-sdk-integration-test.sh`.
 
 Build a host-specific native runtime archive and verify that the packaged Core
 ABI can initialize and shut down:
@@ -2575,6 +2577,7 @@ temporal/client/standalone_nexus optional standalone Nexus Client lifecycle
 temporal/client/standalone_activity optional standalone Activity Client lifecycle
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
+examples/sdk_hello_workflow/ minimal public Client/Worker/Workflow/Activity path
 examples/core_connect/    Odin -> Core -> Temporal proof
 examples/config_connect/  Core TOML profile -> public Client proof
 examples/worker_replace_client/ live Core Worker connection failover proof

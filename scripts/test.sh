@@ -4,6 +4,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$repo_root/scripts/generate-protos.sh" --check
 
+# Keep the small public lifecycle facade warning-clean even when an application
+# does not instantiate every generic API reachable through Worker imports.
+odin check "$repo_root/temporal" \
+	-no-entry-point \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
+
 # Compile the base Client and optional extensions independently so an accidental
 # reverse import cannot collapse the package boundary.
 odin check "$repo_root/temporal/client" \

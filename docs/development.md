@@ -1983,6 +1983,17 @@ result, a 500-case property varies all thirteen capability bits, and the Client
 interceptor property includes the result-bearing operation. The live example
 also requires its interceptor to enter before and unwind after the Core RPC.
 
+The smallest complete public-SDK acceptance path is:
+
+```bash
+./scripts/core-sdk-integration-test.sh
+```
+
+`examples/sdk_hello_workflow` uses the top-level lifecycle facade plus the
+public Client and Workflow packages. It connects, registers one typed Workflow
+and Activity, starts the Workflow from the Worker's ready callback, executes the
+Activity through Core, waits for the result, and checks bounded Worker stats.
+
 ### Standalone Activities
 
 Standalone Activities require a newer Service than the repository's original

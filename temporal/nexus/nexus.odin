@@ -164,16 +164,21 @@ result_async :: proc($T: typeid, operation_token: string) -> Result(T) {
 	return {status = .Started_Async, operation_token = operation_token}
 }
 
+clone_operation_token :: proc(operation_token: string) -> (string, bool) {
+	owned_token, allocation_error := strings.clone(
+		operation_token,
+		allocator_runtime.heap_allocator(),
+	)
+	return owned_token, allocation_error == nil
+}
+
 // result_async_copy is the safe form for a token backed by temporary storage.
 // The Worker takes ownership of the copied token and releases it after the
 // Nexus completion has been encoded. result_async remains allocation-free for
 // literals and other storage that outlives the handler adapter call.
 result_async_copy :: proc($T: typeid, operation_token: string) -> Result(T) {
-	owned_token, allocation_error := strings.clone(
-		operation_token,
-		allocator_runtime.heap_allocator(),
-	)
-	if allocation_error != nil {
+	owned_token, cloned := clone_operation_token(operation_token)
+	if !cloned {
 		return result_handler_error(
 			T,
 			"could not preserve asynchronous Nexus operation token",

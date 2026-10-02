@@ -44,6 +44,15 @@ The core is complete only when these paths are coherent together. A feature
 that works only on the first execution but not after eviction/replay is not a
 completed Workflow feature.
 
+The minimum coherent acceptance path is executable, not just architectural:
+`examples/sdk_hello_workflow` imports the public lifecycle facade, Client, and
+Workflow packages; connects to the CLI dev server; registers a typed Workflow
+and Activity; executes the Activity through Core; and reads the owned Workflow
+result. `scripts/core-sdk-integration-test.sh` runs that path, while
+`scripts/test.sh` compiles the top-level facade independently under strict vet
+settings. Passing this smoke test means the usable SDK core is assembled. It
+does not by itself satisfy the production release gates below.
+
 ## Extended surface
 
 The repository already implements valuable capabilities outside the stable

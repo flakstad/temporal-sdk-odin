@@ -48,6 +48,7 @@ build_example schedule_lifecycle temporal-odin-schedule-lifecycle
 build_example hello_activity temporal-odin-hello-activity
 build_example activity_isolate temporal-odin-activity-isolate
 build_example sdk_hello_activity temporal-odin-sdk-hello-activity
+build_example sdk_hello_workflow temporal-odin-sdk-hello-workflow
 build_example standalone_activity temporal-odin-standalone-activity
 build_example hello_nexus temporal-odin-hello-nexus
 build_example standalone_nexus_client temporal-odin-standalone-nexus-client
