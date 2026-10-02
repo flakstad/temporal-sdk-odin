@@ -32,6 +32,8 @@ Probe_State :: struct {
 	cancellation_observed: bool,
 	cancellation_reason_ok: bool,
 	nondeterminism_replay: bool,
+	shutdown_shards_entered: [EXECUTOR_THREADS]bool,
+	shutdown_shard_count:    int,
 }
 
 probe_state: Probe_State
@@ -63,9 +65,21 @@ concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string
 
 shutdown_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
 	owner_thread := sync.current_thread_id()
+	info, info_present := workflow.info(ctx)
+	shard := -1
+	if info_present {
+		shard, _ = workflow_isolate.workflow_shard_index(info.run_id, EXECUTOR_THREADS)
+	}
 	sync.mutex_lock(&probe_state.mutex)
 	probe_state.valid_started += 1
+	if shard >= 0 && !probe_state.shutdown_shards_entered[shard] {
+		probe_state.shutdown_shards_entered[shard] = true
+		probe_state.shutdown_shard_count += 1
+	}
 	sync.mutex_unlock(&probe_state.mutex)
+	// Deliberate test-only blocking keeps one activation executing on every
+	// shard while the coordinator requests Worker shutdown.
+	time.sleep(2 * time.Second)
 	workflow.sleep(ctx, time.Hour)
 	if sync.current_thread_id() != owner_thread {
 		sync.mutex_lock(&probe_state.mutex)
@@ -276,6 +290,7 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 	started := false
 	valid_started := 0
 	timer_activations_completed := 0
+	shutdown_shard_count := 0
 	expected_timer_activations := len(state.handles)
 	if !state.force_shutdown {
 		expected_timer_activations += 1
@@ -283,20 +298,26 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 	if state.force_replay && !state.force_shutdown {
 		expected_timer_activations += 1
 	}
-	for _ in 0 ..< 500 {
+	wait_iterations := state.force_shutdown ? 3000 : 500
+	for _ in 0 ..< wait_iterations {
 		sync.mutex_lock(&probe_state.mutex)
 		started = probe_state.cancellation_started
 		valid_started = probe_state.valid_started
 		timer_activations_completed = probe_state.timer_activations_completed
+		shutdown_shard_count = probe_state.shutdown_shard_count
 		sync.mutex_unlock(&probe_state.mutex)
-		if (started || state.force_shutdown) && valid_started >= len(state.handles) &&
+		if state.force_shutdown && shutdown_shard_count == EXECUTOR_THREADS {
+			break
+		}
+		if !state.force_shutdown && started && valid_started >= len(state.handles) &&
 		   timer_activations_completed >= expected_timer_activations {
 			break
 		}
 		time.sleep(10 * time.Millisecond)
 	}
-	if (!started && !state.force_shutdown) || valid_started < len(state.handles) ||
-	   timer_activations_completed < expected_timer_activations {
+	if (state.force_shutdown && shutdown_shard_count != EXECUTOR_THREADS) ||
+	   (!state.force_shutdown && (!started || valid_started < len(state.handles) ||
+	   timer_activations_completed < expected_timer_activations)) {
 		state.results_ok = false
 		worker.request_shutdown(state.sdk_worker)
 		return
@@ -724,12 +745,14 @@ run :: proc() -> int {
 
 	options := worker.options_default(task_queue)
 	options.max_concurrent_workflow_tasks = EXECUTOR_THREADS
-	options.max_workflow_task_slots = EXECUTOR_THREADS
-	options.max_cached_workflows = 16
+	options.max_workflow_task_slots = force_shutdown ? 128 : EXECUTOR_THREADS
+	options.max_cached_workflows = force_shutdown ? 128 : 16
 	options.nondeterminism_policy = {
 		fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
 	}
-	options.workflow_task_poller_behavior = worker.poller_simple_maximum(EXECUTOR_THREADS)
+	options.workflow_task_poller_behavior = worker.poller_simple_maximum(
+		force_shutdown ? 16 : EXECUTOR_THREADS,
+	)
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
 		options,
@@ -928,17 +951,23 @@ run :: proc() -> int {
 	if force_shutdown {
 		sync.mutex_lock(&probe_state.mutex)
 		shutdown_migrations := probe_state.migrations
+		shutdown_shards_entered := probe_state.shutdown_shard_count
 		sync.mutex_unlock(&probe_state.mutex)
 		if !state.results_ok || len(state.handles) < EXECUTOR_THREADS ||
-		   run_stats.workflow_activations_completed < len(state.handles) ||
+		   shutdown_shards_entered != EXECUTOR_THREADS ||
+		   run_stats.workflow_activations_completed !=
+		   len(state.handles) + run_stats.workflow_evictions ||
 		   run_stats.workflow_executions_completed != 0 ||
 		   run_stats.workflow_activation_failures != 0 ||
-		   run_stats.workflow_cached_fibers_shutdown != len(state.handles) ||
+		   run_stats.workflow_cached_fibers_shutdown < 1 ||
+		   run_stats.workflow_cached_fibers_shutdown + run_stats.workflow_evictions !=
+		   len(state.handles) ||
 		   run_stats.workflow_activations_peak_owned < 1 ||
 		   run_stats.workflow_executor_queue_peak < 1 || shutdown_migrations != 0 {
 			fmt.eprintf(
-				"In-process Workflow shutdown proof failed handles=%d activations=%d completed=%d failures=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+				"In-process Workflow shutdown proof failed handles=%d mid_activation_shards=%d activations=%d completed=%d failures=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
 				len(state.handles),
+				shutdown_shards_entered,
 				run_stats.workflow_activations_completed,
 				run_stats.workflow_executions_completed,
 				run_stats.workflow_activation_failures,
@@ -951,9 +980,10 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"In-process Workflow shutdown proved handles=%d shards=%d activations=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+			"In-process Workflow shutdown proved handles=%d shards=%d mid_activation_shards=%d activations=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
 			len(state.handles),
 			EXECUTOR_THREADS,
+			shutdown_shards_entered,
 			run_stats.workflow_activations_completed,
 			run_stats.workflow_evictions,
 			run_stats.workflow_cached_fibers_shutdown,

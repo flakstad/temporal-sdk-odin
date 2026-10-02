@@ -4228,13 +4228,19 @@ result requires an active-handler peak of two, typed Update result `14`,
 Workflow result `async:12:2`, owner-thread resumption, complete handler drain,
 and zero warnings or abandonments.
 A third pass covers all four executor shards with Workflow runs suspended on
-one-hour timers, then requests Worker shutdown while those runs remain open.
-Core ends its poll stream without emitting eviction activations. Each shard
-calls `fiber_runtime_executor_shutdown` locally, and
-`Run_Stats.workflow_cached_fibers_shutdown` must equal the number of open runs.
-Any cross-thread destruction, unreleased activation buffer, or incomplete
-shard join turns `worker.run` into an error. The Client terminates the remaining
-server executions only after the Worker has stopped.
+one-hour timers, then requests Worker shutdown while one activation is still
+executing on every shard. Core may race final eviction activations against the
+shutdown poll; every open run must therefore be accounted for exactly once by
+either `workflow_evictions` or `workflow_cached_fibers_shutdown`, and the proof
+requires at least one direct cached teardown. Each remaining shard calls
+`fiber_runtime_executor_shutdown` locally. Any cross-thread destruction,
+unreleased activation buffer, or incomplete shard join turns `worker.run` into
+an error. The Client terminates the remaining server executions only after the
+Worker has stopped. The shutdown probe uses 128 Core Workflow slots and sixteen
+pollers above four language executors. This is intentional test pressure: a
+small Core slot count can be exhausted by blocked activations on only three
+hash shards before the fourth shard receives work. Extra admitted activations
+queue behind their fixed owner and must be drained before executor teardown.
 Its brief wall-clock block is test instrumentation and is not an allowed
 Workflow programming primitive.
 

@@ -1244,13 +1244,19 @@ interleaved retains and batched releases, checks both high-water marks against a
 reference model, drains to zero, and verifies that one extra release is
 rejected without corrupting the count.
 The script's third pass sets `TEMPORAL_ODIN_FORCE_SHUTDOWN=1`, starts enough
-one-hour timer Workflows to cover all four executor shards, waits until every
-initial activation is accepted, and requests Worker shutdown without closing
-the executions. Core ends polling without eviction in this path. Each shard
-then destroys its still-cached fibers on its own executor thread. The pass
-requires `workflow_cached_fibers_shutdown == handles`, zero completed
-executions, zero migrations, and a balanced activation-ownership count; the
-test Client terminates the orphaned server executions afterward.
+one-hour timer Workflows to cover all four executor shards, waits until one
+activation is executing on each shard, and requests Worker shutdown without
+closing the executions. Core may race some final eviction activations against
+the shutdown poll. The pass therefore requires every run to be accounted for
+exactly once by either `workflow_evictions` or
+`workflow_cached_fibers_shutdown`, with at least one direct cached teardown,
+zero completed executions, zero migrations, and balanced activation ownership.
+The test Client terminates the orphaned server executions afterward.
+This pass deliberately configures more Core Workflow slots and pollers than
+language executor threads. Otherwise the first few blocked activations can
+consume every Core slot before a run assigned to the final hash shard is
+polled. Excess work queues behind its fixed shard, which also exercises queue
+draining after shutdown admission closes.
 The blocking probe is instrumentation only; application Workflow code must not
 read wall time or block an executor thread. In concurrent mode, Workflow
 logger/interceptor/metric factory state and the activation observer can be
