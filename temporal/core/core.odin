@@ -46,7 +46,11 @@ Replay_Worker :: struct {
 	pusher: ^raw.Worker_Replay_Pusher,
 }
 
-DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-experimental"
+SDK_NAME :: "temporal-sdk-odin"
+// Development builds intentionally do not claim a numbered public release.
+// A release process will replace this with the selected stable version.
+SDK_VERSION :: "0.0.0-dev"
+DEFAULT_WORKER_BUILD_ID :: "temporal-sdk-odin-development"
 DEFAULT_GRACEFUL_SHUTDOWN_PERIOD :: 5 * time.Second
 
 Runtime_Key_Value :: struct {
@@ -1094,8 +1098,8 @@ wait_until :: proc(done: ^sync.One_Shot_Event) {
 client_connect :: proc(runtime: ^Runtime, target_url := "http://localhost:7233") -> (client: Client, error: Error) {
 	return client_connect_with_options(runtime, {
 		target_url = target_url,
-		client_name = "temporal-sdk-odin",
-		client_version = "0.0.1-experimental",
+		client_name = SDK_NAME,
+		client_version = SDK_VERSION,
 		identity = "temporal-sdk-odin@local",
 		grpc_compression = .Gzip,
 	})
@@ -1140,8 +1144,8 @@ client_update_metadata :: proc(
 	bindings := Client_Connection_Bindings{}
 	bindings_error := client_connection_bindings_init(&bindings, {
 		target_url = "http://localhost:7233",
-		client_name = "temporal-sdk-odin",
-		client_version = "0.0.1-experimental",
+		client_name = SDK_NAME,
+		client_version = SDK_VERSION,
 		identity = "temporal-sdk-odin@local",
 		metadata = metadata,
 		binary_metadata = binary_metadata,

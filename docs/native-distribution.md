@@ -1,7 +1,7 @@
 # Native runtime package
 
-This archive contains the platform-specific part of the experimental Temporal
-SDK for Odin. It is built from the exact SDK Core revision recorded in
+This archive contains the platform-specific native runtime for the Temporal SDK
+for Odin. It is built from the exact SDK Core revision recorded in
 `manifest.txt`; do not combine it with generated Odin protobuf or raw C ABI
 bindings from another repository revision.
 
@@ -12,7 +12,7 @@ Contents:
 - `lib/libtemporal_odin_history_json.{dylib,so}` — optional, replay-only
   canonical protobuf-JSON conversion using the pinned Temporal descriptors;
 - `lib/libtemporal_odin_fiber.a` — the project-owned minicoro shim used by the
-  Workflow experiment;
+  Workflow runtime;
 - `include/temporal-sdk-core-c-bridge.h` — the matching upstream C header;
 - `include/temporal-odin-history-json.h` — the optional replay converter ABI;
 - `manifest.txt` — target, toolchain, upstream version, and file checksums;
@@ -37,12 +37,12 @@ to reserve each fixed Workflow stack lazily and place an inaccessible page at
 its overflow edge. This is part of the native shim ABI and is exercised by
 `scripts/fiber-guard-test.sh`; it is not supplied by SDK Core. Overflow remains
 a fatal process signal, so deployment supervision and explicit stack sizing are
-still required when Workflows execute in-process. The experimental per-run
+still required when Workflows execute in-process. The opt-in per-run
 executor manager now live-proves that the same signal can fail one Workflow
 Task and recover through Core eviction/replay without terminating the parent
 Worker.
 
-These are experimental CI artifacts, not final release bundles. Public binary
+These are pre-release CI artifacts, not final release bundles. Public binary
 distribution still needs an audited notice/SBOM for Core's transitive Rust
 dependencies, and macOS release artifacts need an explicit code-signing and
 notarization policy.

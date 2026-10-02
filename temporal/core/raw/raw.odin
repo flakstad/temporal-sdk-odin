@@ -7,7 +7,7 @@ import "core:c"
 when ODIN_OS == .Darwin || ODIN_OS == .Linux {
 	foreign import temporal_core "system:temporalio_sdk_core_c_bridge"
 } else {
-	#panic("Temporal SDK Core spike currently supports macOS and Linux")
+	#panic("Temporal SDK Core integration currently supports macOS and Linux")
 }
 
 Runtime    :: struct { _opaque: u8 }

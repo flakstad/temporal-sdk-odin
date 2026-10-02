@@ -1,4 +1,4 @@
-// Package workflow_isolate defines the experimental process protocol between
+// Package workflow_isolate defines the opt-in process protocol between
 // a Core-owning Worker parent and a language Workflow executor child. Frames
 // carry the pinned opaque WorkflowActivation/WorkflowActivationCompletion
 // protobuf bytes; this package does not reinterpret Temporal's wire protocol.

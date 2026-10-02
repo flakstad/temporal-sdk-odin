@@ -1,4 +1,4 @@
-// Package client provides the experimental public Temporal client boundary.
+// Package client provides the public Temporal client boundary.
 package client
 
 import allocator_runtime "base:runtime"
@@ -177,8 +177,8 @@ connect_with_options :: proc(options: Connect_Options) -> (client: Client, error
 	}
 	core_options := temporal_core.Client_Connection_Options{
 		target_url = options.target_url,
-		client_name = "temporal-sdk-odin",
-		client_version = "0.0.1-experimental",
+		client_name = temporal_core.SDK_NAME,
+		client_version = temporal_core.SDK_VERSION,
 		identity = identity,
 		metadata = options.metadata,
 		binary_metadata = options.binary_metadata,

@@ -390,8 +390,8 @@ If the property dependency is absent, initialize it with:
 git submodule update --init --recursive
 ```
 
-The raw package also contains compile-time ABI assertions for the structs used
-by the spike. They are checked against the pinned generated header's 64-bit C
+The raw package also contains compile-time ABI assertions for every bound
+struct. They are checked against the pinned generated header's 64-bit C
 layout.
 
 ## Worker registration and polling
@@ -1421,8 +1421,8 @@ runtime clones all strings into the Workflow instance arena. A nil Retry Policy
 leaves the field absent so the Service can apply its default policy. Zero
 duration means unspecified; either Schedule-to-Close or Start-to-Close must be
 positive. Invalid options fail the Workflow with non-retryable
-`OdinActivityOptionsError`. The no-options compatibility calls still use the
-bounded spike defaults: 20-second Start-to-Close, maximum attempts 1, and eager
+`OdinActivityOptionsError`. The no-options compatibility calls retain the
+original bounded defaults: 20-second Start-to-Close, maximum attempts 1, and eager
 execution disabled.
 
 The raw Payload test uses `binary/custom`, an extra `messageType` metadata
@@ -2020,7 +2020,7 @@ Policy/Priority values and must be released with
 Activity request/response pairs in the pinned API.
 
 The suite then repeats that executable with the Core-only Nexus lifecycle
-spike:
+proof:
 
 ```bash
 TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 ./scripts/run-core-connect.sh
@@ -3190,7 +3190,7 @@ conclusive negative evidence.
 
 ## Current platform evidence
 
-Milestones 1–3 and the stackful-fiber experiment were built and run end-to-end
+The Core bridge, Activity path, and stackful Workflow runtime were built and run end-to-end
 on macOS arm64. Native packaging and packaged-runtime smoke verification also
 run locally there. A clean Ubuntu 24.04 arm64 container has also built Core from
 a Git-free complete source archive, run the then-current 135 unit tests and 42

@@ -1,12 +1,14 @@
-# Workflow package (research only)
+# Workflow runtime
 
-`spike.odin` is a bounded explicit state machine for one Workflow shape:
+`state_machine_reference.odin` retains the original bounded explicit state
+machine for one Workflow shape as a replay oracle:
 
 ```text
 initialize -> schedule hello Activity -> resolve Activity -> complete
 ```
 
-`fiber_spike.odin` drives serial commands, multiple outstanding Activities,
+`runtime.odin` is the active stackful runtime. It drives serial commands,
+multiple outstanding Activities,
 handled Activity failures, buffered signals, a durable signal/timer race, and
 Activity-awaiting Workflow Update routines through stackful coroutines. It also
 implements Core's `NotifyHasPatch`/`SetPatchMarker` replay protocol through
@@ -268,9 +270,11 @@ caller may free the builder after the scheduling call returns.
 Continue-As-New options accept the same builder; its terminal call never
 returns, and the run arena releases its working copy when Core evicts the old
 run.
-`temporal/worker` now provides experimental name-based Workflow registration
-and dispatch, but neither the fiber API nor its one-string codec is stable or a
-complete Workflow runtime. Do not build production Workflows against them.
+`temporal/worker` provides name-based Workflow registration and dispatch for
+string, Payload, repeated-Payload, and typed JSON boundaries. The runtime is the
+SDK's active implementation, but its public compatibility contract is not frozen
+and it has not crossed the production release gates in
+[`../../docs/product-scope.md`](../../docs/product-scope.md).
 
 ## Process-local Workflow registry
 

@@ -12073,7 +12073,7 @@ append_fiber_continue_as_new_command :: proc(
 		return error_from_string("Workflow requested Continue-As-New without preserved inputs")
 	}
 	if !commands_are_nonterminal_prefix(commands) {
-		return error_from_string("fiber spike emitted Continue-As-New after another command")
+		return error_from_string("Workflow runtime emitted Continue-As-New after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
 	operation := &instance.continue_as_new
@@ -12153,7 +12153,7 @@ append_fiber_completion_command :: proc(
 	instance: ^Fiber_Instance,
 ) -> Error {
 	if !commands_are_nonterminal_prefix(commands) {
-		return error_from_string("fiber spike emitted completion after another command")
+		return error_from_string("Workflow runtime emitted completion after another command")
 	}
 	append_fiber_timer_cancellations(result, commands, instance)
 	completion_payload := new(proto.Temporal_Api_Common_V1_Payload)
@@ -12180,7 +12180,7 @@ append_fiber_failure_command :: proc(
 	instance: ^Fiber_Instance,
 ) -> Error {
 	if !commands_are_nonterminal_prefix(commands) {
-		return error_from_string("fiber spike emitted failure after another command")
+		return error_from_string("Workflow runtime emitted failure after another command")
 	}
 	failure := new(proto.Temporal_Api_Failure_V1_Failure)
 	if instance.unhandled_activity_seq != 0 {
@@ -12254,7 +12254,7 @@ append_fiber_cancellation_commands :: proc(
 	instance: ^Fiber_Instance,
 ) -> Error {
 	if !commands_are_nonterminal_prefix(commands) {
-		return error_from_string("fiber spike emitted cancellation after another command")
+		return error_from_string("Workflow runtime emitted cancellation after another command")
 	}
 	append_fiber_activity_cancellations(result, commands, instance)
 	append_fiber_nexus_operation_cancellations(result, commands, instance)
@@ -12744,7 +12744,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 				result.resolved_activity_seq = operation.command_seq
 			}
 			if !resolution_handled {
-				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow fiber spike")
+				process_error(&result, activation.run_id, "Activity result is unsupported by the Workflow runtime")
 				return
 			}
 
@@ -13140,7 +13140,7 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 			result.evicted = true
 		}
 		if !handled {
-			process_error(&result, activation.run_id, "Workflow fiber spike received an unsupported activation job")
+			process_error(&result, activation.run_id, "Workflow runtime received an unsupported activation job")
 			return
 		}
 		if instance_found && len(instance.activation_error_message) > 0 {

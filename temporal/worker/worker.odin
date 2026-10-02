@@ -1,5 +1,5 @@
 // Package worker owns registration, Core polling, dispatch, and lifecycle.
-// The payload codecs and Workflow fiber runtime remain experimental.
+// Payload codecs and the Workflow runtime are explicit language-SDK concerns.
 package worker
 
 import allocator_runtime "base:runtime"
@@ -332,7 +332,7 @@ Rejected_Workflow_Run :: struct {
 Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
 Worker_Ready_Proc :: #type proc(user_data: rawptr) -> bool
 // Workflow_Activation_Processor replaces the in-process Workflow dispatcher
-// for online Worker activations. It is an experimental process-isolation seam:
+// for online Worker activations. It is an opt-in process-isolation seam:
 // activation bytes are borrowed for this call, while the returned completion,
 // run ID, cancellation reason, and Error are owned by the Worker. With one
 // Workflow executor it runs serially. External/process-isolated

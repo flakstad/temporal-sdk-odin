@@ -1,6 +1,6 @@
 # Per-invocation Activity process isolation
 
-`temporal/activity/isolate` is an experimental execution boundary for Odin
+`temporal/activity/isolate` is an opt-in execution boundary for Odin
 Activities. SDK Core, its Worker, task polling, task-token routing, and final
 completion remain in the parent process. Callbacks run either in fresh children
 or serially in an opt-in bounded warm pool:

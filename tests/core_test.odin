@@ -31358,7 +31358,7 @@ standalone_activity_description_and_visibility_own_decoded_data :: proc(t: ^test
 		user_metadata = &metadata,
 		total_heartbeat_count = 2,
 		sdk_name = "temporal-sdk-odin",
-		sdk_version = "0.0.1-experimental",
+		sdk_version = "0.0.0-dev",
 	}
 	append(&info.links, link)
 	defer delete(info.links)

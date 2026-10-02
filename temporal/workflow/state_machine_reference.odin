@@ -393,7 +393,7 @@ process_activation :: proc(runtime: ^Runtime, data: []u8) -> (result: Process_Re
 				)
 			}
 			if !status_handled {
-				process_error(&result, activation.run_id, "activity backoff is outside the workflow spike")
+				process_error(&result, activation.run_id, "activity backoff is outside the state-machine reference")
 				return
 			}
 			instance.phase = .Completed
@@ -414,7 +414,7 @@ process_activation :: proc(runtime: ^Runtime, data: []u8) -> (result: Process_Re
 			result.evicted = true
 		}
 		if !handled {
-			process_error(&result, activation.run_id, "workflow spike received an unsupported activation job")
+			process_error(&result, activation.run_id, "state-machine reference received an unsupported activation job")
 			return
 		}
 	}

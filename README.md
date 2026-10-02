@@ -1,10 +1,25 @@
-# Temporal SDK for Odin — experimental
+# Temporal SDK for Odin
 
-An experimental Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
+An Odin language SDK built on [Temporal SDK Core](https://github.com/temporalio/sdk-rust),
 not a reimplementation of Temporal Server or its gRPC protocol.
 
-Current status: Milestones 0–2 plus bounded explicit-state-machine and stackful
-fiber Workflow experiments. The repository builds the official Rust Core C
+The project is under active development toward a usable, production-capable
+SDK. Its Client, Worker, Activity, Workflow, replay, Schedule, Nexus, and
+process-isolation paths are already broad, but the public API, Workflow runtime,
+native distribution, and fault evidence have not yet crossed the documented
+production release bar. Do not treat the current main branch as a stable release.
+
+Development now follows a deliberate stable-core boundary rather than chasing
+every Temporal Service RPC before shipping. Client/Worker lifecycle, Activities,
+deterministic Workflows, replay/testing, observability, and four-target native
+distribution form that core. Already implemented Schedules, Nexus, standalone
+operations, advanced controls, and process isolation remain available as an
+extended surface. See [product scope](docs/product-scope.md) for the exact
+boundary, release gates, and reconsideration rules.
+
+## Implementation inventory
+
+The repository builds the official Rust Core C
 bridge, connects to a Temporal CLI dev server, executes a remote Activity in
 Odin, and now starts a Workflow and obtains its typed result through a public
 Odin Client over Core's generic WorkflowService RPC bridge. A thin top-level
@@ -556,7 +571,7 @@ Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
 fresh-stack history replay, and Signal-driven completion. The whole-Worker
 supervisor contract is documented in
 [`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow
-execution and Activity process isolation are now implemented experimentally.
+execution and Activity process isolation are available as opt-in containment modes.
 The Activity path keeps Core polling and completion in the parent, sends the
 exact Core task to either a fresh child or an opt-in bounded warm pool, validates
 the returned completion/task token, and converts child loss into a retryable
@@ -579,7 +594,7 @@ circuit breaker prevents an incompatible or repeatedly crashing executable from
 being respawned per Activity task; cooldown permits one trial generation. Warm
 children are shut down concurrently, so the configured acknowledgement and exit
 deadlines do not multiply by pool size.
-See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
+See [`docs/activity-isolation.md`](docs/activity-isolation.md). The opt-in
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test
 deliberately crashes
@@ -2565,7 +2580,7 @@ examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof
 examples/replay_history/  offline binary/CLI-JSON compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
-examples/workflow_isolate/ persistent per-run Workflow process spike
+examples/workflow_isolate/ persistent per-run Workflow process proof
 examples/workflow_isolate_app/ shared parent/child Workflow registry
 examples/workflow_isolate_core/ Core-polled crash/replay/nondeterminism proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof

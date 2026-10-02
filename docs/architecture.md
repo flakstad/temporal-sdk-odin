@@ -1,9 +1,9 @@
 # Architecture: Temporal SDK for Odin
 
-Status: Milestone 0 research, Milestone 1 bridge spike, a narrow Milestone 2
-Activity Worker slice, schema-derived Core protobuf bindings, a bounded
-Milestone 3 explicit-state-machine Workflow spike, and stackful-fiber replay
-spikes covering serial operations, two outstanding Activities, handled Activity
+Status: implementation architecture for a production-capable Odin language SDK.
+The SDK has a verified Core bridge, Activity Worker, schema-derived protobuf
+bindings, an explicit-state reference implementation, and a stackful Workflow
+runtime covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
 Activity/Workflow/Nexus worker registry and poll loop, updated 2026-10-02. The
@@ -27,6 +27,11 @@ Workflow initialization metadata, memo, and Search Attributes are also mapped
 into run-owned state. Workflow code can read them through borrowed views and
 emit deterministic memo/Search Attribute upserts or removals; unit, generated
 property, replay, and live Service-history tests cover this boundary.
+
+The product boundary and release gates are defined in
+[`product-scope.md`](product-scope.md). This document records both historical
+experiments and current implementation evidence; those early experiments do
+not describe the current project goal or release scope.
 
 This document separates observed upstream behavior from project decisions. The
 primary upstream snapshot used for implementation is
@@ -194,7 +199,7 @@ The asynchronous functions return through callbacks invoked by Core-managed
 threads. Callers cannot assume a callback thread, and option buffers/user data
 must remain alive until the callback. This affects every Odin wrapper: a stack
 frame can be used only when the calling thread blocks until callback completion,
-as the current spike does. A future async API needs heap-owned operation state
+as the current blocking wrappers do. A future async API needs heap-owned operation state
 or a stable handle table.
 
 ### Client
@@ -1016,9 +1021,9 @@ messages. Core uses Rust `prost` to encode poll results and decode completions.
 The relevant Core-local schemas import Temporal API schemas and Google well-known
 types.
 
-Odin therefore needs protobuf capability for complete workers. Milestone 1
-avoids pretending otherwise: `GetSystemInfoRequest` is an empty message, and
-the spike treats its response as opaque bytes. The generated Activity slice
+Odin therefore needs protobuf capability for complete workers. The initial
+bridge proof did not pretend otherwise: `GetSystemInfoRequest` is an empty
+message, and that proof treated its response as opaque bytes. The generated Activity slice
 now includes representations for:
 
 - Core `ActivityTask`, `ActivityTaskCompletion`, and `ActivityExecutionResult`;
@@ -1272,9 +1277,9 @@ The verified macOS arm64 release dylib is about 32 MiB and depends only on
 system frameworks/libraries (IOKit, CoreFoundation, Security, iconv, and
 libSystem). The first Linux packages target glibc; musl and certificate-store
 policy remain separate validation work. Static linking would require an
-upstream/project modification and is not part of this spike.
+upstream/project modification and is not part of the initial distribution scope.
 
-The Workflow fiber experiment adds a separate, project-owned static archive,
+The Workflow runtime adds a separate, project-owned static archive,
 `libtemporal_odin_fiber.a`. It contains a six-operation C shim over
 [`minicoro`](https://github.com/edubart/minicoro) pinned at
 `02dad0f8b7cbb12fe6e216ae7a76db15ca55cd7b`. The shim deliberately keeps
@@ -1284,12 +1289,11 @@ with the platform C compiler and archives it with `ar`; the Core bridge remains
 a separate dynamic library. Minicoro is available under Unlicense or MIT No
 Attribution terms.
 
-## Milestones 1–3 implementation and evidence
+## Core boundary implementation and evidence
 
 Raw Odin declarations live in `temporal/core/raw` and mirror only the structs,
-enums, callbacks, and symbols required for the spike. `temporal/core` adds a
-small ownership wrapper; this is intentionally not the future public client
-API.
+enums, callbacks, and symbols required by the SDK. `temporal/core` adds the
+ownership wrapper below the public Client API.
 
 Current symbol dependency:
 
@@ -1519,7 +1523,7 @@ The CLI-devserver selector path forces Core eviction and fresh-stack replay: it
 observes one start record rather than a duplicate and then one terminal record,
 while the Workflow result and command history remain unchanged.
 
-The Milestone 2 path, now using schema-generated bindings, also executed
+The Activity path, using schema-generated bindings, also executed
 end-to-end on the same environment:
 
 ```text
@@ -1552,10 +1556,11 @@ for `StartActivityExecution`. The API exists in the pinned client/protos but is
 not available in this server version, so the workflow-only driver is required
 for the requested CLI development loop today.
 
-### Explicit Workflow state-machine experiment
+### Explicit Workflow state-machine reference
 
-The Milestone 3 experiment implements exactly one Workflow shape and does not
-claim to be a user-facing Workflow runtime. Its explicit phases are:
+The original state-machine reference implements exactly one Workflow shape and
+is retained as a replay oracle, not as the user-facing Workflow runtime. Its
+explicit phases are:
 
 ```text
 InitializeWorkflow
@@ -1600,8 +1605,8 @@ checked before implementation:
   from this project's initial matrix.
 - [`foldcat/oasync`](https://github.com/foldcat/oasync) is a complete M:N task
   runtime. Its own documentation says it is incompatible with `core:sync`.
-  Adopting a scheduler and replacement synchronization layer is too broad for
-  the question this spike needs to answer.
+  Adopting a scheduler and replacement synchronization layer was too broad for
+  the initial runtime evaluation.
 - Upstream [minicoro](https://github.com/edubart/minicoro) is a single-header,
   dependency-free asymmetric stackful coroutine implementation. Its documented
   assembly targets include x86_64 and ARM64 on macOS and Linux, covering all
@@ -1642,8 +1647,8 @@ trampoline restores a captured Odin `runtime.Context`, with the instance arena
 as allocator, before calling user code. Inputs, Activity request payloads,
 resolved values, and arbitrary Workflow allocations can therefore survive
 suspension without borrowing an activation decode arena. Command storage
-itself remains alive for the full activation encode; an early version of the
-spike found that pointers to helper-local command structs become invalid before
+itself remains alive for the full activation encode; an early runtime version
+found that pointers to helper-local command structs become invalid before
 protobuf encoding, a concrete reason to keep this ownership rule explicit.
 
 The author-facing proof is genuinely sequential:
@@ -1788,7 +1793,7 @@ versioning values, negative/non-finite priority values, and fairness keys over
 explicit Schedule-to-Close value. Invalid options become a non-retryable
 `OdinActivityOptionsError` Workflow failure rather than a malformed Core
 command. The original convenience functions remain compatibility wrappers with
-the spike's 20-second Start-to-Close timeout, one attempt, and disabled eager
+the original 20-second Start-to-Close timeout, one attempt, and disabled eager
 execution. Options-specific offline and 500-case PBT tests require exact
 command fields, priority and metadata envelopes, and byte-identical fresh-stack
 replay. The live test additionally
@@ -1874,7 +1879,7 @@ failure](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflo
 and .NET documents that
 [Activity failures throw and fail the Workflow only when uncaught](https://github.com/temporalio/sdk-dotnet#invoking-activities).
 
-The Odin spike now records that resolution as `Fiber_Operation_State.Failed`.
+The Odin runtime records that resolution as `Fiber_Operation_State.Failed`.
 It copies the outer message/source/stack, Activity ID/type/identity/retry state,
 and the first nested Application Failure's message, type, retryability,
 category, Payload details, and next-retry delay into the Workflow instance
@@ -2671,7 +2676,7 @@ language-assigned sequence from `StartTimer`. Core's activation preparation
 while the TypeScript SDK only emits
 [timer cancellation while its timer completion is still pending](https://github.com/temporalio/sdk-typescript/blob/main/packages/workflow/src/workflow.ts).
 
-The Odin spike now exposes
+The Odin runtime exposes
 `await_signal_or_timeout(ctx, name, duration) -> Signal_Wait_Result`. With no
 matching signal already buffered, it assigns a timer sequence, emits
 `StartTimer`, and suspends in `Waiting_Signal_Or_Timer`. A later matching signal

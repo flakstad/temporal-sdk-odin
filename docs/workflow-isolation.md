@@ -1,6 +1,6 @@
 # Workflow process isolation
 
-Status: experimental per-run process boundary, connected to `worker.run` and
+Status: opt-in per-run process boundary, connected to `worker.run` and
 live-proven in both zero-cache and sticky-cache modes against the Temporal CLI
 dev server. It is not yet a production executor pool.
 
@@ -78,7 +78,7 @@ One writer owns each pipe direction. Concurrent writers must be serialized by
 the future process-pool layer; the protocol does not rely on a frame fitting in
 the platform's atomic pipe-write size.
 
-## Executed transport spike
+## Executed transport proof
 
 Build and run the process proof without a Temporal Server:
 
@@ -201,7 +201,7 @@ activation.
 
 ## Core-integrated cache proofs
 
-The online Worker now has an experimental `workflow_activation_processor`
+The online Worker has an opt-in `workflow_activation_processor`
 callback. It replaces only language-side activation dispatch: Core still owns
 polling, history processing, Workflow state machines, completion submission,
 retry, and eviction. The callback borrows the opaque activation bytes for one
@@ -455,7 +455,7 @@ child exit. This deadline is process containment, not cooperative Workflow
 preemption: all in-memory work since the prior accepted activation is lost and
 must be deterministically reconstructed from history.
 
-### Ownership at the experimental callback
+### Ownership at the external callback
 
 - The Odin poll result owns its copy of the activation bytes. `worker.run`
   moves that copy into one executor task, borrows it to the callback, and frees

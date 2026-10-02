@@ -1,4 +1,4 @@
-// Package fiber_raw is the narrow C ABI used by the experimental Workflow fiber.
+// Package fiber_raw is the private C ABI used by the Workflow fiber runtime.
 package fiber_raw
 
 import "core:c"

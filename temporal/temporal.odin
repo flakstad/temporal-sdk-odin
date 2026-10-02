@@ -1,13 +1,11 @@
 // Package temporal is the small convenience entry point for SDK lifecycle.
 // Feature-specific APIs remain in temporal/client, temporal/worker,
 // temporal/activity, and temporal/workflow so ownership and error types stay
-// explicit while the public surface is experimental.
+// explicit while the public surface is stabilized for its first release.
 package temporal
 
 import temporal_client "./client"
 import temporal_worker "./worker"
-
-EXPERIMENTAL :: true
 
 Client :: temporal_client.Client
 Client_Connect_Options :: temporal_client.Connect_Options
