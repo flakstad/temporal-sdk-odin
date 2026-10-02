@@ -509,6 +509,63 @@ workflow_executor_manager_validates_and_owns_configuration :: proc(t: ^testing.T
 }
 
 @(test)
+concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/true"}
+	manager := workflow_isolate.Concurrent_Manager{}
+	invalid_error := workflow_isolate.concurrent_manager_init(&manager, {
+		manager = {
+			command = command[:],
+			maximum_executors = 1,
+		},
+		shard_count = 0,
+	})
+	testing.expect(t, invalid_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_error)
+
+	init_error := workflow_isolate.concurrent_manager_init(&manager, {
+		manager = {
+			command = command[:],
+			maximum_executors = 2,
+		},
+		shard_count = 4,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.concurrent_manager_close(&manager)
+
+	first, first_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
+	second, second_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
+	testing.expect(t, first_ok && second_ok)
+	testing.expect_value(t, first, second)
+	testing.expect(t, first >= 0 && first < 4)
+	_, empty_ok := workflow_isolate.workflow_shard_index("", 4)
+	testing.expect(t, !empty_ok)
+	_, zero_ok := workflow_isolate.workflow_shard_index("stable-run", 0)
+	testing.expect(t, !zero_ok)
+
+	manager.shards[0].manager.stats.evictions = 2
+	manager.shards[1].manager.stats.evictions = 3
+	manager.peak_routes = 4
+	stats := workflow_isolate.concurrent_manager_stats(&manager)
+	testing.expect_value(t, stats.evictions, 5)
+	testing.expect_value(t, stats.peak_routes, 4)
+	testing.expect_value(t, workflow_isolate.concurrent_manager_route_count(&manager), 0)
+
+	malformed := [?]u8{0xff}
+	processed := workflow_isolate.concurrent_manager_process_activation(&manager, malformed[:])
+	testing.expect(t, processed.activation_failed)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	shutdown_error := workflow_isolate.concurrent_manager_shutdown(&manager)
+	testing.expect(t, shutdown_error.message == nil)
+	workflow_isolate.manager_error_free(&shutdown_error)
+	shutdown_error = workflow_isolate.concurrent_manager_shutdown(&manager)
+	testing.expect(t, shutdown_error.message == nil)
+	workflow_isolate.manager_error_free(&shutdown_error)
+}
+
+@(test)
 workflow_executor_shutdown_deadline_kills_and_reaps_unresponsive_child :: proc(
 	t: ^testing.T,
 ) {

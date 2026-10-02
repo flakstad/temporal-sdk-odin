@@ -3331,8 +3331,11 @@ coroutines that use thread-local state. The in-process Worker now drives all
 Workflow runtimes from one deterministic poll/executor thread, rejects
 concurrent access and thread migration, and performs cached-fiber destruction
 there before the thread exits. This establishes the safety invariant; it does
-not yet provide a scalable multi-executor scheduler with stable per-run
-partitioning. The chosen fixed, virtual-memory-backed guard-page stack must
+not yet provide a complete scalable multi-executor scheduler. The process
+isolation path now has stable, property-tested run partitioning through
+independently locked `Concurrent_Manager` shards; Worker polling is not yet
+parallel, so that partitioner is not exercised by Core concurrently. The chosen
+fixed, virtual-memory-backed guard-page stack must
 still be exercised by sanitizers and all four target builds, and stack sizing
 remains an operator concern because it does not grow. Panics crossing the C
 trampoline also need an explicit containment policy.

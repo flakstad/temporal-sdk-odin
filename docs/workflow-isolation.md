@@ -240,6 +240,23 @@ performs this drain automatically when the caller has not already requested it.
 Real-process tests cover two clean acknowledgements and four simultaneous
 unresponsive children.
 
+`Concurrent_Manager` is the run-affinity layer for the next Worker scheduler
+slice. It owns a fixed set of independent `Manager` shards and maps the opaque
+run ID with a portable FNV-1a hash. Any poll thread may submit an activation,
+but the same run always takes the same shard mutex; different shards may execute
+their child exchanges concurrently. Each shard owns separate routes, crash-loop
+state, commands, and child processes. `maximum_executors` currently applies per
+shard, which is explicit but can produce hash-skew admission before another
+shard is full. Concurrent entry requires the process-safe heap allocator because
+a later poll thread may evict a route created by another thread. Aggregate stats
+preserve an exact pool-wide route peak, and a
+1,000-case property checks binary run IDs against an independent hash reference.
+Shard teardown currently remains on the owner thread so manager allocations are
+released by their originating allocator; each shard still drains its own child
+sessions concurrently. The ordinary Worker poll loop is serial; wiring multiple
+Core poll/executor threads into this manager is the next vertical step rather
+than an implied capability of this commit.
+
 Admission is deliberately non-waiting. Workflow activations are processed on
 one serial Core poll thread, including the evictions that release capacity, so
 waiting there for a slot would deadlock. When `maximum_executors` is full, the

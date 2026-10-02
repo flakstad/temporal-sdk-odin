@@ -7,6 +7,47 @@ import pbt "pbt:pbt"
 import sc "statecharts:statecharts"
 import workflow_isolate "../temporal/workflow/isolate"
 
+workflow_shard_reference :: proc(run_id: []u8, shard_count: int) -> int {
+	hash := u64(14695981039346656037)
+	for value in run_id {
+		hash = (hash ~ u64(value)) * u64(1099511628211)
+	}
+	return int(hash % u64(shard_count))
+}
+
+workflow_shard_property :: proc(t: ^pbt.T) -> pbt.Result {
+	run_id := pbt.draw(t, pbt.non_empty_byte_array(256))
+	shard_count := pbt.draw(t, pbt.int_range(1, 64))
+	pbt.cover(t, shard_count == 1, 1, "single shard")
+	pbt.cover(t, shard_count >= 32, 40, "large shard set")
+	index, ok := workflow_isolate.workflow_shard_index(
+		transmute(string)run_id,
+		shard_count,
+	)
+	second, second_ok := workflow_isolate.workflow_shard_index(
+		transmute(string)run_id,
+		shard_count,
+	)
+	if !ok || !second_ok || index != second || index < 0 || index >= shard_count {
+		return pbt.fail("Workflow run did not retain a valid stable shard")
+	}
+	if index != workflow_shard_reference(run_id, shard_count) {
+		return pbt.fail("Workflow shard hash diverged from its portable reference")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_runs_have_stable_process_independent_shards :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow runs have stable process-independent shards",
+		workflow_shard_property,
+		{num_tests = 1000, seed = 0x5348_4152_4445_4452},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 workflow_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 	run_id := pbt.draw(t, pbt.non_empty_byte_array(96))
 	payload := pbt.draw(t, pbt.non_empty_byte_array(8_192))

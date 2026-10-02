@@ -1161,6 +1161,17 @@ generation. The callback is synchronous and must copy data it retains. This
 keeps nondeterminism explanations visible even when the affected executor has
 already crashed or been killed.
 
+The new `workflow_isolate.Concurrent_Manager` prepares safe multi-poll routing
+without weakening fiber affinity. A stable FNV-1a mapping assigns every run ID
+to one independently locked manager shard; Core may deliver work on arbitrary
+poll threads, but one run cannot concurrently enter two executor sessions.
+Different shards can already progress in parallel when called concurrently.
+The aggregate route peak is tracked exactly. Shard shutdown remains on the owner
+thread until every manager-owned allocation records allocator provenance; each
+individual shard still drains its child sessions concurrently. The current
+Worker loop remains serial, so the next slice must connect multiple Core
+Workflow polls and completions to this boundary and prove overlap live.
+
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.
 Unit tests use real sleeping/exiting subprocesses for shutdown and breaker
