@@ -308,6 +308,14 @@ Activities and one Timer, split after either one or two early jobs. Every early
 activation must retain `waiting_join=true`; only the final operation may resume
 the Workflow. Result order and all three completions must survive fresh-stack
 replay byte-for-byte across 180 traces.
+A 500-trace mixed-executor property starts three remote Activity awaits owned
+independently by the main Workflow fiber, a Signal routine, and an Update
+routine. It crosses both handler-job orders, all six Activity-resolution
+orders, and the partitions `3`, `1+2`, `2+1`, and `1+1+1`. Eviction occurs
+either before resolution or after a generated partial resolution. Replayed
+history and the post-catch-up continuation must match every completion from an
+uninterrupted reference runtime byte-for-byte, with exactly three scheduled
+Activities and one completed Signal and Update handler.
 A separate 180-trace Signal-join property varies both case and delivery orders
 plus one/two-activation delivery. `join_all_into` must consume each unique
 Signal into the matching caller-provided slot and reproduce every completion

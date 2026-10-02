@@ -4302,6 +4302,14 @@ must match global ownership, owned and queue high-water marks, distinct shard
 usage, final per-shard admission extrema, and final drain. The test suite uses repository-pinned snapshots of the
 projects also checked out at `~/Projects/pbt` and `~/Projects/statecharts`; no
 runtime dependency is added.
+A separate 500-trace runtime property covers the deterministic half of the
+mixed Workflow/Activity boundary. Main, Signal, and Update fibers each own one
+Activity await. Generated traces vary handler order, every Activity-resolution
+permutation, four activation partitions, and eviction before or after partial
+resolution. A fresh stack must reproduce every pre-eviction completion and
+then converge byte-for-byte with an uninterrupted oracle after replay catches
+up. This complements the concurrent dev-server proof; it does not replace the
+remaining long-running concurrent soak and process-fault work.
 
 ## Core-connected Workflow process isolation
 

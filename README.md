@@ -926,7 +926,10 @@ shim. It is a research dependency, not yet a frozen SDK choice.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
 payload/failure contracts, activation races, all six orderings of
 Signal-start/Update-start/token-cancel jobs, and 300 inherited deadline trees,
-and verifies byte-identical replay completions. A pinned
+and verifies byte-identical replay completions. A 500-trace mixed-executor
+property additionally combines main-, Signal-, and Update-owned Activity
+awaits, four resolution partitions, all six resolution orders, and eviction
+before or after partial resolution. A pinned
 [statecharts](https://github.com/flakstad/statecharts)
 model independently checks Update close/await/late-event lifecycle traces.
 
