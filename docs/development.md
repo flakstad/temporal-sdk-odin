@@ -1203,7 +1203,11 @@ after resumption, and uses a short test-only blocking probe to require measured
 overlap. The test also starts an unknown Workflow type and requires at least one
 failed activation plus its eviction while valid runs still complete. This
 proves language-level task failure does not become a scheduler/Worker failure.
-Every valid run must produce a terminal result and final Core eviction.
+It also keeps a Workflow suspended on a one-hour timer, waits until Odin has
+entered that fiber, requests cancellation through the public Client, and
+requires the same executor thread to observe the exact reason and cancel the
+timer. Every valid run must produce its expected terminal result and final Core
+eviction.
 The example also requires
 `Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
 `workflow_executor_queue_peak`. The former counts all activation buffers owned

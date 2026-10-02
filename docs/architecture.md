@@ -4196,8 +4196,11 @@ Individual Workflow state remains run-local and deterministic. The live
 requires them to resume on their original executor threads, measures overlap,
 and requires final eviction for each run. An unknown type simultaneously
 exercises failed activation and rejected-run eviction without stopping valid
-shards. Its brief wall-clock block is test instrumentation and is not an
-allowed Workflow programming primitive.
+shards. A cancellation run stays suspended on a durable one-hour timer; the
+public Client then cancels it, and the proof requires same-thread resumption,
+exact cancellation reason, timer cancellation, canceled close, and eviction.
+Its brief wall-clock block is test instrumentation and is not an allowed
+Workflow programming primitive.
 
 The scheduler accounts for ownership at the activation-buffer boundary.
 Enqueue increments a shared owned count, normal processing releases one after

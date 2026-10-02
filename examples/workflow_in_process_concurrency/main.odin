@@ -13,12 +13,17 @@ import workflow_isolate "../../temporal/workflow/isolate"
 EXECUTOR_THREADS :: 4
 WORKFLOW_TYPE :: "in_process_concurrency_probe"
 UNKNOWN_WORKFLOW_TYPE :: "in_process_unknown_probe"
+CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
+CANCELLATION_REASON :: "affine scheduler cancellation probe"
 
 Probe_State :: struct {
-	mutex:      sync.Mutex,
-	active:     int,
-	peak:       int,
-	migrations: int,
+	mutex:                 sync.Mutex,
+	active:                int,
+	peak:                  int,
+	migrations:            int,
+	cancellation_started:  bool,
+	cancellation_observed: bool,
+	cancellation_reason_ok: bool,
 }
 
 probe_state: Probe_State
@@ -45,22 +50,85 @@ concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string
 	return value
 }
 
+cancellation_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
+	owner_thread := sync.current_thread_id()
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.cancellation_started = true
+	sync.mutex_unlock(&probe_state.mutex)
+	workflow.sleep(ctx, time.Hour)
+	sync.mutex_lock(&probe_state.mutex)
+	if sync.current_thread_id() != owner_thread {
+		probe_state.migrations += 1
+	}
+	probe_state.cancellation_observed = workflow.is_cancellation_requested(ctx)
+	probe_state.cancellation_reason_ok =
+		workflow.cancellation_reason(ctx) == CANCELLATION_REASON
+	sync.mutex_unlock(&probe_state.mutex)
+	return value
+}
+
 Concurrency_State :: struct {
-	client:             ^temporal_client.Client,
-	sdk_worker:         ^worker.Worker,
-	task_queue:         string,
-	id_prefix:          string,
-	handles:            [dynamic]temporal_client.Workflow_Handle,
-	failure_handle:     temporal_client.Workflow_Handle,
-	has_failure_handle: bool,
-	watcher:            ^thread.Thread,
-	start_error:        temporal_client.Error,
-	result_error:       temporal_client.Error,
-	results_ok:         bool,
+	client:                  ^temporal_client.Client,
+	sdk_worker:              ^worker.Worker,
+	task_queue:              string,
+	id_prefix:               string,
+	handles:                 [dynamic]temporal_client.Workflow_Handle,
+	failure_handle:          temporal_client.Workflow_Handle,
+	has_failure_handle:      bool,
+	failure_terminated:      bool,
+	cancellation_handle:     temporal_client.Workflow_Handle,
+	has_cancellation_handle: bool,
+	cancellation_closed:     bool,
+	watcher:                 ^thread.Thread,
+	start_error:             temporal_client.Error,
+	result_error:            temporal_client.Error,
+	cancel_error:            temporal_client.Error,
+	results_ok:              bool,
+	cancellation_ok:         bool,
 }
 
 wait_for_results :: proc(state: ^Concurrency_State) {
 	state.results_ok = true
+	started := false
+	for _ in 0 ..< 500 {
+		sync.mutex_lock(&probe_state.mutex)
+		started = probe_state.cancellation_started
+		sync.mutex_unlock(&probe_state.mutex)
+		if started {
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	if !started {
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	state.cancel_error = temporal_client.cancel_workflow(
+		&state.cancellation_handle,
+		CANCELLATION_REASON,
+	)
+	if state.cancel_error.message != nil {
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	canceled_value: string
+	canceled_result_error := temporal_client.get_result_json(
+		&state.cancellation_handle,
+		&canceled_value,
+	)
+	delete(canceled_value)
+	if canceled_result_error.kind == .Workflow_Canceled {
+		state.cancellation_ok = true
+		state.cancellation_closed = true
+		temporal_client.error_free(&canceled_result_error)
+	} else {
+		state.result_error = canceled_result_error
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
 	for &handle in state.handles {
 		result: string
 		result_error := temporal_client.get_result_json(&handle, &result)
@@ -105,6 +173,26 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	}
 	state.failure_handle = failure_handle
 	state.has_failure_handle = true
+	cancellation_id := fmt.aprintf("%s-cancel", state.id_prefix)
+	cancellation_handle, cancellation_start_error := temporal_client.start_workflow_json(
+		state.client,
+		CANCELLATION_WORKFLOW_TYPE,
+		"cancel me on my owning shard",
+		{
+			id = cancellation_id,
+			task_queue = state.task_queue,
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = time.Minute,
+			workflow_task_timeout = 10 * time.Second,
+		},
+	)
+	delete(cancellation_id)
+	if cancellation_start_error.message != nil {
+		state.start_error = cancellation_start_error
+		return false
+	}
+	state.cancellation_handle = cancellation_handle
+	state.has_cancellation_handle = true
 	first_shard := -1
 	found_distinct_shard := false
 	for candidate in 0 ..< 64 {
@@ -199,6 +287,16 @@ run :: proc() -> int {
 		worker.error_free(&register_error)
 		return 1
 	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
+		CANCELLATION_WORKFLOW_TYPE,
+		cancellation_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Cancellation Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
 
 	state := Concurrency_State{
 		client = &client,
@@ -220,7 +318,24 @@ run :: proc() -> int {
 		}
 		delete(state.handles)
 		if state.has_failure_handle {
+			if !state.failure_terminated {
+				cleanup_error := temporal_client.terminate_workflow(
+					&state.failure_handle,
+					"in-process concurrency cleanup",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
 			temporal_client.workflow_handle_free(&state.failure_handle)
+		}
+		if state.has_cancellation_handle {
+			if !state.cancellation_closed {
+				cleanup_error := temporal_client.terminate_workflow(
+					&state.cancellation_handle,
+					"in-process concurrency cleanup",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
+			temporal_client.workflow_handle_free(&state.cancellation_handle)
 		}
 	}
 	if state.start_error.message != nil {
@@ -232,6 +347,12 @@ run :: proc() -> int {
 	if state.result_error.message != nil {
 		fmt.eprintf("In-process concurrency result failed: %s\n", string(state.result_error.message))
 		temporal_client.error_free(&state.result_error)
+		worker.error_free(&run_error)
+		return 1
+	}
+	if state.cancel_error.message != nil {
+		fmt.eprintf("In-process cancellation request failed: %s\n", string(state.cancel_error.message))
+		temporal_client.error_free(&state.cancel_error)
 		worker.error_free(&run_error)
 		return 1
 	}
@@ -253,35 +374,46 @@ run :: proc() -> int {
 		temporal_client.error_free(&terminate_error)
 		return 1
 	}
+	state.failure_terminated = true
 	sync.mutex_lock(&probe_state.mutex)
 	peak := probe_state.peak
 	migrations := probe_state.migrations
+	cancellation_observed := probe_state.cancellation_observed
+	cancellation_reason_ok := probe_state.cancellation_reason_ok
 	sync.mutex_unlock(&probe_state.mutex)
 	if !state.results_ok || len(state.handles) < 2 ||
-	   run_stats.workflow_executions_completed != len(state.handles) ||
+	   !state.cancellation_ok || !cancellation_observed || !cancellation_reason_ok ||
+	   run_stats.workflow_executions_completed != len(state.handles) + 1 ||
 	   run_stats.workflow_activation_failures < 1 ||
-	   run_stats.workflow_evictions < len(state.handles) + 1 ||
+	   run_stats.workflow_evictions < len(state.handles) + 2 ||
+	   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
 	   run_stats.workflow_activations_peak_owned < 2 ||
 	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			run_stats.workflow_evictions,
+			run_stats.workflow_cancellations_received,
+			run_stats.timers_canceled,
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
 			peak,
 			migrations,
+			state.cancellation_ok && cancellation_observed,
+			cancellation_reason_ok,
 		)
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
 		run_stats.workflow_evictions,
+		run_stats.workflow_cancellations_received,
+		run_stats.timers_canceled,
 		run_stats.workflow_activations_peak_owned,
 		run_stats.workflow_executor_queue_peak,
 		peak,

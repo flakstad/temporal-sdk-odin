@@ -582,7 +582,9 @@ timers, resume on their original executor threads, overlap after resumption,
 complete through concurrent Core calls, and receive final eviction on those
 same threads. An unknown Workflow type concurrently produces failed activation
 completions and eviction without poisoning the valid shards or stopping the
-Worker.
+Worker. A third Workflow remains suspended on a one-hour Temporal timer while a
+Client cancellation arrives; it resumes on its original shard, observes the
+exact reason, cancels the durable timer, closes as canceled, and is evicted.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
