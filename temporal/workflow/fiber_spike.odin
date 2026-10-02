@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:math"
 import "core:mem/virtual"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import codec "../codec"
 import proto "../core/proto"
@@ -1535,6 +1536,62 @@ Fiber_Runtime :: struct {
 	stack_options:          Stack_Options,
 	logger:                 Logger,
 	metric_emitter:         Metric_Emitter,
+	// Minicoro handles and every run-local arena are confined to one executor
+	// thread. The non-blocking guard rejects accidental concurrent activation
+	// processing instead of serializing it onto a potentially different thread.
+	executor_guard:          sync.Mutex,
+	executor_thread_id:      int,
+}
+
+fiber_runtime_executor_enter :: proc(runtime: ^Fiber_Runtime) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow fiber runtime is not initialized")
+	}
+	if !sync.mutex_try_lock(&runtime.executor_guard) {
+		return error_from_string("Workflow fiber runtime is already processing an activation")
+	}
+	thread_id := sync.current_thread_id()
+	if runtime.executor_thread_id == 0 {
+		runtime.executor_thread_id = thread_id
+	} else if runtime.executor_thread_id != thread_id {
+		sync.mutex_unlock(&runtime.executor_guard)
+		return error_from_string("Workflow fiber runtime is bound to another executor thread")
+	}
+	return {}
+}
+
+fiber_runtime_executor_leave :: proc(runtime: ^Fiber_Runtime) {
+	if runtime == nil {
+		return
+	}
+	sync.mutex_unlock(&runtime.executor_guard)
+}
+
+// fiber_runtime_executor_shutdown must run on the same executor thread that
+// processed activations. It destroys any still-cached fibers before that thread
+// exits, then releases affinity so the inert runtime can be closed by its owner.
+fiber_runtime_executor_shutdown :: proc(runtime: ^Fiber_Runtime) -> Error {
+	if runtime == nil || runtime.callback_data == nil {
+		return error_from_string("Workflow fiber runtime is not initialized")
+	}
+	if !sync.mutex_try_lock(&runtime.executor_guard) {
+		return error_from_string("Workflow fiber runtime is still processing an activation")
+	}
+	defer sync.mutex_unlock(&runtime.executor_guard)
+	thread_id := sync.current_thread_id()
+	if runtime.executor_thread_id != 0 && runtime.executor_thread_id != thread_id {
+		return error_from_string("Workflow fiber runtime shutdown requires its executor thread")
+	}
+	for len(runtime.instances) > 0 {
+		index := len(runtime.instances) - 1
+		destroy_error := fiber_instance_destroy(runtime.instances[index])
+		if destroy_error.message != nil {
+			return destroy_error
+		}
+		ordered_remove(&runtime.instances, index)
+	}
+	runtime.executor_thread_id = 0
+	return {}
 }
 
 fiber_runtime_set_logger :: proc(runtime: ^Fiber_Runtime, logger: Logger) -> Error {
@@ -12399,6 +12456,12 @@ process_fiber_activation :: proc(runtime: ^Fiber_Runtime, data: []u8) -> (result
 		result.error = error_from_string("Workflow fiber runtime is not initialized")
 		return
 	}
+	executor_error := fiber_runtime_executor_enter(runtime)
+	if executor_error.message != nil {
+		result.error = executor_error
+		return
+	}
+	defer fiber_runtime_executor_leave(runtime)
 
 	decode_arena: virtual.Arena
 	arena_error := virtual.arena_init_growing(&decode_arena)

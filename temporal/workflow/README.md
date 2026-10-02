@@ -33,6 +33,11 @@ hello_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 The C stack is only a cache. Eviction destroys it; replay starts the procedure
 again on a new stack and must reproduce the same commands from history. A
 per-instance Odin arena owns values that cross activation boundaries.
+Each `Fiber_Runtime` binds to the OS thread that processes its first activation.
+A non-blocking guard rejects overlapping activation/eviction calls and later
+calls from another thread instead of migrating a minicoro stack. Worker
+shutdown destroys any still-cached fibers on that executor thread, then releases
+affinity so ordinary Worker ownership can close the inert runtime safely.
 
 Accepted Update handlers use independent fiber stacks and wait state while
 sharing the Workflow's deterministic command sequence and operation tables.

@@ -3387,10 +3387,38 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 	}
 }
 
+shutdown_workflow_runtimes_on_executor :: proc(worker: ^Worker) -> Error {
+	if worker == nil {
+		return {}
+	}
+	for &registration in worker.workflow_registrations {
+		if registration.external {
+			continue
+		}
+		shutdown_error := workflow.fiber_runtime_executor_shutdown(&registration.runtime)
+		if shutdown_error.message != nil {
+			result := error_from_string(string(shutdown_error.message))
+			workflow.error_free(&shutdown_error)
+			return result
+		}
+	}
+	return {}
+}
+
 run_workflow_loop :: proc(
 	worker: ^Worker,
 	options: Run_Options,
 ) -> (stats: Run_Stats, error: Error) {
+	defer {
+		shutdown_error := shutdown_workflow_runtimes_on_executor(worker)
+		if shutdown_error.message != nil {
+			if error.message == nil {
+				error = shutdown_error
+			} else {
+				error_free(&shutdown_error)
+			}
+		}
+	}
 	target_reached := false
 	for {
 		poll := temporal_core.worker_poll_workflow(&worker.core)

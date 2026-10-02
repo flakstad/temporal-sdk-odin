@@ -7918,6 +7918,238 @@ process_fiber_test_activation :: proc(
 	return workflow.process_fiber_activation(runtime, encoded[:])
 }
 
+Workflow_Executor_Guard_Test_State :: struct {
+	runtime:             ^workflow.Fiber_Runtime,
+	initial_activation:  []u8,
+	eviction_activation: []u8,
+	callback_entered:    sync.Sema,
+	callback_release:    sync.Sema,
+	initial_done:        sync.Sema,
+	cleanup_requested:   sync.Sema,
+	cleanup_done:        sync.Sema,
+	initial_result:      workflow.Process_Result,
+	eviction_result:     workflow.Process_Result,
+	shutdown_error:      workflow.Error,
+}
+
+workflow_executor_guard_test_invoke :: proc(
+	data: rawptr,
+	_: ^workflow.Fiber_Context,
+	_: []codec.Payload_View,
+) -> workflow.Payload_Result {
+	state := cast(^Workflow_Executor_Guard_Test_State)data
+	sync.sema_post(&state.callback_entered)
+	sync.sema_wait(&state.callback_release)
+	payload, encode_error := codec.encode_json("executor-owned")
+	if encode_error != .None {
+		return workflow.payload_fail(
+			"could not encode executor guard result",
+			"OdinWorkflowPayloadConversionError",
+		)
+	}
+	return workflow.payload_complete(payload)
+}
+
+workflow_executor_guard_test_destroy :: proc(_: rawptr) {}
+
+workflow_executor_guard_test_thread :: proc(state: ^Workflow_Executor_Guard_Test_State) {
+	state.initial_result = workflow.process_fiber_activation(
+		state.runtime,
+		state.initial_activation,
+	)
+	sync.sema_post(&state.initial_done)
+	sync.sema_wait(&state.cleanup_requested)
+	state.eviction_result = workflow.process_fiber_activation(
+		state.runtime,
+		state.eviction_activation,
+	)
+	state.shutdown_error = workflow.fiber_runtime_executor_shutdown(state.runtime)
+	sync.sema_post(&state.cleanup_done)
+}
+
+@(test)
+workflow_runtime_confines_activations_to_one_executor_thread :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	state := Workflow_Executor_Guard_Test_State{runtime = &runtime}
+	init_error := workflow.fiber_runtime_init_invoker(
+		&runtime,
+		"executor_guard_workflow",
+		"test-queue",
+		&state,
+		workflow_executor_guard_test_invoke,
+		workflow_executor_guard_test_destroy,
+	)
+	testing.expectf(
+		t,
+		init_error.message == nil,
+		"executor guard runtime initialization failed: %s",
+		string(init_error.message),
+	)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "executor_guard_workflow",
+	}
+	initial := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "executor-guard-run",
+		history_length = 3,
+	}
+	defer delete(initial.jobs)
+	append(
+		&initial.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	initial_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&initial)
+	defer delete(initial_bytes)
+	state.initial_activation = initial_bytes[:]
+
+	eviction := proto.Coresdk_Workflow_Activation_RemoveFromCache{}
+	evict := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "executor-guard-run",
+		history_length = 3,
+	}
+	defer delete(evict.jobs)
+	append(
+		&evict.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Remove_From_Cache{
+				value = &eviction,
+			},
+		},
+	)
+	eviction_bytes := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&evict)
+	defer delete(eviction_bytes)
+	state.eviction_activation = eviction_bytes[:]
+
+	executor_thread := thread.create_and_start_with_poly_data(
+		&state,
+		workflow_executor_guard_test_thread,
+	)
+	testing.expect(t, executor_thread != nil)
+	if executor_thread == nil {
+		return
+	}
+	defer thread.destroy(executor_thread)
+
+	entered := sync.sema_wait_with_timeout(&state.callback_entered, 5 * time.Second)
+	testing.expect(t, entered)
+	concurrent := workflow.process_fiber_activation(&runtime, eviction_bytes[:])
+	testing.expect(t, concurrent.completion == nil)
+	testing.expectf(
+		t,
+		strings.contains(string(concurrent.error.message), "already processing"),
+		"unexpected concurrent executor error: %s",
+		string(concurrent.error.message),
+	)
+	workflow.error_free(&concurrent.error)
+
+	sync.sema_post(&state.callback_release)
+	initial_finished := sync.sema_wait_with_timeout(&state.initial_done, 5 * time.Second)
+	testing.expect(t, initial_finished)
+	cross_thread := workflow.process_fiber_activation(&runtime, eviction_bytes[:])
+	testing.expect(t, cross_thread.completion == nil)
+	testing.expectf(
+		t,
+		strings.contains(string(cross_thread.error.message), "another executor thread"),
+		"unexpected cross-thread executor error: %s",
+		string(cross_thread.error.message),
+	)
+	workflow.error_free(&cross_thread.error)
+
+	sync.sema_post(&state.cleanup_requested)
+	cleanup_finished := sync.sema_wait_with_timeout(&state.cleanup_done, 5 * time.Second)
+	testing.expect(t, cleanup_finished)
+	thread.join(executor_thread)
+	testing.expectf(
+		t,
+		state.initial_result.error.message == nil,
+		"owner-thread activation failed: %s",
+		string(state.initial_result.error.message),
+	)
+	testing.expect(t, state.initial_result.completed)
+	testing.expect(t, state.initial_result.completion != nil)
+	testing.expectf(
+		t,
+		state.eviction_result.error.message == nil,
+		"owner-thread eviction failed: %s",
+		string(state.eviction_result.error.message),
+	)
+	testing.expect(t, state.eviction_result.evicted)
+	testing.expect(t, state.shutdown_error.message == nil)
+	testing.expect_value(t, len(runtime.instances), 0)
+	testing.expect_value(t, runtime.executor_thread_id, 0)
+	delete(state.initial_result.completion)
+	delete(state.eviction_result.completion)
+	workflow.error_free(&state.initial_result.error)
+	workflow.error_free(&state.eviction_result.error)
+	workflow.error_free(&state.shutdown_error)
+}
+
+@(test)
+workflow_runtime_executor_shutdown_destroys_cached_fibers :: proc(t: ^testing.T) {
+	runtime := workflow.Fiber_Runtime{}
+	init_error := workflow.fiber_runtime_init(
+		&runtime,
+		"executor_shutdown_workflow",
+		"test-queue",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.fiber_runtime_close(&runtime)
+
+	input := proto.Temporal_Api_Common_V1_Payload{data = transmute([]u8)string(`"Odin"`)}
+	defer delete(input.metadata)
+	append(
+		&input.metadata,
+		proto.Temporal_Api_Common_V1_Payload_MetadataEntry{
+			key = "encoding",
+			value = transmute([]u8)string("json/plain"),
+		},
+	)
+	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
+		workflow_type = "executor_shutdown_workflow",
+	}
+	defer delete(initialize.arguments)
+	append(&initialize.arguments, input)
+	activation := proto.Coresdk_Workflow_Activation_WorkflowActivation{
+		run_id = "executor-shutdown-run",
+		history_length = 3,
+	}
+	defer delete(activation.jobs)
+	append(
+		&activation.jobs,
+		proto.Coresdk_Workflow_Activation_WorkflowActivationJob{
+			variant = proto.Coresdk_Workflow_Activation_WorkflowActivationJob_Variant_Initialize_Workflow{
+				value = &initialize,
+			},
+		},
+	)
+	processed := process_fiber_test_activation(&runtime, &activation)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, processed.completed)
+	testing.expect_value(t, len(runtime.instances), 1)
+	testing.expect(t, runtime.executor_thread_id != 0)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+
+	shutdown_error := workflow.fiber_runtime_executor_shutdown(&runtime)
+	testing.expectf(
+		t,
+		shutdown_error.message == nil,
+		"executor shutdown failed: %s",
+		string(shutdown_error.message),
+	)
+	testing.expect_value(t, len(runtime.instances), 0)
+	testing.expect_value(t, runtime.executor_thread_id, 0)
+	workflow.error_free(&shutdown_error)
+}
+
 Fiber_Test_Signal :: struct {
 	payload:       codec.Payload,
 	proto_payload: proto.Temporal_Api_Common_V1_Payload,

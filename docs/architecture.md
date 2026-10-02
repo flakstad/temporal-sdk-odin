@@ -2941,7 +2941,17 @@ The blocking C calls can run concurrently against the same Core worker. The
 Workflow registry itself is frozen while `run` is active, and only the Workflow
 poll thread accesses its fiber runtimes and run-ID table. This preserves
 single-threaded fiber affinity while allowing a Workflow-produced Activity to
-execute without stopping Workflow polling. Activity start tasks own
+execute without stopping Workflow polling. The invariant is enforced inside
+each `Fiber_Runtime`, not only by the current loop shape: a non-blocking guard
+rejects overlapping activation/eviction processing, the first activation binds
+the runtime to its executor thread, and later processing on another thread is a
+fatal language-runtime boundary error. When the poll loop ends, it destroys
+every still-cached fiber on that same thread before releasing affinity;
+`worker.close` therefore only frees inert runtime ownership on its caller.
+A two-thread unit test blocks inside Workflow code and proves both concurrent
+and sequential cross-thread rejection, followed by owner-thread eviction and
+shutdown. A second test destroys a cached terminal fiber during executor
+shutdown. Activity start tasks own
 heap-stable execution/context state until their callback thread joins. Core's
 fixed or resource-based Activity slot supplier bounds concurrency; the single
 poll thread continues to
@@ -3293,13 +3303,15 @@ This answers the narrow feasibility question: stackful suspension and
 history-driven reconstruction work across the Odin/C boundary without a large
 runtime. It does not yet answer scheduling at scale. A coroutine object is not
 thread-safe, fixed stacks can overflow, and minicoro cautions against migrating
-coroutines that use thread-local state. The Worker now validates and propagates
-an explicit per-fiber resource policy, but the production runtime should still
-drive a Workflow instance from one deterministic executor thread at a time and
-prohibit concurrent resume/eviction. The chosen fixed, virtual-memory-backed
-guard-page stack must still be exercised by sanitizers and all four target
-builds, and stack sizing remains an operator concern because it does not grow.
-Panics crossing the C trampoline also need an explicit containment policy.
+coroutines that use thread-local state. The in-process Worker now drives all
+Workflow runtimes from one deterministic poll/executor thread, rejects
+concurrent access and thread migration, and performs cached-fiber destruction
+there before the thread exits. This establishes the safety invariant; it does
+not yet provide a scalable multi-executor scheduler with stable per-run
+partitioning. The chosen fixed, virtual-memory-backed guard-page stack must
+still be exercised by sanitizers and all four target builds, and stack sizing
+remains an operator concern because it does not grow. Panics crossing the C
+trampoline also need an explicit containment policy.
 
 The blocking wrapper now drains both enabled poll streams during shutdown.
 Core requires every enabled workflow/activity poll stream to observe shutdown
@@ -3449,7 +3461,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, and replay on macOS arm64 | Stress shared-state scheduling without moving fibers between threads |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and enforced single-executor affinity on macOS arm64 | Partition multiple Workflow runs across stable executor threads without ever moving a live fiber |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay

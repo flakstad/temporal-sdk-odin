@@ -2287,6 +2287,12 @@ If Core includes `InitializeWorkflow` and `CancelWorkflow` in one initial
 activation, the root cancellation is installed before Odin first resumes the
 new stackful fiber, so the same rule holds even for an immediately returning
 procedure.
+The in-process Workflow Worker executes activations on one deterministic poll
+thread. Every `Fiber_Runtime` now enforces that contract independently: it
+rejects overlapping calls and later calls from another OS thread, then destroys
+any cached fibers on the owning executor before the poll loop exits. This keeps
+minicoro stacks from being resumed, evicted, or destroyed after thread
+migration even if the dispatcher is refactored later.
 Detached scope state is local to the currently running main or Update fiber.
 To let a detached handler finish, the main Workflow must itself use a detached
 scope around `workflow.await_all_handlers_finished(ctx)` after observing
