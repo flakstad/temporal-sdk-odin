@@ -53,9 +53,27 @@ external_activity_test_invoke :: proc(
 
 external_activity_test_processor :: proc(
 	_: rawptr,
+	_: ^activity.Context,
 	_: []u8,
 ) -> worker.Activity_Task_Process_Result {
 	return {}
+}
+
+External_Heartbeat_Capture :: struct {
+	calls: int,
+	value: u32,
+}
+
+external_heartbeat_capture :: proc(
+	user_data: rawptr,
+	details: codec.Payload_View,
+) -> activity.Heartbeat_Status {
+	capture := cast(^External_Heartbeat_Capture)user_data
+	capture.calls += 1
+	if codec.decode_json(details, &capture.value) != .None {
+		return .Encoding_Failed
+	}
+	return .Recorded
 }
 
 @(test)
@@ -1844,6 +1862,35 @@ external_activity_child_helper_preserves_core_task_and_completion_contract :: pr
 	case:
 	}
 	testing.expect_value(t, string(result_data), `"isolated:Odin"`)
+}
+
+@(test)
+external_activity_heartbeat_reenters_the_parent_context :: proc(t: ^testing.T) {
+	details, encode_error := codec.encode_json(u32(17))
+	testing.expect(t, encode_error == .None)
+	defer codec.payload_free(&details)
+	token := [?]u8{0, 0xff, 7, 0}
+	heartbeat := proto.encode_activity_heartbeat_payload(
+		token[:],
+		codec.payload_view(&details),
+	)
+	defer delete(heartbeat)
+	capture := External_Heartbeat_Capture{}
+	ctx := activity.Context{}
+	activity.context_init(&ctx, "isolated", 2, &capture, external_heartbeat_capture)
+	status, ok := activity_isolate.forward_heartbeat(&ctx, heartbeat[:], token[:])
+	testing.expect(t, ok)
+	testing.expect(t, status == .Recorded)
+	testing.expect_value(t, capture.calls, 1)
+	testing.expect_value(t, capture.value, u32(17))
+	wrong_token := [?]u8{1, 2, 3}
+	_, mismatch_ok := activity_isolate.forward_heartbeat(
+		&ctx,
+		heartbeat[:],
+		wrong_token[:],
+	)
+	testing.expect(t, !mismatch_ok)
+	testing.expect_value(t, capture.calls, 1)
 }
 
 Heartbeat_Capture :: struct {

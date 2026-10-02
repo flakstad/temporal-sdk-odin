@@ -903,10 +903,11 @@ The repository also contains an experimental per-invocation boundary:
 Unlike the whole-Worker proof below, this keeps the Core-owning parent alive.
 It forwards opaque Core task/completion protobufs over the versioned
 `temporal/activity/isolate` protocol, deliberately panics the first child, and
-requires Temporal retry attempt 2 to complete in a fresh child. The current v1
-transport has no heartbeat forwarding or cooperative child cancellation and
-starts one process per attempt; use it as crash-containment evidence, not yet as
-the default production executor. See
+requires Temporal retry attempt 2 to complete in a fresh child. Protocol v2
+also requires attempt 2's heartbeat to traverse the parent Activity context and
+Core before completion. Cooperative child cancellation is still missing, and
+the manager starts one process per attempt; use it as crash-containment
+evidence, not yet as the default production executor. See
 [`activity-isolation.md`](activity-isolation.md).
 
 The supported containment pattern is now exercised end-to-end:

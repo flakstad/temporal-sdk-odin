@@ -39,9 +39,11 @@ Activity_Invoke_Proc :: #type proc(
 // This is the process-isolation seam: Core polling and completion remain in
 // the parent Worker while a child may own language callback execution. The
 // returned completion and allocator are released by the Worker after Core has
-// copied the bytes. A zero allocator means the processor's call-scoped
-// context allocator. Processor errors become retryable Activity failures and
-// do not stop unrelated Worker pollers.
+// copied the bytes. The Context is parent-owned and callback-scoped; processors
+// use it to route heartbeat events through the existing interceptor/Core path.
+// A zero allocator means the processor's call-scoped context allocator.
+// Processor errors become retryable Activity failures and do not stop
+// unrelated Worker pollers.
 Activity_Task_Process_Result :: struct {
 	completion: []u8,
 	allocator:  mem.Allocator,
@@ -65,6 +67,7 @@ activity_task_process_result_free :: proc(result: ^Activity_Task_Process_Result)
 
 Activity_Task_Processor_Proc :: #type proc(
 	processor_data: rawptr,
+	ctx: ^activity.Context,
 	task: []u8,
 ) -> Activity_Task_Process_Result
 
@@ -953,9 +956,9 @@ add_activity_interceptor :: proc(
 		return error_from_string("Activity interceptor must implement execute or heartbeat")
 	}
 	for registration in worker.activity_registrations {
-		if registration.external {
+		if registration.external && interceptor.execute != nil {
 			return error_from_string(
-				"parent Activity interceptors cannot wrap an external Activity processor",
+				"parent Activity execute interceptors cannot wrap an external Activity processor",
 			)
 		}
 	}
@@ -1178,10 +1181,12 @@ register_external_activity_processor :: proc(
 	if len(name) == 0 || process_task == nil {
 		return error_from_string("external activity name and processor are required")
 	}
-	if len(worker.activity_interceptors) > 0 {
-		return error_from_string(
-			"parent Activity interceptors cannot wrap an external Activity processor",
-		)
+	for interceptor in worker.activity_interceptors {
+		if interceptor.execute != nil {
+			return error_from_string(
+				"parent Activity execute interceptors cannot wrap an external Activity processor",
+			)
+		}
 	}
 	for registration in worker.activity_registrations {
 		if registration.name == name {
@@ -2299,7 +2304,11 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 		// External processor results cross the call boundary and therefore use
 		// the caller's ordinary allocator, not this execution's decode arena.
 		context.allocator = previous_allocator
-		processed := execution.process_task(execution.processor_data, execution.raw_task)
+		processed := execution.process_task(
+			execution.processor_data,
+			&execution.ctx,
+			execution.raw_task,
+		)
 		defer activity_task_process_result_free(&processed)
 
 		completion := processed.completion
@@ -2448,6 +2457,8 @@ execute_activity_task_callback :: proc(
 	task_protobuf: []u8,
 	namespace := "default",
 	task_queue := "external-activity",
+	heartbeat_user_data: rawptr = nil,
+	heartbeat_recorder: activity.Heartbeat_Recorder = nil,
 ) -> Activity_Task_Process_Result {
 	if len(expected_name) == 0 || callback_data == nil || invoke == nil {
 		return {error = error_from_string("external Activity callback is not configured")}
@@ -2504,7 +2515,13 @@ execute_activity_task_callback :: proc(
 	metric_meter := temporal_core.metric_meter_noop()
 	defer temporal_core.metric_meter_close(&metric_meter)
 	ctx := activity.Context{}
-	activity.context_init_info(&ctx, info_owner.info, nil, nil, &metric_meter)
+	activity.context_init_info(
+		&ctx,
+		info_owner.info,
+		heartbeat_user_data,
+		heartbeat_recorder,
+		&metric_meter,
+	)
 
 	callback_arena: virtual.Arena
 	if virtual.arena_init_growing(&callback_arena) != nil {

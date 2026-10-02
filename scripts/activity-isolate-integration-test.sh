@@ -102,7 +102,7 @@ fi
 parent_pid=""
 
 grep -q 'isolated Activity executor forcing panic on attempt 1' "$parent_log"
-grep -q 'isolated Activity panic was contained and retry completed' "$parent_log"
+grep -q 'isolated Activity panic was contained, heartbeat forwarded, and retry completed' "$parent_log"
 grep -q 'Workflow survived the Activity process crash: Recovered on Activity attempt 2' "$driver_log"
 
 cat "$parent_log"

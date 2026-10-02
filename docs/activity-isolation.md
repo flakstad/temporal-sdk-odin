@@ -64,8 +64,8 @@ Activity. Attempt 1 invokes Odin `panic` in the per-invocation child. The child
 dies, the parent converts that loss into a retryable Activity failure, and
 Temporal delivers attempt 2. A fresh child returns `Recovered on Activity
 attempt 2`; the parent then shuts Core down cleanly. Exact manager statistics
-require two children, one failed child, one valid completion, and a fully
-drained route set.
+require two children, one failed child, one valid completion, one attempt-2
+heartbeat acknowledged by Core, and a fully drained route set.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -78,21 +78,22 @@ This is a correctness and crash-containment slice, not yet the default Activity
 runtime:
 
 - a fresh process is started per attempt; there is no warm bounded pool;
-- child heartbeats are not transported to the parent yet;
+- child heartbeats use protocol v2 `Heartbeat`/`Heartbeat_Ack` frames and run
+  through the parent's ordinary heartbeat/interceptor/Core chain;
 - a Core cancel task kills the matching child and the parent returns a canceled
   completion, rather than first offering cooperative child cancellation;
-- parent Activity interceptors are rejected for external registrations because
-  callback execution occurs in the child; child-side interceptor registration
+- parent Activity execute interceptors are rejected for external registrations
+  because callback execution occurs in the child. Parent heartbeat interceptors
+  still wrap forwarded heartbeats; child-side execute interceptor registration
   is not yet exposed by `Host_Options`;
 - child metrics use a no-op meter; structured log/metric forwarding is not yet
-  part of protocol v1;
+  part of protocol v2;
 - shutdown currently assumes `worker.run` has drained all invocations before
   `manager_close`; forced manager teardown is best-effort;
 - CPU/memory sandboxing, warm-pool admission, crash-loop policy, release
   signing, and all-target fault evidence remain production work.
 
-The next increment should make the protocol duplex while a callback is live:
-child heartbeat events flow through the parent's existing heartbeat/interceptor
-chain, and parent cancellation becomes a cooperative cancel frame followed by
+The next increment should use the now-duplex protocol for cancellation: the
+parent sends a cooperative cancel frame while the callback is live, followed by
 a bounded TERM/KILL fallback. Only then should persistent warm children and
 multi-activity manifests be added.

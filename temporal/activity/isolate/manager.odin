@@ -7,6 +7,8 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import activity ".."
+import codec "../../codec"
 import process_start "../../internal/process_start"
 import proto "../../core/proto"
 import worker "../../worker"
@@ -45,6 +47,7 @@ Stats :: struct {
 	protocol_failures: int,
 	timeouts: int,
 	cancellations_forwarded: int,
+	heartbeats_forwarded: int,
 	peak_in_flight: int,
 }
 
@@ -209,7 +212,40 @@ read_with_timeout :: proc(
 	return state.frame, state.error, !finished
 }
 
-process_task :: proc(processor_data: rawptr, task: []u8) -> worker.Activity_Task_Process_Result {
+forward_heartbeat :: proc(
+	ctx: ^activity.Context,
+	payload: []u8,
+	task_token: []u8,
+) -> (status: activity.Heartbeat_Status, ok: bool) {
+	if ctx == nil {
+		return .Invalid_Context, false
+	}
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return .Core_Error, false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	heartbeat := proto.Coresdk_ActivityHeartbeat{}
+	decoded := proto.decode_Coresdk_ActivityHeartbeat(payload, &heartbeat)
+	context.allocator = previous
+	if !decoded || !bytes.equal(heartbeat.task_token, task_token) || len(heartbeat.details) != 1 {
+		return .Core_Error, false
+	}
+	details, clone_error := proto.clone_payload(&heartbeat.details[0])
+	if clone_error != .None {
+		return .Core_Error, false
+	}
+	defer codec.payload_free(&details)
+	return activity.heartbeat_payload(ctx, codec.payload_view(&details)), true
+}
+
+process_task :: proc(
+	processor_data: rawptr,
+	ctx: ^activity.Context,
+	task: []u8,
+) -> worker.Activity_Task_Process_Result {
 	manager := cast(^Manager)processor_data
 	if manager == nil || !manager.initialized {
 		return {error = worker.error_from_string("Activity executor manager is not initialized")}
@@ -274,47 +310,114 @@ process_task :: proc(processor_data: rawptr, task: []u8) -> worker.Activity_Task
 		return {error = worker.error_from_string("could not send Activity task to executor child")}
 	}
 
-	response, read_error, timed_out := read_with_timeout(
-		parent_output,
-		manager.maximum_payload_bytes,
-		manager.execution_timeout,
-		process,
-	)
-	defer owned_frame_free(&response)
-	state, _ := os.process_wait(process)
-	if timed_out {
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.timeouts += 1
-		manager.stats.child_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string("Activity executor timed out")}
-	}
-	if read_error.kind != .None || !state.exited {
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.child_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string("Activity executor exited without a completion")}
-	}
-	if response.frame.request_id != 1 {
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.protocol_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string("Activity executor returned a mismatched request id")}
-	}
-	if response.frame.kind == .Executor_Error {
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.child_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string(string(response.frame.payload))}
-	}
-	if response.frame.kind != .Completion || !state.success {
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.protocol_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string("Activity executor returned an invalid response")}
-	}
 	completion_allocator := context.allocator
-	completion := bytes.clone(response.frame.payload, completion_allocator)
+	completion: []u8
+	execution_started := time.tick_now()
+	for {
+		read_timeout := manager.execution_timeout
+		if read_timeout > 0 {
+			read_timeout -= time.tick_diff(execution_started, time.tick_now())
+			if read_timeout <= 0 {
+				_ = os.process_kill(process)
+				_, _ = os.process_wait(process)
+				sync.mutex_lock(&manager.mutex)
+				manager.stats.timeouts += 1
+				manager.stats.child_failures += 1
+				sync.mutex_unlock(&manager.mutex)
+				return {error = worker.error_from_string("Activity executor timed out")}
+			}
+		}
+		response, read_error, timed_out := read_with_timeout(
+			parent_output,
+			manager.maximum_payload_bytes,
+			read_timeout,
+			process,
+		)
+		if timed_out {
+			owned_frame_free(&response)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.timeouts += 1
+			manager.stats.child_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			_, _ = os.process_wait(process)
+			return {error = worker.error_from_string("Activity executor timed out")}
+		}
+		if read_error.kind != .None {
+			owned_frame_free(&response)
+			_, _ = os.process_wait(process)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.child_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			return {error = worker.error_from_string("Activity executor exited without a completion")}
+		}
+		if response.frame.request_id != 1 {
+			owned_frame_free(&response)
+			_ = os.process_kill(process)
+			_, _ = os.process_wait(process)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.protocol_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			return {error = worker.error_from_string("Activity executor returned a mismatched request id")}
+		}
+		if response.frame.kind == .Heartbeat {
+			heartbeat_status, heartbeat_ok := forward_heartbeat(ctx, response.frame.payload, token)
+			owned_frame_free(&response)
+			if !heartbeat_ok {
+				_ = os.process_kill(process)
+				_, _ = os.process_wait(process)
+				sync.mutex_lock(&manager.mutex)
+				manager.stats.protocol_failures += 1
+				sync.mutex_unlock(&manager.mutex)
+				return {error = worker.error_from_string("Activity executor returned an invalid heartbeat")}
+			}
+			ack := [1]u8{u8(heartbeat_status)}
+			ack_error := write(parent_input, {
+				kind = .Heartbeat_Ack,
+				request_id = 1,
+				payload = ack[:],
+			}, manager.maximum_payload_bytes)
+			if ack_error.kind != .None {
+				_ = os.process_kill(process)
+				_, _ = os.process_wait(process)
+				return {error = worker.error_from_string("could not acknowledge Activity heartbeat")}
+			}
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.heartbeats_forwarded += 1
+			sync.mutex_unlock(&manager.mutex)
+			continue
+		}
+		if response.frame.kind == .Executor_Error {
+			message := string(bytes.clone(response.frame.payload))
+			owned_frame_free(&response)
+			_, _ = os.process_wait(process)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.child_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			error := worker.error_from_string(message)
+			delete(message)
+			return {error = error}
+		}
+		if response.frame.kind != .Completion {
+			owned_frame_free(&response)
+			_ = os.process_kill(process)
+			_, _ = os.process_wait(process)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.protocol_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			return {error = worker.error_from_string("Activity executor returned an invalid response")}
+		}
+		completion = bytes.clone(response.frame.payload, completion_allocator)
+		owned_frame_free(&response)
+		break
+	}
+	state, _ := os.process_wait(process)
+	if !state.exited || !state.success {
+		delete(completion, completion_allocator)
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.child_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("Activity executor exited unsuccessfully")}
+	}
 	sync.mutex_lock(&manager.mutex)
 	manager.stats.children_completed += 1
 	sync.mutex_unlock(&manager.mutex)

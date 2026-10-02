@@ -154,7 +154,13 @@ activity_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 	if pbt.draw(t, pbt.boolean()) {
 		request_id |= u64(1) << 63
 	}
-	kinds := [?]activity_isolate.Kind{.Execute, .Completion, .Executor_Error}
+	kinds := [?]activity_isolate.Kind{
+		.Execute,
+		.Completion,
+		.Executor_Error,
+		.Heartbeat,
+		.Heartbeat_Ack,
+	}
 	kind := kinds[pbt.draw(t, pbt.int_range(0, len(kinds) - 1))]
 	has_zero := false
 	for value in payload {
@@ -163,7 +169,9 @@ activity_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 			break
 		}
 	}
-	pbt.cover(t, kind == .Executor_Error, 25, "executor error frame")
+	pbt.cover(t, kind == .Executor_Error, 15, "executor error frame")
+	pbt.cover(t, kind == .Heartbeat, 15, "heartbeat frame")
+	pbt.cover(t, kind == .Heartbeat_Ack, 15, "heartbeat acknowledgement frame")
 	pbt.cover(t, request_id & (u64(1) << 63) != 0, 35, "high-bit Activity correlation ID")
 	pbt.cover(t, len(payload) >= 4_096, 25, "large Activity frame payload")
 	pbt.cover(t, has_zero, 35, "embedded zero Activity payload byte")
