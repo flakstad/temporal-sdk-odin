@@ -1222,6 +1222,11 @@ fresh replay fiber emits `CompleteWorkflow`. The Client result must be
 `.Workflow_Failed` and contain Core's `[TMPRL1100]` diagnostic, while all valid
 Workflow results still succeed. This is test-only code that intentionally
 breaks the determinism rules.
+Both normal and replay passes also start a typed Signal-handler Workflow. Two
+Signals may arrive before registration and are buffered by the runtime; the
+registered handler accumulates their values and releases the main fiber through
+`await_condition`. The proof requires exactly two started and completed
+handlers, `signals:3`, owner-thread execution, and no abandoned handlers.
 The example also requires
 `Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
 `workflow_executor_queue_peak`. The former counts all activation buffers owned

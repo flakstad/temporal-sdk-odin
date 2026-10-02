@@ -597,6 +597,10 @@ The replay pass also runs one deliberately incompatible Workflow: its first
 activation records a Timer, while its reconstructed fiber emits completion.
 The type-scoped Core policy must turn the mismatch into terminal
 `[TMPRL1100]` nondeterminism while the valid shards continue to completion.
+A separate affine Workflow registers an immediate typed Signal handler,
+receives two buffered Client Signals, mutates run-local state on its owner
+thread, and completes through `await_condition`. The live pass requires two
+started/completed handlers, the exact result, and no shard migration.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one

@@ -16,6 +16,7 @@ WORKFLOW_TYPE :: "in_process_concurrency_probe"
 UNKNOWN_WORKFLOW_TYPE :: "in_process_unknown_probe"
 CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
 NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
+SIGNAL_HANDLER_WORKFLOW_TYPE :: "in_process_signal_handler_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
 
 Probe_State :: struct {
@@ -99,6 +100,40 @@ nondeterminism_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> str
 	return value
 }
 
+Signal_Handler_State :: struct {
+	owner_thread: int,
+	value:        int,
+}
+
+signal_handler_apply :: proc(state: ^Signal_Handler_State, value: int) {
+	if sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+	state.value += value
+}
+
+signal_handler_ready :: proc(state: ^Signal_Handler_State) -> bool {
+	return state.value == 3
+}
+
+signal_handler_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Signal_Handler_State{owner_thread = sync.current_thread_id()}
+	if !workflow.set_signal_handler_json(
+		ctx,
+		"accumulate",
+		&state,
+		signal_handler_apply,
+	) {
+		return "signal handler registration failed"
+	}
+	if !workflow.await_condition(ctx, &state, signal_handler_ready) {
+		return "signal handler wait canceled"
+	}
+	return fmt.aprintf("signals:%d", state.value)
+}
+
 Concurrency_State :: struct {
 	client:                  ^temporal_client.Client,
 	sdk_worker:              ^worker.Worker,
@@ -114,14 +149,19 @@ Concurrency_State :: struct {
 	nondeterminism_handle:   temporal_client.Workflow_Handle,
 	has_nondeterminism_handle: bool,
 	nondeterminism_closed:   bool,
+	signal_handler_handle:  temporal_client.Workflow_Handle,
+	has_signal_handler_handle: bool,
+	signal_handler_closed:  bool,
 	watcher:                 ^thread.Thread,
 	start_error:             temporal_client.Error,
 	result_error:            temporal_client.Error,
 	cancel_error:            temporal_client.Error,
+	signal_error:            temporal_client.Error,
 	eviction_error:          worker.Error,
 	results_ok:              bool,
 	cancellation_ok:         bool,
 	nondeterminism_ok:       bool,
+	signal_handler_ok:      bool,
 	force_replay:            bool,
 }
 
@@ -243,6 +283,23 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 			break
 		}
 	}
+	signal_result: string
+	signal_result_error := temporal_client.get_result_json(
+		&state.signal_handler_handle,
+		&signal_result,
+	)
+	if signal_result_error.message == nil && signal_result == "signals:3" {
+		state.signal_handler_ok = true
+		state.signal_handler_closed = true
+	} else if signal_result_error.message != nil {
+		state.result_error = signal_result_error
+		state.results_ok = false
+	}
+	delete(signal_result)
+	if !state.signal_handler_ok {
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
 	worker.request_shutdown(state.sdk_worker)
 }
 
@@ -291,6 +348,42 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	}
 	state.cancellation_handle = cancellation_handle
 	state.has_cancellation_handle = true
+	signal_handler_id := fmt.aprintf("%s-signal-handler", state.id_prefix)
+	signal_handler_handle, signal_handler_start_error := temporal_client.start_workflow_json(
+		state.client,
+		SIGNAL_HANDLER_WORKFLOW_TYPE,
+		"affine signal handler",
+		{
+			id = signal_handler_id,
+			task_queue = state.task_queue,
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = time.Minute,
+			workflow_task_timeout = 10 * time.Second,
+		},
+	)
+	delete(signal_handler_id)
+	if signal_handler_start_error.message != nil {
+		state.start_error = signal_handler_start_error
+		return false
+	}
+	state.signal_handler_handle = signal_handler_handle
+	state.has_signal_handler_handle = true
+	state.signal_error = temporal_client.signal_workflow_json(
+		&state.signal_handler_handle,
+		"accumulate",
+		1,
+	)
+	if state.signal_error.message != nil {
+		return false
+	}
+	state.signal_error = temporal_client.signal_workflow_json(
+		&state.signal_handler_handle,
+		"accumulate",
+		2,
+	)
+	if state.signal_error.message != nil {
+		return false
+	}
 	first_shard := -1
 	found_distinct_shard := false
 	for candidate in 0 ..< 64 {
@@ -427,6 +520,16 @@ run :: proc() -> int {
 	}
 	register_error = worker.register_json_workflow(
 		&sdk_worker,
+		SIGNAL_HANDLER_WORKFLOW_TYPE,
+		signal_handler_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Signal-handler Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
 		NONDETERMINISM_WORKFLOW_TYPE,
 		nondeterminism_probe,
 	)
@@ -487,6 +590,16 @@ run :: proc() -> int {
 			}
 			temporal_client.workflow_handle_free(&state.nondeterminism_handle)
 		}
+		if state.has_signal_handler_handle {
+			if !state.signal_handler_closed {
+				cleanup_error := temporal_client.terminate_workflow(
+					&state.signal_handler_handle,
+					"in-process signal-handler cleanup",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
+			temporal_client.workflow_handle_free(&state.signal_handler_handle)
+		}
 	}
 	if state.start_error.message != nil {
 		fmt.eprintf("In-process concurrency start failed: %s\n", string(state.start_error.message))
@@ -503,6 +616,12 @@ run :: proc() -> int {
 	if state.cancel_error.message != nil {
 		fmt.eprintf("In-process cancellation request failed: %s\n", string(state.cancel_error.message))
 		temporal_client.error_free(&state.cancel_error)
+		worker.error_free(&run_error)
+		return 1
+	}
+	if state.signal_error.message != nil {
+		fmt.eprintf("In-process signal delivery failed: %s\n", string(state.signal_error.message))
+		temporal_client.error_free(&state.signal_error)
 		worker.error_free(&run_error)
 		return 1
 	}
@@ -539,22 +658,30 @@ run :: proc() -> int {
 	sync.mutex_unlock(&probe_state.mutex)
 	if !state.results_ok || len(state.handles) < 2 ||
 	   !state.cancellation_ok || !cancellation_observed || !cancellation_reason_ok ||
+	   !state.signal_handler_ok ||
 	   (force_replay && !state.nondeterminism_ok) ||
-	   run_stats.workflow_executions_completed != len(state.handles) + 1 + int(force_replay) ||
+	   run_stats.workflow_executions_completed != len(state.handles) + 2 + int(force_replay) ||
 	   run_stats.workflow_activation_failures < 1 ||
 	   run_stats.workflow_evictions < len(state.handles) + 2 ||
 	   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
+	   run_stats.workflow_signals_received != 2 ||
+	   run_stats.workflow_signal_handlers_started != 2 ||
+	   run_stats.workflow_signal_handlers_completed != 2 ||
+	   run_stats.workflow_signal_handlers_abandoned != 0 ||
+	   run_stats.workflow_signal_handler_warnings != 0 ||
 	   (force_replay && run_stats.workflow_replay_activations < 1) ||
 	   run_stats.workflow_activations_peak_owned < 2 ||
 	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v nondeterminism_ok=%v\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d handlers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v signal_handler_ok=%v nondeterminism_ok=%v\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			run_stats.workflow_evictions,
 			run_stats.workflow_cancellations_received,
 			run_stats.timers_canceled,
+			run_stats.workflow_signals_received,
+			run_stats.workflow_signal_handlers_completed,
 			run_stats.workflow_replay_activations,
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
@@ -562,18 +689,21 @@ run :: proc() -> int {
 			migrations,
 			state.cancellation_ok && cancellation_observed,
 			cancellation_reason_ok,
+			state.signal_handler_ok,
 			state.nondeterminism_ok,
 		)
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d nondeterminism=%v\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d handlers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d nondeterminism=%v\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
 		run_stats.workflow_evictions,
 		run_stats.workflow_cancellations_received,
 		run_stats.timers_canceled,
+		run_stats.workflow_signals_received,
+		run_stats.workflow_signal_handlers_completed,
 		run_stats.workflow_replay_activations,
 		run_stats.workflow_activations_peak_owned,
 		run_stats.workflow_executor_queue_peak,
