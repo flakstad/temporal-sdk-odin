@@ -55,6 +55,11 @@ event includes stable metadata plus an owned canonical protobuf representation.
 The live suite requests one-event pages against the CLI dev server and follows
 every returned token. The Client can now eagerly aggregate those pages into the
 binary `temporal.api.history.v1.History` accepted by Core's offline replayer.
+The optional `temporal/history_json` package converts canonical protobuf JSON
+from `temporal workflow show --output json` into that same binary message using
+the pinned Temporal descriptors and standard protobuf-JSON semantics. Its
+small native sidecar is linked only by programs that import the package; the
+ordinary Client and Worker still depend only on SDK Core and the fiber shim.
 `worker.create_replayer` uses the dedicated C-bridge replay worker, drives the
 same Odin Workflow registry with Core activations, and distinguishes compatible
 history, nondeterminism, Workflow-task failure, and unexpected eviction. Unit
@@ -1041,8 +1046,9 @@ if replay_result.failure == .Nondeterminism {
 }
 ```
 
-CLI JSON is not silently converted. The C bridge requires protobuf wire bytes;
-`fetch_history_protobuf` is the supported path from Service history to replay.
+The C bridge requires protobuf wire bytes. `fetch_history_protobuf` is the
+direct in-process path from Service history to replay; `temporal/history_json`
+is an explicit optional conversion step for canonical Temporal CLI JSON.
 `worker.replay_histories` accepts a borrowed slice of histories and runs all of
 them through one Core worker. Results remain in input order; malformed protobuf,
 nondeterminism, and Workflow-task failures are per-history results so a corpus
@@ -1059,6 +1065,18 @@ TEMPORAL_REPLAY_HISTORY_OUT=/tmp/eager.pb \
 
 ./scripts/run-replay-history.sh /tmp/eager.pb
 ```
+
+The same replay tool recognizes Temporal CLI JSON by its first non-whitespace
+byte and converts it before calling Core:
+
+```bash
+temporal workflow show --workflow-id my-workflow --output json >/tmp/history.json
+./scripts/run-replay-history.sh /tmp/history.json
+```
+
+JSON fields absent from the pinned schema are rejected instead of silently
+dropped. `./scripts/history-json-integration-test.sh` proves the complete
+CLI-export → conversion → Core replay path against `temporal server start-dev`.
 
 `examples/replay_history` intentionally registers the eager sample Workflow.
 Applications should copy its small driver and replace that registration with
@@ -2387,6 +2405,7 @@ native/                   pinned sdk-core/minicoro and native bridge sources
 temporal/core/raw/        near-1:1 subset of the C ABI
 temporal/core/            blocking ownership/lifecycle wrapper
 temporal/core/proto/      generated Core Activity and Workflow schema types
+temporal/history_json/    optional Temporal CLI History JSON replay converter
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
 temporal/nexus/           sync/async Nexus operation context and results
@@ -2407,7 +2426,7 @@ examples/client_control/  Odin Client signal/cancel/terminate proof
 examples/update_with_start/ atomic create-or-attach Update proof
 examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof
-examples/replay_history/  offline binary-history compatibility corpus runner
+examples/replay_history/  offline binary/CLI-JSON compatibility corpus runner
 examples/worker_supervisor/ whole-Worker readiness/restart proof
 examples/workflow_isolate/ persistent per-run Workflow process spike
 examples/workflow_isolate_app/ shared parent/child Workflow registry

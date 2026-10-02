@@ -180,15 +180,14 @@ packaged library to prove that the loader-policy gate fails closed. CI runs it
 for every target.
 
 Every verified package is inspected by
-`scripts/verify-native-link-policy.sh`. On macOS, the Core dylib must be thin
-for the declared architecture, identify itself as
-`@rpath/libtemporalio_sdk_core_c_bridge.dylib`, contain no `LC_RPATH`, retain a
-valid linker signature, and depend only on Apple system libraries/frameworks.
-On Linux, it must have the declared ELF machine and exact bridge SONAME, contain
-no RPATH/RUNPATH, and use only the allowlisted glibc-era system libraries. The
-single real object in the static fiber archive must match the same architecture
-on both platforms. The application—not the artifact—chooses its runtime search
-path.
+`scripts/verify-native-link-policy.sh`. On macOS, both dynamic bridges must be
+thin for the declared architecture, identify themselves through their exact
+`@rpath` names, contain no `LC_RPATH`, retain valid linker signatures, and
+depend only on Apple system libraries/frameworks. On Linux, both must have the
+declared ELF machine and exact SONAME, contain no RPATH/RUNPATH, and use only
+the allowlisted glibc-era system libraries. The single real object in the
+static fiber archive must match the same architecture on both platforms. The
+application—not the artifact—chooses its runtime search path.
 
 `.github/workflows/ci.yml` runs the full unit/property suite, builds all
 examples, packages, and smoke-tests on macOS arm64/x86_64 and Linux glibc
@@ -2327,10 +2326,21 @@ asserts this output.
 
 Set `TEMPORAL_REPLAY_HISTORY_OUT` to make the eager example persist the exact
 binary History it fetched. `./scripts/run-replay-history.sh` accepts one or more
-of those files, runs them as one Core replay batch, prints one PASS/FAIL line per
-file, and exits non-zero if any result is incompatible or invalid. The example
+binary History files or canonical JSON files from
+`temporal workflow show --output json`, runs them as one Core replay batch,
+prints one PASS/FAIL line per file, and exits non-zero if any result is
+incompatible or invalid. JSON is converted with the optional pinned-descriptor
+native bridge before the unchanged binary replay API is called. The example
 registers `odin_eager_workflow`; application repositories should use the driver
 with their own complete Workflow registry.
+
+Run `./scripts/history-json-integration-test.sh` for the focused JSON proof. It
+starts `temporal server start-dev` when needed, completes the eager Workflow,
+exports its real CLI JSON, converts it, and replays the result through Core.
+The unit suite checks canonical field names, enum names, timestamps, base64
+Payload bytes, oneof selection, malformed input, and unknown-field rejection.
+A 1,000-case PBT property sends arbitrary binary data—including embedded zero
+bytes—through the raw ABI and requires exactly one valid, freeable owned result.
 
 `run-hello-activity.sh` polls task queue `odin-hello-activity` and completes one
 task before shutting down. Run `./scripts/integration-test.sh` instead when you

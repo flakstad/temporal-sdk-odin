@@ -8,11 +8,18 @@ if [[ -z "${TEMPORAL_ODIN_NATIVE_LIB_DIR:-}" ]]; then
   "$repo_root/scripts/build-core.sh"
 fi
 case "$(uname -s)" in
-  Darwin) core_library="libtemporalio_sdk_core_c_bridge.dylib" ;;
-  Linux) core_library="libtemporalio_sdk_core_c_bridge.so" ;;
+  Darwin)
+    core_library="libtemporalio_sdk_core_c_bridge.dylib"
+    history_json_library="libtemporal_odin_history_json.dylib"
+    ;;
+  Linux)
+    core_library="libtemporalio_sdk_core_c_bridge.so"
+    history_json_library="libtemporal_odin_history_json.so"
+    ;;
   *) echo "Unsupported example-build host: $(uname -s)" >&2; exit 1 ;;
 esac
-for required in "$lib_dir/$core_library" "$lib_dir/libtemporal_odin_fiber.a"; do
+for required in "$lib_dir/$core_library" "$lib_dir/$history_json_library" \
+  "$lib_dir/libtemporal_odin_fiber.a"; do
   if [[ ! -f "$required" ]]; then
     echo "Native library is missing: $required" >&2
     exit 1

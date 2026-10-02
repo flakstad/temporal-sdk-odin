@@ -1,9 +1,9 @@
 package main
 
-import "base:runtime"
 import "core:fmt"
 import "core:os"
 import temporal_core "../../temporal/core"
+import history_json "../../temporal/history_json"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
 
@@ -21,7 +21,7 @@ Owned_History :: struct {
 
 run :: proc() -> int {
 	if len(os.args) < 2 {
-		fmt.eprintln("usage: replay_history <history.pb> [history.pb ...]")
+		fmt.eprintln("usage: replay_history <history.pb|history.json> [...]")
 		return 2
 	}
 	runtime_handle, runtime_error := temporal_core.runtime_create()
@@ -58,22 +58,44 @@ run :: proc() -> int {
 	owned := make([dynamic]Owned_History, 0, len(os.args) - 1)
 	defer {
 		for history in owned {
-			delete(history.bytes, runtime.heap_allocator())
+			delete(history.bytes)
 		}
 		delete(owned)
 	}
 	histories := make([dynamic]worker.Replay_History, 0, len(os.args) - 1)
 	defer delete(histories)
 	for path in os.args[1:] {
-		contents, read_error := os.read_entire_file(path, runtime.heap_allocator())
+		contents, read_error := os.read_entire_file(path, context.allocator)
 		if read_error != nil {
 			fmt.eprintf("Could not read %s: %v\n", path, read_error)
 			return 1
 		}
-		append(&owned, Owned_History{bytes = contents})
+		history_bytes := contents
+		for byte in contents {
+			if byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n' {
+				continue
+			}
+			if byte == '{' {
+				converted, conversion_error := history_json.to_protobuf(contents)
+				if conversion_error.message != nil {
+					fmt.eprintf(
+						"Could not convert Temporal History JSON %s: %s\n",
+						path,
+						string(conversion_error.message),
+					)
+					history_json.error_free(&conversion_error)
+					delete(contents)
+					return 1
+				}
+				delete(contents)
+				history_bytes = converted
+			}
+			break
+		}
+		append(&owned, Owned_History{bytes = history_bytes})
 		append(&histories, worker.Replay_History{
 			workflow_id = path,
-			protobuf = owned[len(owned) - 1].bytes,
+			protobuf = history_bytes,
 		})
 	}
 

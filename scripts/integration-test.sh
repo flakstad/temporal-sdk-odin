@@ -339,6 +339,13 @@ temporal workflow show \
   --command-timeout 10s \
   --output json >"$typed_history_file"
 grep -q '"eagerExecutionAccepted": true' "$typed_history_file"
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/run-replay-history.sh" \
+  "$typed_history_file" >"$workflow_output_file"
+json_replay_output="$(<"$workflow_output_file")"
+echo "$json_replay_output"
+grep -q "PASS $typed_history_file" <<<"$json_replay_output"
+echo 'Temporal CLI History JSON converted through the optional native bridge and replayed through Core.'
 
 eager_activity_workflow_id="odin-sdk-eager-activity-$$-$(date +%s)"
 TEMPORAL_EAGER_ACTIVITY_WORKFLOW_ID="$eager_activity_workflow_id" \

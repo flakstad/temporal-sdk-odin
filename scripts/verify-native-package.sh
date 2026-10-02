@@ -58,18 +58,22 @@ case "$(uname -s):$(uname -m)" in
   Darwin:arm64)
     expected_target="macos-arm64"
     expected_core_library="libtemporalio_sdk_core_c_bridge.dylib"
+    expected_history_json_library="libtemporal_odin_history_json.dylib"
     ;;
   Darwin:x86_64)
     expected_target="macos-x86_64"
     expected_core_library="libtemporalio_sdk_core_c_bridge.dylib"
+    expected_history_json_library="libtemporal_odin_history_json.dylib"
     ;;
   Linux:aarch64|Linux:arm64)
     expected_target="linux-arm64"
     expected_core_library="libtemporalio_sdk_core_c_bridge.so"
+    expected_history_json_library="libtemporal_odin_history_json.so"
     ;;
   Linux:x86_64)
     expected_target="linux-x86_64"
     expected_core_library="libtemporalio_sdk_core_c_bridge.so"
+    expected_history_json_library="libtemporal_odin_history_json.so"
     ;;
   *)
     echo "Unsupported native verification host: $(uname -s) $(uname -m)" >&2
@@ -79,12 +83,14 @@ esac
 
 target="$(manifest_value target)"
 core_library="$(manifest_value core_library)"
+history_json_library="$(manifest_value history_json_library)"
 fiber_library="$(manifest_value fiber_library)"
-if [[ "$(manifest_value format_version)" != "1" || "$target" != "$expected_target" ]]; then
+if [[ "$(manifest_value format_version)" != "2" || "$target" != "$expected_target" ]]; then
   echo "Native package target mismatch: expected $expected_target, got $target" >&2
   exit 1
 fi
 if [[ "$core_library" != "$expected_core_library" ||
+      "$history_json_library" != "$expected_history_json_library" ||
       "$fiber_library" != "libtemporal_odin_fiber.a" ]]; then
   echo "Native package library names do not match target $target" >&2
   exit 1
@@ -109,9 +115,12 @@ checksum() {
 }
 
 core_path="$package_root/lib/$core_library"
+history_json_path="$package_root/lib/$history_json_library"
 fiber_path="$package_root/lib/$fiber_library"
 header_path="$package_root/include/temporal-sdk-core-c-bridge.h"
-for required in "$core_path" "$fiber_path" "$header_path" \
+history_json_header_path="$package_root/include/temporal-odin-history-json.h"
+for required in "$core_path" "$history_json_path" "$fiber_path" "$header_path" \
+  "$history_json_header_path" \
   "$package_root/README.md" \
   "$package_root/licenses/temporal-sdk-odin-MIT.txt" \
   "$package_root/licenses/temporal-sdk-core-MIT.txt" \
@@ -123,16 +132,24 @@ for required in "$core_path" "$fiber_path" "$header_path" \
 done
 
 if [[ "$(checksum "$core_path")" != "$(manifest_value core_sha256)" ||
+      "$(checksum "$history_json_path")" != "$(manifest_value history_json_sha256)" ||
       "$(checksum "$fiber_path")" != "$(manifest_value fiber_sha256)" ||
-      "$(checksum "$header_path")" != "$(manifest_value header_sha256)" ]]; then
+      "$(checksum "$header_path")" != "$(manifest_value header_sha256)" ||
+      "$(checksum "$history_json_header_path")" != "$(manifest_value history_json_header_sha256)" ]]; then
   echo "Native package checksum verification failed" >&2
   exit 1
 fi
 
 source_header="$repo_root/native/sdk-core/crates/sdk-core-c-bridge/include/temporal-sdk-core-c-bridge.h"
+source_history_json_header="$repo_root/native/history-json-bridge/include/temporal-odin-history-json.h"
 if [[ -f "$source_header" &&
       "$(checksum "$header_path")" != "$(checksum "$source_header")" ]]; then
   echo "Native package C header does not match the pinned source checkout" >&2
+  exit 1
+fi
+if [[ -f "$source_history_json_header" &&
+      "$(checksum "$history_json_header_path")" != "$(checksum "$source_history_json_header")" ]]; then
+  echo "Native package History JSON header does not match the source checkout" >&2
   exit 1
 fi
 
@@ -143,6 +160,6 @@ if [[ "$smoke" == "--smoke" ]]; then
 fi
 
 "$repo_root/scripts/verify-native-link-policy.sh" \
-  "$target" "$core_path" "$fiber_path"
+  "$target" "$core_path" "$fiber_path" "$history_json_path"
 
 echo "Verified native package target=$target core=$(manifest_value sdk_core_version) commit=$sdk_core_commit"

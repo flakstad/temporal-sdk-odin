@@ -18,6 +18,7 @@ import raw "../temporal/core/raw"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 import temporal_failure "../temporal/failure"
+import history_json "../temporal/history_json"
 import nexus "../temporal/nexus"
 import protobuf "../temporal/protobuf"
 import supervisor "../temporal/supervisor"
@@ -26,6 +27,91 @@ import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
 import workflow_isolate "../temporal/workflow/isolate"
+
+@(test)
+history_json_converts_canonical_temporal_cli_shape :: proc(t: ^testing.T) {
+	json := transmute([]u8)string(`{
+  "events": [{
+    "eventId": "1",
+    "eventTime": "2026-01-02T03:04:05.000000006Z",
+    "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
+    "workflowExecutionStartedEventAttributes": {
+      "workflowType": {"name": "odin_json_history_workflow"},
+      "taskQueue": {"name": "odin-json-history"},
+      "input": {"payloads": [{
+        "metadata": {"encoding": "anNvbi9wbGFpbg=="},
+        "data": "Ik9kaW4i"
+      }]}
+    }
+  }]
+}`)
+	protobuf_bytes, conversion_error := history_json.to_protobuf(json)
+	defer delete(protobuf_bytes)
+	defer history_json.error_free(&conversion_error)
+	testing.expectf(
+		t,
+		conversion_error.message == nil,
+		"History JSON conversion failed: %s",
+		string(conversion_error.message),
+	)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	history := proto.Temporal_Api_History_V1_History{}
+	decoded := proto.decode_Temporal_Api_History_V1_History(protobuf_bytes, &history)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, len(history.events), 1)
+	if len(history.events) != 1 {
+		return
+	}
+	event := &history.events[0]
+	testing.expect_value(t, event.event_id, i64(1))
+	testing.expect_value(
+		t,
+		event.event_type,
+		proto.Temporal_Api_Enums_V1_EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,
+	)
+	testing.expect(t, event.event_time != nil)
+	if event.event_time != nil {
+		testing.expect_value(t, event.event_time.nanos, i32(6))
+	}
+	#partial switch attributes in event.attributes {
+	case proto.Temporal_Api_History_V1_HistoryEvent_Attributes_Workflow_Execution_Started_Event_Attributes:
+		testing.expect(t, attributes.value != nil)
+		if attributes.value != nil {
+			testing.expect(t, attributes.value.workflow_type != nil)
+			if attributes.value.workflow_type != nil {
+				testing.expect_value(
+					t,
+					attributes.value.workflow_type.name,
+					"odin_json_history_workflow",
+				)
+			}
+		}
+	case:
+		testing.expectf(t, false, "History JSON did not preserve its oneof attributes")
+	}
+}
+
+@(test)
+history_json_rejects_empty_malformed_and_unknown_input :: proc(t: ^testing.T) {
+	inputs := [?][]u8{
+		nil,
+		transmute([]u8)string(`{"events":[}`),
+		transmute([]u8)string(`{"unknownPinnedField":true}`),
+	}
+	for input in inputs {
+		protobuf_bytes, conversion_error := history_json.to_protobuf(input)
+		testing.expect(t, protobuf_bytes == nil)
+		testing.expect(t, len(conversion_error.message) > 0)
+		delete(protobuf_bytes)
+		history_json.error_free(&conversion_error)
+	}
+}
 
 fiber_guard_test_entry :: proc "c" (user_data: rawptr) {
 	called := cast(^bool)user_data

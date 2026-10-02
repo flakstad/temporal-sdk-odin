@@ -24,6 +24,8 @@ cargo build --manifest-path "$repo_root/native/Cargo.toml" --release
 "$repo_root/scripts/build-fiber.sh"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  library="$repo_root/native/target/release/libtemporalio_sdk_core_c_bridge.dylib"
-  install_name_tool -id "@rpath/libtemporalio_sdk_core_c_bridge.dylib" "$library"
+  core_library="$repo_root/native/target/release/libtemporalio_sdk_core_c_bridge.dylib"
+  history_json_library="$repo_root/native/target/release/libtemporal_odin_history_json.dylib"
+  install_name_tool -id "@rpath/libtemporalio_sdk_core_c_bridge.dylib" "$core_library"
+  install_name_tool -id "@rpath/libtemporal_odin_history_json.dylib" "$history_json_library"
 fi

@@ -1,0 +1,22 @@
+[package]
+name = "temporal-odin-history-json"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Replay-only protobuf JSON conversion bridge for Temporal SDK for Odin"
+
+[lib]
+name = "temporal_odin_history_json"
+crate-type = ["cdylib"]
+
+[dependencies]
+prost = { workspace = true }
+prost-reflect = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+prost = { workspace = true }
+protox = { workspace = true }
+
+[lints]
+workspace = true

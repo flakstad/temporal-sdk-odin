@@ -145,7 +145,19 @@ each canonical encoded event until aggregation is finished, and returns the
 single History message Core expects. Retaining event buffers matters: generated
 protobuf decoders allocate message structure in the supplied arena but borrow
 strings and bytes from their input. CLI `workflow show --output json` is not an
-input to this ABI and is not part of the current replay path.
+input to this ABI. The optional `temporal/history_json` package supplies a
+separate conversion boundary for that canonical JSON. Its small Rust sidecar
+compiles a descriptor set from the exact pinned Temporal API sources and uses
+`prost-reflect`'s standard protobuf-JSON decoder; it does not deserialize into
+a hand-written second History model. The sidecar returns one owned binary
+buffer or one owned UTF-8 error buffer. Odin copies and frees that allocation
+through the same sidecar before passing the binary message to Core. Unknown
+JSON fields are rejected so schema skew cannot silently remove event data.
+Programs that never import `temporal/history_json` do not link the sidecar.
+Canonical fixtures cover proto field names, enum strings, timestamps, base64
+bytes, and oneof attributes. A 1,000-case arbitrary-byte property verifies the
+raw result exclusivity/layout/free contract, and a CLI-dev-server test proves
+that an actual exported history replays successfully through Core.
 
 ## The C bridge that exists today
 
@@ -156,6 +168,9 @@ Its generated
 is the ABI source of truth.
 
 The bridge exposes opaque handles plus C-layout options and callback APIs:
+
+The History JSON row is the project-owned optional sidecar described above;
+every other row in this table is supplied by the pinned SDK Core C bridge.
 
 | Concern | C representation | Payload across boundary |
 | --- | --- | --- |
@@ -171,6 +186,7 @@ The bridge exposes opaque handles plus C-layout options and callback APIs:
 | Replay construction | `temporal_core_worker_replayer_new` | worker options, without a Client connection |
 | Replay history input | `temporal_core_worker_replay_push` | binary `temporal.api.history.v1.History` plus Workflow ID |
 | Replay input close | `temporal_core_worker_replay_pusher_free` | closes Core's history stream |
+| Optional History JSON conversion | `temporal_odin_history_json_to_protobuf` | canonical protobuf JSON in; owned binary `History` or UTF-8 error out |
 | Application metric meter | `temporal_core_metric_*` | opaque meters, instruments, typed attributes, and scalar records |
 | Errors | `TemporalCoreByteArray*` | UTF-8 message, with gRPC status/details where applicable |
 
@@ -1164,6 +1180,11 @@ as ABI requirements:
   closes Core's history stream. Odin calls it after the final replay eviction
   and before normal worker shutdown/finalization. It must be called exactly
   once and before freeing the runtime.
+- `temporal_odin_history_json_to_protobuf` synchronously borrows its JSON bytes
+  and returns exactly one sidecar-owned buffer: binary History on success or a
+  UTF-8 diagnostic on failure. Odin copies that buffer and calls
+  `temporal_odin_history_json_bytes_free` exactly once. The allocation never
+  belongs to the Core runtime and must not be passed to Core's byte-array free.
 - Forwarded-log references are valid only inside the log callback. Similar
   callback-borrowed data must be copied before returning when it must persist.
 - Callback thread identity is unspecified. Odin callbacks must not assume they

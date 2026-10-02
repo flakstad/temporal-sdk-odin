@@ -74,19 +74,24 @@ installed_package_matches() {
   local installed_manifest="$install_dir/manifest.txt"
   [[ -f "$installed_manifest" ]] || return 1
   cmp -s "$manifest" "$installed_manifest" || return 1
-  local core_library fiber_library
+  local core_library fiber_library history_json_library
   core_library="$(manifest_value core_library)"
   fiber_library="$(manifest_value fiber_library)"
+  history_json_library="$(manifest_value history_json_library)"
   [[ -f "$install_dir/lib/$core_library" &&
+     -f "$install_dir/lib/$history_json_library" &&
      -f "$install_dir/lib/$fiber_library" &&
      -f "$install_dir/include/temporal-sdk-core-c-bridge.h" &&
+     -f "$install_dir/include/temporal-odin-history-json.h" &&
      -f "$install_dir/README.md" &&
      -f "$install_dir/licenses/temporal-sdk-odin-MIT.txt" &&
      -f "$install_dir/licenses/temporal-sdk-core-MIT.txt" &&
      -f "$install_dir/licenses/minicoro-MIT-0.txt" ]] || return 1
   [[ "$(checksum "$install_dir/lib/$core_library")" == "$(manifest_value core_sha256)" &&
+     "$(checksum "$install_dir/lib/$history_json_library")" == "$(manifest_value history_json_sha256)" &&
      "$(checksum "$install_dir/lib/$fiber_library")" == "$(manifest_value fiber_sha256)" &&
-     "$(checksum "$install_dir/include/temporal-sdk-core-c-bridge.h")" == "$(manifest_value header_sha256)" ]]
+     "$(checksum "$install_dir/include/temporal-sdk-core-c-bridge.h")" == "$(manifest_value header_sha256)" &&
+     "$(checksum "$install_dir/include/temporal-odin-history-json.h")" == "$(manifest_value history_json_header_sha256)" ]]
 }
 
 if [[ -e "$install_dir" ]]; then

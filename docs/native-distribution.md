@@ -9,9 +9,12 @@ Contents:
 
 - `lib/libtemporalio_sdk_core_c_bridge.{dylib,so}` — Temporal SDK Core's C
   bridge;
+- `lib/libtemporal_odin_history_json.{dylib,so}` — optional, replay-only
+  canonical protobuf-JSON conversion using the pinned Temporal descriptors;
 - `lib/libtemporal_odin_fiber.a` — the project-owned minicoro shim used by the
   Workflow experiment;
 - `include/temporal-sdk-core-c-bridge.h` — the matching upstream C header;
+- `include/temporal-odin-history-json.h` — the optional replay converter ABI;
 - `manifest.txt` — target, toolchain, upstream version, and file checksums;
 - `licenses/` — licenses for the Odin SDK, SDK Core, and minicoro.
 
@@ -23,9 +26,11 @@ directory. The repository scripts do this with:
 -L/path/to/archive/lib -Wl,-rpath,/path/to/archive/lib
 ```
 
-The Core bridge is dynamic; the fiber shim is static. macOS uses an `@rpath`
-install name. Linux packages currently target glibc, not musl. The package is
-host-targeted and is not a cross-compilation sysroot.
+The Core and History JSON bridges are dynamic; the fiber shim is static. A
+program links the History JSON bridge only when it imports
+`temporal/history_json`. macOS uses `@rpath` install names. Linux packages
+currently target glibc, not musl. The package is host-targeted and is not a
+cross-compilation sysroot.
 
 On the packaged macOS and Linux targets, the fiber shim uses `mmap`/`mprotect`
 to reserve each fixed Workflow stack lazily and place an inaccessible page at
@@ -67,11 +72,11 @@ installation returns the same `lib` directory; existing different or corrupt
 contents are rejected rather than replaced. This prevents generated Odin
 protobuf/raw ABI code from silently linking a different Core bridge.
 
-Verification also enforces the loader contract. macOS packages contain a thin
-dylib with the exact `@rpath` install name, no embedded `LC_RPATH`, a valid
-linker signature, and only system dependencies. Linux packages contain the
-declared ELF architecture and exact SONAME, no RPATH/RUNPATH, and only the
-allowlisted system dependencies. The static fiber archive is checked for one
-path-free object of the same architecture. These checks intentionally leave
-runtime library discovery to the consuming executable's rpath or deployment
-environment.
+Verification also enforces the loader contract. Both macOS dylibs must be thin,
+have their exact `@rpath` install name, contain no embedded `LC_RPATH`, carry a
+valid linker signature, and use only system dependencies. Both Linux shared
+libraries must have the declared ELF architecture and exact SONAME, no
+RPATH/RUNPATH, and only allowlisted system dependencies. The static fiber
+archive is checked for one path-free object of the same architecture. These
+checks intentionally leave runtime library discovery to the consuming
+executable's rpath or deployment environment.

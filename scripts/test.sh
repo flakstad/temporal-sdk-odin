@@ -6,6 +6,9 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
   --package odin-proto-gen
+cargo test --quiet \
+  --manifest-path "$repo_root/native/Cargo.toml" \
+  --package temporal-odin-history-json
 lib_dir="${TEMPORAL_ODIN_NATIVE_LIB_DIR:-$repo_root/native/target/release}"
 if [[ -z "${TEMPORAL_ODIN_NATIVE_LIB_DIR:-}" ]]; then
   "$repo_root/scripts/build-core.sh"
