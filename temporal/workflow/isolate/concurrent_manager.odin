@@ -22,6 +22,8 @@ Concurrent_Manager :: struct {
 	stats_mutex:       sync.Mutex,
 	active_routes:     int,
 	peak_routes:       int,
+	active_activations: int,
+	peak_activations:   int,
 	initialized:       bool,
 	shutting_down:     bool,
 	shutdown_complete: bool,
@@ -82,26 +84,33 @@ concurrent_manager_process_activation :: proc(
 ) -> workflow.Process_Result {
 	manager := cast(^Concurrent_Manager)user_data
 	if manager == nil || !manager.initialized || manager.shutting_down {
-		return workflow.activation_failure_result(
+		return failure_result(
 			"unknown",
 			"concurrent Workflow executor manager is not available",
 		)
 	}
 	route, route_ok := decode_activation_route(activation)
 	if !route_ok {
-		return workflow.activation_failure_result(
+		return failure_result(
 			"unknown",
 			"concurrent Workflow executor manager received a malformed activation",
 		)
 	}
 	shard_index, shard_ok := workflow_shard_index(route.run_id, len(manager.shards))
 	if !shard_ok {
-		return workflow.activation_failure_result(
+		return failure_result(
 			route.run_id,
 			"concurrent Workflow executor manager could not route activation",
 		)
 	}
 	shard := &manager.shards[shard_index]
+	sync.mutex_lock(&manager.stats_mutex)
+	manager.active_activations += 1
+	manager.peak_activations = max(
+		manager.peak_activations,
+		manager.active_activations,
+	)
+	sync.mutex_unlock(&manager.stats_mutex)
 	sync.mutex_lock(&shard.mutex)
 	before_routes := len(shard.manager.routes)
 	result := manager_process_activation(&shard.manager, activation)
@@ -112,6 +121,9 @@ concurrent_manager_process_activation :: proc(
 		manager.peak_routes = max(manager.peak_routes, manager.active_routes)
 		sync.mutex_unlock(&manager.stats_mutex)
 	}
+	sync.mutex_lock(&manager.stats_mutex)
+	manager.active_activations -= 1
+	sync.mutex_unlock(&manager.stats_mutex)
 	sync.mutex_unlock(&shard.mutex)
 	return result
 }
@@ -200,6 +212,16 @@ concurrent_manager_route_count :: proc(manager: ^Concurrent_Manager) -> int {
 	total := manager.active_routes
 	sync.mutex_unlock(&manager.stats_mutex)
 	return total
+}
+
+concurrent_manager_peak_activations :: proc(manager: ^Concurrent_Manager) -> int {
+	if manager == nil || !manager.initialized {
+		return 0
+	}
+	sync.mutex_lock(&manager.stats_mutex)
+	peak := manager.peak_activations
+	sync.mutex_unlock(&manager.stats_mutex)
+	return peak
 }
 
 concurrent_manager_close :: proc(manager: ^Concurrent_Manager) {

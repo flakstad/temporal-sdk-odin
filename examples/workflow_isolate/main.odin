@@ -29,7 +29,10 @@ Child_Fault_Mode :: enum {
 	Stack_Overflow,
 	Panic,
 	Infinite_Loop,
+	Slow,
 }
+
+slow_executor := false
 
 executor_log :: proc(user_data: rawptr, record: ^workflow.Log_Record) {
 	if record == nil {
@@ -86,6 +89,9 @@ executor_execute_workflow_interceptor :: proc(
 	input: ^workflow.Inbound_Execute_Workflow_Input,
 	next: workflow.Inbound_Execute_Workflow_Next,
 ) -> workflow.Payload_Result {
+	if slow_executor {
+		time.sleep(2 * time.Second)
+	}
 	fields := [1]workflow.Log_Field{
 		workflow.log_field_string("hook", "executor-host-inbound"),
 	}
@@ -123,6 +129,7 @@ run_child :: proc(
 	} else if fault_mode == .Infinite_Loop {
 		registry_revision = .Infinite_Loop
 	}
+	slow_executor = fault_mode == .Slow
 	registration_error := workflow_app.register_revision(&registry, registry_revision)
 	if registration_error.message != nil {
 		fmt.eprintf("Could not register executor Workflows: %s\n", string(registration_error.message))
@@ -150,7 +157,7 @@ run_child :: proc(
 		return 1
 	}
 	defer workflow_isolate.executor_host_close(&host)
-	if fault_mode != .None && fault_mode != .Nondeterministic &&
+	if fault_mode != .None && fault_mode != .Nondeterministic && fault_mode != .Slow &&
 	   fault_mode != .Stack_Overflow && fault_mode != .Panic &&
 	   fault_mode != .Infinite_Loop {
 		manifest_request, read_error := workflow_isolate.read(os.stdin)
@@ -600,6 +607,10 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child-infinite-loop" {
 		task_queue := len(os.args) >= 3 ? os.args[2] : ""
 		os.exit(run_child(.Infinite_Loop, task_queue))
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-slow" {
+		task_queue := len(os.args) >= 3 ? os.args[2] : ""
+		os.exit(run_child(.Slow, task_queue))
 	}
 	os.exit(run_parent())
 }

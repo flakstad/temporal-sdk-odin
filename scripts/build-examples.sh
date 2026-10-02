@@ -54,6 +54,7 @@ build_example hello_nexus_workflow temporal-odin-hello-nexus-workflow
 build_example worker_supervisor temporal-odin-worker-supervisor
 build_example workflow_isolate temporal-odin-workflow-isolate
 build_example workflow_isolate_core temporal-odin-workflow-isolate-core
+build_example workflow_concurrency temporal-odin-workflow-concurrency
 build_example hello_workflow temporal-odin-hello-workflow
 build_example eager_workflow temporal-odin-eager-workflow
 build_example eager_activity temporal-odin-eager-activity

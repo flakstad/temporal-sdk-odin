@@ -205,9 +205,12 @@ The online Worker now has an experimental `workflow_activation_processor`
 callback. It replaces only language-side activation dispatch: Core still owns
 polling, history processing, Workflow state machines, completion submission,
 retry, and eviction. The callback borrows the opaque activation bytes for one
-serial invocation and returns an ordinarily owned `workflow.Process_Result`.
-The existing in-process dispatcher remains the default, and offline replay
-deliberately remains in-process.
+invocation and returns an owned `workflow.Process_Result`, including completion,
+run ID, cancellation reason, and error data. With one Workflow executor the
+callback is serial. A configured external executor pool may invoke it
+concurrently, so implementations must be thread-safe and preserve per-run
+serialization. The existing in-process dispatcher remains the default, and
+offline replay deliberately remains in-process.
 
 `temporal/workflow/isolate.Manager` is the reusable per-run implementation of
 that callback. Initialization copies both child command vectors, requires a
@@ -240,26 +243,26 @@ performs this drain automatically when the caller has not already requested it.
 Real-process tests cover two clean acknowledgements and four simultaneous
 unresponsive children.
 
-`Concurrent_Manager` is the run-affinity layer for the next Worker scheduler
-slice. It owns a fixed set of independent `Manager` shards and maps the opaque
-run ID with a portable FNV-1a hash. Any poll thread may submit an activation,
-but the same run always takes the same shard mutex; different shards may execute
-their child exchanges concurrently. Each shard owns separate routes, crash-loop
-state, commands, and child processes. `maximum_executors` currently applies per
-shard, which is explicit but can produce hash-skew admission before another
-shard is full. Concurrent entry requires the process-safe heap allocator because
-a later poll thread may evict a route created by another thread. Aggregate stats
-preserve an exact pool-wide route peak, and a
+`Concurrent_Manager` is the run-affinity layer for the external Worker
+scheduler. It owns a fixed set of independent `Manager` shards and maps the
+opaque run ID with a portable FNV-1a hash. One Core poller submits activations
+to arbitrary language executor threads, but the same run always takes the same
+shard mutex; different shards may execute their child exchanges concurrently.
+Each shard owns separate routes, crash-loop state, commands, and child
+processes. `maximum_executors` currently applies per shard, which is explicit
+but can produce hash-skew admission before another shard is full. Concurrent
+entry requires the process-safe heap allocator because a later executor thread
+may evict a route created by another thread. Aggregate stats preserve an exact
+pool-wide route peak, and a
 1,000-case property checks binary run IDs against an independent hash reference.
 Shard teardown currently remains on the owner thread so manager allocations are
 released by their originating allocator; each shard still drains its own child
-sessions concurrently. The ordinary Worker poll loop is serial; wiring multiple
-Core poll/executor threads into this manager is the next vertical step rather
-than an implied capability of this commit.
+sessions concurrently. The Worker executor pool has a live CLI-dev-server proof
+that requires at least two slow independent activations to overlap.
 
-Admission is deliberately non-waiting. Workflow activations are processed on
-one serial Core poll thread, including the evictions that release capacity, so
-waiting there for a slot would deadlock. When `maximum_executors` is full, the
+Admission is deliberately non-waiting. Waiting while holding a shard mutex
+would prevent the same shard's eviction from releasing capacity. When
+`maximum_executors` is full, the
 manager returns a failed activation immediately and increments
 `capacity_rejections`; Core remains responsible for eviction and retry.
 
@@ -451,20 +454,21 @@ must be deterministically reconstructed from history.
 
 ### Ownership at the experimental callback
 
-- Core's poll result owns the activation bytes. `worker.run` borrows them to the
-  callback and frees them immediately after it returns.
+- The Odin poll result owns its copy of the activation bytes. `worker.run`
+  moves that copy into one executor task, borrows it to the callback, and frees
+  it after processing and completion have finished.
 - Route strings decoded from an activation also borrow those bytes. The manager
-  clones a run ID for every owned route and separately keeps a reporting
-  copy alive until `worker.run` has consumed the returned result.
+  clones a run ID for every owned route and a separate per-result run ID that
+  remains stable while other executor threads enter the same manager.
 - The child protocol decoder returns owned run-ID/payload buffers; callers use
   `owned_frame_free`.
-- The callback returns an owned completion buffer. `worker.run` submits it to
-  Core and deletes it after the synchronous bridge call returns.
+- The callback returns an owned completion buffer. Its executor submits it to
+  Core, invokes the synchronous observer, and the poll thread deletes it when
+  it reaps the completed executor task.
 - The child metadata encoder borrows `Process_Result` only for synchronous JSON
   encoding. The parent decoder owns its error bytes and cancellation-reason
-  string. The returned Worker result owns the error bytes; the manager retains
-  the cancellation-reason allocation until the next serial activation or
-  `manager_close`, matching the callback's borrowed-field lifetime.
+  string. The returned Worker result owns those bytes and the per-result run
+  ID until the observer returns and the Worker reaps that executor task.
 - Replay flag, history length, eviction status, and reported run ID continue to
   come from the parent-decoded activation/route, not child metadata.
 - Every started child is reaped. Normal eviction uses a correlated shutdown

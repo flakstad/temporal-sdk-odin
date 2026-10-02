@@ -253,8 +253,6 @@ Manager :: struct {
 	manifest_verified:  bool,
 	consecutive_failures: int,
 	last_failure:         time.Tick,
-	report_run_id:      string,
-	report_cancellation_reason: string,
 	diagnostic_observer: Manager_Diagnostic_Observer,
 	diagnostic_observer_data: rawptr,
 	eviction_observer: Manager_Eviction_Observer,
@@ -586,8 +584,6 @@ manager_close :: proc(manager: ^Manager) {
 	free_command(&manager.command)
 	free_command(&manager.first_command)
 	delete(manager.expected_manifest)
-	delete(manager.report_run_id)
-	delete(manager.report_cancellation_reason)
 	manager^ = {}
 }
 
@@ -1092,16 +1088,16 @@ inspect_completion :: proc(data: []u8, result: ^workflow.Process_Result) -> bool
 	return true
 }
 
-set_report_run_id :: proc(manager: ^Manager, run_id: string) -> bool {
-	delete(manager.report_run_id)
-	manager.report_run_id = ""
-	delete(manager.report_cancellation_reason)
-	manager.report_cancellation_reason = ""
-	owned, clone_error := strings.clone(run_id)
-	if clone_error != nil {
+own_result_run_id :: proc(result: ^workflow.Process_Result, run_id: string) -> bool {
+	if result == nil {
 		return false
 	}
-	manager.report_run_id = owned
+	owned, clone_error := strings.clone(run_id)
+	if clone_error != nil {
+		result.run_id = ""
+		return false
+	}
+	result.run_id = owned
 	return true
 }
 
@@ -1128,17 +1124,16 @@ adopt_exchange_result :: proc(
 ) -> workflow.Process_Result {
 	result := metadata
 	result.completion = completion
-	result.run_id = manager.report_run_id
+	_ = own_result_run_id(&result, route.run_id)
 	result.is_replaying = route.is_replaying
 	result.history_length = route.history_length
 	result.evicted = route.evicts
-	manager.report_cancellation_reason = result.cancellation_reason
 	return result
 }
 
-failure_result :: proc(manager: ^Manager, run_id, message: string) -> workflow.Process_Result {
+failure_result :: proc(run_id, message: string) -> workflow.Process_Result {
 	result := workflow.activation_failure_result(run_id, message)
-	result.run_id = manager.report_run_id
+	_ = own_result_run_id(&result, run_id)
 	return result
 }
 
@@ -1192,18 +1187,17 @@ manager_process_activation :: proc(
 	manager := cast(^Manager)user_data
 	route_info, route_ok := decode_activation_route(activation)
 	if manager == nil || !manager.initialized || !route_ok {
-		return workflow.activation_failure_result(
+		return failure_result(
 			"unknown",
 			"Workflow executor manager received a malformed activation",
 		)
 	}
 	if manager.shutting_down {
-		return workflow.activation_failure_result(
+		return failure_result(
 			route_info.run_id,
 			"Workflow executor manager is shutting down",
 		)
 	}
-	_ = set_report_run_id(manager, route_info.run_id)
 	route_index, route_found := find_route(manager, route_info.run_id)
 
 	if route_info.evicts {
@@ -1232,11 +1226,11 @@ manager_process_activation :: proc(
 		}
 		result := workflow.Process_Result{
 			completion = workflow.encode_empty_activation_success(route_info.run_id),
-			run_id = manager.report_run_id,
 			evicted = true,
 			is_replaying = route_info.is_replaying,
 			history_length = route_info.history_length,
 		}
+		_ = own_result_run_id(&result, route_info.run_id)
 		if !route_found {
 			return result
 		}
@@ -1275,7 +1269,6 @@ manager_process_activation :: proc(
 		if route.state == .Failed_Awaiting_Eviction {
 			route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 			return failure_result(
-				manager,
 				route_info.run_id,
 				"Workflow executor failed and is awaiting Core eviction",
 			)
@@ -1285,7 +1278,6 @@ manager_process_activation :: proc(
 			manager.stats.protocol_failures += 1
 			_ = session_abort(manager, &route.session)
 			return failure_result(
-				manager,
 				route_info.run_id,
 				"Workflow executor route was initialized more than once",
 			)
@@ -1294,7 +1286,6 @@ manager_process_activation :: proc(
 	} else {
 		if !route_info.initializes {
 			return failure_result(
-				manager,
 				route_info.run_id,
 				"Workflow activation has no live executor route",
 			)
@@ -1303,7 +1294,6 @@ manager_process_activation :: proc(
 		route_index, start_failure = start_route(manager, route_info.run_id)
 		if start_failure != .None {
 			return failure_result(
-				manager,
 				route_info.run_id,
 				route_start_failure_message(start_failure),
 			)
@@ -1316,7 +1306,6 @@ manager_process_activation :: proc(
 		process_result_metadata_free(&metadata)
 		record_exchange_failure(manager, route, exchange_failure)
 		return failure_result(
-			manager,
 			route_info.run_id,
 			exchange_failure_message(exchange_failure),
 		)
@@ -1329,7 +1318,6 @@ manager_process_activation :: proc(
 		_ = session_abort(manager, &route.session)
 		route.state, _ = lifecycle_step(route.state, .Activation_Failed)
 		return failure_result(
-			manager,
 			route_info.run_id,
 			"isolated Workflow executor returned a malformed completion",
 		)

@@ -554,8 +554,7 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 	malformed := [?]u8{0xff}
 	processed := workflow_isolate.concurrent_manager_process_activation(&manager, malformed[:])
 	testing.expect(t, processed.activation_failed)
-	delete(processed.completion)
-	workflow.error_free(&processed.error)
+	workflow_isolate.process_result_metadata_free(&processed)
 
 	shutdown_error := workflow_isolate.concurrent_manager_shutdown(&manager)
 	testing.expect(t, shutdown_error.message == nil)
@@ -708,8 +707,13 @@ workflow_executor_manager_bounds_parallel_forced_drain :: proc(t: ^testing.T) {
 		t,
 		strings.contains(string(processed.error.message), "manager is shutting down"),
 	)
-	delete(processed.completion)
-	workflow.error_free(&processed.error)
+	second_blocked := workflow_isolate_test_initialization("second-after-manager-shutdown")
+	second_processed := workflow_isolate.manager_process_activation(&manager, second_blocked[:])
+	delete(second_blocked)
+	testing.expect_value(t, processed.run_id, "after-manager-shutdown")
+	testing.expect_value(t, second_processed.run_id, "second-after-manager-shutdown")
+	workflow_isolate.process_result_metadata_free(&processed)
+	workflow_isolate.process_result_metadata_free(&second_processed)
 }
 
 workflow_isolate_test_initialization :: proc(run_id: string) -> [dynamic]u8 {
@@ -804,8 +808,7 @@ workflow_executor_manager_classifies_semantic_eviction_reasons :: proc(t: ^testi
 		delete(run_id)
 		testing.expect(t, processed.evicted)
 		testing.expect(t, !processed.activation_failed)
-		delete(processed.completion)
-		workflow.error_free(&processed.error)
+		workflow_isolate.process_result_metadata_free(&processed)
 	}
 
 	stats := workflow_isolate.manager_stats(&manager)
@@ -844,14 +847,12 @@ workflow_executor_crash_loop_breaker_stops_process_respawn_until_cooldown :: pro
 		processed := workflow_isolate.manager_process_activation(&manager, initialization[:])
 		delete(initialization)
 		testing.expect(t, processed.activation_failed)
-		delete(processed.completion)
-		workflow.error_free(&processed.error)
+		workflow_isolate.process_result_metadata_free(&processed)
 		eviction := workflow_isolate_test_eviction(run_id)
 		processed = workflow_isolate.manager_process_activation(&manager, eviction[:])
 		delete(eviction)
 		testing.expect(t, processed.evicted)
-		delete(processed.completion)
-		workflow.error_free(&processed.error)
+		workflow_isolate.process_result_metadata_free(&processed)
 		delete(run_id)
 	}
 	testing.expect_value(t, manager.stats.generations_started, 2)
@@ -867,8 +868,7 @@ workflow_executor_crash_loop_breaker_stops_process_respawn_until_cooldown :: pro
 	delete(blocked)
 	testing.expect(t, processed.activation_failed)
 	testing.expect(t, strings.contains(string(processed.error.message), "breaker is open"))
-	delete(processed.completion)
-	workflow.error_free(&processed.error)
+	workflow_isolate.process_result_metadata_free(&processed)
 	testing.expect_value(t, manager.stats.generations_started, 2)
 	testing.expect_value(t, manager.stats.crash_loop_rejections, 1)
 	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)
@@ -1267,9 +1267,13 @@ workflow_processor_test_invoke :: proc(
 	if !state.return_completion {
 		return {}
 	}
+	owned_run_id, clone_error := strings.clone("external-processor-run")
+	if clone_error != nil {
+		return {}
+	}
 	return {
 		completion = workflow.encode_empty_activation_success("external-processor-run"),
-		run_id = "external-processor-run",
+		run_id = owned_run_id,
 	}
 }
 
@@ -1294,6 +1298,7 @@ worker_dispatches_online_activations_through_an_external_processor :: proc(t: ^t
 	testing.expect(t, processed.completion != nil)
 	testing.expect_value(t, processed.run_id, "external-processor-run")
 	delete(processed.completion)
+	delete(processed.run_id)
 	workflow.error_free(&processed.error)
 	worker.error_free(&dispatch_error)
 
@@ -11836,6 +11841,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	options.identity_override = identity
 	options.max_concurrent_activities = 19
 	options.max_concurrent_nexus_tasks = 5
+	options.max_concurrent_workflow_tasks = 4
 	options.max_workflow_task_slots = 9
 	options.max_cached_workflows = 8
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(3)
@@ -11870,6 +11876,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	testing.expect_value(t, sdk_worker.max_concurrent_activities, 11)
 	testing.expect_value(t, sdk_worker.max_concurrent_local_activities, 7)
 	testing.expect_value(t, sdk_worker.max_concurrent_nexus_tasks, 13)
+	testing.expect_value(t, sdk_worker.max_concurrent_workflow_tasks, 4)
 	testing.expect_value(t, sdk_worker.core_options.max_cached_workflows, u32(8))
 	testing.expect_value(t, sdk_worker.core_options.max_worker_activities_per_second, 7.5)
 	testing.expect_value(
@@ -11892,6 +11899,83 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	testing.expect(t, close_error.message == nil)
 	worker.error_free(&close_error)
 	testing.expect(t, sdk_worker.core_options.identity_override == "")
+}
+
+@(test)
+concurrent_external_workflow_options_validate_before_core_start :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+
+	invalid_options := worker.options_default("invalid-workflow-concurrency")
+	invalid_options.max_concurrent_workflow_tasks = 0
+	_, invalid_error := worker.create_with_options(&client, invalid_options)
+	testing.expect(t, invalid_error.message != nil)
+	worker.error_free(&invalid_error)
+
+	slot_options := worker.options_default("invalid-workflow-slots")
+	slot_options.max_concurrent_workflow_tasks = 3
+	slot_options.max_workflow_task_slots = 2
+	_, slot_error := worker.create_with_options(&client, slot_options)
+	testing.expect(t, slot_error.message != nil)
+	testing.expect(t, strings.contains(string(slot_error.message), "must not be below"))
+	worker.error_free(&slot_error)
+
+	cacheless_options := worker.options_default("cacheless-workflow-concurrency")
+	cacheless_options.max_concurrent_workflow_tasks = 3
+	cacheless_options.max_workflow_task_slots = 3
+	cacheless_worker, cacheless_create_error := worker.create_with_options(
+		&client,
+		cacheless_options,
+	)
+	testing.expect(t, cacheless_create_error.message == nil)
+	worker.error_free(&cacheless_create_error)
+	cacheless_register_error := worker.register_external_workflow(
+		&cacheless_worker,
+		"cacheless-external",
+	)
+	testing.expect(t, cacheless_register_error.message == nil)
+	worker.error_free(&cacheless_register_error)
+	_, cacheless_error := worker.run(&cacheless_worker, {
+		workflow_activation_processor = workflow_processor_test_invoke,
+	})
+	testing.expect(t, cacheless_error.message != nil)
+	testing.expect(
+		t,
+		strings.contains(string(cacheless_error.message), "positive Workflow cache size"),
+	)
+	worker.error_free(&cacheless_error)
+	testing.expect(t, cacheless_worker.core.handle == nil)
+	cacheless_close_error := worker.close(&cacheless_worker)
+	testing.expect(t, cacheless_close_error.message == nil)
+	worker.error_free(&cacheless_close_error)
+
+	auto_options := worker.options_default("concurrent-external-workflows")
+	auto_options.max_concurrent_workflow_tasks = 3
+	auto_options.max_cached_workflows = 8
+	sdk_worker, create_error := worker.create_with_options(&client, auto_options)
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		worker.error_free(&close_error)
+	}
+	testing.expect_value(t, sdk_worker.core_options.max_workflow_task_slots, 3)
+	register_error := worker.register_external_workflow(&sdk_worker, "concurrent-external")
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	run_stats, run_error := worker.run(&sdk_worker, {
+		max_workflow_executions = 1,
+		workflow_activation_processor = workflow_processor_test_invoke,
+	})
+	_ = run_stats
+	testing.expect(t, run_error.message != nil)
+	testing.expect(
+		t,
+		strings.contains(string(run_error.message), "bounded Workflow execution counts"),
+	)
+	worker.error_free(&run_error)
 }
 
 @(test)

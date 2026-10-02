@@ -280,9 +280,11 @@ Workflow_Activation_Observer :: #type proc(result: ^workflow.Process_Result)
 Worker_Ready_Proc :: #type proc(user_data: rawptr) -> bool
 // Workflow_Activation_Processor replaces the in-process Workflow dispatcher
 // for online Worker activations. It is an experimental process-isolation seam:
-// activation bytes are borrowed for this call, while the returned completion
-// and Error follow the ordinary owned workflow.Process_Result contract. The
-// callback runs serially on the Worker's Workflow poll thread.
+// activation bytes are borrowed for this call, while the returned completion,
+// run ID, cancellation reason, and Error are owned by the Worker. With one
+// Workflow executor it runs serially. External/process-isolated
+// Workflows may opt into multiple concurrent calls; then processor state and
+// observers must be thread-safe and preserve per-run serialization.
 Workflow_Activation_Processor_Proc :: #type proc(
 	user_data: rawptr,
 	activation: []u8,
@@ -425,6 +427,10 @@ Options :: struct {
 	identity_override:                               string,
 	max_concurrent_activities:                       int,
 	max_concurrent_nexus_tasks:                      int,
+	// More than one is currently supported only for external/process-isolated
+	// Workflows. Core is polled by exactly one thread; activations are dispatched
+	// to this many language executor threads and completed concurrently.
+	max_concurrent_workflow_tasks:                   int,
 	// Core Workflow Task admission. Zero safely derives one slot without a
 	// cache and two with a cache; this does not change Odin executor threading.
 	max_workflow_task_slots:                         int,
@@ -456,6 +462,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		namespace = namespace,
 		max_concurrent_activities = core_options.max_activity_slots,
 		max_concurrent_nexus_tasks = core_options.max_nexus_task_slots,
+		max_concurrent_workflow_tasks = 1,
 		max_workflow_task_slots = core_options.max_workflow_task_slots,
 		max_cached_workflows = core_options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
@@ -495,6 +502,7 @@ Worker :: struct {
 	max_concurrent_activities: int,
 	max_concurrent_local_activities: int,
 	max_concurrent_nexus_tasks: int,
+	max_concurrent_workflow_tasks: int,
 	graceful_shutdown_period: time.Duration,
 	core_options:          temporal_core.Worker_Options,
 	versioning:             Worker_Versioning_Options,
@@ -655,11 +663,27 @@ create_with_options :: proc(
 			"custom Activity slot suppliers require positive executor concurrency",
 		)
 	}
+	if options.max_concurrent_workflow_tasks <= 0 {
+		return {}, error_from_string("maximum concurrent Workflow tasks must be positive")
+	}
+	if options.max_workflow_task_slots > 0 &&
+	   options.max_workflow_task_slots < options.max_concurrent_workflow_tasks {
+		return {}, error_from_string(
+			"Workflow task slots must not be below Workflow executor concurrency",
+		)
+	}
+	workflow_task_slots := options.max_workflow_task_slots
+	if workflow_task_slots == 0 && options.max_concurrent_workflow_tasks > 1 {
+		workflow_task_slots = options.max_concurrent_workflow_tasks
+		if options.max_cached_workflows > 0 {
+			workflow_task_slots = max(workflow_task_slots, 2)
+		}
+	}
 	core_options := temporal_core.Worker_Options{
 		identity_override = options.identity_override,
 		max_activity_slots = options.max_concurrent_activities,
 		max_nexus_task_slots = options.max_concurrent_nexus_tasks,
-		max_workflow_task_slots = options.max_workflow_task_slots,
+		max_workflow_task_slots = workflow_task_slots,
 		max_cached_workflows = options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
 			options.sticky_queue_schedule_to_start_timeout,
@@ -748,6 +772,7 @@ create_with_options :: proc(
 	worker.max_concurrent_activities = options.max_concurrent_activities
 	worker.max_concurrent_local_activities = 1
 	worker.max_concurrent_nexus_tasks = options.max_concurrent_nexus_tasks
+	worker.max_concurrent_workflow_tasks = options.max_concurrent_workflow_tasks
 	if options.resource_based_activity_tuner.enabled {
 		worker.max_concurrent_activities =
 			options.resource_based_activity_tuner.activity_slots.maximum_slots
@@ -2528,6 +2553,16 @@ dispatch_workflow_activation :: proc(
 	return processed, {}
 }
 
+external_workflow_result_release :: proc(processed: ^workflow.Process_Result) {
+	if processed == nil {
+		return
+	}
+	delete(processed.run_id)
+	delete(processed.cancellation_reason)
+	processed.run_id = ""
+	processed.cancellation_reason = ""
+}
+
 Callback_Drain_Watch :: struct {
 	done:     sync.Sema,
 	policy:   Uncooperative_Callback_Policy,
@@ -3410,7 +3445,7 @@ shutdown_workflow_runtimes_on_executor :: proc(worker: ^Worker) -> Error {
 	return {}
 }
 
-run_workflow_loop :: proc(
+run_workflow_loop_serial :: proc(
 	worker: ^Worker,
 	options: Run_Options,
 ) -> (stats: Run_Stats, error: Error) {
@@ -3441,6 +3476,9 @@ run_workflow_loop :: proc(
 		}
 		if processed.completion == nil {
 			workflow.error_free(&processed.error)
+			if options.workflow_activation_processor != nil {
+				external_workflow_result_release(&processed)
+			}
 			return stats, error_from_string("Workflow activation produced no completion")
 		}
 		complete_error := temporal_core.worker_complete_workflow(
@@ -3454,6 +3492,9 @@ run_workflow_loop :: proc(
 		processed.completion = nil
 		if complete_error.message != nil {
 			workflow.error_free(&processed.error)
+			if options.workflow_activation_processor != nil {
+				external_workflow_result_release(&processed)
+			}
 			return stats, error_from_core(&complete_error)
 		}
 		record_workflow_result(&stats, &processed)
@@ -3471,17 +3512,22 @@ run_workflow_loop :: proc(
 				processed.warned_unfinished_signal_handlers,
 			)
 		}
-		if processed.error.message != nil {
-			if !processed.activation_failed {
-				message := string(processed.error.message)
-				result := error_from_string(message)
-				workflow.error_free(&processed.error)
-				return stats, result
-			}
+		if processed.error.message != nil && !processed.activation_failed {
+			message := string(processed.error.message)
+			result := error_from_string(message)
 			workflow.error_free(&processed.error)
-			continue
+			if options.workflow_activation_processor != nil {
+				external_workflow_result_release(&processed)
+			}
+			return stats, result
 		}
 		workflow.error_free(&processed.error)
+		if options.workflow_activation_processor != nil {
+			external_workflow_result_release(&processed)
+		}
+		if processed.activation_failed {
+			continue
+		}
 
 		if options.max_workflow_executions > 0 &&
 		   stats.workflow_executions_completed >= options.max_workflow_executions {
@@ -3494,6 +3540,182 @@ run_workflow_loop :: proc(
 		}
 	}
 	return
+}
+
+Workflow_Execution :: struct {
+	worker:     ^Worker,
+	options:    Run_Options,
+	activation: []u8,
+	processed:  workflow.Process_Result,
+	error:      Error,
+}
+
+workflow_execution_main :: proc(execution: ^Workflow_Execution) {
+	if execution == nil || execution.worker == nil {
+		return
+	}
+	execution.processed, execution.error = dispatch_workflow_activation(
+		execution.worker,
+		execution.options,
+		execution.activation,
+	)
+	if execution.error.message != nil {
+		worker_initiate_shutdown(execution.worker)
+		return
+	}
+	if execution.processed.completion == nil {
+		execution.error = error_from_string("Workflow activation produced no completion")
+		worker_initiate_shutdown(execution.worker)
+		return
+	}
+	complete_error := temporal_core.worker_complete_workflow(
+		&execution.worker.core,
+		execution.processed.completion[:],
+	)
+	if execution.options.on_workflow_activation != nil {
+		execution.options.on_workflow_activation(&execution.processed)
+	}
+	if complete_error.message != nil {
+		execution.error = error_from_core(&complete_error)
+		worker_initiate_shutdown(execution.worker)
+		return
+	}
+	if execution.processed.error.message != nil && !execution.processed.activation_failed {
+		execution.error = error_from_string(string(execution.processed.error.message))
+		worker_initiate_shutdown(execution.worker)
+	}
+}
+
+workflow_execution_task :: proc(task: thread.Task) {
+	workflow_execution_main(cast(^Workflow_Execution)task.data)
+}
+
+workflow_execution_destroy :: proc(execution: ^Workflow_Execution) {
+	if execution == nil {
+		return
+	}
+	delete(execution.activation)
+	delete(execution.processed.completion)
+	// External processors return owned diagnostic strings. They are retained
+	// through the observer callback and released when the pool result is reaped.
+	external_workflow_result_release(&execution.processed)
+	workflow.error_free(&execution.processed.error)
+	error_free(&execution.error)
+	free(execution, allocator_runtime.heap_allocator())
+}
+
+reap_workflow_executions :: proc(
+	pool: ^thread.Pool,
+	stats: ^Run_Stats,
+) -> (error: Error) {
+	for {
+		task, done := thread.pool_pop_done(pool)
+		if !done {
+			break
+		}
+		execution := cast(^Workflow_Execution)task.data
+		if execution == nil {
+			if error.message == nil {
+				error = error_from_string("Workflow executor returned an empty task")
+			}
+			continue
+		}
+		if execution.error.message != nil {
+			if error.message == nil {
+				error = execution.error
+				execution.error = {}
+			}
+		} else {
+			record_workflow_result(stats, &execution.processed)
+			if !execution.processed.is_replaying &&
+			   execution.processed.warned_unfinished_update_handlers > 0 {
+				fmt.eprintf(
+					"Temporal warning: Workflow %s closed with %d unfinished Update handler(s); handlers were abandoned\n",
+					execution.processed.run_id,
+					execution.processed.warned_unfinished_update_handlers,
+				)
+			}
+			if !execution.processed.is_replaying &&
+			   execution.processed.warned_unfinished_signal_handlers > 0 {
+				fmt.eprintf(
+					"Temporal warning: Workflow %s closed with %d unfinished Signal handler(s); handlers were abandoned\n",
+					execution.processed.run_id,
+					execution.processed.warned_unfinished_signal_handlers,
+				)
+			}
+		}
+		workflow_execution_destroy(execution)
+	}
+	return
+}
+
+run_external_workflow_executor_loop :: proc(
+	worker: ^Worker,
+	options: Run_Options,
+	executor_threads: int,
+) -> (stats: Run_Stats, error: Error) {
+	pool := thread.Pool{}
+	thread.pool_init(&pool, allocator_runtime.heap_allocator(), executor_threads)
+	thread.pool_start(&pool)
+	pool_finished := false
+	defer {
+		if !pool_finished {
+			thread.pool_finish(&pool)
+			cleanup_error := reap_workflow_executions(&pool, &stats)
+			error_free(&cleanup_error)
+		}
+		thread.pool_destroy(&pool)
+	}
+	for {
+		reap_error := reap_workflow_executions(&pool, &stats)
+		if reap_error.message != nil {
+			worker_initiate_shutdown(worker)
+			return stats, reap_error
+		}
+		poll := temporal_core.worker_poll_workflow(&worker.core)
+		if poll.error.message != nil {
+			return stats, error_from_core(&poll.error)
+		}
+		if poll.shutdown {
+			break
+		}
+		execution, allocation_error := new(
+			Workflow_Execution,
+			allocator_runtime.heap_allocator(),
+		)
+		if allocation_error != nil {
+			delete(poll.protobuf)
+			worker_initiate_shutdown(worker)
+			return stats, error_from_string("could not allocate Workflow execution")
+		}
+		execution.worker = worker
+		execution.options = options
+		execution.activation = poll.protobuf
+		thread.pool_add_task(
+			&pool,
+			allocator_runtime.heap_allocator(),
+			workflow_execution_task,
+			execution,
+		)
+	}
+	thread.pool_finish(&pool)
+	pool_finished = true
+	error = reap_workflow_executions(&pool, &stats)
+	return
+}
+
+run_workflow_loop :: proc(
+	worker: ^Worker,
+	options: Run_Options,
+) -> (stats: Run_Stats, error: Error) {
+	if worker.max_concurrent_workflow_tasks > 1 {
+		return run_external_workflow_executor_loop(
+			worker,
+			options,
+			worker.max_concurrent_workflow_tasks,
+		)
+	}
+	return run_workflow_loop_serial(worker, options)
 }
 
 Replay_Eviction :: struct {
@@ -3859,6 +4081,23 @@ run :: proc(worker: ^Worker, options := Run_Options{}) -> (stats: Run_Stats, err
 			"external Workflow registrations require a Workflow activation processor",
 		)
 	}
+	if has_in_process_workflows && worker.max_concurrent_workflow_tasks > 1 {
+		return {}, error_from_string(
+			"concurrent Workflow tasks currently require external Workflow executors",
+		)
+	}
+	if has_external_workflows && worker.max_concurrent_workflow_tasks > 1 &&
+	   worker.core_options.max_cached_workflows == 0 {
+		return {}, error_from_string(
+			"concurrent Workflow execution requires a positive Workflow cache size",
+		)
+	}
+	if has_external_workflows && worker.max_concurrent_workflow_tasks > 1 &&
+	   options.max_workflow_executions > 0 {
+		return {}, error_from_string(
+			"bounded Workflow execution counts are not supported by concurrent external executors",
+		)
+	}
 	if has_external_workflows &&
 	   (len(worker.workflow_inbound_interceptors) > 0 ||
 	    len(worker.workflow_interceptors) > 0 ||
@@ -4136,6 +4375,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.max_concurrent_activities = 0
 	worker.max_concurrent_local_activities = 0
 	worker.max_concurrent_nexus_tasks = 0
+	worker.max_concurrent_workflow_tasks = 0
 	worker.graceful_shutdown_period = 0
 	worker.core_options = {}
 	worker.versioning = {}

@@ -1161,16 +1161,21 @@ generation. The callback is synchronous and must copy data it retains. This
 keeps nondeterminism explanations visible even when the affected executor has
 already crashed or been killed.
 
-The new `workflow_isolate.Concurrent_Manager` prepares safe multi-poll routing
-without weakening fiber affinity. A stable FNV-1a mapping assigns every run ID
-to one independently locked manager shard; Core may deliver work on arbitrary
-poll threads, but one run cannot concurrently enter two executor sessions.
-Different shards can already progress in parallel when called concurrently.
-The aggregate route peak is tracked exactly. Shard shutdown remains on the owner
-thread until every manager-owned allocation records allocator provenance; each
-individual shard still drains its child sessions concurrently. The current
-Worker loop remains serial, so the next slice must connect multiple Core
-Workflow polls and completions to this boundary and prove overlap live.
+`workflow_isolate.Concurrent_Manager` provides stable run-affine sharding for
+the external Workflow executor pool. The Worker deliberately keeps exactly one
+Core activation poll outstanding—required by upstream—and dispatches returned
+activations onto the configured number of Odin executor threads. Different
+shards can overlap; each shard serializes access to its process sessions. Run:
+
+```bash
+./scripts/workflow-concurrency-integration-test.sh
+```
+
+The proof uses `temporal server start-dev`, four language executor threads, a
+positive Workflow cache, and slow child executors. It requires two independent
+runs to overlap, concurrent completion through Core, clean shutdown, and zero
+remaining routes. Cacheless concurrency is rejected because Core's immediate
+uncached eviction sequence makes this activation stream effectively serial.
 
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.

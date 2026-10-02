@@ -304,6 +304,7 @@ options := worker.options_default("orders")
 options.identity_override = "orders-worker-1"
 options.max_concurrent_activities = 32
 options.max_cached_workflows = 1_000
+options.max_concurrent_workflow_tasks = 4 // external/process-isolated only
 options.max_workflow_task_slots = 8
 options.sticky_queue_schedule_to_start_timeout = 10 * time.Second
 options.max_worker_activities_per_second = 50
@@ -325,9 +326,12 @@ Zero rate limits mean unset. Default poller behavior leaves both C pointers
 null so SDK Core can use its default and accept server-directed poller
 autoscaling. Durations are rounded upward to whole milliseconds at the C ABI;
 zero Workflow Task slots safely derives one without caching or two with caching.
-Larger explicit values raise Core admission capacity but do not yet make the
-single-threaded Odin Workflow executor parallel; they are intended for the
-run-affine dispatcher and isolated executor pool now being built.
+Larger explicit values raise Core admission capacity. The in-process fiber
+runtime remains single-threaded, but an external/process-isolated processor can
+set `max_concurrent_workflow_tasks` and use a bounded Odin executor pool. Core
+is still polled by exactly one thread, as upstream requires; activation
+callbacks and completion calls run concurrently. This mode requires a positive
+Workflow cache and at least as many task slots as executor threads.
 invalid rates, poller ranges, cache/poller combinations, resource targets/slot
 ranges, and negative durations are rejected before `worker_new`. A
 resource-based Activity tuner supersedes `max_concurrent_activities` and uses
@@ -560,8 +564,13 @@ One live Worker completes both string and typed-JSON Workflow types through the
 same executor binary. Procedure pointers never cross the process boundary. It
 now verifies a canonical type manifest in a pre-poll child and again in every
 executor generation. Shutdown acknowledgement and process exit have an optional
-deadline, full capacity rejects without blocking the serial Core poll thread,
+deadline, full capacity rejects without blocking a run-affine manager shard,
 and an optional cooldown circuit breaker bounds consecutive executor failures.
+`./scripts/workflow-concurrency-integration-test.sh` adds a live concurrency
+proof: four language executor threads process slow independent Workflow runs on
+distinct shards, the measured activation peak must reach at least two, and all
+results and routes must drain cleanly. It also guards the upstream contract
+that Workflow polling itself is never concurrent.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's
@@ -2428,6 +2437,7 @@ examples/config_connect/  Core TOML profile -> public Client proof
 examples/worker_replace_client/ live Core Worker connection failover proof
 examples/client_start/    Odin Client start-and-result proof
 examples/client_control/  Odin Client signal/cancel/terminate proof
+examples/workflow_concurrency/ single-Core-poller/external-executor overlap proof
 examples/update_with_start/ atomic create-or-attach Update proof
 examples/eager_workflow/  same-connection eager Workflow start proof
 examples/eager_activity/  same-worker eager Activity dispatch proof

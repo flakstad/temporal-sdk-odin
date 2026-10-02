@@ -616,7 +616,14 @@ occasionally an upstream change.
 
 `temporal_core_worker_new` takes a connection and a C `WorkerOptions` struct.
 Separate poll calls exist for workflow activations, activity tasks, and Nexus
-tasks. The language layer controls poll concurrency and dispatch.
+tasks. The pinned Core
+[`Worker` contract](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/sdk-core/src/worker/mod.rs#L1460-L1498)
+explicitly says not to call a given poll method concurrently: Core owns
+concurrent server long polls internally. The language layer therefore uses one
+poll loop per task kind and controls dispatch after a task has crossed that
+boundary. Workflow activation completions are the opposite: Core explicitly
+documents that they may, and should, be submitted concurrently because a
+completion can itself wait for more history.
 
 An [`ActivityTask`](https://github.com/temporalio/sdk-rust/blob/e163abd6dc19040064986a63c8b8cf4756ffd320/crates/protos/protos/local/temporal/sdk/core/activity_task/activity_task.proto)
 contains a task token and a `oneof`: start or cancel. A start includes activity
@@ -3139,7 +3146,9 @@ the remote/Local maxima to size their shared callback pool. The Nexus tuner
 supersedes `max_concurrent_nexus_tasks` and sizes its separate callback pool
 from the configured maximum. This safely permits Core to vary granted slots
 between the minimum and maximum without outgrowing the Odin executor. Workflow
-activation execution remains serial, so its supplier remains fixed.
+slots remain fixed-size. In-process fiber activation stays serial; an external
+processor may configure a bounded executor pool and maps zero/default slots to
+that concurrency.
 
 Activity suppliers additionally support the bridge's custom callback arm. Odin
 maps `TemporalCoreSlotReserveCtx` and tagged `TemporalCoreSlotInfo` into
@@ -3331,10 +3340,12 @@ coroutines that use thread-local state. The in-process Worker now drives all
 Workflow runtimes from one deterministic poll/executor thread, rejects
 concurrent access and thread migration, and performs cached-fiber destruction
 there before the thread exits. This establishes the safety invariant; it does
-not yet provide a complete scalable multi-executor scheduler. The process
-isolation path now has stable, property-tested run partitioning through
-independently locked `Concurrent_Manager` shards; Worker polling is not yet
-parallel, so that partitioner is not exercised by Core concurrently. The chosen
+not yet provide a complete scalable in-process scheduler. The process-isolation
+path now has stable, property-tested run partitioning through independently
+locked `Concurrent_Manager` shards and a bounded language executor pool. Core
+polling intentionally remains single-threaded per its contract, while
+independent activations and their Core completions overlap on those executor
+threads. The chosen
 fixed, virtual-memory-backed guard-page stack must
 still be exercised by sanitizers and all four target builds, and stack sizing
 remains an operator concern because it does not grow. Panics crossing the C
@@ -4146,8 +4157,11 @@ The language boundary can now be replaced for online Workflow activations
 without moving any Temporal protocol responsibility out of Core. `worker.run`
 normally calls its in-process fiber dispatcher. When the experimental
 `Run_Options.workflow_activation_processor` callback is configured, the same
-borrowed `WorkflowActivation` bytes are handed to that callback serially and
-its owned `WorkflowActivationCompletion` bytes are passed unchanged to Core.
+borrowed `WorkflowActivation` bytes are handed to that callback and its owned
+`WorkflowActivationCompletion` bytes are passed unchanged to Core. One
+executor preserves the original serial behavior. With
+`Options.max_concurrent_workflow_tasks > 1`, one Core poll loop feeds a bounded
+Odin executor pool and callbacks plus their completion calls may overlap.
 Offline replay intentionally continues to use the ordinary in-process registry.
 
 No new C ABI is required. This path depends on the already-pinned bridge calls:
@@ -4159,6 +4173,19 @@ No new C ABI is required. This path depends on the already-pinned bridge calls:
   sequence retain ownership of Worker teardown; and
 - the existing generic WorkflowService RPC bridge starts the execution and
   waits for its result through the public Odin Client.
+
+The executor topology is deliberately asymmetric. The pinned Rust API states
+that `poll_workflow_activation` must not be called concurrently because Core
+already owns concurrent server long polls. It separately says
+`complete_workflow_activation` may—and should—be called concurrently. Odin
+therefore keeps one Core poller, hands owned activation copies to a bounded
+external executor pool, and lets each executor submit its completion directly.
+A positive Workflow cache and at least as many Core Workflow task slots as
+executor threads are required. The CLI-dev-server proof showed that cache size
+zero forces an immediate eviction sequence and effectively serial activation
+delivery, so the SDK rejects that misleading configuration. The
+`examples/workflow_concurrency` proof holds independent child executors for two
+seconds and requires a measured overlap of at least two activations.
 
 The child protocol carries the Core protobufs opaquely. The parent decodes only
 the routing fields (`run_id`, initialization, eviction, replay flag, history
@@ -4257,8 +4284,8 @@ rejects activation or host verification once draining begins. This keeps total
 shutdown latency bounded by the two protocol phases rather than by the number
 of cached workflows; explicit shutdown reports partial failure, while close
 retains cleanup-safe best-effort semantics. Capacity exhaustion fails
-immediately because waiting on the serial activation thread would prevent
-eviction from releasing a slot. A configurable consecutive-failure breaker
+immediately because waiting while holding a run's manager shard would prevent
+its eviction from releasing a slot. A configurable consecutive-failure breaker
 prevents unbounded respawn and admits a trial after cooldown. Complete
 observation metadata is now preserved through the process manager and fed to
 ordinary Worker statistics/observers;
