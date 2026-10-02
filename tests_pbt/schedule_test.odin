@@ -6,6 +6,7 @@ import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
+import schedule "../temporal/client/schedule"
 import codec "../temporal/codec"
 import proto "../temporal/core/proto"
 
@@ -28,18 +29,18 @@ schedule_create_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	trigger := pbt.draw(t, pbt.boolean())
 	pbt.cover(t, phase_seconds == 0, 30, "zero phase")
-	pbt.cover(t, overlap_number == i32(temporal_client.Schedule_Overlap_Policy.Allow_All), 10, "allow all")
+	pbt.cover(t, overlap_number == i32(schedule.Schedule_Overlap_Policy.Allow_All), 10, "allow all")
 	pbt.cover(t, paused, 30, "initially paused")
 	pbt.cover(t, limited && remaining == 0, 15, "exhausted limited schedule")
 	pbt.cover(t, trigger, 30, "initial trigger")
 
 	input := codec.payload_create(transmute([]u8)string(`"property-input"`))
 	defer codec.payload_free(&input)
-	intervals := [?]temporal_client.Schedule_Interval{{
+	intervals := [?]schedule.Schedule_Interval{{
 		every = time.Duration(interval_seconds) * time.Second,
 		phase = time.Duration(phase_seconds) * time.Second,
 	}}
-	encoded, encode_error := temporal_client.encode_create_schedule_request(
+	encoded, encode_error := schedule.encode_create_schedule_request(
 		"property-namespace",
 		"property-schedule",
 		"property_workflow",
@@ -47,7 +48,7 @@ schedule_create_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 		{
 			spec = {intervals = intervals[:]},
 			action = {workflow_id = "property-workflow", task_queue = "property-queue"},
-			overlap_policy = temporal_client.Schedule_Overlap_Policy(overlap_number),
+			overlap_policy = schedule.Schedule_Overlap_Policy(overlap_number),
 			paused = paused,
 			limited_actions = limited,
 			remaining_actions = remaining,
@@ -109,13 +110,13 @@ schedule_update_calendar_property :: proc(t: ^pbt.T) -> pbt.Result {
 	step := i32(pbt.draw(t, pbt.int_range(0, 12)))
 	pbt.cover(t, step == 0, 5, "default calendar step")
 	pbt.cover(t, hour_start == hour_end, 5, "single-hour range")
-	hours := [?]temporal_client.Schedule_Range{{start = hour_start, end = hour_end, step = step}}
-	minutes := [?]temporal_client.Schedule_Range{{start = minute_start, end = minute_end}}
-	calendars := [?]temporal_client.Schedule_Calendar{{hour = hours[:], minute = minutes[:]}}
+	hours := [?]schedule.Schedule_Range{{start = hour_start, end = hour_end, step = step}}
+	minutes := [?]schedule.Schedule_Range{{start = minute_start, end = minute_end}}
+	calendars := [?]schedule.Schedule_Calendar{{hour = hours[:], minute = minutes[:]}}
 	input := codec.payload_create(transmute([]u8)string(`"property-calendar"`))
 	defer codec.payload_free(&input)
 	conflict_token := transmute([]u8)string("property-conflict")
-	encoded, encode_error := temporal_client.encode_update_schedule_request(
+	encoded, encode_error := schedule.encode_update_schedule_request(
 		"property-namespace",
 		"property-calendar-schedule",
 		"property_workflow",

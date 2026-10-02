@@ -2951,8 +2951,11 @@ metadata, external details, headers, and deterministic request bytes.
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
 cancellation, termination, deletion, Workflow result waiting, Visibility list/count,
-standalone Nexus start/poll/describe/mutation/list/count, and Schedule
-Describe/List/Count/Matching-Times, plus System Info discovery. Each operation has a dedicated
+standalone Nexus start/poll/describe/mutation/list/count, and System Info
+discovery. The optional `temporal/client/schedule` package installs its own
+ordered interceptor chain with `schedule.add_interceptor`; the owned chain state
+uses the base Client extension lifecycle without making the base package import
+Schedules. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time
@@ -2996,8 +2999,9 @@ application-level synchronization.
 The unit and 1,000-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
 Visibility queries, the complete standalone Nexus surface, and the complete
-Schedule surface. The generative chain now varies twenty-four operation
-families. `workflow-delete-integration-test.sh` first proves that an empty Run
+Schedule surface across the base and optional chains. The generative chain now
+varies twenty-four operation families. `workflow-delete-integration-test.sh`
+first proves that an empty Run
 ID is rejected locally, then deletes a unique running execution by exact Run ID
 through Core and requires a later Describe to return gRPC `NOT_FOUND`. The
 `workflow-properties` live scenario

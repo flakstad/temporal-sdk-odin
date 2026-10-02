@@ -1,4 +1,4 @@
-package client
+package schedule
 
 import allocator_runtime "base:runtime"
 import "core:bytes"
@@ -7,9 +7,39 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
-import codec "../codec"
-import temporal_core "../core"
-import proto "../core/proto"
+import client ".."
+import codec "../../codec"
+import temporal_core "../../core"
+import proto "../../core/proto"
+
+Client :: client.Client
+Error :: client.Error
+Named_Payload :: client.Named_Payload
+Optional_Duration :: client.Optional_Duration
+Optional_Time :: client.Optional_Time
+Priority :: client.Priority
+Retry_Policy :: client.Retry_Policy
+Start_Metadata :: client.Start_Metadata
+Start_Workflow_Options :: client.Start_Workflow_Options
+Workflow_Priority :: client.Workflow_Priority
+Workflow_Status :: client.Workflow_Status
+
+DEFAULT_CLIENT_IDENTITY :: client.DEFAULT_CLIENT_IDENTITY
+
+client_request_identity :: client.client_request_identity
+description_clone_payload :: client.description_clone_payload
+description_clone_named_payload :: client.description_clone_named_payload
+description_clone_string :: client.description_clone_string
+description_duration :: client.description_duration
+description_priority :: client.description_priority
+description_time :: client.description_time
+duration_proto :: client.duration_proto
+error_from_core :: client.error_from_core
+error_from_string :: client.error_from_string
+free_start_proto_payloads :: client.free_start_proto_payloads
+request_identity :: client.request_identity
+resolve_request_id :: client.resolve_request_id
+start_workflow_options_error :: client.start_workflow_options_error
 
 Schedule_Overlap_Policy :: enum i32 {
 	Unspecified = 0,
@@ -730,7 +760,7 @@ create_schedule_payload_terminal :: proc(interceptor_input: ^Client_Create_Sched
 
 create_schedule_payload :: proc(client: ^Client, schedule_id, workflow_type: string, input: codec.Payload_View, options: Schedule_Create_Options) -> (Schedule_Handle, Error) {
 	interceptor_input := Client_Create_Schedule_Input{client = client, schedule_id = schedule_id, workflow_type = workflow_type, input = input, options = options}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_create_schedule_chain(&state, &interceptor_input)
 }
 
@@ -861,7 +891,7 @@ update_schedule_payload_unintercepted :: proc(
 update_schedule_payload :: proc(handle: ^Schedule_Handle, workflow_type: string, input: codec.Payload_View, options: Schedule_Create_Options, conflict_token: []u8 = nil) -> Error {
 	interceptor_input := Client_Schedule_Mutation_Input{handle = handle, kind = .Update, workflow_type = workflow_type, input = input, options = options, conflict_token = conflict_token}
 	client: ^Client; if handle != nil do client = handle.client
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_schedule_mutation_chain(&state, &interceptor_input)
 }
 
@@ -1294,7 +1324,7 @@ describe_schedule :: proc(handle: ^Schedule_Handle, allocator := context.allocat
 	input := Client_Describe_Schedule_Input{handle = handle, allocator = allocator}
 	client: ^Client
 	if handle != nil do client = handle.client
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_describe_schedule_chain(&state, &input)
 }
 
@@ -1443,7 +1473,7 @@ list_schedules_terminal :: proc(input: ^Client_List_Schedules_Input) -> (Schedul
 
 list_schedules :: proc(client: ^Client, options := List_Schedules_Options{}) -> (Schedule_List_Page, Error) {
 	input := Client_List_Schedules_Input{client = client, options = options}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_list_schedules_chain(&state, &input)
 }
 
@@ -1531,7 +1561,7 @@ count_schedules_terminal :: proc(input: ^Client_Count_Schedules_Input) -> (Sched
 
 count_schedules :: proc(client: ^Client, query := "") -> (Schedule_Count, Error) {
 	input := Client_Count_Schedules_Input{client = client, query = query}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_count_schedules_chain(&state, &input)
 }
 
@@ -1611,7 +1641,7 @@ backfill_schedule_unintercepted :: proc(handle: ^Schedule_Handle, backfills: []S
 backfill_schedule :: proc(handle: ^Schedule_Handle, backfills: []Schedule_Backfill) -> Error {
 	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Backfill, backfills = backfills}
 	client: ^Client; if handle != nil do client = handle.client
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_schedule_mutation_chain(&state, &input)
 }
 
@@ -1688,7 +1718,7 @@ list_schedule_matching_times :: proc(handle: ^Schedule_Handle, start_time, end_t
 	input := Client_List_Schedule_Matching_Times_Input{handle = handle, start_time = start_time, end_time = end_time, allocator = allocator}
 	client: ^Client
 	if handle != nil do client = handle.client
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_list_schedule_matching_times_chain(&state, &input)
 }
 
@@ -1748,13 +1778,15 @@ schedule_patch_unintercepted :: proc(
 pause_schedule :: proc(handle: ^Schedule_Handle, note := "Paused by temporal-sdk-odin") -> Error {
 	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Pause, note = note}
 	client: ^Client; if handle != nil do client = handle.client
-	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+	state := client_interceptor_state(client)
+	return client_schedule_mutation_chain(&state, &input)
 }
 
 unpause_schedule :: proc(handle: ^Schedule_Handle, note := "Unpaused by temporal-sdk-odin") -> Error {
 	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Unpause, note = note}
 	client: ^Client; if handle != nil do client = handle.client
-	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+	state := client_interceptor_state(client)
+	return client_schedule_mutation_chain(&state, &input)
 }
 
 trigger_schedule :: proc(
@@ -1763,7 +1795,8 @@ trigger_schedule :: proc(
 ) -> Error {
 	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Trigger, overlap_policy = overlap_policy}
 	client: ^Client; if handle != nil do client = handle.client
-	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+	state := client_interceptor_state(client)
+	return client_schedule_mutation_chain(&state, &input)
 }
 
 encode_delete_schedule_request :: proc(
@@ -1810,7 +1843,21 @@ delete_schedule_unintercepted :: proc(handle: ^Schedule_Handle) -> Error {
 delete_schedule :: proc(handle: ^Schedule_Handle) -> Error {
 	input := Client_Schedule_Mutation_Input{handle = handle, kind = .Delete}
 	client: ^Client; if handle != nil do client = handle.client
-	return client_schedule_mutation_chain(&Client_Interceptor_State{client = client}, &input)
+	state := client_interceptor_state(client)
+	return client_schedule_mutation_chain(&state, &input)
+}
+
+probe_count_support :: proc(
+	temporal_client: ^Client,
+) -> (client.Server_Feature_Observation, Error) {
+	count, probe_error := count_schedules(temporal_client)
+	schedule_count_free(&count)
+	observation := client.server_feature_from_rpc_error(.Schedule_Count, &probe_error)
+	if observation.support == .Unsupported {
+		client.error_free(&probe_error)
+		return observation, {}
+	}
+	return observation, probe_error
 }
 
 schedule_mutation_terminal :: proc(input: ^Client_Schedule_Mutation_Input) -> Error {

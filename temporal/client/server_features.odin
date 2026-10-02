@@ -144,9 +144,9 @@ server_feature_from_rpc_error :: proc(
 // because authentication, namespace, and transport failures do not establish
 // whether the feature is supported.
 //
-// Workflow Pause and standalone Activity support would require mutations to
-// prove on Services without an authoritative capability bit. Both therefore
-// return Unknown with no evidence and no network call.
+// Optional packages own probes which require their RPC implementations. The
+// base package therefore reports those features as Unknown without importing
+// an extension solely to probe it.
 probe_server_feature :: proc(
 	client: ^Client,
 	feature: Server_Feature,
@@ -163,15 +163,6 @@ probe_server_feature :: proc(
 		}
 		defer system_info_free(&info)
 		return server_feature_from_system_info(feature, info.capabilities), {}
-	case .Schedule_Count:
-		count, probe_error := count_schedules(client)
-		schedule_count_free(&count)
-		observation := server_feature_from_rpc_error(feature, &probe_error)
-		if observation.support == .Unsupported {
-			error_free(&probe_error)
-			return observation, {}
-		}
-		return observation, probe_error
 	case .Standalone_Nexus:
 		count, probe_error := count_nexus_operations(client)
 		nexus_operation_count_free(&count)
@@ -181,7 +172,7 @@ probe_server_feature :: proc(
 			return observation, {}
 		}
 		return observation, probe_error
-	case .Workflow_Pause, .Standalone_Activity:
+	case .Schedule_Count, .Workflow_Pause, .Standalone_Activity:
 		return base, {}
 	}
 	return base, {}

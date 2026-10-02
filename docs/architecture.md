@@ -365,8 +365,11 @@ symbols:
   as strings, integers, dates, or other Search Attribute types belongs above
   this transport-level API.
 
-Schedules use the same generic client bridge and add no C ABI. The implemented
-surface encodes `CreateSchedule`, `DescribeSchedule`, `ListSchedules`,
+Schedules live in the optional `temporal/client/schedule` package. They use the
+same generic client bridge and add no C ABI or reverse dependency from the base
+Client package. Schedule interceptor state is attached to the Client through an
+owned opaque extension slot and is destroyed exactly once by `client.close`.
+The implemented surface encodes `CreateSchedule`, `DescribeSchedule`, `ListSchedules`,
 `CountSchedules`, `UpdateSchedule`, `ListScheduleMatchingTimes`,
 `PatchSchedule`, and `DeleteSchedule`. Create and full replacement accept cron
 strings, interval specs, structured/excluded calendars, timezone names and TZif
@@ -397,9 +400,12 @@ transport acceptance, not proof of application; callers needing that guarantee
 must Describe and verify. The live test sends a deliberately different stale
 definition after an intervening patch and proves it was not applied.
 
-`CountSchedules` is present in the pinned
-Core descriptors, but CLI Server 1.29.1 reports gRPC `UNIMPLEMENTED`; its wire
-and owned-response tests pass, while live acceptance requires a newer server.
+`CountSchedules` is present in the pinned Core descriptors, but CLI Server
+1.29.1 reports gRPC `UNIMPLEMENTED`; its wire and owned-response tests pass,
+while live acceptance requires a newer server. Because the RPC implementation
+belongs to the optional package, the non-mutating capability check is
+`schedule.probe_count_support`. The generic base Client probe intentionally
+returns `Unknown` for this feature without importing the extension.
 
 The ownership rule is the same for all of these calls: Core's callback response buffer
 is copied by `temporal/core`, generated decoding borrows a short-lived virtual

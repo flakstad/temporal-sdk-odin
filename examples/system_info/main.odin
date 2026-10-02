@@ -3,6 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 import temporal_client "../../temporal/client"
+import schedule "../../temporal/client/schedule"
 
 System_Info_Interceptor_State :: struct {
 	entered: int,
@@ -77,7 +78,13 @@ main :: proc() {
 		.Standalone_Activity,
 	}
 	for feature in features {
-		observation, probe_error := temporal_client.probe_server_feature(&client, feature)
+		observation: temporal_client.Server_Feature_Observation
+		probe_error: temporal_client.Error
+		if feature == .Schedule_Count {
+			observation, probe_error = schedule.probe_count_support(&client)
+		} else {
+			observation, probe_error = temporal_client.probe_server_feature(&client, feature)
+		}
 		if probe_error.message != nil {
 			fmt.eprintf(
 				"Feature probe %s failed (status=%d): %s\n",

@@ -16,6 +16,11 @@ odin check "$repo_root/temporal/client/workflow_control" \
 	-vet \
 	-strict-style \
 	-warnings-as-errors
+odin check "$repo_root/temporal/client/schedule" \
+	-no-entry-point \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
 
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \

@@ -1243,6 +1243,9 @@ TEMPORAL_SCHEDULE_ID=odin-schedule-manual \
 The public Client API remains explicit:
 
 ```odin
+import temporal_client "path/to/temporal/client"
+import schedule "path/to/temporal/client/schedule"
+
 client, err := temporal_client.connect()
 defer temporal_client.close(&client)
 
@@ -1362,8 +1365,8 @@ counts, err := temporal_client.count_workflows(
 )
 defer temporal_client.workflow_count_free(&counts)
 
-intervals := [?]temporal_client.Schedule_Interval{{every = 24 * time.Hour}}
-schedule, err := temporal_client.create_schedule_json(
+intervals := [?]schedule.Schedule_Interval{{every = 24 * time.Hour}}
+schedule_handle, err := schedule.create_schedule_json(
     &client,
     "daily-order-reconciliation",
     "reconcile_orders",
@@ -1377,26 +1380,26 @@ schedule, err := temporal_client.create_schedule_json(
         overlap_policy = .Skip,
     },
 )
-defer temporal_client.schedule_handle_free(&schedule)
+defer schedule.schedule_handle_free(&schedule_handle)
 
-description, err = temporal_client.describe_schedule(&schedule)
-defer temporal_client.schedule_description_free(&description)
-err = temporal_client.update_schedule_json(
-    &schedule,
+description, err = schedule.describe_schedule(&schedule_handle)
+defer schedule.schedule_description_free(&description)
+err = schedule.update_schedule_json(
+    &schedule_handle,
     "reconcile_orders",
     Reconcile_Input{region = "no"},
     replacement_options,
     description.conflict_token, // guarded; empty means unconditional
 )
-matching, err := temporal_client.list_schedule_matching_times(
-    &schedule,
+matching, err := schedule.list_schedule_matching_times(
+    &schedule_handle,
     time.now(),
     time.time_add(time.now(), 7 * 24 * time.Hour),
 )
-defer temporal_client.schedule_matching_times_free(&matching)
-err = temporal_client.pause_schedule(&schedule)
-err = temporal_client.trigger_schedule(&schedule)
-err = temporal_client.delete_schedule(&schedule)
+defer schedule.schedule_matching_times_free(&matching)
+err = schedule.pause_schedule(&schedule_handle)
+err = schedule.trigger_schedule(&schedule_handle)
+err = schedule.delete_schedule(&schedule_handle)
 ```
 
 Temporal Cloud API-key authentication uses the same Core connection:
@@ -2571,6 +2574,7 @@ temporal/workflow/        stackful Workflow runtime and activation routing
 temporal/workflow/isolate optional versioned subprocess framing and execution
 temporal/client/          stable-core Client and Workflow handle APIs
 temporal/client/workflow_control optional Pause/Unpause operations and interceptors
+temporal/client/schedule  optional Schedule lifecycle and typed interceptors
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof

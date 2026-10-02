@@ -4,6 +4,7 @@ import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
+import schedule "../temporal/client/schedule"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 import codec "../temporal/codec"
@@ -232,59 +233,59 @@ client_interceptor_property_count_workflows :: proc(
 	return
 }
 
-client_interceptor_property_describe_schedule :: proc(user_data: rawptr, input: ^temporal_client.Client_Describe_Schedule_Input, next: temporal_client.Client_Describe_Schedule_Next) -> (result: temporal_client.Schedule_Description, error: temporal_client.Error) {
+client_interceptor_property_describe_schedule :: proc(user_data: rawptr, input: ^schedule.Client_Describe_Schedule_Input, next: schedule.Client_Describe_Schedule_Next) -> (result: schedule.Schedule_Description, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_describe_schedule_next(next, input)
+	else do result, error = schedule.client_describe_schedule_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_list_schedules :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedules_Input, next: temporal_client.Client_List_Schedules_Next) -> (result: temporal_client.Schedule_List_Page, error: temporal_client.Error) {
+client_interceptor_property_list_schedules :: proc(user_data: rawptr, input: ^schedule.Client_List_Schedules_Input, next: schedule.Client_List_Schedules_Next) -> (result: schedule.Schedule_List_Page, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	input.options.maximum_page_size = i32(node.id)
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_list_schedules_next(next, input)
+	else do result, error = schedule.client_list_schedules_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_count_schedules :: proc(user_data: rawptr, input: ^temporal_client.Client_Count_Schedules_Input, next: temporal_client.Client_Count_Schedules_Next) -> (result: temporal_client.Schedule_Count, error: temporal_client.Error) {
+client_interceptor_property_count_schedules :: proc(user_data: rawptr, input: ^schedule.Client_Count_Schedules_Input, next: schedule.Client_Count_Schedules_Next) -> (result: schedule.Schedule_Count, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	input.query = "generated Schedule count query"
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_count_schedules_next(next, input)
+	else do result, error = schedule.client_count_schedules_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_matching_times :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Schedule_Matching_Times_Input, next: temporal_client.Client_List_Schedule_Matching_Times_Next) -> (result: temporal_client.Schedule_Matching_Times, error: temporal_client.Error) {
+client_interceptor_property_matching_times :: proc(user_data: rawptr, input: ^schedule.Client_List_Schedule_Matching_Times_Input, next: schedule.Client_List_Schedule_Matching_Times_Next) -> (result: schedule.Schedule_Matching_Times, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_list_schedule_matching_times_next(next, input)
+	else do result, error = schedule.client_list_schedule_matching_times_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_create_schedule :: proc(user_data: rawptr, input: ^temporal_client.Client_Create_Schedule_Input, next: temporal_client.Client_Create_Schedule_Next) -> (result: temporal_client.Schedule_Handle, error: temporal_client.Error) {
+client_interceptor_property_create_schedule :: proc(user_data: rawptr, input: ^schedule.Client_Create_Schedule_Input, next: schedule.Client_Create_Schedule_Next) -> (result: schedule.Schedule_Handle, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_create_schedule_next(next, input)
+	else do result, error = schedule.client_create_schedule_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_schedule_mutation :: proc(user_data: rawptr, input: ^temporal_client.Client_Schedule_Mutation_Input, next: temporal_client.Client_Schedule_Mutation_Next) -> temporal_client.Error {
+client_interceptor_property_schedule_mutation :: proc(user_data: rawptr, input: ^schedule.Client_Schedule_Mutation_Input, next: schedule.Client_Schedule_Mutation_Next) -> temporal_client.Error {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	result: temporal_client.Error
 	if node.short_circuit do result = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result = temporal_client.client_schedule_mutation_next(next, input)
+	else do result = schedule.client_schedule_mutation_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return result
 }
@@ -424,6 +425,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		interceptors = make([dynamic]temporal_client.Client_Interceptor),
 	}
 	defer delete(client.interceptors)
+	defer temporal_client.client_extensions_close(&client)
 	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
 	client.connection = &connection
 	for index in 0..<depth {
@@ -433,6 +435,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			short_circuit = index == short_index,
 		}
 		interceptor := temporal_client.Client_Interceptor{user_data = &nodes[index]}
+		schedule_interceptor := schedule.Interceptor{user_data = &nodes[index]}
+		is_schedule_operation := operation >= 7 && operation <= 12
 		switch operation {
 		case 0:
 			interceptor.signal_workflow = client_interceptor_property_signal
@@ -449,17 +453,17 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		case 6:
 			interceptor.count_workflows = client_interceptor_property_count_workflows
 		case 7:
-			interceptor.describe_schedule = client_interceptor_property_describe_schedule
+			schedule_interceptor.describe_schedule = client_interceptor_property_describe_schedule
 		case 8:
-			interceptor.list_schedules = client_interceptor_property_list_schedules
+			schedule_interceptor.list_schedules = client_interceptor_property_list_schedules
 		case 9:
-			interceptor.count_schedules = client_interceptor_property_count_schedules
+			schedule_interceptor.count_schedules = client_interceptor_property_count_schedules
 		case 10:
-			interceptor.list_schedule_matching_times = client_interceptor_property_matching_times
+			schedule_interceptor.list_schedule_matching_times = client_interceptor_property_matching_times
 		case 11:
-			interceptor.create_schedule = client_interceptor_property_create_schedule
+			schedule_interceptor.create_schedule = client_interceptor_property_create_schedule
 		case 12:
-			interceptor.schedule_mutation = client_interceptor_property_schedule_mutation
+			schedule_interceptor.schedule_mutation = client_interceptor_property_schedule_mutation
 		case 13:
 			interceptor.connection_mutation = client_interceptor_property_connection_mutation
 		case 14:
@@ -483,7 +487,15 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		case 23:
 			interceptor.delete_workflow = client_interceptor_property_delete
 		}
-		append(&client.interceptors, interceptor)
+		if is_schedule_operation {
+			add_error := schedule.add_interceptor(&client, schedule_interceptor)
+			if add_error.message != nil {
+				temporal_client.error_free(&add_error)
+				return pbt.error("could not register generated Schedule interceptor")
+			}
+		} else {
+			append(&client.interceptors, interceptor)
+		}
 	}
 
 	headers := temporal_client.Headers{}
@@ -501,7 +513,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	temporal_client.error_free(&caller_error)
 	handle := temporal_client.Workflow_Handle{client = &client, id = "property-workflow"}
-	schedule_handle := temporal_client.Schedule_Handle{client = &client, id = "property-schedule"}
+	schedule_handle := schedule.Schedule_Handle{client = &client, id = "property-schedule"}
 	update_handle := temporal_client.Update_Handle{
 		client = &client,
 		workflow_id = "property-workflow",
@@ -552,38 +564,38 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		count, operation_error = temporal_client.count_workflows(&client, "caller count query")
 		temporal_client.workflow_count_free(&count)
 	case 7:
-		description: temporal_client.Schedule_Description
-		description, operation_error = temporal_client.describe_schedule(&schedule_handle)
-		temporal_client.schedule_description_free(&description)
+		description: schedule.Schedule_Description
+		description, operation_error = schedule.describe_schedule(&schedule_handle)
+		schedule.schedule_description_free(&description)
 	case 8:
-		page: temporal_client.Schedule_List_Page
-		page, operation_error = temporal_client.list_schedules(&client, {maximum_page_size = 100})
-		temporal_client.schedule_list_page_free(&page)
+		page: schedule.Schedule_List_Page
+		page, operation_error = schedule.list_schedules(&client, {maximum_page_size = 100})
+		schedule.schedule_list_page_free(&page)
 	case 9:
-		count: temporal_client.Schedule_Count
-		count, operation_error = temporal_client.count_schedules(&client, "caller Schedule query")
-		temporal_client.schedule_count_free(&count)
+		count: schedule.Schedule_Count
+		count, operation_error = schedule.count_schedules(&client, "caller Schedule query")
+		schedule.schedule_count_free(&count)
 	case 10:
-		matching: temporal_client.Schedule_Matching_Times
+		matching: schedule.Schedule_Matching_Times
 		start := time.now()
-		matching, operation_error = temporal_client.list_schedule_matching_times(
+		matching, operation_error = schedule.list_schedule_matching_times(
 			&schedule_handle,
 			start,
 			time.time_add(start, time.Hour),
 		)
-		temporal_client.schedule_matching_times_free(&matching)
+		schedule.schedule_matching_times_free(&matching)
 	case 11:
-		created: temporal_client.Schedule_Handle
-		created, operation_error = temporal_client.create_schedule_payload(
+		created: schedule.Schedule_Handle
+		created, operation_error = schedule.create_schedule_payload(
 			&client,
 			"property-schedule",
 			"property-workflow",
 			{},
 			{},
 		)
-		temporal_client.schedule_handle_free(&created)
+		schedule.schedule_handle_free(&created)
 	case 12:
-		operation_error = temporal_client.pause_schedule(&schedule_handle, "property pause")
+		operation_error = schedule.pause_schedule(&schedule_handle, "property pause")
 	case 13:
 		operation_error = temporal_client.update_api_key(&client, "caller API key")
 	case 14:

@@ -14,6 +14,7 @@ import "core:time"
 import activity "../temporal/activity"
 import activity_isolate "../temporal/activity/isolate"
 import temporal_client "../temporal/client"
+import schedule "../temporal/client/schedule"
 import workflow_control "../temporal/client/workflow_control"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
@@ -15901,9 +15902,9 @@ client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) 
 	input, input_error := codec.encode_json("Scheduled Odin")
 	testing.expect(t, input_error == .None)
 	defer codec.payload_free(&input)
-	intervals := [?]temporal_client.Schedule_Interval{{every = time.Hour, phase = 5 * time.Minute}}
+	intervals := [?]schedule.Schedule_Interval{{every = time.Hour, phase = 5 * time.Minute}}
 	priority := temporal_client.Priority{priority_key = 3, fairness_key = "schedule-tenant", fairness_weight = 2}
-	request_bytes, request_error := temporal_client.encode_create_schedule_request(
+	request_bytes, request_error := schedule.encode_create_schedule_request(
 		"default",
 		"daily-orders",
 		"order_workflow",
@@ -15983,18 +15984,18 @@ client_schedule_create_request_encodes_action_and_policy :: proc(t: ^testing.T) 
 client_schedule_create_encodes_structured_and_excluded_calendars :: proc(t: ^testing.T) {
 	input := codec.payload_create(transmute([]u8)string(`"calendar"`))
 	defer codec.payload_free(&input)
-	hours := [?]temporal_client.Schedule_Range{{start = 9}}
-	excluded_days := [?]temporal_client.Schedule_Range{{start = 0}, {start = 6}}
-	calendars := [?]temporal_client.Schedule_Calendar{{
+	hours := [?]schedule.Schedule_Range{{start = 9}}
+	excluded_days := [?]schedule.Schedule_Range{{start = 0}, {start = 6}}
+	calendars := [?]schedule.Schedule_Calendar{{
 		hour = hours[:],
 		comment = "daily at nine",
 	}}
-	excluded := [?]temporal_client.Schedule_Calendar{{
+	excluded := [?]schedule.Schedule_Calendar{{
 		day_of_week = excluded_days[:],
 		comment = "weekends",
 	}}
 	timezone_data := transmute([]u8)string("TZif-test")
-	encoded, encode_error := temporal_client.encode_create_schedule_request(
+	encoded, encode_error := schedule.encode_create_schedule_request(
 		"default",
 		"calendar-schedule",
 		"calendar_workflow",
@@ -16049,9 +16050,9 @@ client_schedule_update_is_full_replace_with_conflict_token :: proc(t: ^testing.T
 	testing.expect(t, metadata_error.message == nil)
 	temporal_client.error_free(&metadata_error)
 	defer temporal_client.start_metadata_free(&empty_metadata)
-	intervals := [?]temporal_client.Schedule_Interval{{every = 12 * time.Hour}}
+	intervals := [?]schedule.Schedule_Interval{{every = 12 * time.Hour}}
 	conflict_token := transmute([]u8)string("optimistic-token")
-	encoded, encode_error := temporal_client.encode_update_schedule_request(
+	encoded, encode_error := schedule.encode_update_schedule_request(
 		"default",
 		"updated-schedule",
 		"updated_workflow",
@@ -16094,11 +16095,11 @@ client_schedule_update_is_full_replace_with_conflict_token :: proc(t: ^testing.T
 @(test)
 client_schedule_backfill_encodes_all_ranges :: proc(t: ^testing.T) {
 	start := time.unix(1_800_000_000, 0)
-	backfills := [?]temporal_client.Schedule_Backfill{
+	backfills := [?]schedule.Schedule_Backfill{
 		{start_time = start, end_time = time.time_add(start, time.Hour), overlap_policy = .Buffer_All},
 		{start_time = time.time_add(start, 2 * time.Hour), end_time = time.time_add(start, 3 * time.Hour), overlap_policy = .Allow_All},
 	}
-	encoded, encode_error := temporal_client.encode_backfill_schedule_request(
+	encoded, encode_error := schedule.encode_backfill_schedule_request(
 		"default",
 		"backfill-schedule",
 		backfills[:],
@@ -16183,7 +16184,7 @@ client_control_and_schedule_mutation_requests_use_configured_identity :: proc(t:
 	testing.expect(t, terminate_request.details != nil && len(terminate_request.details.payloads) == 1)
 
 	patch := proto.Temporal_Api_Schedule_V1_SchedulePatch{}
-	patch_encoded, patch_error := temporal_client.encode_schedule_patch_request(
+	patch_encoded, patch_error := schedule.encode_schedule_patch_request(
 		"default",
 		"patched-schedule",
 		&patch,
@@ -16202,7 +16203,7 @@ client_control_and_schedule_mutation_requests_use_configured_identity :: proc(t:
 	testing.expect_value(t, patch_request.request_id, "patch-request")
 	testing.expect_value(t, patch_request.schedule_id, "patched-schedule")
 
-	delete_encoded, delete_error := temporal_client.encode_delete_schedule_request(
+	delete_encoded, delete_error := schedule.encode_delete_schedule_request(
 		"default",
 		"deleted-schedule",
 		identity,
@@ -16226,9 +16227,9 @@ client_schedule_matching_times_are_owned :: proc(t: ^testing.T) {
 	append(&response.start_time, proto.Google_Protobuf_Timestamp{seconds = 1_800_000_000})
 	append(&response.start_time, proto.Google_Protobuf_Timestamp{seconds = 1_800_003_600})
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListScheduleMatchingTimesResponse(&response)
-	result, decode_error := temporal_client.decode_schedule_matching_times(encoded[:])
+	result, decode_error := schedule.decode_schedule_matching_times(encoded[:])
 	delete(encoded)
-	defer temporal_client.schedule_matching_times_free(&result)
+	defer schedule.schedule_matching_times_free(&result)
 	defer temporal_client.error_free(&decode_error)
 	testing.expectf(t, decode_error.message == nil, "Schedule matching-times decode failed: %s", string(decode_error.message))
 	testing.expect_value(t, len(result.times), 2)
@@ -16274,7 +16275,7 @@ client_schedule_description_is_owned :: proc(t: ^testing.T) {
 		pause_on_failure = true,
 	}
 	state := proto.Temporal_Api_Schedule_V1_ScheduleState{notes = "paused for test", paused = true}
-	schedule := proto.Temporal_Api_Schedule_V1_Schedule{
+	schedule_proto := proto.Temporal_Api_Schedule_V1_Schedule{
 		spec = &spec,
 		action = &action,
 		policies = &policies,
@@ -16297,17 +16298,17 @@ client_schedule_description_is_owned :: proc(t: ^testing.T) {
 	append(&info.recent_actions, action_result)
 	append(&info.future_action_times, action_time)
 	response := proto.Temporal_Api_Workflowservice_V1_DescribeScheduleResponse{
-		schedule = &schedule,
+		schedule = &schedule_proto,
 		info = &info,
 		conflict_token = transmute([]u8)string("schedule-conflict"),
 	}
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeScheduleResponse(&response)
-	description, description_error := temporal_client.decode_schedule_description(
+	description, description_error := schedule.decode_schedule_description(
 		"schedule-owned",
 		encoded[:],
 	)
 	delete(encoded)
-	defer temporal_client.schedule_description_free(&description)
+	defer schedule.schedule_description_free(&description)
 	defer temporal_client.error_free(&description_error)
 	testing.expectf(t, description_error.message == nil, "Schedule decode failed: %s", string(description_error.message))
 	testing.expect_value(t, description.schedule_id, "schedule-owned")
@@ -16354,9 +16355,9 @@ client_schedule_list_and_count_are_owned :: proc(t: ^testing.T) {
 		info = &info,
 	})
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_ListSchedulesResponse(&response)
-	page, page_error := temporal_client.decode_schedule_list_page(encoded[:])
+	page, page_error := schedule.decode_schedule_list_page(encoded[:])
 	delete(encoded)
-	defer temporal_client.schedule_list_page_free(&page)
+	defer schedule.schedule_list_page_free(&page)
 	defer temporal_client.error_free(&page_error)
 	testing.expectf(t, page_error.message == nil, "Schedule list decode failed: %s", string(page_error.message))
 	testing.expect_value(t, len(page.schedules), 1)
@@ -16374,9 +16375,9 @@ client_schedule_list_and_count_are_owned :: proc(t: ^testing.T) {
 	defer delete(count_response.groups)
 	append(&count_response.groups, group)
 	count_encoded := proto.encode_Temporal_Api_Workflowservice_V1_CountSchedulesResponse(&count_response)
-	count, count_error := temporal_client.decode_schedule_count(count_encoded[:])
+	count, count_error := schedule.decode_schedule_count(count_encoded[:])
 	delete(count_encoded)
-	defer temporal_client.schedule_count_free(&count)
+	defer schedule.schedule_count_free(&count)
 	defer temporal_client.error_free(&count_error)
 	testing.expectf(t, count_error.message == nil, "Schedule count decode failed: %s", string(count_error.message))
 	testing.expect_value(t, count.count, i64(7))
@@ -16389,13 +16390,13 @@ client_schedule_list_and_count_are_owned :: proc(t: ^testing.T) {
 client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
 	input := codec.payload_create(transmute([]u8)string(`"input"`))
 	defer codec.payload_free(&input)
-	invalid_intervals := [?]temporal_client.Schedule_Interval{
+	invalid_intervals := [?]schedule.Schedule_Interval{
 		{every = 0},
 		{every = time.Hour, phase = time.Hour},
 	}
 	for interval in invalid_intervals {
-		intervals := [?]temporal_client.Schedule_Interval{interval}
-		encoded, encode_error := temporal_client.encode_create_schedule_request(
+		intervals := [?]schedule.Schedule_Interval{interval}
+		encoded, encode_error := schedule.encode_create_schedule_request(
 			"default",
 			"invalid-schedule",
 			"workflow",
@@ -16409,9 +16410,9 @@ client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
 		testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
 		temporal_client.error_free(&encode_error)
 	}
-	invalid_hours := [?]temporal_client.Schedule_Range{{start = 24}}
-	invalid_calendars := [?]temporal_client.Schedule_Calendar{{hour = invalid_hours[:]}}
-	encoded, encode_error := temporal_client.encode_create_schedule_request(
+	invalid_hours := [?]schedule.Schedule_Range{{start = 24}}
+	invalid_calendars := [?]schedule.Schedule_Calendar{{hour = invalid_hours[:]}}
+	encoded, encode_error := schedule.encode_create_schedule_request(
 		"default",
 		"invalid-calendar",
 		"workflow",
@@ -16424,11 +16425,11 @@ client_schedule_validation_rejects_invalid_specs :: proc(t: ^testing.T) {
 	delete(encoded)
 	testing.expect_value(t, encode_error.kind, temporal_client.Error_Kind.Invalid_Argument)
 	temporal_client.error_free(&encode_error)
-	invalid_backfills := [?]temporal_client.Schedule_Backfill{{
+	invalid_backfills := [?]schedule.Schedule_Backfill{{
 		start_time = time.unix(200, 0),
 		end_time = time.unix(100, 0),
 	}}
-	encoded, encode_error = temporal_client.encode_backfill_schedule_request(
+	encoded, encode_error = schedule.encode_backfill_schedule_request(
 		"default",
 		"invalid-backfill",
 		invalid_backfills[:],
