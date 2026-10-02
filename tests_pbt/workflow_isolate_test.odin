@@ -5,6 +5,7 @@ import "core:testing"
 import "core:time"
 import pbt "pbt:pbt"
 import sc "statecharts:statecharts"
+import activity_isolate "../temporal/activity/isolate"
 import workflow_isolate "../temporal/workflow/isolate"
 
 workflow_shard_reference :: proc(run_id: []u8, shard_count: int) -> int {
@@ -137,6 +138,61 @@ workflow_isolation_frames_roundtrip_generated_binary_payloads :: proc(t: ^testin
 		"Workflow isolation frames roundtrip generated binary payloads",
 		workflow_isolation_frame_property,
 		{num_tests = 500, seed = 0x4953_4f4c_4154_4544},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+activity_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
+	payload := pbt.draw(t, pbt.non_empty_byte_array(8_192))
+	request_high := u64(pbt.draw(t, pbt.int_range(0, 0x7fff_ffff)))
+	request_low := u64(pbt.draw(t, pbt.int_range(0, 0x7fff_ffff)))
+	request_id := request_high << 32 | request_low
+	if request_id == 0 {
+		request_id = 1
+	}
+	if pbt.draw(t, pbt.boolean()) {
+		request_id |= u64(1) << 63
+	}
+	kinds := [?]activity_isolate.Kind{.Execute, .Completion, .Executor_Error}
+	kind := kinds[pbt.draw(t, pbt.int_range(0, len(kinds) - 1))]
+	has_zero := false
+	for value in payload {
+		if value == 0 {
+			has_zero = true
+			break
+		}
+	}
+	pbt.cover(t, kind == .Executor_Error, 25, "executor error frame")
+	pbt.cover(t, request_id & (u64(1) << 63) != 0, 35, "high-bit Activity correlation ID")
+	pbt.cover(t, len(payload) >= 4_096, 25, "large Activity frame payload")
+	pbt.cover(t, has_zero, 35, "embedded zero Activity payload byte")
+
+	encoded, encode_error := activity_isolate.encode({
+		kind = kind,
+		request_id = request_id,
+		payload = payload,
+	})
+	defer delete(encoded)
+	if encode_error.kind != .None {
+		return pbt.fail("valid generated Activity isolation frame did not encode")
+	}
+	decoded, decode_error := activity_isolate.decode(encoded)
+	defer activity_isolate.owned_frame_free(&decoded)
+	if decode_error.kind != .None || decoded.frame.kind != kind ||
+	   decoded.frame.request_id != request_id ||
+	   !bytes.equal(decoded.frame.payload, payload) {
+		return pbt.fail("generated Activity isolation frame did not roundtrip exactly")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_isolation_frames_roundtrip_generated_binary_payloads :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Activity isolation frames roundtrip generated binary payloads",
+		activity_isolation_frame_property,
+		{num_tests = 500, seed = 0x4143_5449_534f_4c41},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

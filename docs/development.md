@@ -891,9 +891,23 @@ Activity panics are not caught in-process. In the tested Odin toolchain,
 `panic` delegates to `context.assertion_failure_proc`, whose type returns `!`;
 there is no supported unwind/recover boundary. A `setjmp`/`longjmp` shim would
 skip Odin `defer`s and allocator cleanup, so the SDK intentionally does not
-present it as containment. Until subprocess-isolated Activity executors or
-language/runtime support is designed, deploy workers under a process supervisor
-and return `activity.Result(T)` for expected failures.
+present it as containment. In-process Activities should still run under a
+process supervisor and return `activity.Result(T)` for expected failures.
+
+The repository also contains an experimental per-invocation boundary:
+
+```bash
+./scripts/activity-isolate-integration-test.sh
+```
+
+Unlike the whole-Worker proof below, this keeps the Core-owning parent alive.
+It forwards opaque Core task/completion protobufs over the versioned
+`temporal/activity/isolate` protocol, deliberately panics the first child, and
+requires Temporal retry attempt 2 to complete in a fresh child. The current v1
+transport has no heartbeat forwarding or cooperative child cancellation and
+starts one process per attempt; use it as crash-containment evidence, not yet as
+the default production executor. See
+[`activity-isolation.md`](activity-isolation.md).
 
 The supported containment pattern is now exercised end-to-end:
 

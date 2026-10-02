@@ -3393,10 +3393,14 @@ Workflows are enabled.
    shutdown case also validates the configurable grace delay, concurrent
    heartbeats, exact Core cancellation flags, completion flush, and clean
    finalization. Activity-only process crash/replacement and suspended Workflow
-   process loss/replay on an identical replacement Worker are live-proven. The
-   remaining concurrency risks are mixed-process panic containment, infinite
-   Workflow code, and process-level recovery after an uncooperative callback
-   notification.
+   process loss/replay on an identical replacement Worker are live-proven. A
+   second live path now keeps the Core-owning parent alive and executes each
+   Activity attempt in a fresh child through opaque Core task/completion bytes;
+   an attempt-1 Odin panic becomes a retryable failure and attempt 2 completes
+   in a new child. The remaining concurrency risks are heartbeat/cooperative
+   cancellation transport for isolated Activities, warm-pool scheduling,
+   infinite Workflow code, and process-level recovery after an uncooperative
+   in-process callback notification.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
    timers, multiple outstanding Activities, multi-command completions,
    apply-all-before-resume, catchable Activity failures, buffered signals, and
@@ -3448,9 +3452,11 @@ Workflows are enabled.
    Policy, and prior heartbeat details. Its Activity-only process-isolation
    policy is now live-proven. The SDK now manages optional whole-Worker child
    restart/readiness/backoff. A versioned bounded pipe protocol and a persistent
-   two-activation Workflow executor child are proven independently, while
-   Worker/Core routing and a per-Activity subprocess executor remain
-   unimplemented. Typed JSON decode/encode errors
+   two-activation Workflow executor child are proven independently. Worker/Core
+   Activity routing is now connected to a versioned per-invocation subprocess
+   executor with completion/task-token validation and live crash/retry evidence.
+   Heartbeat forwarding, cooperative child cancellation, and a warm production
+   pool remain unimplemented. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
@@ -3535,6 +3541,10 @@ distribution targets. The live proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
 containment option for panicking, overflowing, or uncooperative Workflow code.
+In parallel, Activity isolation should advance from its verified one-process-
+per-attempt protocol to duplex heartbeat and cooperative-cancellation events;
+only after those semantics are preserved should the implementation reuse warm
+children in a bounded pool.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core,
@@ -3755,8 +3765,10 @@ current Temporal protocol does not expose that as a language-token operation.
 
 Activity panic containment is defined as an Activity-only supervised process
 and its crash/replacement retry path is live-proven. The SDK can now supervise
-and restart that whole Worker child; a per-Activity subprocess executor remains
-future work unless Odin gains supported recovery. Activity and Nexus callback
+and restart that whole Worker child. It also has a live-proven per-attempt
+Activity subprocess executor that keeps the Core parent alive across a callback
+panic; heartbeat transport, cooperative cancellation, and warm pooling remain
+future work. Activity and Nexus callback
 drains now have deadline observation without forced thread termination; truly
 stuck callbacks still require the supervisor's parent process to detect and
 replace the child. Infinite Workflow code cannot reach the activation boundary
@@ -4467,6 +4479,39 @@ per-runtime metric-emitter creation are implemented; optional structured event
 transport remains. See
 `docs/workflow-isolation.md` for the executed recovery trace and remaining
 safety work.
+
+## Core-connected Activity process isolation
+
+The Activity boundary now has an analogous but deliberately smaller external
+processor seam. The parent still calls
+`temporal_core_worker_poll_activity_task`, owns the opaque task-token route,
+receives Core cancel tasks, and calls
+`temporal_core_worker_complete_activity_task`. For registrations created with
+`worker.register_external_activity_processor`, the exact borrowed
+`coresdk.activity_task.ActivityTask` bytes are copied into the execution and
+sent to a child. The child returns an owned
+`coresdk.ActivityTaskCompletion`; the parent decodes only enough to require a
+result and the exact original token before forwarding the unchanged bytes to
+Core. No new C ABI or direct Server RPC is involved.
+
+Protocol v1 in `temporal/activity/isolate` uses a fixed magic/version/kind/
+request-ID header plus a bounded stream record. A fresh process and private
+pipes are created for each attempt. `execute_activity_task_callback` rebuilds
+the same owned Activity metadata used by in-process callbacks and shares the
+ordinary completion encoder for success, Application Failure, cancellation,
+and async-completion contracts. Child exit, timeout, malformed framing, stale
+request ID, or mismatched completion becomes a retryable Activity failure;
+only a failure in the parent's Core completion call shuts the Worker down.
+
+This boundary is not yet semantically complete for a warm pool. Heartbeats
+cannot be represented as a single request/response, and cancellation should be
+offered cooperatively before a bounded kill. Protocol v1 therefore reports no
+child heartbeat recorder and kills a matching process on Core cancellation;
+the parent emits the canceled completion. Parent-side Activity interceptors are
+rejected for external registrations because they cannot truthfully wrap code
+executing in another process. Protocol duplexing, child-side interceptors and
+metrics, then bounded warm-process reuse are the required order of work. See
+`docs/activity-isolation.md` for the live crash/retry proof and ownership rules.
 
 ### Local Activity boundary
 

@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:os"
 import "core:sync"
 import "core:time"
+import process_start "../internal/process_start"
 
 Restart_Policy :: enum {
 	On_Failure,
@@ -93,11 +94,6 @@ options_default :: proc(command: []string) -> Options {
 Control :: struct {
 	stop_requested: bool,
 }
-
-// Odin's process_start mutates handle-inheritance state and is not thread-safe.
-// Serialize every launch performed by this package so multiple supervised
-// Worker groups can restart concurrently without racing each other.
-process_start_mutex: sync.Mutex
 
 request_stop :: proc(control: ^Control) {
 	if control == nil {
@@ -279,8 +275,7 @@ run :: proc(control: ^Control, requested_options: Options) -> (stats: Stats, err
 
 		process: os.Process
 		start_error: os.Error
-		sync.mutex_lock(&process_start_mutex)
-		process, start_error = os.process_start({
+		process, start_error = process_start.start({
 			working_dir = options.working_dir,
 			command = options.command,
 			env = options.env,
@@ -288,7 +283,6 @@ run :: proc(control: ^Control, requested_options: Options) -> (stats: Stats, err
 			stdout = options.stdout,
 			stderr = options.stderr,
 		})
-		sync.mutex_unlock(&process_start_mutex)
 		if start_error != nil {
 			stats.start_failures += 1
 			if options.policy.restart == .Never ||

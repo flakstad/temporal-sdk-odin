@@ -1,0 +1,343 @@
+package activity_isolate
+
+import "core:bytes"
+import "core:mem/virtual"
+import "core:os"
+import "core:strings"
+import "core:sync"
+import "core:thread"
+import "core:time"
+import process_start "../../internal/process_start"
+import proto "../../core/proto"
+import worker "../../worker"
+
+Manager_Error :: struct { message: []u8 }
+
+manager_error :: proc(message: string) -> Manager_Error {
+	return {message = bytes.clone(transmute([]u8)message)}
+}
+
+manager_error_free :: proc(error: ^Manager_Error) {
+	if error == nil {
+		return
+	}
+	delete(error.message)
+	error^ = {}
+}
+
+Options :: struct {
+	command:               []string,
+	execution_timeout:     time.Duration,
+	maximum_payload_bytes: u32,
+}
+
+options_default :: proc(command: []string) -> Options {
+	return {
+		command = command,
+		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
+	}
+}
+
+Stats :: struct {
+	children_started: int,
+	children_completed: int,
+	child_failures: int,
+	protocol_failures: int,
+	timeouts: int,
+	cancellations_forwarded: int,
+	peak_in_flight: int,
+}
+
+Route :: struct {
+	task_token: []u8,
+	process:    os.Process,
+}
+
+Manager :: struct {
+	command:               [dynamic]string,
+	execution_timeout:     time.Duration,
+	maximum_payload_bytes: u32,
+	routes:                [dynamic]Route,
+	mutex:                 sync.Mutex,
+	stats:                 Stats,
+	initialized:           bool,
+}
+
+manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
+	if manager == nil || len(options.command) == 0 || len(options.command[0]) == 0 {
+		return manager_error("Activity executor command must not be empty")
+	}
+	if options.execution_timeout < 0 {
+		return manager_error("Activity executor timeout must not be negative")
+	}
+	if options.maximum_payload_bytes == 0 {
+		return manager_error("Activity executor payload limit must be positive")
+	}
+	manager^ = {}
+	manager.command = make([dynamic]string, 0, len(options.command))
+	for argument in options.command {
+		owned, allocation_error := strings.clone(argument)
+		if allocation_error != nil {
+			manager_close(manager)
+			return manager_error("could not allocate Activity executor command")
+		}
+		append(&manager.command, owned)
+	}
+	manager.routes = make([dynamic]Route)
+	manager.execution_timeout = options.execution_timeout
+	manager.maximum_payload_bytes = options.maximum_payload_bytes
+	manager.initialized = true
+	return {}
+}
+
+manager_close :: proc(manager: ^Manager) {
+	if manager == nil {
+		return
+	}
+	sync.mutex_lock(&manager.mutex)
+	for route in manager.routes {
+		_ = os.process_kill(route.process)
+		delete(route.task_token)
+	}
+	delete(manager.routes)
+	manager.routes = nil
+	sync.mutex_unlock(&manager.mutex)
+	for argument in manager.command {
+		delete(argument)
+	}
+	delete(manager.command)
+	manager.command = nil
+	manager.initialized = false
+}
+
+manager_stats :: proc(manager: ^Manager) -> Stats {
+	if manager == nil {
+		return {}
+	}
+	sync.mutex_lock(&manager.mutex)
+	defer sync.mutex_unlock(&manager.mutex)
+	return manager.stats
+}
+
+manager_in_flight :: proc(manager: ^Manager) -> int {
+	if manager == nil {
+		return 0
+	}
+	sync.mutex_lock(&manager.mutex)
+	defer sync.mutex_unlock(&manager.mutex)
+	return len(manager.routes)
+}
+
+decode_task_token :: proc(task: []u8) -> (token: []u8, ok: bool) {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return
+	}
+	defer virtual.arena_destroy(&arena)
+	previous := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	decoded, decode_error := proto.decode_activity_task(task)
+	context.allocator = previous
+	if decode_error != .None {
+		return
+	}
+	token = bytes.clone(decoded.task_token)
+	ok = len(token) > 0
+	return
+}
+
+route_add :: proc(manager: ^Manager, token: []u8, process: os.Process) -> bool {
+	sync.mutex_lock(&manager.mutex)
+	defer sync.mutex_unlock(&manager.mutex)
+	for route in manager.routes {
+		if bytes.equal(route.task_token, token) {
+			return false
+		}
+	}
+	append(&manager.routes, Route{task_token = token, process = process})
+	manager.stats.children_started += 1
+	manager.stats.peak_in_flight = max(manager.stats.peak_in_flight, len(manager.routes))
+	return true
+}
+
+route_remove :: proc(manager: ^Manager, token: []u8) {
+	sync.mutex_lock(&manager.mutex)
+	defer sync.mutex_unlock(&manager.mutex)
+	for &route, index in manager.routes {
+		if bytes.equal(route.task_token, token) {
+			delete(route.task_token)
+			ordered_remove(&manager.routes, index)
+			return
+		}
+	}
+}
+
+Read_State :: struct {
+	file: ^os.File,
+	maximum_payload_bytes: u32,
+	frame: Owned_Frame,
+	error: Error,
+	done: sync.Sema,
+}
+
+read_main :: proc(state: ^Read_State) {
+	state.frame, state.error = read(state.file, state.maximum_payload_bytes)
+	sync.sema_post(&state.done)
+}
+
+read_with_timeout :: proc(
+	file: ^os.File,
+	maximum_payload_bytes: u32,
+	timeout: time.Duration,
+	process: os.Process,
+) -> (frame: Owned_Frame, error: Error, timed_out: bool) {
+	if timeout <= 0 {
+		frame, error = read(file, maximum_payload_bytes)
+		return
+	}
+	state := Read_State{file = file, maximum_payload_bytes = maximum_payload_bytes}
+	reader := thread.create_and_start_with_poly_data(&state, read_main)
+	if reader == nil {
+		return {}, {kind = .IO}, false
+	}
+	finished := sync.sema_wait_with_timeout(&state.done, timeout)
+	if !finished {
+		_ = os.process_kill(process)
+	}
+	thread.join(reader)
+	thread.destroy(reader)
+	return state.frame, state.error, !finished
+}
+
+process_task :: proc(processor_data: rawptr, task: []u8) -> worker.Activity_Task_Process_Result {
+	manager := cast(^Manager)processor_data
+	if manager == nil || !manager.initialized {
+		return {error = worker.error_from_string("Activity executor manager is not initialized")}
+	}
+	token, token_ok := decode_task_token(task)
+	if !token_ok {
+		return {error = worker.error_from_string("external Activity task is malformed")}
+	}
+
+	child_input, parent_input, input_error := os.pipe()
+	if input_error != nil {
+		delete(token)
+		return {error = worker.error_from_string("could not create Activity executor input pipe")}
+	}
+	parent_output, child_output, output_error := os.pipe()
+	if output_error != nil {
+		os.close(child_input)
+		os.close(parent_input)
+		delete(token)
+		return {error = worker.error_from_string("could not create Activity executor output pipe")}
+	}
+	process, start_error := process_start.start({
+		command = manager.command[:],
+		stdin = child_input,
+		stdout = child_output,
+		stderr = os.stderr,
+	})
+	os.close(child_input)
+	os.close(child_output)
+	if start_error != nil {
+		os.close(parent_input)
+		os.close(parent_output)
+		delete(token)
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.child_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("could not start Activity executor child")}
+	}
+	if !route_add(manager, token, process) {
+		_ = os.process_kill(process)
+		_, _ = os.process_wait(process)
+		os.close(parent_input)
+		os.close(parent_output)
+		delete(token)
+		return {error = worker.error_from_string("duplicate Activity executor task token")}
+	}
+	defer route_remove(manager, token)
+	defer os.close(parent_input)
+	defer os.close(parent_output)
+
+	write_error := write(parent_input, {
+		kind = .Execute,
+		request_id = 1,
+		payload = task,
+	}, manager.maximum_payload_bytes)
+	if write_error.kind != .None {
+		_ = os.process_kill(process)
+		_, _ = os.process_wait(process)
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.protocol_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("could not send Activity task to executor child")}
+	}
+
+	response, read_error, timed_out := read_with_timeout(
+		parent_output,
+		manager.maximum_payload_bytes,
+		manager.execution_timeout,
+		process,
+	)
+	defer owned_frame_free(&response)
+	state, _ := os.process_wait(process)
+	if timed_out {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.timeouts += 1
+		manager.stats.child_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("Activity executor timed out")}
+	}
+	if read_error.kind != .None || !state.exited {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.child_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("Activity executor exited without a completion")}
+	}
+	if response.frame.request_id != 1 {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.protocol_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("Activity executor returned a mismatched request id")}
+	}
+	if response.frame.kind == .Executor_Error {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.child_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string(string(response.frame.payload))}
+	}
+	if response.frame.kind != .Completion || !state.success {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.protocol_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return {error = worker.error_from_string("Activity executor returned an invalid response")}
+	}
+	completion_allocator := context.allocator
+	completion := bytes.clone(response.frame.payload, completion_allocator)
+	sync.mutex_lock(&manager.mutex)
+	manager.stats.children_completed += 1
+	sync.mutex_unlock(&manager.mutex)
+	return {completion = completion, allocator = completion_allocator}
+}
+
+cancel_task :: proc(processor_data: rawptr, task: []u8) {
+	manager := cast(^Manager)processor_data
+	if manager == nil || !manager.initialized {
+		return
+	}
+	token, token_ok := decode_task_token(task)
+	if !token_ok {
+		return
+	}
+	defer delete(token)
+	sync.mutex_lock(&manager.mutex)
+	defer sync.mutex_unlock(&manager.mutex)
+	for route in manager.routes {
+		if bytes.equal(route.task_token, token) {
+			_ = os.process_kill(route.process)
+			manager.stats.cancellations_forwarded += 1
+			return
+		}
+	}
+}

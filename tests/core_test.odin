@@ -12,6 +12,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import activity "../temporal/activity"
+import activity_isolate "../temporal/activity/isolate"
 import temporal_client "../temporal/client"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
@@ -27,6 +28,35 @@ import worker "../temporal/worker"
 import workflow "../temporal/workflow"
 import fiber_raw "../temporal/workflow/fiber/raw"
 import workflow_isolate "../temporal/workflow/isolate"
+
+external_activity_test_invoke :: proc(
+	_: rawptr,
+	ctx: ^activity.Context,
+	inputs: []codec.Payload_View,
+) -> activity.Payload_Result {
+	if len(inputs) != 1 || activity.attempt(ctx) != 4 {
+		return activity.payload_fail("unexpected external Activity callback input")
+	}
+	value: string
+	if codec.decode_json(inputs[0], &value) != .None {
+		return activity.payload_fail("could not decode external Activity callback input")
+	}
+	defer delete(value)
+	output := fmt.aprintf("isolated:%s", value)
+	defer delete(output)
+	payload, encode_error := codec.encode_json(output)
+	if encode_error != .None {
+		return activity.payload_fail("could not encode external Activity callback output")
+	}
+	return activity.payload_complete(payload)
+}
+
+external_activity_test_processor :: proc(
+	_: rawptr,
+	_: []u8,
+) -> worker.Activity_Task_Process_Result {
+	return {}
+}
 
 @(test)
 history_json_converts_canonical_temporal_cli_shape :: proc(t: ^testing.T) {
@@ -1673,6 +1703,147 @@ activity_execution_routes_preserve_opaque_binary_task_tokens :: proc(t: ^testing
 	testing.expect(t, !worker.activity_execution_route_add(&routes, nil))
 	empty := worker.Activity_Execution{}
 	testing.expect(t, !worker.activity_execution_route_add(&routes, &empty))
+}
+
+@(test)
+activity_isolation_protocol_rejects_corruption_and_round_trips_binary_tasks :: proc(
+	t: ^testing.T,
+) {
+	payload := [?]u8{0x00, 0xff, 0x41, 0x00, 0x7f}
+	encoded, encode_error := activity_isolate.encode({
+		kind = .Execute,
+		request_id = 17,
+		payload = payload[:],
+	})
+	defer delete(encoded)
+	testing.expect(t, encode_error.kind == .None)
+	decoded, decode_error := activity_isolate.decode(encoded)
+	defer activity_isolate.owned_frame_free(&decoded)
+	testing.expect(t, decode_error.kind == .None)
+	testing.expect(t, decoded.frame.kind == .Execute)
+	testing.expect_value(t, decoded.frame.request_id, u64(17))
+	testing.expect(t, bytes.equal(decoded.frame.payload, payload[:]))
+
+	corrupt := bytes.clone(encoded)
+	defer delete(corrupt)
+	corrupt[0] = 0
+	_, corrupt_error := activity_isolate.decode(corrupt)
+	testing.expect(t, corrupt_error.kind == .Invalid_Magic)
+	_, truncated_error := activity_isolate.decode(encoded[:activity_isolate.HEADER_SIZE])
+	testing.expect(t, truncated_error.kind == .Truncated)
+	_, too_large_error := activity_isolate.encode({
+		kind = .Completion,
+		request_id = 1,
+		payload = payload[:],
+	}, 4)
+	testing.expect(t, too_large_error.kind == .Too_Large)
+}
+
+@(test)
+external_activity_registration_borrows_processor_state :: proc(t: ^testing.T) {
+	sdk_worker := worker.Worker{
+		lifecycle = .Configuring,
+		activity_registrations = make([dynamic]worker.Activity_Registration),
+	}
+	defer {
+		for registration in sdk_worker.activity_registrations {
+			delete(registration.name)
+		}
+		delete(sdk_worker.activity_registrations)
+	}
+	marker := 42
+	register_error := worker.register_external_activity_processor(
+		&sdk_worker,
+		"isolated_test",
+		&marker,
+		external_activity_test_processor,
+	)
+	defer worker.error_free(&register_error)
+	testing.expect(t, register_error.message == nil)
+	testing.expect_value(t, len(sdk_worker.activity_registrations), 1)
+	if len(sdk_worker.activity_registrations) == 1 {
+		registration := sdk_worker.activity_registrations[0]
+		testing.expect(t, registration.external)
+		testing.expect(t, registration.processor_data == &marker)
+		testing.expect(t, !registration.callback_data_owned)
+	}
+	duplicate_error := worker.register_external_activity_processor(
+		&sdk_worker,
+		"isolated_test",
+		&marker,
+		external_activity_test_processor,
+	)
+	testing.expect(t, duplicate_error.message != nil)
+	worker.error_free(&duplicate_error)
+}
+
+@(test)
+external_activity_child_helper_preserves_core_task_and_completion_contract :: proc(
+	t: ^testing.T,
+) {
+	input, input_error := codec.encode_json("Odin")
+	testing.expect(t, input_error == .None)
+	defer codec.payload_free(&input)
+	input_proto := proto.encode_payload(codec.payload_view(&input))
+	defer delete(input_proto.metadata)
+	defer delete(input_proto.external_payloads)
+	start := proto.Coresdk_Activity_Task_Start{
+		workflow_namespace = "default",
+		activity_id = "isolated-activity",
+		activity_type = "isolated_test",
+		attempt = 4,
+	}
+	defer delete(start.input)
+	append(&start.input, input_proto)
+	token := [?]u8{0, 1, 0xff, 2}
+	raw := proto.Coresdk_Activity_Task_ActivityTask{
+		task_token = token[:],
+		variant = proto.Coresdk_Activity_Task_ActivityTask_Variant_Start{value = &start},
+	}
+	encoded := proto.encode_Coresdk_Activity_Task_ActivityTask(&raw)
+	defer delete(encoded)
+	marker := true
+	processed := worker.execute_activity_task_callback(
+		"isolated_test",
+		&marker,
+		external_activity_test_invoke,
+		encoded[:],
+		"default",
+		"isolation-test",
+	)
+	defer worker.activity_task_process_result_free(&processed)
+	testing.expect(t, processed.error.message == nil)
+	testing.expect(t, proto.activity_completion_matches_task(processed.completion, token[:]))
+	wrong_token := [?]u8{9, 9}
+	testing.expect(
+		t,
+		!proto.activity_completion_matches_task(processed.completion, wrong_token[:]),
+	)
+
+	arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&arena) == nil)
+	defer virtual.arena_destroy(&arena)
+	previous := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	completion := proto.Coresdk_ActivityTaskCompletion{}
+	completion_ok := proto.decode_Coresdk_ActivityTaskCompletion(
+		processed.completion,
+		&completion,
+	)
+	context.allocator = previous
+	testing.expect(t, completion_ok && completion.result != nil)
+	if !completion_ok || completion.result == nil {
+		return
+	}
+	result_data: []u8
+	#partial switch status in completion.result.status {
+	case proto.Coresdk_Activity_Result_ActivityExecutionResult_Status_Completed:
+		if status.value != nil && status.value.result != nil {
+			result_data = status.value.result.data
+		}
+	case:
+	}
+	testing.expect_value(t, string(result_data), `"isolated:Odin"`)
 }
 
 Heartbeat_Capture :: struct {

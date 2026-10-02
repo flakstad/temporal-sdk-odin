@@ -5,6 +5,7 @@ package worker
 import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:fmt"
+import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:sync"
@@ -32,6 +33,45 @@ Activity_Invoke_Proc :: #type proc(
 	ctx: ^activity.Context,
 	inputs: []codec.Payload_View,
 ) -> activity.Payload_Result
+
+// External Activity processors receive the exact borrowed ActivityTask
+// protobuf emitted by SDK Core and return an owned ActivityTaskCompletion.
+// This is the process-isolation seam: Core polling and completion remain in
+// the parent Worker while a child may own language callback execution. The
+// returned completion and allocator are released by the Worker after Core has
+// copied the bytes. A zero allocator means the processor's call-scoped
+// context allocator. Processor errors become retryable Activity failures and
+// do not stop unrelated Worker pollers.
+Activity_Task_Process_Result :: struct {
+	completion: []u8,
+	allocator:  mem.Allocator,
+	error:      Error,
+}
+
+activity_task_process_result_free :: proc(result: ^Activity_Task_Process_Result) {
+	if result == nil {
+		return
+	}
+	if result.completion != nil {
+		allocator := result.allocator
+		if allocator.procedure == nil {
+			allocator = context.allocator
+		}
+		delete(result.completion, allocator)
+	}
+	error_free(&result.error)
+	result^ = {}
+}
+
+Activity_Task_Processor_Proc :: #type proc(
+	processor_data: rawptr,
+	task: []u8,
+) -> Activity_Task_Process_Result
+
+// Cancellation notifications run on the single Activity poller and must
+// return promptly. The bytes are the exact borrowed Core cancel task. A
+// subprocess manager can use the task token to signal or terminate the child.
+Activity_Task_Cancel_Proc :: #type proc(processor_data: rawptr, task: []u8)
 
 Payload_Nexus_Operation_Proc :: #type proc(
 	ctx: ^nexus.Context,
@@ -129,9 +169,14 @@ activity_heartbeat_next :: proc(
 }
 
 Activity_Registration :: struct {
-	name:          string,
-	callback_data: rawptr,
-	invoke:        Activity_Invoke_Proc,
+	name:                 string,
+	callback_data:        rawptr,
+	invoke:               Activity_Invoke_Proc,
+	callback_data_owned:  bool,
+	external:             bool,
+	processor_data:       rawptr,
+	process_task:         Activity_Task_Processor_Proc,
+	cancel_task:          Activity_Task_Cancel_Proc,
 }
 
 Nexus_Operation_Registration :: struct {
@@ -907,6 +952,13 @@ add_activity_interceptor :: proc(
 	if interceptor.execute == nil && interceptor.heartbeat == nil {
 		return error_from_string("Activity interceptor must implement execute or heartbeat")
 	}
+	for registration in worker.activity_registrations {
+		if registration.external {
+			return error_from_string(
+				"parent Activity interceptors cannot wrap an external Activity processor",
+			)
+		}
+	}
 	append(&worker.activity_interceptors, interceptor)
 	return {}
 }
@@ -1100,6 +1152,54 @@ register_activity_invoker :: proc(
 			name = owned_name,
 			callback_data = callback_data,
 			invoke = invoke,
+			callback_data_owned = true,
+		},
+	)
+	return {}
+}
+
+// register_external_activity_processor registers only Activity type metadata
+// in the Core-owning parent. The processor owns language execution elsewhere
+// and speaks in SDK Core's pinned protobuf messages. processor_data is borrowed
+// until Worker close; the SDK never frees it.
+register_external_activity_processor :: proc(
+	worker: ^Worker,
+	name: string,
+	processor_data: rawptr,
+	process_task: Activity_Task_Processor_Proc,
+	cancel_task: Activity_Task_Cancel_Proc = nil,
+) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.lifecycle != .Configuring {
+		return error_from_string("activities cannot be registered after worker.run starts")
+	}
+	if len(name) == 0 || process_task == nil {
+		return error_from_string("external activity name and processor are required")
+	}
+	if len(worker.activity_interceptors) > 0 {
+		return error_from_string(
+			"parent Activity interceptors cannot wrap an external Activity processor",
+		)
+	}
+	for registration in worker.activity_registrations {
+		if registration.name == name {
+			return error_from_string("activity is already registered")
+		}
+	}
+	owned_name, allocation_error := strings.clone(name)
+	if allocation_error != nil {
+		return error_from_string("could not allocate activity name")
+	}
+	append(
+		&worker.activity_registrations,
+		Activity_Registration{
+			name = owned_name,
+			external = true,
+			processor_data = processor_data,
+			process_task = process_task,
+			cancel_task = cancel_task,
 		},
 	)
 	return {}
@@ -1792,6 +1892,11 @@ Activity_Execution :: struct {
 	worker:        ^Worker,
 	callback_data: rawptr,
 	invoke:        Activity_Invoke_Proc,
+	external:      bool,
+	processor_data: rawptr,
+	process_task:  Activity_Task_Processor_Proc,
+	cancel_task:   Activity_Task_Cancel_Proc,
+	raw_task:      []u8,
 	task_token:    []u8,
 	inputs:        [dynamic]codec.Payload,
 	input_views:   []codec.Payload_View,
@@ -2190,6 +2295,55 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	defer virtual.arena_destroy(&arena)
 	previous_allocator := context.allocator
 	context.allocator = virtual.arena_allocator(&arena)
+	if execution.external {
+		// External processor results cross the call boundary and therefore use
+		// the caller's ordinary allocator, not this execution's decode arena.
+		context.allocator = previous_allocator
+		processed := execution.process_task(execution.processor_data, execution.raw_task)
+		defer activity_task_process_result_free(&processed)
+
+		completion := processed.completion
+		fallback: [dynamic]u8
+		if activity.is_cancellation_requested(&execution.ctx) {
+			fallback = proto.encode_activity_cancellation(
+				execution.task_token,
+				"Activity canceled while running in an external executor",
+			)
+			completion = fallback[:]
+		} else if processed.error.message != nil {
+			fallback = proto.encode_activity_failure(
+				execution.task_token,
+				string(processed.error.message),
+				"OdinExternalActivityExecutorError",
+				false,
+			)
+			completion = fallback[:]
+		} else {
+			validation_allocator := context.allocator
+			context.allocator = virtual.arena_allocator(&arena)
+			completion_valid := proto.activity_completion_matches_task(
+				completion[:],
+				execution.task_token,
+			)
+			context.allocator = validation_allocator
+			if !completion_valid {
+				fallback = proto.encode_activity_failure(
+					execution.task_token,
+					"external Activity processor returned a malformed or mismatched completion",
+					"OdinExternalActivityProtocolError",
+					false,
+				)
+				completion = fallback[:]
+			}
+		}
+		defer delete(fallback)
+		core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
+		if core_error.message != nil {
+			execution.error = error_from_core(&core_error)
+			worker_initiate_shutdown(execution.worker)
+		}
+		return
+	}
 	input := Activity_Execute_Input{
 		ctx = &execution.ctx,
 		inputs = execution.input_views,
@@ -2203,25 +2357,51 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 	defer activity.application_failure_free(&result.failure)
 	defer activity.cancellation_free(&result.cancellation)
 
-	completion: [dynamic]u8
+	completion := activity_result_completion(
+		execution.task_token,
+		&result,
+		execution.info_owner.info.is_local,
+		activity.is_cancellation_requested(&execution.ctx),
+	)
+	defer delete(completion)
+	core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
+	if core_error.message != nil {
+		execution.error = error_from_core(&core_error)
+		worker_initiate_shutdown(execution.worker)
+	}
+}
+
+activity_result_completion :: proc(
+	task_token: []u8,
+	result: ^activity.Payload_Result,
+	is_local: bool,
+	cancellation_requested: bool,
+) -> [dynamic]u8 {
+	if result == nil {
+		return proto.encode_activity_failure(
+			task_token,
+			"Activity callback returned no result",
+			"OdinActivityFailureContractError",
+			true,
+		)
+	}
 	if result.status == .Will_Complete_Async {
-		if execution.info_owner.info.is_local {
-			completion = proto.encode_activity_failure(
-				execution.task_token,
+		if is_local {
+			return proto.encode_activity_failure(
+				task_token,
 				"Local Activities cannot complete asynchronously",
 				"OdinActivityFailureContractError",
 				true,
 			)
-		} else {
-			completion = proto.encode_activity_will_complete_async(execution.task_token)
 		}
-	} else if result.status == .Canceled || activity.is_cancellation_requested(&execution.ctx) {
+		return proto.encode_activity_will_complete_async(task_token)
+	} else if result.status == .Canceled || cancellation_requested {
 		message := result.cancellation.message
 		if len(message) == 0 {
 			message = "Activity canceled"
 		}
-		completion = proto.encode_activity_cancellation(
-			execution.task_token,
+		return proto.encode_activity_cancellation(
+			task_token,
 			message,
 			codec.payload_view(&result.cancellation.details),
 			result.status == .Canceled && result.cancellation.has_details,
@@ -2232,35 +2412,118 @@ activity_execution_main :: proc(execution: ^Activity_Execution) {
 			failure_type = "OdinActivityError"
 		}
 		if result.failure.next_retry_delay < 0 {
-			completion = proto.encode_activity_failure(
-				execution.task_token,
+			return proto.encode_activity_failure(
+				task_token,
 				"Activity returned a negative next retry delay",
 				"OdinActivityFailureContractError",
 				true,
 			)
-		} else {
-			completion = proto.encode_activity_failure(
-				execution.task_token,
-				result.failure.message,
-				failure_type,
-				result.failure.non_retryable,
-				codec.payload_view(&result.failure.details),
-				result.failure.has_details,
-				result.failure.next_retry_delay,
-			)
 		}
-	} else {
-		completion = proto.encode_activity_success_payload(
-			execution.task_token,
-			codec.payload_view(&result.payload),
+		return proto.encode_activity_failure(
+			task_token,
+			result.failure.message,
+			failure_type,
+			result.failure.non_retryable,
+			codec.payload_view(&result.failure.details),
+			result.failure.has_details,
+			result.failure.next_retry_delay,
 		)
 	}
-	defer delete(completion)
-	core_error := temporal_core.worker_complete_activity(&execution.worker.core, completion[:])
-	if core_error.message != nil {
-		execution.error = error_from_core(&core_error)
-		worker_initiate_shutdown(execution.worker)
+	return proto.encode_activity_success_payload(
+		task_token,
+		codec.payload_view(&result.payload),
+	)
+}
+
+// execute_activity_task_callback is the child-side half of the external
+// processor seam. It decodes one exact Core ActivityTask, constructs the same
+// callback-visible Info as the online Worker, invokes one registered leaf
+// callback, and returns an owned Core completion. Heartbeats and live
+// cancellation require a bidirectional host transport and are intentionally
+// not fabricated here.
+execute_activity_task_callback :: proc(
+	expected_name: string,
+	callback_data: rawptr,
+	invoke: Activity_Invoke_Proc,
+	task_protobuf: []u8,
+	namespace := "default",
+	task_queue := "external-activity",
+) -> Activity_Task_Process_Result {
+	if len(expected_name) == 0 || callback_data == nil || invoke == nil {
+		return {error = error_from_string("external Activity callback is not configured")}
 	}
+	decode_arena: virtual.Arena
+	if virtual.arena_init_growing(&decode_arena) != nil {
+		return {error = error_from_string("could not initialize external Activity decode arena")}
+	}
+	defer virtual.arena_destroy(&decode_arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	task, decode_error := proto.decode_activity_task(task_protobuf)
+	context.allocator = previous_allocator
+	if decode_error != .None || task.kind != .Start {
+		return {error = error_from_string("external executor received a malformed non-start Activity task")}
+	}
+	if task.activity_type != expected_name {
+		return {error = error_from_string("external executor received an unexpected Activity type")}
+	}
+
+	heap := allocator_runtime.heap_allocator()
+	inputs := make([dynamic]codec.Payload, heap)
+	defer {
+		for &input in inputs {
+			codec.payload_free(&input)
+		}
+		delete(inputs)
+	}
+	for input in task.inputs {
+		owned, clone_error := proto.clone_payload_view(input, heap)
+		if clone_error != .None {
+			return {error = error_from_string("could not allocate external Activity input")}
+		}
+		append(&inputs, owned)
+	}
+	input_views := make([]codec.Payload_View, len(inputs), heap)
+	defer delete(input_views, heap)
+	for &input, index in inputs {
+		input_views[index] = codec.payload_view(&input)
+	}
+
+	fake_worker := Worker{namespace = namespace, task_queue = task_queue}
+	info_owner := Activity_Info_Owner{}
+	info_error := activity_info_owner_init(&info_owner, &fake_worker, &task, task.task_token)
+	if info_error.message != nil {
+		return {error = info_error}
+	}
+	defer {
+		cleanup_allocator := context.allocator
+		context.allocator = heap
+		activity_info_owner_destroy(&info_owner)
+		context.allocator = cleanup_allocator
+	}
+	metric_meter := temporal_core.metric_meter_noop()
+	defer temporal_core.metric_meter_close(&metric_meter)
+	ctx := activity.Context{}
+	activity.context_init_info(&ctx, info_owner.info, nil, nil, &metric_meter)
+
+	callback_arena: virtual.Arena
+	if virtual.arena_init_growing(&callback_arena) != nil {
+		return {error = error_from_string("could not initialize external Activity callback arena")}
+	}
+	defer virtual.arena_destroy(&callback_arena)
+	context.allocator = virtual.arena_allocator(&callback_arena)
+	result := invoke(callback_data, &ctx, input_views[:])
+	context.allocator = previous_allocator
+	defer codec.payload_free(&result.payload)
+	defer activity.application_failure_free(&result.failure)
+	defer activity.cancellation_free(&result.cancellation)
+	completion := activity_result_completion(
+		task.task_token,
+		&result,
+		info_owner.info.is_local,
+		activity.is_cancellation_requested(&ctx),
+	)
+	return {completion = completion[:], allocator = previous_allocator}
 }
 
 activity_execution_task :: proc(task: thread.Task) {
@@ -2271,6 +2534,7 @@ activity_execution_destroy :: proc(execution: ^Activity_Execution) {
 	if execution == nil {
 		return
 	}
+	delete(execution.raw_task)
 	delete(execution.task_token)
 	for &input in execution.inputs {
 		codec.payload_free(&input)
@@ -2287,6 +2551,7 @@ activity_execution_start :: proc(
 	worker: ^Worker,
 	pool: ^thread.Pool,
 	task: ^proto.Activity_Task,
+	raw_task: []u8,
 ) -> (execution: ^Activity_Execution, error: Error) {
 	registration, found := find_activity(worker, task.activity_type)
 	if !found {
@@ -2302,6 +2567,17 @@ activity_execution_start :: proc(
 	execution.worker = worker
 	execution.callback_data = registration.callback_data
 	execution.invoke = registration.invoke
+	execution.external = registration.external
+	execution.processor_data = registration.processor_data
+	execution.process_task = registration.process_task
+	execution.cancel_task = registration.cancel_task
+	if registration.external {
+		execution.raw_task = bytes.clone(raw_task)
+		if execution.raw_task == nil && len(raw_task) > 0 {
+			activity_execution_destroy(execution)
+			return nil, error_from_string("could not allocate external Activity task protobuf")
+		}
+	}
 	execution.task_token = bytes.clone(task.task_token)
 	heap := allocator_runtime.heap_allocator()
 	execution.inputs = make([dynamic]codec.Payload, heap)
@@ -2802,6 +3078,9 @@ run_activity_loop :: proc(
 		if task.kind == .Cancel {
 			execution, found := activity_execution_route_find(routes, task.task_token)
 			if found {
+				if execution.external && execution.cancel_task != nil {
+					execution.cancel_task(execution.processor_data, poll.protobuf)
+				}
 				activity.context_request_cancellation(
 					&execution.ctx,
 					activity_cancel_reason(task.cancel_reason),
@@ -2824,7 +3103,12 @@ run_activity_loop :: proc(
 			return completed, cancellations, peak_in_flight, error_from_string("Core returned a duplicate Activity task token")
 		}
 
-		execution, execute_error := activity_execution_start(worker, &pool, &task)
+		execution, execute_error := activity_execution_start(
+			worker,
+			&pool,
+			&task,
+			poll.protobuf,
+		)
 		virtual.arena_destroy(&decode_arena)
 		delete(poll.protobuf)
 		if execute_error.message != nil {
@@ -4354,7 +4638,9 @@ close :: proc(worker: ^Worker) -> Error {
 	}
 	core_error := temporal_core.worker_close(&worker.core)
 	for registration in worker.activity_registrations {
-		free(registration.callback_data, allocator_runtime.heap_allocator())
+		if registration.callback_data_owned && registration.callback_data != nil {
+			free(registration.callback_data, allocator_runtime.heap_allocator())
+		}
 		delete(registration.name)
 	}
 	for registration in worker.nexus_operation_registrations {

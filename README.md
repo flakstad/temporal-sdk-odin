@@ -555,8 +555,16 @@ runs the SDK's `temporal/supervisor`, kills child generation 1 after a committed
 Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
 fresh-stack history replay, and Signal-driven completion. The whole-Worker
 supervisor contract is documented in
-[`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow or
-per-Activity production subprocess pools are not implemented. The experimental
+[`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow
+execution and per-invocation Activity process isolation are now implemented
+experimentally; warm per-Activity production subprocess pools are not. The
+Activity path keeps Core polling and completion in the parent, sends the exact
+Core task to a fresh child, validates the returned completion/task token, and
+converts child loss into a retryable Activity failure.
+`./scripts/activity-isolate-integration-test.sh` proves a real Odin panic on
+attempt 1 while the parent remains alive and Temporal completes attempt 2.
+Heartbeat forwarding and cooperative child cancellation are the next protocol
+increment; see [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test
 deliberately crashes
@@ -2519,6 +2527,7 @@ temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/history_json/    optional Temporal CLI History JSON replay converter
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
+temporal/activity/isolate versioned per-invocation Activity process boundary
 temporal/nexus/           sync/async Nexus operation context and results
 temporal/worker/          Activity/Workflow/Nexus registry and concurrent polling
 temporal/supervisor/      whole-Worker child process lifecycle and restart policy
@@ -2546,6 +2555,7 @@ examples/workflow_isolate_app/ shared parent/child Workflow registry
 examples/workflow_isolate_core/ Core-polled crash/replay/nondeterminism proof
 examples/schedule_lifecycle/ Schedule create/patch/trigger/delete proof
 examples/hello_activity/  Odin hello Activity Worker
+examples/activity_isolate/ Core-parent/child-crash/Temporal-retry proof
 examples/hello_nexus/     synchronous Odin Nexus operation Worker
 examples/standalone_nexus_client/ standalone Nexus Client lifecycle proof
 examples/hello_nexus_workflow/ all-Odin Workflow-to-Nexus and replay proof

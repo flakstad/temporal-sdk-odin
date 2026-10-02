@@ -2,6 +2,7 @@
 package proto
 
 import "core:time"
+import "core:mem/virtual"
 import codec "../../codec"
 
 Task_Kind :: enum {
@@ -281,6 +282,35 @@ decode_activity_task :: proc(data: []u8) -> (task: Activity_Task, error: Decode_
 		return {}, .Missing_Variant
 	}
 	return task, .None
+}
+
+// activity_completion_matches_task validates the minimum trust boundary for
+// an externally executed Activity: a well-formed completion with the exact
+// opaque task token and a result variant. Decoded views borrow data and the
+// caller controls their allocation lifetime through context.allocator.
+activity_completion_matches_task :: proc(data, task_token: []u8) -> bool {
+	arena: virtual.Arena
+	if virtual.arena_init_growing(&arena) != nil {
+		return false
+	}
+	defer virtual.arena_destroy(&arena)
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&arena)
+	completion := Coresdk_ActivityTaskCompletion{}
+	decoded := decode_Coresdk_ActivityTaskCompletion(data, &completion)
+	context.allocator = previous_allocator
+	if !decoded {
+		return false
+	}
+	if completion.result == nil || len(completion.task_token) != len(task_token) {
+		return false
+	}
+	for value, index in task_token {
+		if completion.task_token[index] != value {
+			return false
+		}
+	}
+	return true
 }
 
 encode_payload :: proc(view: codec.Payload_View) -> Temporal_Api_Common_V1_Payload {

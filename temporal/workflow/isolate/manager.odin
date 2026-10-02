@@ -7,6 +7,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import process_start "../../internal/process_start"
 import proto "../../core/proto"
 import workflow ".."
 
@@ -264,8 +265,6 @@ Manager :: struct {
 	shutting_down:      bool,
 	shutdown_complete:  bool,
 }
-
-process_start_mutex: sync.Mutex
 
 clone_command :: proc(input: []string) -> (output: [dynamic]string, ok: bool) {
 	if len(input) == 0 || len(input[0]) == 0 {
@@ -689,14 +688,12 @@ start_session :: proc(command: []string) -> (session: Child_Session, ok: bool) {
 		os.close(parent_input)
 		return
 	}
-	sync.mutex_lock(&process_start_mutex)
-	process, start_error := os.process_start({
+	process, start_error := process_start.start({
 		command = command,
 		stdin = child_input,
 		stdout = child_output,
 		stderr = os.stderr,
 	})
-	sync.mutex_unlock(&process_start_mutex)
 	os.close(child_input)
 	os.close(child_output)
 	if start_error != nil {

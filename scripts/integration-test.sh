@@ -1265,6 +1265,9 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/activity-panic-integration-test.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/activity-isolate-integration-test.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/uncooperative-callback-integration-test.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
