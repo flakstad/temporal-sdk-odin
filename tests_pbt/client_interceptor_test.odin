@@ -5,6 +5,7 @@ import "core:time"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
 import schedule "../temporal/client/schedule"
+import standalone_nexus "../temporal/client/standalone_nexus"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 import codec "../temporal/codec"
@@ -304,7 +305,7 @@ client_interceptor_property_connection_mutation :: proc(user_data: rawptr, input
 	return result
 }
 
-client_interceptor_property_start_nexus_operation :: proc(user_data: rawptr, input: ^temporal_client.Client_Start_Nexus_Operation_Input, next: temporal_client.Client_Start_Nexus_Operation_Next) -> (result: temporal_client.Nexus_Operation_Handle, error: temporal_client.Error) {
+client_interceptor_property_start_nexus_operation :: proc(user_data: rawptr, input: ^standalone_nexus.Client_Start_Nexus_Operation_Input, next: standalone_nexus.Client_Start_Nexus_Operation_Next) -> (result: standalone_nexus.Nexus_Operation_Handle, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.id > 1 && input.options.operation != "generated operation" {
@@ -312,12 +313,12 @@ client_interceptor_property_start_nexus_operation :: proc(user_data: rawptr, inp
 	}
 	input.options.operation = "generated operation"
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_start_nexus_operation_next(next, input)
+	else do result, error = standalone_nexus.client_start_nexus_operation_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_poll_nexus_operation :: proc(user_data: rawptr, input: ^temporal_client.Client_Poll_Nexus_Operation_Input, next: temporal_client.Client_Poll_Nexus_Operation_Next) -> (result: temporal_client.Nexus_Operation_Poll_Result, error: temporal_client.Error) {
+client_interceptor_property_poll_nexus_operation :: proc(user_data: rawptr, input: ^standalone_nexus.Client_Poll_Nexus_Operation_Input, next: standalone_nexus.Client_Poll_Nexus_Operation_Next) -> (result: standalone_nexus.Nexus_Operation_Poll_Result, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.id > 1 && input.wait_stage != .Started {
@@ -325,12 +326,12 @@ client_interceptor_property_poll_nexus_operation :: proc(user_data: rawptr, inpu
 	}
 	input.wait_stage = .Started
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_poll_nexus_operation_next(next, input)
+	else do result, error = standalone_nexus.client_poll_nexus_operation_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_describe_nexus_operation :: proc(user_data: rawptr, input: ^temporal_client.Client_Describe_Nexus_Operation_Input, next: temporal_client.Client_Describe_Nexus_Operation_Next) -> (result: temporal_client.Nexus_Operation_Description, error: temporal_client.Error) {
+client_interceptor_property_describe_nexus_operation :: proc(user_data: rawptr, input: ^standalone_nexus.Client_Describe_Nexus_Operation_Input, next: standalone_nexus.Client_Describe_Nexus_Operation_Next) -> (result: standalone_nexus.Nexus_Operation_Description, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.id > 1 && !input.options.include_input {
@@ -338,12 +339,12 @@ client_interceptor_property_describe_nexus_operation :: proc(user_data: rawptr, 
 	}
 	input.options.include_input = true
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_describe_nexus_operation_next(next, input)
+	else do result, error = standalone_nexus.client_describe_nexus_operation_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_nexus_operation_mutation :: proc(user_data: rawptr, input: ^temporal_client.Client_Nexus_Operation_Mutation_Input, next: temporal_client.Client_Nexus_Operation_Mutation_Next) -> temporal_client.Error {
+client_interceptor_property_nexus_operation_mutation :: proc(user_data: rawptr, input: ^standalone_nexus.Client_Nexus_Operation_Mutation_Input, next: standalone_nexus.Client_Nexus_Operation_Mutation_Next) -> temporal_client.Error {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	if node.id > 1 && input.reason != "generated Nexus mutation" {
@@ -352,27 +353,27 @@ client_interceptor_property_nexus_operation_mutation :: proc(user_data: rawptr, 
 	input.reason = "generated Nexus mutation"
 	result: temporal_client.Error
 	if node.short_circuit do result = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result = temporal_client.client_nexus_operation_mutation_next(next, input)
+	else do result = standalone_nexus.client_nexus_operation_mutation_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return result
 }
 
-client_interceptor_property_list_nexus_operations :: proc(user_data: rawptr, input: ^temporal_client.Client_List_Nexus_Operations_Input, next: temporal_client.Client_List_Nexus_Operations_Next) -> (result: temporal_client.Nexus_Operation_List_Page, error: temporal_client.Error) {
+client_interceptor_property_list_nexus_operations :: proc(user_data: rawptr, input: ^standalone_nexus.Client_List_Nexus_Operations_Input, next: standalone_nexus.Client_List_Nexus_Operations_Next) -> (result: standalone_nexus.Nexus_Operation_List_Page, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	input.options.query = "generated Nexus list query"
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_list_nexus_operations_next(next, input)
+	else do result, error = standalone_nexus.client_list_nexus_operations_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
 
-client_interceptor_property_count_nexus_operations :: proc(user_data: rawptr, input: ^temporal_client.Client_Count_Nexus_Operations_Input, next: temporal_client.Client_Count_Nexus_Operations_Next) -> (result: temporal_client.Nexus_Operation_Count, error: temporal_client.Error) {
+client_interceptor_property_count_nexus_operations :: proc(user_data: rawptr, input: ^standalone_nexus.Client_Count_Nexus_Operations_Input, next: standalone_nexus.Client_Count_Nexus_Operations_Next) -> (result: standalone_nexus.Nexus_Operation_Count, error: temporal_client.Error) {
 	node := cast(^Client_Interceptor_Property_Node)user_data
 	node.state.events[node.state.event_count] = node.id; node.state.event_count += 1
 	input.query = "generated Nexus count query"
 	if node.short_circuit do error = temporal_client.error_from_string(.Rpc, "generated short circuit")
-	else do result, error = temporal_client.client_count_nexus_operations_next(next, input)
+	else do result, error = standalone_nexus.client_count_nexus_operations_next(next, input)
 	node.state.events[node.state.event_count] = -node.id; node.state.event_count += 1
 	return
 }
@@ -436,7 +437,9 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		}
 		interceptor := temporal_client.Client_Interceptor{user_data = &nodes[index]}
 		schedule_interceptor := schedule.Interceptor{user_data = &nodes[index]}
+		nexus_interceptor := standalone_nexus.Interceptor{user_data = &nodes[index]}
 		is_schedule_operation := operation >= 7 && operation <= 12
+		is_nexus_operation := operation >= 15 && operation <= 20
 		switch operation {
 		case 0:
 			interceptor.signal_workflow = client_interceptor_property_signal
@@ -469,17 +472,17 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		case 14:
 			interceptor.wait_update = client_interceptor_property_wait_update
 		case 15:
-			interceptor.start_nexus_operation = client_interceptor_property_start_nexus_operation
+			nexus_interceptor.start_nexus_operation = client_interceptor_property_start_nexus_operation
 		case 16:
-			interceptor.poll_nexus_operation = client_interceptor_property_poll_nexus_operation
+			nexus_interceptor.poll_nexus_operation = client_interceptor_property_poll_nexus_operation
 		case 17:
-			interceptor.describe_nexus_operation = client_interceptor_property_describe_nexus_operation
+			nexus_interceptor.describe_nexus_operation = client_interceptor_property_describe_nexus_operation
 		case 18:
-			interceptor.nexus_operation_mutation = client_interceptor_property_nexus_operation_mutation
+			nexus_interceptor.nexus_operation_mutation = client_interceptor_property_nexus_operation_mutation
 		case 19:
-			interceptor.list_nexus_operations = client_interceptor_property_list_nexus_operations
+			nexus_interceptor.list_nexus_operations = client_interceptor_property_list_nexus_operations
 		case 20:
-			interceptor.count_nexus_operations = client_interceptor_property_count_nexus_operations
+			nexus_interceptor.count_nexus_operations = client_interceptor_property_count_nexus_operations
 		case 21:
 			interceptor.update_with_start = client_interceptor_property_update_with_start
 		case 22:
@@ -492,6 +495,12 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			if add_error.message != nil {
 				temporal_client.error_free(&add_error)
 				return pbt.error("could not register generated Schedule interceptor")
+			}
+		} else if is_nexus_operation {
+			add_error := standalone_nexus.add_interceptor(&client, nexus_interceptor)
+			if add_error.message != nil {
+				temporal_client.error_free(&add_error)
+				return pbt.error("could not register generated standalone Nexus interceptor")
 			}
 		} else {
 			append(&client.interceptors, interceptor)
@@ -519,7 +528,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		workflow_id = "property-workflow",
 		update_id = "property-update",
 	}
-	nexus_handle := temporal_client.Nexus_Operation_Handle{
+	nexus_handle := standalone_nexus.Nexus_Operation_Handle{
 		client = &client,
 		id = "property-operation",
 		run_id = "property-run",
@@ -603,8 +612,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		result, operation_error = temporal_client.wait_update_payload(&update_handle)
 		codec.payload_free(&result)
 	case 15:
-		started: temporal_client.Nexus_Operation_Handle
-		started, operation_error = temporal_client.start_nexus_operation_payload(
+		started: standalone_nexus.Nexus_Operation_Handle
+		started, operation_error = standalone_nexus.start_nexus_operation_payload(
 			&client,
 			{},
 			{
@@ -615,29 +624,29 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 				schedule_to_close_timeout = time.Minute,
 			},
 		)
-		temporal_client.nexus_operation_handle_free(&started)
+		standalone_nexus.nexus_operation_handle_free(&started)
 	case 16:
-		result: temporal_client.Nexus_Operation_Poll_Result
-		result, operation_error = temporal_client.poll_nexus_operation(&nexus_handle)
-		temporal_client.nexus_operation_poll_result_free(&result)
+		result: standalone_nexus.Nexus_Operation_Poll_Result
+		result, operation_error = standalone_nexus.poll_nexus_operation(&nexus_handle)
+		standalone_nexus.nexus_operation_poll_result_free(&result)
 	case 17:
-		result: temporal_client.Nexus_Operation_Description
-		result, operation_error = temporal_client.describe_nexus_operation(&nexus_handle)
-		temporal_client.nexus_operation_description_free(&result)
+		result: standalone_nexus.Nexus_Operation_Description
+		result, operation_error = standalone_nexus.describe_nexus_operation(&nexus_handle)
+		standalone_nexus.nexus_operation_description_free(&result)
 	case 18:
-		operation_error = temporal_client.nexus_operation_mutation(
+		operation_error = standalone_nexus.nexus_operation_mutation(
 			&nexus_handle,
-			temporal_client.Nexus_Operation_Mutation_Kind(pbt.draw(t, pbt.int_range(0, 2))),
+			standalone_nexus.Nexus_Operation_Mutation_Kind(pbt.draw(t, pbt.int_range(0, 2))),
 			"caller reason",
 		)
 	case 19:
-		page: temporal_client.Nexus_Operation_List_Page
-		page, operation_error = temporal_client.list_nexus_operations(&client)
-		temporal_client.nexus_operation_list_page_free(&page)
+		page: standalone_nexus.Nexus_Operation_List_Page
+		page, operation_error = standalone_nexus.list_nexus_operations(&client)
+		standalone_nexus.nexus_operation_list_page_free(&page)
 	case 20:
-		count: temporal_client.Nexus_Operation_Count
-		count, operation_error = temporal_client.count_nexus_operations(&client)
-		temporal_client.nexus_operation_count_free(&count)
+		count: standalone_nexus.Nexus_Operation_Count
+		count, operation_error = standalone_nexus.count_nexus_operations(&client)
+		standalone_nexus.nexus_operation_count_free(&count)
 	case 21:
 		result: temporal_client.Update_With_Start_Result
 		result, operation_error = temporal_client.update_with_start_payload(

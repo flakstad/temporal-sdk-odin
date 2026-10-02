@@ -846,15 +846,16 @@ trace_activity :: proc(
 }
 ```
 
-Client connections accept an ordered `[]Client_Interceptor`. The current
-typesafe outbound surface wraps Workflow start, Signal-With-Start,
+Client connections accept an ordered `[]Client_Interceptor`. The base typesafe
+outbound surface wraps Workflow start, Signal-With-Start,
 Update-With-Start, Signal, Query, Workflow result waiting, Update start/result
 waiting, cancellation,
 termination, exact-run deletion, and Workflow
-Visibility list/count, standalone Nexus start/poll/describe, cancel/terminate/
-delete and list/count, standalone Activity start/poll/describe,
-cancel/terminate/delete, pause/unpause/reset/options update and list/count, plus Schedule
-Describe/List/Count/Matching-Times; each
+Visibility list/count, and standalone Activity start/poll/describe,
+cancel/terminate/delete, pause/unpause/reset/options update and list/count.
+Schedule and standalone Nexus install
+separate typed chains through `schedule.add_interceptor` and
+`standalone_nexus.add_interceptor`; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
 Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`.
@@ -2575,6 +2576,7 @@ temporal/workflow/isolate optional versioned subprocess framing and execution
 temporal/client/          stable-core Client and Workflow handle APIs
 temporal/client/workflow_control optional Pause/Unpause operations and interceptors
 temporal/client/schedule  optional Schedule lifecycle and typed interceptors
+temporal/client/standalone_nexus optional standalone Nexus Client lifecycle
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof

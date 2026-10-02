@@ -2950,12 +2950,13 @@ metadata, external details, headers, and deterministic request bytes.
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
-cancellation, termination, deletion, Workflow result waiting, Visibility list/count,
-standalone Nexus start/poll/describe/mutation/list/count, and System Info
-discovery. The optional `temporal/client/schedule` package installs its own
-ordered interceptor chain with `schedule.add_interceptor`; the owned chain state
-uses the base Client extension lifecycle without making the base package import
-Schedules. Each operation has a dedicated
+cancellation, termination, deletion, Workflow result waiting, Visibility
+list/count, and System Info discovery. The optional
+`temporal/client/schedule` and `temporal/client/standalone_nexus` packages
+install their own ordered interceptor chains with `schedule.add_interceptor`
+and `standalone_nexus.add_interceptor`. Their owned chain state uses the base
+Client extension lifecycle without making the base package import either
+feature. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time

@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import temporal_client "../../temporal/client"
 import schedule "../../temporal/client/schedule"
+import standalone_nexus "../../temporal/client/standalone_nexus"
 
 System_Info_Interceptor_State :: struct {
 	entered: int,
@@ -82,6 +83,8 @@ main :: proc() {
 		probe_error: temporal_client.Error
 		if feature == .Schedule_Count {
 			observation, probe_error = schedule.probe_count_support(&client)
+		} else if feature == .Standalone_Nexus {
+			observation, probe_error = standalone_nexus.probe_support(&client)
 		} else {
 			observation, probe_error = temporal_client.probe_server_feature(&client, feature)
 		}

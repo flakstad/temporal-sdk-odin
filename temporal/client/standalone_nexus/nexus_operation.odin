@@ -1,4 +1,4 @@
-package client
+package standalone_nexus
 
 import allocator_runtime "base:runtime"
 import "core:bytes"
@@ -7,9 +7,52 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
-import codec "../codec"
-import temporal_core "../core"
-import proto "../core/proto"
+import client ".."
+import codec "../../codec"
+import temporal_core "../../core"
+import proto "../../core/proto"
+
+Client :: client.Client
+Client_Cancellation_Token :: client.Client_Cancellation_Token
+Error :: client.Error
+Error_Kind :: client.Error_Kind
+Link :: client.Link
+Named_Payload :: client.Named_Payload
+Nexus_Callback_Header :: client.Nexus_Callback_Header
+Nexus_Completion_Callback :: client.Nexus_Completion_Callback
+Optional_Duration :: client.Optional_Duration
+Optional_Time :: client.Optional_Time
+Start_Metadata :: client.Start_Metadata
+
+Pending_Nexus_Operation_State :: client.Pending_Nexus_Operation_State
+Nexus_Operation_Cancellation_State :: client.Nexus_Operation_Cancellation_State
+Nexus_Operation_Cancellation_Description :: client.Nexus_Operation_Cancellation_Description
+
+client_request_identity :: client.client_request_identity
+description_clone_named_payload :: client.description_clone_named_payload
+description_clone_payload :: client.description_clone_payload
+description_clone_string :: client.description_clone_string
+description_decode_user_metadata_string :: client.description_decode_user_metadata_string
+description_duration :: client.description_duration
+description_failure_message :: client.description_failure_message
+description_time :: client.description_time
+duration_proto :: client.duration_proto
+encode_link :: client.encode_link
+encoded_link_storage_free :: client.encoded_link_storage_free
+encoded_link_storage_make :: client.encoded_link_storage_make
+error_from_core :: client.error_from_core
+error_from_string :: client.error_from_string
+error_free :: client.error_free
+free_start_proto_payloads :: client.free_start_proto_payloads
+link_error :: client.link_error
+link_free :: client.link_free
+link_from_proto :: client.link_from_proto
+request_identity :: client.request_identity
+resolve_request_id :: client.resolve_request_id
+pending_nexus_operation_state_from_proto :: client.pending_nexus_operation_state_from_proto
+nexus_operation_cancellation_state_from_proto :: client.nexus_operation_cancellation_state_from_proto
+update_poll_failure_is_timeout :: client.update_poll_failure_is_timeout
+workflow_event_link_error :: client.workflow_event_link_error
 
 Nexus_Operation_Id_Reuse_Policy :: enum {
 	Unspecified,
@@ -96,24 +139,6 @@ Nexus_Operation_Status :: enum i32 {
 	Timed_Out = 6,
 }
 
-Pending_Nexus_Operation_State :: enum i32 {
-	Unspecified = 0,
-	Scheduled = 1,
-	Backing_Off = 2,
-	Started = 3,
-	Blocked = 4,
-}
-
-Nexus_Operation_Cancellation_State :: enum i32 {
-	Unspecified = 0,
-	Scheduled = 1,
-	Backing_Off = 2,
-	Succeeded = 3,
-	Failed = 4,
-	Timed_Out = 5,
-	Blocked = 6,
-}
-
 Nexus_Operation_Callback_State :: enum i32 {
 	Unspecified = 0,
 	Standby = 1,
@@ -129,19 +154,6 @@ Nexus_Operation_Callback_Kind :: enum {
 	Nexus,
 	Internal,
 	Nexus_Handler,
-}
-
-Nexus_Operation_Cancellation_Description :: struct {
-	present:                    bool,
-	requested_time:             Optional_Time,
-	state:                      Nexus_Operation_Cancellation_State,
-	attempt:                    i32,
-	last_attempt_complete_time: Optional_Time,
-	next_attempt_schedule_time: Optional_Time,
-	last_failure_message:       string,
-	last_failure_proto:         []u8,
-	blocked_reason:             string,
-	reason:                     string,
 }
 
 Nexus_Operation_Completion_Callback_Description :: struct {
@@ -629,7 +641,7 @@ start_nexus_operation_payload :: proc(
 		input = input,
 		options = options,
 	}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_start_nexus_operation_chain(&state, &interceptor_input)
 }
 
@@ -694,26 +706,6 @@ nexus_operation_status_from_proto :: proc(
 		return {}, false
 	}
 	return Nexus_Operation_Status(numeric), true
-}
-
-pending_nexus_operation_state_from_proto :: proc(
-	value: proto.Temporal_Api_Enums_V1_PendingNexusOperationState,
-) -> (Pending_Nexus_Operation_State, bool) {
-	numeric := i32(value)
-	if numeric < i32(Pending_Nexus_Operation_State.Unspecified) || numeric > i32(Pending_Nexus_Operation_State.Blocked) {
-		return {}, false
-	}
-	return Pending_Nexus_Operation_State(numeric), true
-}
-
-nexus_operation_cancellation_state_from_proto :: proc(
-	value: proto.Temporal_Api_Enums_V1_NexusOperationCancellationState,
-) -> (Nexus_Operation_Cancellation_State, bool) {
-	numeric := i32(value)
-	if numeric < i32(Nexus_Operation_Cancellation_State.Unspecified) || numeric > i32(Nexus_Operation_Cancellation_State.Blocked) {
-		return {}, false
-	}
-	return Nexus_Operation_Cancellation_State(numeric), true
 }
 
 nexus_operation_callback_state_from_proto :: proc(
@@ -1184,7 +1176,7 @@ poll_nexus_operation :: proc(
 		wait_stage = wait_stage,
 		options = options,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_poll_nexus_operation_chain(&state, &interceptor_input)
 }
 
@@ -1342,7 +1334,7 @@ describe_nexus_operation :: proc(
 		options = options,
 		allocator = allocator,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_describe_nexus_operation_chain(&state, &interceptor_input)
 }
 
@@ -1438,7 +1430,7 @@ nexus_operation_mutation :: proc(
 		reason = reason,
 		request_id = request_id,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_nexus_operation_mutation_chain(&state, &input)
 }
 

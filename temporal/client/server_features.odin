@@ -163,16 +163,7 @@ probe_server_feature :: proc(
 		}
 		defer system_info_free(&info)
 		return server_feature_from_system_info(feature, info.capabilities), {}
-	case .Standalone_Nexus:
-		count, probe_error := count_nexus_operations(client)
-		nexus_operation_count_free(&count)
-		observation := server_feature_from_rpc_error(feature, &probe_error)
-		if observation.support == .Unsupported {
-			error_free(&probe_error)
-			return observation, {}
-		}
-		return observation, probe_error
-	case .Schedule_Count, .Workflow_Pause, .Standalone_Activity:
+	case .Schedule_Count, .Standalone_Nexus, .Workflow_Pause, .Standalone_Activity:
 		return base, {}
 	}
 	return base, {}

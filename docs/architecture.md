@@ -748,8 +748,11 @@ selector/join integration are implemented.
 
 ### Standalone Nexus operation Client boundary
 
-The upgraded pinned API and C bridge also carry the pre-release standalone
-Nexus operation RPC family. This is a Client-side execution model: no caller
+The optional `temporal/client/standalone_nexus` package owns the pre-release
+standalone Nexus operation RPC family carried by the upgraded pinned API and C
+bridge. The base Client retains only the Nexus state snapshots shared by normal
+Workflow Describe responses. Typed interceptor state uses the Client's owned
+opaque extension slot, so the dependency remains one-way. This is a Client-side execution model: no caller
 Workflow is required, but the operation is still routed through the same Nexus
 endpoint, task queue, Core Nexus poll, and Odin handler registry described
 above. It adds no raw C symbol. Odin serializes the exact WorkflowService
@@ -765,7 +768,7 @@ with these verified method names:
 - `ListNexusOperationExecutions`;
 - `CountNexusOperationExecutions`.
 
-`temporal/client/nexus_operation.odin` now exposes an owned
+`temporal/client/standalone_nexus` exposes an owned
 `Nexus_Operation_Handle`, borrowed start options, codec-neutral and typed JSON
 start/result helpers, Started/Closed polling, monotonic local wait timeouts,
 Core cancellation tokens, cancellation requests, an allocator-owned typed
@@ -775,8 +778,8 @@ headers, Search Attributes, static summary/details, optional input/result or
 encoded terminal Failure, and the opaque long-poll token. The list API owns its
 limited execution summaries, typed status/times, Search Attribute Payloads,
 and pagination token. Count preserves both the approximate total and optional
-group values as codec-neutral Payloads. Both participate in the public Client
-outbound-interceptor chain. Start, Poll/result waiting, Describe, and the
+group values as codec-neutral Payloads. The package owns its outbound-
+interceptor chain. Start, Poll/result waiting, Describe, and the
 cancel/terminate/delete mutation family participate in the same chain, giving
 the complete standalone lifecycle typed nested continuations. Starts carry all three operation timeouts, ID
 reuse/conflict policies, Nexus string headers, typed Search Attributes, static

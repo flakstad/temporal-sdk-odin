@@ -62,12 +62,12 @@ but a server-version-specific limitation in one of them does not block the core
 SDK release unless the feature is promoted into the stable core. The standard
 Worker depends only on the Workflow routing contract; importing it does not
 compile the opt-in Activity or Workflow subprocess implementations. Workflow
-Pause/Unpause and Schedules are the first Client extensions physically
-extracted from the base package. Their typed interceptors are stored through
-owned opaque extension slots, so base Client lifecycle remains responsible for
-cleanup without a reverse dependency on either optional package. Standalone
-operations and other extended Client families should migrate through the same
-boundary.
+Pause/Unpause, Schedules, and standalone Nexus operations are the first Client
+extensions physically extracted from the base package. Their typed interceptors
+are stored through owned opaque extension slots, so base Client lifecycle
+remains responsible for cleanup without a reverse dependency on an optional
+package. Standalone Activities and other extended Client families should
+migrate through the same boundary after shared Describe types are separated.
 
 ## Deliberately deferred
 

@@ -21,6 +21,11 @@ odin check "$repo_root/temporal/client/schedule" \
 	-vet \
 	-strict-style \
 	-warnings-as-errors
+odin check "$repo_root/temporal/client/standalone_nexus" \
+	-no-entry-point \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
 
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
