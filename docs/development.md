@@ -1247,8 +1247,9 @@ A second 1,000-case property uses `test-deps/pbt`, the repository-pinned
 snapshot of `~/Projects/pbt`, to generate up to 256 routed arrivals and
 interleaved completions over one to
 sixteen shards. It checks owned/queue high-water marks and
-`workflow_executor_shards_used` against an independent per-shard load model,
-then drains the generated skew to zero.
+`workflow_executor_shards_used` plus the minimum/maximum per-shard activation
+admission counts against an independent per-shard load model, then drains the
+generated skew to zero.
 The script's third pass sets `TEMPORAL_ODIN_FORCE_SHUTDOWN=1`, starts enough
 one-hour timer Workflows to cover all four executor shards, waits until one
 activation is executing on each shard, and requests Worker shutdown without
@@ -1268,6 +1269,15 @@ The blocking probe is instrumentation only; application Workflow code must not
 read wall time or block an executor thread. In concurrent mode, Workflow
 logger/interceptor/metric factory state and the activation observer can be
 called from several shard threads and must be concurrency-safe.
+The fourth pass sets `TEMPORAL_ODIN_HANDLER_LOAD=1`. It starts at least two
+runs on every shard, sends four typed Signals to every run, and waits until all
+stackful Signal routines have suspended on five-second durable timers. It then
+requests Core eviction for every run while those handlers are live. Completion
+requires fresh-stack replay, exact `load:10:4` results, every non-replay Signal
+handler started and completed exactly once, no abandonment or warnings, all
+four shards used, positive per-shard admission minima, and zero thread
+migrations. This covers many simultaneous handler stacks and history
+reconstruction rather than only overlapping one Signal and one Update.
 
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.

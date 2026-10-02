@@ -68,6 +68,7 @@ workflow_scheduler_shard_load_property :: proc(t: ^pbt.T) -> pbt.Result {
 	model_owned_peak := 0
 	model_queue_peak := 0
 	model_shards_used := 0
+	model_shard_arrivals: [16]int
 
 	for encoded in events {
 		run_id := fmt.aprintf("generated-run-%d", encoded % 64)
@@ -82,6 +83,7 @@ workflow_scheduler_shard_load_property :: proc(t: ^pbt.T) -> pbt.Result {
 			model_shards_used += 1
 		}
 		queue_depths[shard] += 1
+		model_shard_arrivals[shard] += 1
 		model_owned += 1
 		model_owned_peak = max(model_owned_peak, model_owned)
 		model_queue_peak = max(model_queue_peak, queue_depths[shard])
@@ -111,6 +113,25 @@ workflow_scheduler_shard_load_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, model_shards_used == shard_count, 30, "all configured shards used")
 	pbt.cover(t, model_queue_peak >= 8, 20, "skewed shard queue")
 	pbt.cover(t, model_owned_peak >= 32, 30, "many owned activations")
+	model_shard_min := 0
+	model_shard_max := 0
+	model_shards_observed := 0
+	for shard in 0 ..< shard_count {
+		arrivals := model_shard_arrivals[shard]
+		worker.workflow_scheduler_observe_shard_activations(&scheduler, arrivals)
+		if arrivals > 0 {
+			if model_shards_observed == 0 || arrivals < model_shard_min {
+				model_shard_min = arrivals
+			}
+			model_shard_max = max(model_shard_max, arrivals)
+			model_shards_observed += 1
+		}
+	}
+	if scheduler.shards_observed != model_shards_observed ||
+	   scheduler.shard_activations_min != model_shard_min ||
+	   scheduler.shard_activations_max != model_shard_max {
+		return pbt.fail("Workflow scheduler shard distribution diverged from reference model")
+	}
 	if !worker.workflow_scheduler_release_activations(&scheduler, model_owned) ||
 	   scheduler.activations_owned != 0 {
 		return pbt.fail("generated shard load did not drain ownership")

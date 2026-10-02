@@ -375,6 +375,11 @@ Run_Stats :: struct {
 	// Number of fixed in-process executor shards which received at least one
 	// activation. Serial and external-processor execution report zero.
 	workflow_executor_shards_used:        int,
+	// Minimum and maximum activation admission count among the fixed in-process
+	// executor shards which received work. These expose sustained routing skew;
+	// serial and external-processor execution report zero.
+	workflow_executor_shard_activations_min: int,
+	workflow_executor_shard_activations_max: int,
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,

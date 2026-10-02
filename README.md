@@ -606,6 +606,13 @@ the same time. Both suspend on durable two-second timers, remain logically
 active together, resume on the owner shard, and drain before the main fiber
 closes. The Client receives the typed Update result and the Workflow requires
 an in-run handler peak of two.
+A fourth live pass starts at least two Workflow runs on every executor shard,
+sends four independent stackful Signal routines to each run, and waits until
+all routines have suspended on durable timers. It then requests Core eviction
+for every live run. Fresh stacks must replay every Signal/timer command and
+produce the exact aggregate result with a per-run concurrency peak of four,
+complete every handler without warnings or abandonment, and report zero thread
+migrations.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
@@ -613,6 +620,10 @@ fixed in-process shard; serial and external-processor execution report zero for
 that shard-specific value. `workflow_executor_shards_used` reports how many
 fixed shards received work. `workflow_cached_fibers_shutdown` counts cached
 in-process fibers destroyed during teardown rather than by Core eviction.
+`workflow_executor_shard_activations_min` and
+`workflow_executor_shard_activations_max` expose the least and most activation
+admissions among shards that received work, making sustained routing skew
+observable without exposing an allocated per-shard result.
 The live shutdown pass leaves runs suspended on one-hour durable timers across
 all four shards and requests shutdown while one activation is executing on
 each shard. It then requires every fiber to be destroyed on its owner thread.

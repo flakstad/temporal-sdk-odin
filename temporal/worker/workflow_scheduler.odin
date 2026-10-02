@@ -18,6 +18,9 @@ In_Process_Workflow_Scheduler :: struct {
 	peak_owned:         int,
 	queue_peak:         int,
 	shards_used:        int,
+	shards_observed:    int,
+	shard_activations_min: int,
+	shard_activations_max: int,
 }
 
 In_Process_Workflow_Shard :: struct {
@@ -34,6 +37,7 @@ In_Process_Workflow_Shard :: struct {
 	stop:        bool,
 	thread:      ^thread.Thread,
 	stats:       Run_Stats,
+	activations_enqueued: int,
 	error:       Error,
 }
 
@@ -69,6 +73,22 @@ workflow_scheduler_release_activations :: proc(
 	}
 	sync.mutex_unlock(&scheduler.mutex)
 	return balanced
+}
+
+workflow_scheduler_observe_shard_activations :: proc(
+	scheduler: ^In_Process_Workflow_Scheduler,
+	count: int,
+) {
+	if scheduler == nil || count <= 0 {
+		return
+	}
+	sync.mutex_lock(&scheduler.mutex)
+	if scheduler.shards_observed == 0 || count < scheduler.shard_activations_min {
+		scheduler.shard_activations_min = count
+	}
+	scheduler.shard_activations_max = max(scheduler.shard_activations_max, count)
+	scheduler.shards_observed += 1
+	sync.mutex_unlock(&scheduler.mutex)
 }
 
 workflow_runtime_set_close_on_executor :: proc(
@@ -356,6 +376,7 @@ workflow_shard_enqueue :: proc(
 		return result
 	}
 	append(&shard.queue, activation)
+	shard.activations_enqueued += 1
 	queue_depth := len(shard.queue)
 	first_shard_use := !shard.used
 	shard.used = true
@@ -391,6 +412,10 @@ workflow_shards_finish :: proc(
 		if shard.thread != nil {
 			thread.join(shard.thread)
 		}
+		workflow_scheduler_observe_shard_activations(
+			shard.scheduler,
+			shard.activations_enqueued,
+		)
 		workflow_stats_add(stats, shard.stats)
 		if shard.error.message != nil {
 			if error.message == nil {
@@ -497,6 +522,8 @@ run_in_process_workflow_executor_loop :: proc(
 	stats.workflow_activations_peak_owned = scheduler.peak_owned
 	stats.workflow_executor_queue_peak = scheduler.queue_peak
 	stats.workflow_executor_shards_used = scheduler.shards_used
+	stats.workflow_executor_shard_activations_min = scheduler.shard_activations_min
+	stats.workflow_executor_shard_activations_max = scheduler.shard_activations_max
 	remaining_owned := scheduler.activations_owned
 	sync.mutex_unlock(&scheduler.mutex)
 	if remaining_owned != 0 {

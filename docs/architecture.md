@@ -3504,7 +3504,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and replay/nondeterminism/stackful-handler isolation on fixed run-affine concurrent executors on macOS arm64 | Stress shutdown faults and handler-heavy load across many shards without moving a live fiber |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, mid-activation shutdown, and replay/nondeterminism/handler-load isolation on fixed run-affine concurrent executors on macOS arm64 | Run longer mixed-operation soak/fault tests and validate guard pages plus affinity on every distribution target |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -3518,10 +3518,11 @@ The current next milestone is production hardening of the run-affine
 in-process scheduler. Replay reconstruction, concurrent activation failure,
 cancellation, immediate and suspending Signal/Update handlers, clean shutdown
 of cached fibers, and Core-detected nondeterminism are now live-proven on
-affine shards. Next, exercise mid-activation shutdown faults and handler-heavy
-load concurrently across many shards; add queue-depth/fairness observations;
-and run the guard-page plus
-affinity suite on all four distribution targets. The live proofs establish the
+affine shards. Mid-activation shutdown and handler-heavy fresh-stack replay
+are now covered across all shards, and queue depth plus per-shard admission
+min/max make routing pressure observable. Next, run longer mixed-operation
+soak/fault tests and the guard-page plus affinity suite on all four
+distribution targets. The live proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
 containment option for panicking, overflowing, or uncooperative Workflow code.
@@ -4243,6 +4244,14 @@ hash shards before the fourth shard receives work. Extra admitted activations
 queue behind their fixed owner and must be drained before executor teardown.
 Its brief wall-clock block is test instrumentation and is not an allowed
 Workflow programming primitive.
+A fourth pass starts at least two runs on each shard and delivers four typed
+Signals to every run. Each Signal owns an independent stackful routine and
+suspends on a five-second durable timer. After all routines have entered, the
+coordinator explicitly evicts every cached execution. Core reloads the
+histories and fresh fibers must reproduce the Signal handlers and timer
+commands before returning `load:10:4` for every run. The pass requires at
+least 32 non-replay handler starts/completions, no warning or abandonment,
+positive replay/eviction counts, all shards used, and zero fiber migration.
 
 The scheduler accounts for ownership at the activation-buffer boundary.
 Enqueue increments a shared owned count, normal processing releases one after
@@ -4251,6 +4260,11 @@ completion cleanup, and fault teardown releases every discarded queued buffer.
 `workflow_executor_queue_peak` exposes the largest individual shard queue.
 `workflow_executor_shards_used` exposes how many fixed shards received at least
 one activation during the run.
+`workflow_executor_shard_activations_min` and
+`workflow_executor_shard_activations_max` expose the least and most activation
+admissions among used shards. They are finalized after the shard threads join
+and make routing/fairness skew inspectable without returning an allocated
+per-shard collection.
 `workflow_cached_fibers_shutdown` counts in-process fibers still present when
 their owner executor tears down; normal `RemoveFromCache` destruction is
 reported separately by `workflow_evictions`.
@@ -4262,7 +4276,7 @@ requires exact drain plus underflow rejection.
 A second 1,000-case PBT generates routed run arrivals and interleaved
 completions across one to sixteen shards. Its independent per-shard load model
 must match global ownership, owned and queue high-water marks, distinct shard
-usage, and final drain. The test suite uses repository-pinned snapshots of the
+usage, final per-shard admission extrema, and final drain. The test suite uses repository-pinned snapshots of the
 projects also checked out at `~/Projects/pbt` and `~/Projects/statecharts`; no
 runtime dependency is added.
 

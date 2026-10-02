@@ -18,8 +18,11 @@ CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
 NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
 SIGNAL_HANDLER_WORKFLOW_TYPE :: "in_process_signal_handler_probe"
 ASYNC_HANDLER_WORKFLOW_TYPE :: "in_process_async_handler_probe"
+HANDLER_LOAD_WORKFLOW_TYPE :: "in_process_handler_load_probe"
 SHUTDOWN_WORKFLOW_TYPE :: "in_process_shutdown_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
+HANDLER_LOAD_ROUTINES :: 4
+HANDLER_LOAD_RUNS_PER_SHARD :: 2
 
 Probe_State :: struct {
 	mutex:                 sync.Mutex,
@@ -34,6 +37,7 @@ Probe_State :: struct {
 	nondeterminism_replay: bool,
 	shutdown_shards_entered: [EXECUTOR_THREADS]bool,
 	shutdown_shard_count:    int,
+	handler_load_started:    int,
 }
 
 probe_state: Probe_State
@@ -248,6 +252,61 @@ async_handler_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
 	)
 }
 
+Handler_Load_State :: struct {
+	owner_thread: int,
+	active:       int,
+	peak:         int,
+	completed:    int,
+	sum:          int,
+}
+
+handler_load_routine :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Handler_Load_State,
+	value: int,
+) {
+	if sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+	state.active += 1
+	state.peak = max(state.peak, state.active)
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.handler_load_started += 1
+	sync.mutex_unlock(&probe_state.mutex)
+	workflow.sleep(ctx, 5 * time.Second)
+	if sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+	state.sum += value
+	state.completed += 1
+	state.active -= 1
+}
+
+handler_load_ready :: proc(state: ^Handler_Load_State) -> bool {
+	return state.completed == HANDLER_LOAD_ROUTINES
+}
+
+handler_load_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Handler_Load_State{owner_thread = sync.current_thread_id()}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"load",
+		&state,
+		handler_load_routine,
+	) {
+		return "handler load registration failed"
+	}
+	if !workflow.await_condition(ctx, &state, handler_load_ready) {
+		return "handler load wait canceled"
+	}
+	workflow.await_all_handlers_finished(ctx)
+	return fmt.aprintf("load:%d:%d", state.sum, state.peak)
+}
+
 Concurrency_State :: struct {
 	client:                  ^temporal_client.Client,
 	sdk_worker:              ^worker.Worker,
@@ -283,6 +342,124 @@ Concurrency_State :: struct {
 	async_handler_ok:       bool,
 	force_replay:            bool,
 	force_shutdown:          bool,
+	force_handler_load:      bool,
+}
+
+wait_for_handler_load_results :: proc(state: ^Concurrency_State) {
+	state.results_ok = true
+	expected_handlers := len(state.handles) * HANDLER_LOAD_ROUTINES
+	for &handle in state.handles {
+		for value in 1 ..= HANDLER_LOAD_ROUTINES {
+			state.signal_error = temporal_client.signal_workflow_json(
+				&handle,
+				"load",
+				value,
+			)
+			if state.signal_error.message != nil {
+				state.results_ok = false
+				worker.request_shutdown(state.sdk_worker)
+				return
+			}
+		}
+	}
+	started := 0
+	for _ in 0 ..< 1000 {
+		sync.mutex_lock(&probe_state.mutex)
+		started = probe_state.handler_load_started
+		sync.mutex_unlock(&probe_state.mutex)
+		if started >= expected_handlers {
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	if started < expected_handlers {
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	// Every routine has emitted its durable timer. Let Core install the sticky
+	// completions, then discard every cached stack while all handlers are live.
+	time.sleep(200 * time.Millisecond)
+	for &handle in state.handles {
+		state.eviction_error = worker.request_workflow_eviction(
+			state.sdk_worker,
+			handle.run_id,
+		)
+		if state.eviction_error.message != nil {
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+	}
+	for &handle in state.handles {
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		if result_error.message != nil {
+			state.result_error = result_error
+			state.results_ok = false
+			delete(result)
+			break
+		}
+		if result != "load:10:4" {
+			state.results_ok = false
+		}
+		delete(result)
+		if !state.results_ok {
+			break
+		}
+	}
+	worker.request_shutdown(state.sdk_worker)
+}
+
+start_handler_load_workflows :: proc(state: ^Concurrency_State) -> bool {
+	if state == nil || state.client == nil || state.sdk_worker == nil {
+		return false
+	}
+	runs_per_shard: [EXECUTOR_THREADS]int
+	covered_shards := 0
+	for candidate in 0 ..< 128 {
+		workflow_id := fmt.aprintf("%s-load-%d", state.id_prefix, candidate)
+		handle, start_error := temporal_client.start_workflow_json(
+			state.client,
+			HANDLER_LOAD_WORKFLOW_TYPE,
+			workflow_id,
+			{
+				id = workflow_id,
+				task_queue = state.task_queue,
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		delete(workflow_id)
+		if start_error.message != nil {
+			state.start_error = start_error
+			return false
+		}
+		append(&state.handles, handle)
+		shard, shard_ok := workflow_isolate.workflow_shard_index(
+			handle.run_id,
+			EXECUTOR_THREADS,
+		)
+		if !shard_ok {
+			return false
+		}
+		runs_per_shard[shard] += 1
+		if runs_per_shard[shard] == HANDLER_LOAD_RUNS_PER_SHARD {
+			covered_shards += 1
+		}
+		if covered_shards == EXECUTOR_THREADS {
+			break
+		}
+	}
+	if covered_shards != EXECUTOR_THREADS {
+		return false
+	}
+	state.watcher = thread.create_and_start_with_poly_data(
+		state,
+		wait_for_handler_load_results,
+	)
+	return state.watcher != nil
 }
 
 wait_for_results :: proc(state: ^Concurrency_State) {
@@ -549,6 +726,9 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	if state.force_shutdown {
 		return start_shutdown_workflows(state)
 	}
+	if state.force_handler_load {
+		return start_handler_load_workflows(state)
+	}
 	failure_id := fmt.aprintf("%s-invalid", state.id_prefix)
 	failure_handle, failure_start_error := temporal_client.start_workflow_json(
 		state.client,
@@ -721,6 +901,11 @@ run :: proc() -> int {
 		shutdown_buffer[:],
 		"TEMPORAL_ODIN_FORCE_SHUTDOWN",
 	) == "1"
+	handler_load_buffer: [64]u8
+	force_handler_load := os.get_env(
+		handler_load_buffer[:],
+		"TEMPORAL_ODIN_HANDLER_LOAD",
+	) == "1"
 	task_queue_buffer: [256]u8
 	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
 	if len(task_queue) == 0 {
@@ -745,13 +930,14 @@ run :: proc() -> int {
 
 	options := worker.options_default(task_queue)
 	options.max_concurrent_workflow_tasks = EXECUTOR_THREADS
-	options.max_workflow_task_slots = force_shutdown ? 128 : EXECUTOR_THREADS
-	options.max_cached_workflows = force_shutdown ? 128 : 16
+	stress_mode := force_shutdown || force_handler_load
+	options.max_workflow_task_slots = stress_mode ? 128 : EXECUTOR_THREADS
+	options.max_cached_workflows = stress_mode ? 128 : 16
 	options.nondeterminism_policy = {
 		fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
 	}
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(
-		force_shutdown ? 16 : EXECUTOR_THREADS,
+		stress_mode ? 16 : EXECUTOR_THREADS,
 	)
 	sdk_worker, create_error := worker.create_with_options(
 		temporal_client.core_client(&client),
@@ -818,6 +1004,16 @@ run :: proc() -> int {
 	}
 	register_error = worker.register_json_workflow(
 		&sdk_worker,
+		HANDLER_LOAD_WORKFLOW_TYPE,
+		handler_load_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Handler-load Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
 		NONDETERMINISM_WORKFLOW_TYPE,
 		nondeterminism_probe,
 	)
@@ -834,6 +1030,7 @@ run :: proc() -> int {
 		id_prefix = id_prefix,
 		force_replay = force_replay,
 		force_shutdown = force_shutdown,
+		force_handler_load = force_handler_load,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
 		on_ready = start_concurrent_workflows,
@@ -846,7 +1043,7 @@ run :: proc() -> int {
 	}
 	defer {
 		for &handle in state.handles {
-			if state.force_shutdown {
+			if state.force_shutdown || (state.force_handler_load && !state.results_ok) {
 				cleanup_error := temporal_client.terminate_workflow(
 					&handle,
 					"in-process affine shutdown proof completed",
@@ -993,6 +1190,63 @@ run :: proc() -> int {
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
 			shutdown_migrations,
+		)
+		return 0
+	}
+	if force_handler_load {
+		sync.mutex_lock(&probe_state.mutex)
+		migrations := probe_state.migrations
+		handler_load_started := probe_state.handler_load_started
+		sync.mutex_unlock(&probe_state.mutex)
+		expected_handlers := len(state.handles) * HANDLER_LOAD_ROUTINES
+		if !state.results_ok || len(state.handles) < EXECUTOR_THREADS * HANDLER_LOAD_RUNS_PER_SHARD ||
+		   handler_load_started < expected_handlers ||
+		   run_stats.workflow_executions_completed != len(state.handles) ||
+		   run_stats.workflow_activation_failures != 0 ||
+		   run_stats.workflow_signals_received != expected_handlers ||
+		   run_stats.workflow_signal_handlers_started != expected_handlers ||
+		   run_stats.workflow_signal_handlers_completed != expected_handlers ||
+		   run_stats.workflow_signal_handlers_abandoned != 0 ||
+		   run_stats.workflow_signal_handler_warnings != 0 ||
+		   run_stats.workflow_replay_activations < len(state.handles) ||
+		   run_stats.workflow_evictions < len(state.handles) ||
+		   run_stats.workflow_executor_shards_used != EXECUTOR_THREADS ||
+		   run_stats.workflow_executor_shard_activations_min < 1 ||
+		   run_stats.workflow_executor_shard_activations_max <
+			   run_stats.workflow_executor_shard_activations_min ||
+		   run_stats.workflow_activations_peak_owned < EXECUTOR_THREADS ||
+		   run_stats.workflow_executor_queue_peak < 1 || migrations != 0 {
+			fmt.eprintf(
+				"In-process Workflow handler load failed handles=%d shards=%d signals=%d handlers_started=%d handlers_completed=%d replay_activations=%d evictions=%d shard_activations_min=%d shard_activations_max=%d owned_peak=%d queue_peak=%d migrations=%d results_ok=%v\n",
+				len(state.handles),
+				run_stats.workflow_executor_shards_used,
+				run_stats.workflow_signals_received,
+				run_stats.workflow_signal_handlers_started,
+				run_stats.workflow_signal_handlers_completed,
+				run_stats.workflow_replay_activations,
+				run_stats.workflow_evictions,
+				run_stats.workflow_executor_shard_activations_min,
+				run_stats.workflow_executor_shard_activations_max,
+				run_stats.workflow_activations_peak_owned,
+				run_stats.workflow_executor_queue_peak,
+				migrations,
+				state.results_ok,
+			)
+			return 1
+		}
+		fmt.printf(
+			"In-process Workflow handler load proved handles=%d shards=%d signals=%d handlers=%d replay_activations=%d evictions=%d shard_activations_min=%d shard_activations_max=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+			len(state.handles),
+			EXECUTOR_THREADS,
+			run_stats.workflow_signals_received,
+			run_stats.workflow_signal_handlers_completed,
+			run_stats.workflow_replay_activations,
+			run_stats.workflow_evictions,
+			run_stats.workflow_executor_shard_activations_min,
+			run_stats.workflow_executor_shard_activations_max,
+			run_stats.workflow_activations_peak_owned,
+			run_stats.workflow_executor_queue_peak,
+			migrations,
 		)
 		return 0
 	}
