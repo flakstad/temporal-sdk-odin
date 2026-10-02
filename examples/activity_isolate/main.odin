@@ -214,6 +214,10 @@ run_parent :: proc() {
 		"ACTIVITY_ISOLATE_MANIFEST_MISMATCH",
 	)
 	mismatch_case := len(mismatch_mode) > 0
+	pool_buffer: [32]u8
+	pool_mode := os.get_env(pool_buffer[:], "ACTIVITY_ISOLATE_POOL")
+	pool_case := pool_mode == "concurrent"
+	parallel_shutdown_case := pool_mode == "parallel-shutdown"
 	child_mode := mismatch_case ? "--child-loop-mismatch" : "--child-loop"
 	command := [?]string{os.args[0], child_mode}
 	manager := activity_isolate.Manager{}
@@ -221,7 +225,7 @@ run_parent :: proc() {
 	manager_options.execution_timeout = 10 * time.Second
 	manager_options.cancellation_grace = 500 * time.Millisecond
 	manager_options.shutdown_timeout = 2 * time.Second
-	manager_options.warm_pool_size = 1
+	manager_options.warm_pool_size = parallel_shutdown_case ? 2 : 1
 	if mismatch_case {
 		manager_options.crash_loop = {
 			maximum_consecutive_failures = 1,
@@ -271,9 +275,6 @@ run_parent :: proc() {
 	multi_buffer: [32]u8
 	multi_mode := os.get_env(multi_buffer[:], "ACTIVITY_ISOLATE_MULTI")
 	multi_case := multi_mode == "manifest"
-	pool_buffer: [32]u8
-	pool_mode := os.get_env(pool_buffer[:], "ACTIVITY_ISOLATE_POOL")
-	pool_case := pool_mode == "concurrent"
 	fmt.printf(
 		"Odin external Activity parent is polling task queue %s (manifest=%v mismatch=%v)\n",
 		task_queue,
@@ -384,20 +385,23 @@ run_parent :: proc() {
 		}
 		return
 	}
-	reuse_case := multi_case || pool_case
+	reuse_case := multi_case || pool_case || parallel_shutdown_case
 	expected_completed := reuse_case ? 2 : 1
 	expected_failures := reuse_case ? 0 : 1
-	expected_started := reuse_case ? 1 : 2
-	expected_reused := reuse_case ? 1 : 0
+	expected_started := parallel_shutdown_case ? 2 : (reuse_case ? 1 : 2)
+	expected_reused := parallel_shutdown_case ? 0 : (reuse_case ? 1 : 0)
 	expected_retired := reuse_case ? 0 : 1
+	expected_shutdown := parallel_shutdown_case ? 2 : 1
+	expected_peak_in_flight := parallel_shutdown_case ? 2 : 1
+	expected_peak_pool := parallel_shutdown_case ? 2 : 1
 	if stats.activity_tasks_completed != 2 || executor_stats.children_started != expected_started ||
 	   executor_stats.children_completed != expected_completed ||
 	   executor_stats.child_failures != expected_failures ||
 	   executor_stats.children_reused != expected_reused ||
 	   executor_stats.children_retired != expected_retired ||
-	   executor_stats.children_shutdown != 1 ||
-	   executor_stats.peak_in_flight != 1 ||
-	   executor_stats.peak_pool_children != 1 ||
+	   executor_stats.children_shutdown != expected_shutdown ||
+	   executor_stats.peak_in_flight != expected_peak_in_flight ||
+	   executor_stats.peak_pool_children != expected_peak_pool ||
 	   executor_stats.manifest_handshakes != expected_started ||
 	   executor_stats.manifest_mismatches != 0 ||
 	   executor_stats.heartbeats_forwarded != (reuse_case ? 0 : 1) ||
@@ -421,6 +425,10 @@ run_parent :: proc() {
 	}
 	if pool_case {
 		fmt.println("warm Activity pool serialized two concurrent tasks through one reused child")
+		return
+	}
+	if parallel_shutdown_case {
+		fmt.println("two warm Activity children shut down through the parallel pool drain")
 		return
 	}
 	fmt.println("isolated Activity panic was contained, heartbeat forwarded, and retry completed")

@@ -3556,8 +3556,8 @@ containment option for panicking, overflowing, or uncooperative Workflow code.
 In parallel, Activity isolation now has opt-in warm children in a bounded pool
 without changing its duplex-heartbeat and cooperative-cancellation semantics.
 Concurrent admission, failed-child replacement, and bounded shutdown are
-live-proven. Per-generation manifest verification and crash-loop fencing are
-also live-proven; general readiness, parallel shutdown, and longer fault/soak
+live-proven. Per-generation manifest verification, crash-loop fencing, and
+parallel pool shutdown are also live-proven; general readiness and longer fault/soak
 evidence remain.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
@@ -4533,8 +4533,7 @@ truthfully wrap code executing in another process; heartbeat interceptors still
 wrap forwarded heartbeat events. Protocol-v5 shutdown bounds acknowledgement
 and exit separately. The live matrix proves sequential `hello`/`goodbye`
 dispatch and two concurrently submitted tasks through one reused child.
-General readiness probes, parallel pool shutdown, and child-side execute
-interceptors/metrics remain. See
+General readiness probes and child-side execute interceptors/metrics remain. See
 `docs/activity-isolation.md` for the live crash/retry proof and ownership rules.
 
 ### Local Activity boundary

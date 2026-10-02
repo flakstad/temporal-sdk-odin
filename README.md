@@ -576,7 +576,9 @@ acknowledged and time-limited. Every warm generation must first return the exact
 canonical Activity manifest; a live incompatible-child case is rejected before
 callback dispatch or task-token routing. An optional consecutive-failure
 circuit breaker prevents an incompatible or repeatedly crashing executable from
-being respawned per Activity task; cooldown permits one trial generation.
+being respawned per Activity task; cooldown permits one trial generation. Warm
+children are shut down concurrently, so the configured acknowledgement and exit
+deadlines do not multiply by pool size.
 See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test

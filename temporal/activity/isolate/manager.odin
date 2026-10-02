@@ -806,9 +806,22 @@ session_shutdown :: proc(manager: ^Manager, session: ^Session) -> bool {
 	return graceful
 }
 
+Manager_Shutdown_Task :: struct {
+	manager: ^Manager,
+	session: ^Session,
+	ok:      bool,
+}
+
+manager_shutdown_task_main :: proc(task: ^Manager_Shutdown_Task) {
+	if task == nil {
+		return
+	}
+	task.ok = session_shutdown(task.manager, task.session)
+}
+
 // manager_shutdown is valid after Worker polling and Activity execution have
-// drained. It closes every idle warm child through protocol v5 and bounds both
-// acknowledgement and process-exit waits.
+// drained. It closes every idle warm child concurrently through protocol v5,
+// so acknowledgement and process-exit bounds do not multiply by pool size.
 manager_shutdown :: proc(manager: ^Manager) -> Manager_Error {
 	if manager == nil || !manager.initialized {
 		return manager_error("Activity executor manager is not initialized")
@@ -828,15 +841,33 @@ manager_shutdown :: proc(manager: ^Manager) -> Manager_Error {
 	delete(manager.pool)
 	manager.pool = nil
 	sync.mutex_unlock(&manager.mutex)
+	tasks := make([]Manager_Shutdown_Task, len(sessions))
+	threads := make([]^thread.Thread, len(sessions))
+	defer delete(tasks)
+	defer delete(threads)
+	defer delete(sessions)
+	for session, index in sessions {
+		tasks[index] = {manager = manager, session = session}
+		threads[index] = thread.create_and_start_with_poly_data(
+			&tasks[index],
+			manager_shutdown_task_main,
+		)
+	}
 	all_graceful := true
-	for session in sessions {
-		was_busy := session.busy
-		shutdown_ok := session_shutdown(manager, session)
-		if was_busy || !shutdown_ok {
+	for index in 0 ..< len(tasks) {
+		was_busy := tasks[index].session.busy
+		if threads[index] != nil {
+			thread.join(threads[index])
+			thread.destroy(threads[index])
+		} else {
+			// A thread allocation failure must not leak this child. Other
+			// successfully started shutdown tasks continue in parallel.
+			manager_shutdown_task_main(&tasks[index])
+		}
+		if was_busy || !tasks[index].ok {
 			all_graceful = false
 		}
 	}
-	delete(sessions)
 	if !all_graceful {
 		return manager_error("one or more Activity executor children did not shut down cleanly")
 	}

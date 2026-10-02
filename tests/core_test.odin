@@ -1878,6 +1878,44 @@ activity_isolation_manager_validates_warm_pool_and_empty_shutdown :: proc(t: ^te
 }
 
 @(test)
+activity_isolation_manager_shutdown_bounds_the_pool_in_parallel :: proc(t: ^testing.T) {
+	command := [?]string{"/bin/sh", "-c", "sleep 5"}
+	options := activity_isolate.options_default(command[:])
+	options.warm_pool_size = 5
+	options.shutdown_timeout = 80 * time.Millisecond
+	manager := activity_isolate.Manager{}
+	init_error := activity_isolate.manager_init(&manager, options)
+	testing.expect(t, init_error.message == nil)
+	activity_isolate.manager_error_free(&init_error)
+	if !manager.initialized {
+		return
+	}
+	defer activity_isolate.manager_close(&manager)
+	for _ in 0 ..< options.warm_pool_size {
+		session := activity_isolate.session_start(&manager, true)
+		testing.expect(t, session != nil)
+		if session != nil {
+			append(&manager.pool, session)
+		}
+	}
+	if len(manager.pool) != options.warm_pool_size {
+		return
+	}
+	started_at := time.tick_now()
+	shutdown_error := activity_isolate.manager_shutdown(&manager)
+	elapsed := time.tick_diff(started_at, time.tick_now())
+	testing.expect(t, shutdown_error.message != nil)
+	activity_isolate.manager_error_free(&shutdown_error)
+	// Five sequential 80 ms deadlines exceed this bound; a parallel drain
+	// pays approximately one deadline plus process/thread scheduling overhead.
+	testing.expect(t, elapsed < 300 * time.Millisecond)
+	stats := activity_isolate.manager_stats(&manager)
+	testing.expect_value(t, stats.children_started, options.warm_pool_size)
+	testing.expect_value(t, stats.children_shutdown, 0)
+	testing.expect_value(t, stats.child_failures, options.warm_pool_size)
+}
+
+@(test)
 activity_isolation_crash_loop_admits_only_one_cooldown_trial :: proc(t: ^testing.T) {
 	manager := activity_isolate.Manager{
 		crash_loop = {

@@ -922,6 +922,9 @@ production hardening are still missing, so this is not yet the default
 production executor. See
 [`activity-isolation.md`](activity-isolation.md).
 
+A seventh pass uses a size-two warm pool and requires both children to complete
+the concurrent shutdown drain.
+
 The supported containment pattern is now exercised end-to-end:
 
 ```bash

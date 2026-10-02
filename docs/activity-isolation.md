@@ -37,7 +37,8 @@ between a forwarded Core cancel task and termination of an unresponsive child.
 `warm_pool_size = 0` retains one process per invocation; a positive value bounds
 the number of persistent children. `startup_timeout` bounds the manifest
 handshake for every newly started warm child. `shutdown_timeout` independently
-bounds each child's protocol acknowledgement and process exit. The optional
+bounds each child's protocol acknowledgement and process exit. Idle children
+are drained concurrently, so those bounds do not multiply by pool size. The optional
 `crash_loop` policy opens after a configured number of consecutive child/start
 failures and rejects new starts until its cooldown admits one trial generation.
 A successful Activity completion resets the count; a successful handshake alone
@@ -107,9 +108,10 @@ queues prove cooperative cancellation with zero kills and ignored cancellation
 with exactly one grace-deadline kill. A fourth queue runs `hello` followed by
 `goodbye` in one child and proves exact type dispatch plus reuse. A fifth starts
 two Activities concurrently against pool size one and requires bounded
-admission, serial execution, one process start, and one reuse. Every surviving
-idle child acknowledges shutdown and exits within the configured deadline. A
-sixth queue deliberately starts an incompatible child manifest twice. The first
+admission, serial execution, one process start, and one reuse. A sixth queue
+runs the same concurrent Activities through a size-two pool and requires both
+children to acknowledge the parallel shutdown drain. A seventh queue deliberately
+starts an incompatible child manifest twice. The first
 failure opens a one-failure breaker; the second task is rejected without a new
 process, while callback dispatch, pool admission, and task-token routing remain
 at zero.
@@ -136,12 +138,9 @@ runtime:
   is not yet exposed by `Host_Options`;
 - child metrics use a no-op meter; structured log/metric forwarding is not yet
   part of protocol v5;
-- shutdown requires `worker.run` to have drained all invocations; idle children
-  are currently drained serially, so the total upper bound scales with pool
-  size;
+- shutdown requires `worker.run` to have drained all invocations;
 - prewarming/general readiness probes, CPU/memory sandboxing, release signing,
   and all-target fault evidence remain production work.
 
-Parallel pool shutdown, general readiness probes, and child-side
-interceptor/diagnostic transport remain the next hardening steps before treating
-the warm pool as a default.
+General readiness probes and child-side interceptor/diagnostic transport remain
+the next hardening steps before treating the warm pool as a default.
