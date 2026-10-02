@@ -624,6 +624,17 @@ Workflow stacks from history, resume all three paths through durable timers,
 and return exact Workflow and Update results. The proof covers every affine
 shard and requires exact Activity/Signal/Update counts, positive replay and
 eviction counts, bounded Activity concurrency, and zero thread migration.
+For an opt-in repeated live soak without rerunning the unrelated probes, use:
+
+```bash
+TEMPORAL_ODIN_CONCURRENCY_SCENARIO=mixed \
+TEMPORAL_ODIN_MIXED_SOAK_ITERATIONS=20 \
+./scripts/workflow-in-process-concurrency-integration-test.sh
+```
+
+Each iteration uses a new task queue and new server-assigned Run IDs, while
+retaining the same exact per-run counters, replay, eviction, shard-affinity,
+and executor-capacity assertions.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one

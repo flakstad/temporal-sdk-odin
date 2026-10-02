@@ -4275,6 +4275,12 @@ warnings or abandonment, positive replay and eviction counts, and zero fiber
 migration. This closes the previously untested interaction between the affine
 Workflow executor and the separate Activity executor; it is still a bounded
 proof rather than a long-running soak test.
+The same harness has an opt-in mixed-only repeat mode. It reuses one CLI dev
+server and one built binary while assigning a fresh task queue and Run-ID
+sample to every iteration. Exact task/handler counts, eviction/replay,
+capacity, and affinity invariants remain mandatory per iteration. This makes a
+longer concurrent soak practical without lengthening the default integration
+suite; cross-target and injected process-fault evidence remain outstanding.
 
 The scheduler accounts for ownership at the activation-buffer boundary.
 Enqueue increments a shared owned count, normal processing releases one after

@@ -161,8 +161,28 @@ run_mixed_load_probe() {
   grep -Eq 'handles=([8-9]|[1-9][0-9]+) activities=([2-9][0-9]|[1-9][0-9]{2,}) activity_peak=([2-9][0-9]|[1-9][0-9]{2,}) activity_owned_peak=([2-9][0-9]|[1-9][0-9]{2,}) signals=([8-9]|[1-9][0-9]+) signal_handlers=([8-9]|[1-9][0-9]+) updates=([8-9]|[1-9][0-9]+) replay_activations=([8-9]|[1-9][0-9]+) evictions=([8-9]|[1-9][0-9]+) shards=4 shard_activations_min=([1-9][0-9]*) shard_activations_max=([1-9][0-9]*) owned_peak=([4-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) migrations=0' <<<"$output"
 }
 
-run_probe "$unique_suffix" 0
-run_probe "$unique_suffix-replay" 1
-run_shutdown_probe "$unique_suffix-shutdown"
-run_handler_load_probe "$unique_suffix-handler-load"
-run_mixed_load_probe "$unique_suffix-mixed-load"
+scenario="${TEMPORAL_ODIN_CONCURRENCY_SCENARIO:-all}"
+case "$scenario" in
+  all)
+    run_probe "$unique_suffix" 0
+    run_probe "$unique_suffix-replay" 1
+    run_shutdown_probe "$unique_suffix-shutdown"
+    run_handler_load_probe "$unique_suffix-handler-load"
+    run_mixed_load_probe "$unique_suffix-mixed-load"
+    ;;
+  mixed)
+    iterations="${TEMPORAL_ODIN_MIXED_SOAK_ITERATIONS:-1}"
+    if [[ ! "$iterations" =~ ^[1-9][0-9]*$ ]]; then
+      echo "TEMPORAL_ODIN_MIXED_SOAK_ITERATIONS must be a positive integer" >&2
+      exit 1
+    fi
+    for ((iteration = 1; iteration <= iterations; iteration++)); do
+      echo "Mixed Workflow/Activity soak iteration $iteration/$iterations"
+      run_mixed_load_probe "$unique_suffix-mixed-soak-$iteration"
+    done
+    ;;
+  *)
+    echo "TEMPORAL_ODIN_CONCURRENCY_SCENARIO must be 'all' or 'mixed'" >&2
+    exit 1
+    ;;
+esac

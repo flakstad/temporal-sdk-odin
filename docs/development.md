@@ -1294,6 +1294,19 @@ completions must reconstruct fresh stacks from history, resolve all three
 awaits, cross durable timers, and return `mixed:4:6:10` plus typed Update value
 `10`. Exact task and handler counts, all four Workflow shards, positive replay,
 bounded Activity concurrency, and zero migrations are required.
+Run only that pass repeatedly as an opt-in concurrent soak with:
+
+```bash
+TEMPORAL_ODIN_CONCURRENCY_SCENARIO=mixed \
+TEMPORAL_ODIN_MIXED_SOAK_ITERATIONS=20 \
+./scripts/workflow-in-process-concurrency-integration-test.sh
+```
+
+The harness builds once and keeps one CLI dev server alive for the loop. Every
+iteration receives an isolated task queue and server-assigned Run-ID sample;
+one failed invariant stops the soak immediately. The default remains the five
+distinct passes with one mixed iteration, keeping the normal integration loop
+bounded.
 
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.
