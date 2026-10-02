@@ -18,6 +18,7 @@ CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
 NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
 SIGNAL_HANDLER_WORKFLOW_TYPE :: "in_process_signal_handler_probe"
 ASYNC_HANDLER_WORKFLOW_TYPE :: "in_process_async_handler_probe"
+SHUTDOWN_WORKFLOW_TYPE :: "in_process_shutdown_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
 
 Probe_State :: struct {
@@ -57,6 +58,20 @@ concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string
 	sync.mutex_lock(&probe_state.mutex)
 	probe_state.active -= 1
 	sync.mutex_unlock(&probe_state.mutex)
+	return value
+}
+
+shutdown_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
+	owner_thread := sync.current_thread_id()
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.valid_started += 1
+	sync.mutex_unlock(&probe_state.mutex)
+	workflow.sleep(ctx, time.Hour)
+	if sync.current_thread_id() != owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
 	return value
 }
 
@@ -253,6 +268,7 @@ Concurrency_State :: struct {
 	signal_handler_ok:      bool,
 	async_handler_ok:       bool,
 	force_replay:            bool,
+	force_shutdown:          bool,
 }
 
 wait_for_results :: proc(state: ^Concurrency_State) {
@@ -260,8 +276,11 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 	started := false
 	valid_started := 0
 	timer_activations_completed := 0
-	expected_timer_activations := len(state.handles) + 1
-	if state.force_replay {
+	expected_timer_activations := len(state.handles)
+	if !state.force_shutdown {
+		expected_timer_activations += 1
+	}
+	if state.force_replay && !state.force_shutdown {
 		expected_timer_activations += 1
 	}
 	for _ in 0 ..< 500 {
@@ -270,15 +289,19 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 		valid_started = probe_state.valid_started
 		timer_activations_completed = probe_state.timer_activations_completed
 		sync.mutex_unlock(&probe_state.mutex)
-		if started && valid_started >= len(state.handles) &&
+		if (started || state.force_shutdown) && valid_started >= len(state.handles) &&
 		   timer_activations_completed >= expected_timer_activations {
 			break
 		}
 		time.sleep(10 * time.Millisecond)
 	}
-	if !started || valid_started < len(state.handles) ||
+	if (!started && !state.force_shutdown) || valid_started < len(state.handles) ||
 	   timer_activations_completed < expected_timer_activations {
 		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	if state.force_shutdown {
 		worker.request_shutdown(state.sdk_worker)
 		return
 	}
@@ -449,10 +472,61 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 	worker.request_shutdown(state.sdk_worker)
 }
 
+start_shutdown_workflows :: proc(state: ^Concurrency_State) -> bool {
+	if state == nil || state.client == nil || state.sdk_worker == nil {
+		return false
+	}
+	seen_shards: [EXECUTOR_THREADS]bool
+	seen_count := 0
+	for candidate in 0 ..< 128 {
+		workflow_id := fmt.aprintf("%s-shutdown-%d", state.id_prefix, candidate)
+		handle, start_error := temporal_client.start_workflow_json(
+			state.client,
+			SHUTDOWN_WORKFLOW_TYPE,
+			workflow_id,
+			{
+				id = workflow_id,
+				task_queue = state.task_queue,
+				workflow_execution_timeout = time.Minute,
+				workflow_run_timeout = time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		delete(workflow_id)
+		if start_error.message != nil {
+			state.start_error = start_error
+			return false
+		}
+		append(&state.handles, handle)
+		shard, shard_ok := workflow_isolate.workflow_shard_index(
+			handle.run_id,
+			EXECUTOR_THREADS,
+		)
+		if !shard_ok {
+			return false
+		}
+		if !seen_shards[shard] {
+			seen_shards[shard] = true
+			seen_count += 1
+		}
+		if seen_count == EXECUTOR_THREADS {
+			break
+		}
+	}
+	if seen_count != EXECUTOR_THREADS {
+		return false
+	}
+	state.watcher = thread.create_and_start_with_poly_data(state, wait_for_results)
+	return state.watcher != nil
+}
+
 start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	state := cast(^Concurrency_State)user_data
 	if state == nil || state.client == nil || state.sdk_worker == nil {
 		return false
+	}
+	if state.force_shutdown {
+		return start_shutdown_workflows(state)
 	}
 	failure_id := fmt.aprintf("%s-invalid", state.id_prefix)
 	failure_handle, failure_start_error := temporal_client.start_workflow_json(
@@ -621,6 +695,11 @@ run :: proc() -> int {
 		replay_buffer[:],
 		"TEMPORAL_ODIN_FORCE_REPLAY",
 	) == "1"
+	shutdown_buffer: [64]u8
+	force_shutdown := os.get_env(
+		shutdown_buffer[:],
+		"TEMPORAL_ODIN_FORCE_SHUTDOWN",
+	) == "1"
 	task_queue_buffer: [256]u8
 	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
 	if len(task_queue) == 0 {
@@ -676,6 +755,16 @@ run :: proc() -> int {
 	}
 	register_error = worker.register_json_workflow(
 		&sdk_worker,
+		SHUTDOWN_WORKFLOW_TYPE,
+		shutdown_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Shutdown Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
 		CANCELLATION_WORKFLOW_TYPE,
 		cancellation_probe,
 	)
@@ -721,6 +810,7 @@ run :: proc() -> int {
 		task_queue = task_queue,
 		id_prefix = id_prefix,
 		force_replay = force_replay,
+		force_shutdown = force_shutdown,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
 		on_ready = start_concurrent_workflows,
@@ -733,6 +823,13 @@ run :: proc() -> int {
 	}
 	defer {
 		for &handle in state.handles {
+			if state.force_shutdown {
+				cleanup_error := temporal_client.terminate_workflow(
+					&handle,
+					"in-process affine shutdown proof completed",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
 			temporal_client.workflow_handle_free(&handle)
 		}
 		delete(state.handles)
@@ -827,6 +924,44 @@ run :: proc() -> int {
 		fmt.eprintf("In-process concurrency Worker failed: %s\n", string(run_error.message))
 		worker.error_free(&run_error)
 		return 1
+	}
+	if force_shutdown {
+		sync.mutex_lock(&probe_state.mutex)
+		shutdown_migrations := probe_state.migrations
+		sync.mutex_unlock(&probe_state.mutex)
+		if !state.results_ok || len(state.handles) < EXECUTOR_THREADS ||
+		   run_stats.workflow_activations_completed < len(state.handles) ||
+		   run_stats.workflow_executions_completed != 0 ||
+		   run_stats.workflow_activation_failures != 0 ||
+		   run_stats.workflow_cached_fibers_shutdown != len(state.handles) ||
+		   run_stats.workflow_activations_peak_owned < 1 ||
+		   run_stats.workflow_executor_queue_peak < 1 || shutdown_migrations != 0 {
+			fmt.eprintf(
+				"In-process Workflow shutdown proof failed handles=%d activations=%d completed=%d failures=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+				len(state.handles),
+				run_stats.workflow_activations_completed,
+				run_stats.workflow_executions_completed,
+				run_stats.workflow_activation_failures,
+				run_stats.workflow_evictions,
+				run_stats.workflow_cached_fibers_shutdown,
+				run_stats.workflow_activations_peak_owned,
+				run_stats.workflow_executor_queue_peak,
+				shutdown_migrations,
+			)
+			return 1
+		}
+		fmt.printf(
+			"In-process Workflow shutdown proved handles=%d shards=%d activations=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+			len(state.handles),
+			EXECUTOR_THREADS,
+			run_stats.workflow_activations_completed,
+			run_stats.workflow_evictions,
+			run_stats.workflow_cached_fibers_shutdown,
+			run_stats.workflow_activations_peak_owned,
+			run_stats.workflow_executor_queue_peak,
+			shutdown_migrations,
+		)
+		return 0
 	}
 	if !state.has_failure_handle {
 		fmt.eprintln("In-process concurrency failure probe was not started")

@@ -3516,10 +3516,11 @@ a comparison point; it is not yet enough to freeze the public API.
 
 The current next milestone is production hardening of the run-affine
 in-process scheduler. Replay reconstruction, concurrent activation failure,
-cancellation, immediate and suspending Signal/Update handlers, and
-Core-detected nondeterminism are now live-proven on affine shards. Next,
-exercise shutdown faults and handler-heavy load concurrently across many
-shards; add queue-depth/fairness observations; and run the guard-page plus
+cancellation, immediate and suspending Signal/Update handlers, clean shutdown
+of cached fibers, and Core-detected nondeterminism are now live-proven on
+affine shards. Next, exercise mid-activation shutdown faults and handler-heavy
+load concurrently across many shards; add queue-depth/fairness observations;
+and run the guard-page plus
 affinity suite on all four distribution targets. The live proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
@@ -4226,6 +4227,14 @@ routine records itself active before yielding to a durable timer. The final
 result requires an active-handler peak of two, typed Update result `14`,
 Workflow result `async:12:2`, owner-thread resumption, complete handler drain,
 and zero warnings or abandonments.
+A third pass covers all four executor shards with Workflow runs suspended on
+one-hour timers, then requests Worker shutdown while those runs remain open.
+Core ends its poll stream without emitting eviction activations. Each shard
+calls `fiber_runtime_executor_shutdown` locally, and
+`Run_Stats.workflow_cached_fibers_shutdown` must equal the number of open runs.
+Any cross-thread destruction, unreleased activation buffer, or incomplete
+shard join turns `worker.run` into an error. The Client terminates the remaining
+server executions only after the Worker has stopped.
 Its brief wall-clock block is test instrumentation and is not an allowed
 Workflow programming primitive.
 
@@ -4234,6 +4243,9 @@ Enqueue increments a shared owned count, normal processing releases one after
 completion cleanup, and fault teardown releases every discarded queued buffer.
 `Run_Stats.workflow_activations_peak_owned` exposes the global high-water mark;
 `workflow_executor_queue_peak` exposes the largest individual shard queue.
+`workflow_cached_fibers_shutdown` counts in-process fibers still present when
+their owner executor tears down; normal `RemoveFromCache` destruction is
+reported separately by `workflow_evictions`.
 After all executor threads join, a non-zero owned count is a Worker error. This
 turns shutdown balance and bounded Core-to-language handoff into explicit,
 testable invariants. A 1,000-case property test compares generated retain and

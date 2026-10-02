@@ -1243,6 +1243,14 @@ error rather than silently dropping it. A 1,000-case PBT generates up to 128
 interleaved retains and batched releases, checks both high-water marks against a
 reference model, drains to zero, and verifies that one extra release is
 rejected without corrupting the count.
+The script's third pass sets `TEMPORAL_ODIN_FORCE_SHUTDOWN=1`, starts enough
+one-hour timer Workflows to cover all four executor shards, waits until every
+initial activation is accepted, and requests Worker shutdown without closing
+the executions. Core ends polling without eviction in this path. Each shard
+then destroys its still-cached fibers on its own executor thread. The pass
+requires `workflow_cached_fibers_shutdown == handles`, zero completed
+executions, zero migrations, and a balanced activation-ownership count; the
+test Client terminates the orphaned server executions afterward.
 The blocking probe is instrumentation only; application Workflow code must not
 read wall time or block an executor thread. In concurrent mode, Workflow
 logger/interceptor/metric factory state and the activation observer can be

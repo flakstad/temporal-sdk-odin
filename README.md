@@ -610,7 +610,11 @@ an in-run handler peak of two.
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
 fixed in-process shard; serial and external-processor execution report zero for
-that shard-specific value. Shutdown verifies that ownership returns to zero.
+that shard-specific value. `workflow_cached_fibers_shutdown` counts cached
+in-process fibers destroyed during teardown rather than by Core eviction.
+The live shutdown pass leaves runs suspended on one-hour durable timers across
+all four shards and requires every fiber to be destroyed on its owner thread.
+Shutdown also verifies that activation ownership returns to zero.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's

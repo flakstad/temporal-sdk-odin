@@ -375,6 +375,9 @@ Run_Stats :: struct {
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,
+	// Cached in-process Workflow fibers destroyed on their owning executor
+	// during Worker teardown rather than by a Core RemoveFromCache activation.
+	workflow_cached_fibers_shutdown:      int,
 	workflow_signals_received:            int,
 	workflow_signal_handlers_started:      int,
 	workflow_signal_handlers_completed:    int,
@@ -3414,22 +3417,25 @@ record_workflow_result :: proc(stats: ^Run_Stats, processed: ^workflow.Process_R
 	}
 }
 
-shutdown_workflow_runtimes_on_executor :: proc(worker: ^Worker) -> Error {
+shutdown_workflow_runtimes_on_executor :: proc(
+	worker: ^Worker,
+) -> (destroyed: int, error: Error) {
 	if worker == nil {
-		return {}
+		return
 	}
 	for &registration in worker.workflow_registrations {
 		if registration.external {
 			continue
 		}
+		destroyed += len(registration.runtime.instances)
 		shutdown_error := workflow.fiber_runtime_executor_shutdown(&registration.runtime)
 		if shutdown_error.message != nil {
-			result := error_from_string(string(shutdown_error.message))
+			error = error_from_string(string(shutdown_error.message))
 			workflow.error_free(&shutdown_error)
-			return result
+			return
 		}
 	}
-	return {}
+	return
 }
 
 run_workflow_loop_serial :: proc(
@@ -3437,7 +3443,8 @@ run_workflow_loop_serial :: proc(
 	options: Run_Options,
 ) -> (stats: Run_Stats, error: Error) {
 	defer {
-		shutdown_error := shutdown_workflow_runtimes_on_executor(worker)
+		shutdown_count, shutdown_error := shutdown_workflow_runtimes_on_executor(worker)
+		stats.workflow_cached_fibers_shutdown += shutdown_count
 		if shutdown_error.message != nil {
 			if error.message == nil {
 				error = shutdown_error

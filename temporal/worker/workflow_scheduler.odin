@@ -67,11 +67,15 @@ workflow_scheduler_release_activations :: proc(
 
 workflow_runtime_set_close_on_executor :: proc(
 	runtime_set: ^Workflow_Runtime_Set,
+	destroyed: ^int = nil,
 ) -> (error: Error) {
 	if runtime_set == nil {
 		return
 	}
 	for &registration in runtime_set.registrations {
+		if destroyed != nil {
+			destroyed^ += len(registration.runtime.instances)
+		}
 		shutdown_error := workflow.fiber_runtime_executor_shutdown(&registration.runtime)
 		if shutdown_error.message != nil {
 			if error.message == nil {
@@ -162,6 +166,7 @@ workflow_stats_add :: proc(total: ^Run_Stats, value: Run_Stats) {
 	total.workflow_executions_completed += value.workflow_executions_completed
 	total.workflow_replay_activations += value.workflow_replay_activations
 	total.workflow_evictions += value.workflow_evictions
+	total.workflow_cached_fibers_shutdown += value.workflow_cached_fibers_shutdown
 	total.workflow_signals_received += value.workflow_signals_received
 	total.workflow_signal_handlers_started += value.workflow_signal_handlers_started
 	total.workflow_signal_handlers_completed += value.workflow_signal_handlers_completed
@@ -316,7 +321,12 @@ workflow_shard_thread_main :: proc(shard: ^In_Process_Workflow_Shard) {
 			error_from_string("Workflow scheduler queued ownership underflow"),
 		)
 	}
-	close_error := workflow_runtime_set_close_on_executor(&shard.runtime_set)
+	shutdown_count := 0
+	close_error := workflow_runtime_set_close_on_executor(
+		&shard.runtime_set,
+		&shutdown_count,
+	)
+	shard.stats.workflow_cached_fibers_shutdown += shutdown_count
 	if close_error.message != nil {
 		workflow_shard_mark_failed(shard, close_error)
 	}
