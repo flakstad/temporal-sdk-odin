@@ -996,8 +996,12 @@ example-local process code. `manager_init` copies the ordinary and optional
 first-generation command vectors and sets a hard maximum for owned routes.
 Failed routes retain their generation and consume capacity until Core eviction;
 normal eviction exchanges the final activation, performs a correlated shutdown
-handshake, and reaps the child. `manager_close` aborts and reaps any remaining
-children. Generated `statecharts`/PBT traces cover lifecycle equivalence,
+handshake, and reaps the child. `manager_shutdown` concurrently performs that
+correlated handshake for every remaining cached child, rejects new activations,
+and kills/reaps failures under the configured deadline; `manager_close` invokes
+it automatically. This avoids a route-count-multiplied shutdown delay while
+preserving explicit error reporting for callers that invoke `manager_shutdown`
+directly. Generated `statecharts`/PBT traces cover lifecycle equivalence,
 capacity, and generation fencing. A positive `activation_timeout` adds a
 joinable pipe-reader thread; expiry kills and reaps the child before returning
 the activation failure. Run the real hung-child recovery path with:
@@ -1138,9 +1142,14 @@ correlated oversized frame, requires one protocol/budget rejection, Core
 eviction, and successful replay in a fresh child.
 
 The manager now has independent activation and shutdown deadlines. The latter
-bounds both acknowledgement and child exit, then kills/reaps on expiry. Capacity
-admission never waits because the same serial poll thread must receive the
-eviction that frees a route; exhaustion returns a failed activation immediately.
+bounds both acknowledgement and child exit, then kills/reaps on expiry. Manager
+teardown drains cached child sessions in parallel and aggregates their results
+after joining, so four hung children consume one concurrent deadline window
+rather than four serial windows. Tests also verify clean multi-child handshake,
+idempotence, post-shutdown activation rejection, and complete route release.
+Capacity admission never waits because the same serial poll thread must receive
+the eviction that frees a route; exhaustion returns a failed activation
+immediately.
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.
 Unit tests use real sleeping/exiting subprocesses for shutdown and breaker

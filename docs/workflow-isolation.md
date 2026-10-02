@@ -228,6 +228,18 @@ no reader thread or zombie is left behind. A real-process unit test starts a
 child that never reads the request and proves the 20 ms deadline returns well
 before that child would exit naturally.
 
+Worker teardown calls `manager_shutdown` after activation dispatch has stopped.
+It marks the manager as draining, rejects any later activation, and sends the
+correlated shutdown exchange to every cached child concurrently. Results are
+joined and folded into manager statistics on the calling thread, so there are
+no concurrent stats writes. The total wait is bounded by the acknowledgement
+and process-exit phases rather than multiplying those deadlines by the number
+of routes. Every failure still kills and reaps its child, all route-owned run
+IDs are released, and a repeated shutdown is idempotent. `manager_close`
+performs this drain automatically when the caller has not already requested it.
+Real-process tests cover two clean acknowledgements and four simultaneous
+unresponsive children.
+
 Admission is deliberately non-waiting. Workflow activations are processed on
 one serial Core poll thread, including the evictions that release capacity, so
 waiting there for a slot would deadlock. When `maximum_executors` is full, the
@@ -431,7 +443,9 @@ must be deterministically reconstructed from history.
   come from the parent-decoded activation/route, not child metadata.
 - Every started child is reaped. Normal eviction uses a correlated shutdown
   handshake; EOF/protocol failure closes pipes, kills only when necessary, and
-  waits for the process.
+  waits for the process. Manager teardown performs the same handshake for all
+  remaining routes concurrently and reports whether any route needed forced
+  cleanup.
 
 ### Lifecycle model and generated traces
 

@@ -538,6 +538,123 @@ workflow_executor_shutdown_deadline_kills_and_reaps_unresponsive_child :: proc(
 	testing.expect(t, elapsed < 500 * time.Millisecond)
 }
 
+workflow_isolate_test_append_route :: proc(
+	manager: ^workflow_isolate.Manager,
+	command: []string,
+	run_id: string,
+) -> bool {
+	session, started := workflow_isolate.start_session(command)
+	if !started {
+		return false
+	}
+	owned_run_id, clone_error := strings.clone(run_id)
+	if clone_error != nil {
+		_ = workflow_isolate.session_abort(manager, &session)
+		return false
+	}
+	append(&manager.routes, workflow_isolate.Executor_Route{
+		run_id = owned_run_id,
+		generation = u64(len(manager.routes) + 1),
+		state = .Live,
+		session = session,
+	})
+	return true
+}
+
+@(test)
+workflow_executor_manager_gracefully_drains_all_cached_children :: proc(t: ^testing.T) {
+	manager := workflow_isolate.Manager{}
+	placeholder := [?]string{"unused"}
+	init_error := workflow_isolate.manager_init(&manager, {
+		command = placeholder[:],
+		maximum_executors = 2,
+		shutdown_timeout = time.Second,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.manager_close(&manager)
+
+	// A new session's shutdown request ID is one. This dependency-free POSIX
+	// child consumes that frame, writes the corresponding 24-byte
+	// Shutdown_Acknowledged frame, and exits successfully.
+	acknowledge := `dd bs=24 count=1 >/dev/null 2>/dev/null; printf '\124\117\111\123\000\004\000\004\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\000'`
+	command := [?]string{"/bin/sh", "-c", acknowledge}
+	for route_index in 0 ..< 2 {
+		run_id := fmt.aprintf("graceful-drain-%d", route_index)
+		appended := workflow_isolate_test_append_route(&manager, command[:], run_id)
+		delete(run_id)
+		testing.expect(t, appended)
+		if !appended {
+			return
+		}
+	}
+
+	shutdown_error := workflow_isolate.manager_shutdown(&manager)
+	testing.expectf(
+		t,
+		shutdown_error.message == nil,
+		"graceful manager shutdown failed: %s",
+		string(shutdown_error.message),
+	)
+	workflow_isolate.manager_error_free(&shutdown_error)
+	testing.expect(t, manager.shutting_down)
+	testing.expect(t, manager.shutdown_complete)
+	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)
+	testing.expect_value(t, manager.stats.graceful_shutdowns, 2)
+	testing.expect_value(t, manager.stats.aborted_children, 0)
+
+	// Shutdown is idempotent until manager_close releases configuration.
+	shutdown_error = workflow_isolate.manager_shutdown(&manager)
+	testing.expect(t, shutdown_error.message == nil)
+	workflow_isolate.manager_error_free(&shutdown_error)
+}
+
+@(test)
+workflow_executor_manager_bounds_parallel_forced_drain :: proc(t: ^testing.T) {
+	manager := workflow_isolate.Manager{}
+	placeholder := [?]string{"unused"}
+	init_error := workflow_isolate.manager_init(&manager, {
+		command = placeholder[:],
+		maximum_executors = 4,
+		shutdown_timeout = 200 * time.Millisecond,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	defer workflow_isolate.manager_close(&manager)
+
+	command := [?]string{"/bin/sh", "-c", "sleep 2"}
+	for route_index in 0 ..< 4 {
+		run_id := fmt.aprintf("forced-drain-%d", route_index)
+		appended := workflow_isolate_test_append_route(&manager, command[:], run_id)
+		delete(run_id)
+		testing.expect(t, appended)
+		if !appended {
+			return
+		}
+	}
+
+	started_at := time.tick_now()
+	shutdown_error := workflow_isolate.manager_shutdown(&manager)
+	elapsed := time.tick_diff(started_at, time.tick_now())
+	testing.expect(t, shutdown_error.message != nil)
+	workflow_isolate.manager_error_free(&shutdown_error)
+	testing.expect(t, elapsed < 600 * time.Millisecond)
+	testing.expect_value(t, workflow_isolate.manager_route_count(&manager), 0)
+	testing.expect_value(t, manager.stats.shutdown_timeouts, 4)
+	testing.expect_value(t, manager.stats.aborted_children, 4)
+
+	blocked := workflow_isolate_test_initialization("after-manager-shutdown")
+	processed := workflow_isolate.manager_process_activation(&manager, blocked[:])
+	delete(blocked)
+	testing.expect(t, processed.activation_failed)
+	testing.expect(
+		t,
+		strings.contains(string(processed.error.message), "manager is shutting down"),
+	)
+	delete(processed.completion)
+	workflow.error_free(&processed.error)
+}
+
 workflow_isolate_test_initialization :: proc(run_id: string) -> [dynamic]u8 {
 	initialize := proto.Coresdk_Workflow_Activation_InitializeWorkflow{
 		workflow_type = "crash-loop-test",

@@ -4244,10 +4244,16 @@ and generation fencing. Activation deadlines use a joinable reader thread and
 kill/reap on expiry; the hung-child live path proves retry and replay. Startup
 and per-generation manifest verification now fence executable/registry skew.
 Shutdown deadlines now kill/reap both missing acknowledgements and processes
-that acknowledge but do not exit. Capacity exhaustion fails immediately because
-waiting on the serial activation thread would prevent eviction from releasing a
-slot. A configurable consecutive-failure breaker prevents unbounded respawn and
-admits a trial after cooldown. Complete observation metadata is now preserved
+that acknowledge but do not exit. Manager teardown starts this exchange for all
+cached routes concurrently, joins them before freeing route ownership, and
+rejects activation or host verification once draining begins. This keeps total
+shutdown latency bounded by the two protocol phases rather than by the number
+of cached workflows; explicit shutdown reports partial failure, while close
+retains cleanup-safe best-effort semantics. Capacity exhaustion fails
+immediately because waiting on the serial activation thread would prevent
+eviction from releasing a slot. A configurable consecutive-failure breaker
+prevents unbounded respawn and admits a trial after cooldown. Complete
+observation metadata is now preserved
 through the process manager and fed to ordinary Worker statistics/observers;
 the live proof checks child-only timer sequence values in zero- and sticky-cache
 modes. Executor-host log, metric, and interceptor hooks remain language-runtime

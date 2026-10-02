@@ -318,6 +318,13 @@ thread. `Crash_Loop_Policy` can bound consecutive child/session failures and
 opens for a monotonic cooldown before one trial is admitted. A successful
 activation resets this global streak.
 
+After Worker polling stops, call `workflow_isolate.manager_shutdown` to drain
+all still-cached executors with correlated shutdown exchanges. Routes drain in
+parallel, failures are killed and reaped, new activations are rejected, and a
+second call is a no-op. `manager_close` performs the drain automatically but
+discards its returned diagnostic, so use the explicit call when teardown
+failure must be surfaced.
+
 With a non-zero Core Workflow cache, the same route and child remain alive for
 incremental activations until `RemoveFromCache`. The live sticky test keeps two
 timer Workflows on two successful generations across suspension/resolution;

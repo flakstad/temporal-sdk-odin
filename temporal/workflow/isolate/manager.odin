@@ -242,6 +242,8 @@ Manager :: struct {
 	maximum_diagnostic_payload_bytes_per_activation: int,
 	stats:              Manager_Stats,
 	initialized:        bool,
+	shutting_down:      bool,
+	shutdown_complete:  bool,
 }
 
 process_start_mutex: sync.Mutex
@@ -448,13 +450,114 @@ session_shutdown :: proc(manager: ^Manager, session: ^Child_Session) -> bool {
 	return true
 }
 
+Manager_Shutdown_Task :: struct {
+	session: ^Child_Session,
+	timeout: time.Duration,
+	stats:   Manager_Stats,
+	ok:      bool,
+}
+
+manager_shutdown_task_main :: proc(task: ^Manager_Shutdown_Task) {
+	if task == nil {
+		return
+	}
+	// session_shutdown mutates only this task-local manager and the task's
+	// distinct child session. The caller aggregates stats after every thread
+	// has joined, avoiding shared writes during a parallel drain.
+	local := Manager{shutdown_timeout = task.timeout}
+	task.ok = session_shutdown(&local, task.session)
+	task.stats = local.stats
+}
+
+manager_merge_shutdown_stats :: proc(manager: ^Manager, stats: Manager_Stats) {
+	manager.stats.child_exits += stats.child_exits
+	if stats.child_exits > 0 {
+		manager.stats.last_child_exit_code = stats.last_child_exit_code
+	}
+	manager.stats.protocol_failures += stats.protocol_failures
+	manager.stats.activation_timeouts += stats.activation_timeouts
+	manager.stats.graceful_shutdowns += stats.graceful_shutdowns
+	manager.stats.aborted_children += stats.aborted_children
+	manager.stats.shutdown_timeouts += stats.shutdown_timeouts
+}
+
+// manager_shutdown drains all cached executor processes. Every child receives
+// its correlated shutdown concurrently, so the wall-clock bound is the
+// protocol's acknowledgement and exit phases rather than route_count times
+// those phases. Call this only after the Worker has stopped dispatching
+// activations; new calls are rejected once shutdown begins.
+manager_shutdown :: proc(manager: ^Manager) -> Manager_Error {
+	if manager == nil || !manager.initialized {
+		return manager_error("Workflow executor manager is not initialized")
+	}
+	if manager.shutdown_complete {
+		return {}
+	}
+	manager.shutting_down = true
+
+	route_count := len(manager.routes)
+	tasks := make([]Manager_Shutdown_Task, route_count)
+	threads := make([]^thread.Thread, route_count)
+	defer delete(tasks)
+	defer delete(threads)
+
+	for route_index in 0 ..< route_count {
+		tasks[route_index] = {
+			session = &manager.routes[route_index].session,
+			timeout = manager.shutdown_timeout,
+		}
+	}
+	for route_index in 0 ..< route_count {
+		threads[route_index] = thread.create_and_start_with_poly_data(
+			&tasks[route_index],
+			manager_shutdown_task_main,
+		)
+	}
+
+	all_graceful := true
+	for route_index in 0 ..< route_count {
+		if threads[route_index] != nil {
+			thread.join(threads[route_index])
+			thread.destroy(threads[route_index])
+		} else {
+			// Thread creation failure must not leak the child. Already-started
+			// drains keep progressing while this fallback runs synchronously.
+			manager_shutdown_task_main(&tasks[route_index])
+		}
+		manager_merge_shutdown_stats(manager, tasks[route_index].stats)
+		if !tasks[route_index].ok {
+			all_graceful = false
+			manager_record_failure(manager)
+		}
+	}
+	for &route in manager.routes {
+		// session_shutdown always clears an active session, but retain a final
+		// defensive reap if a future implementation returns early.
+		if route.session.active {
+			_ = session_abort(manager, &route.session)
+			all_graceful = false
+			manager_record_failure(manager)
+		}
+		delete(route.run_id)
+	}
+	delete(manager.routes)
+	manager.routes = nil
+	manager.shutdown_complete = true
+	if !all_graceful {
+		return manager_error(
+			"one or more Workflow executor children did not shut down cleanly",
+		)
+	}
+	return {}
+}
+
 manager_close :: proc(manager: ^Manager) {
 	if manager == nil {
 		return
 	}
-	for &route in manager.routes {
-		_ = session_abort(manager, &route.session)
-		delete(route.run_id)
+	if manager.initialized && !manager.shutdown_complete {
+		shutdown_error := manager_shutdown(manager)
+		manager_error_free(&shutdown_error)
 	}
 	delete(manager.routes)
 	free_command(&manager.command)
@@ -769,6 +872,9 @@ manager_verify_host :: proc(manager: ^Manager) -> Manager_Error {
 	if manager == nil || !manager.initialized || len(manager.expected_manifest) == 0 {
 		return manager_error("Workflow executor manager has no expected registry manifest")
 	}
+	if manager.shutting_down {
+		return manager_error("Workflow executor manager is shutting down")
+	}
 	if manager.manifest_verified {
 		return {}
 	}
@@ -1066,6 +1172,12 @@ manager_process_activation :: proc(
 		return workflow.activation_failure_result(
 			"unknown",
 			"Workflow executor manager received a malformed activation",
+		)
+	}
+	if manager.shutting_down {
+		return workflow.activation_failure_result(
+			route_info.run_id,
+			"Workflow executor manager is shutting down",
 		)
 	}
 	_ = set_report_run_id(manager, route_info.run_id)
