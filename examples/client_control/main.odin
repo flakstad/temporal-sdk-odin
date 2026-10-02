@@ -165,9 +165,27 @@ terminate_interceptor :: proc(
 	return result
 }
 
+delete_interceptor :: proc(
+	_: rawptr,
+	input: ^temporal_client.Client_Delete_Workflow_Input,
+	next: temporal_client.Client_Delete_Workflow_Next,
+) -> temporal_client.Error {
+	fmt.printf(
+		"Client delete interceptor entered run_id=%q allow_latest_run=%v\n",
+		input.handle.run_id,
+		input.options.allow_latest_run,
+	)
+	result := temporal_client.client_delete_workflow_next(next, input)
+	if result.message == nil {
+		fmt.println("Client delete interceptor exited after Core")
+	}
+	return result
+}
+
 run :: proc() -> int {
 	action_buffer: [32]u8
 	id_buffer: [256]u8
+	run_id_buffer: [256]u8
 	name_buffer: [128]u8
 	input_buffer: [1024]u8
 	reason_buffer: [512]u8
@@ -177,6 +195,7 @@ run :: proc() -> int {
 	reset_priority_buffer: [64]u8
 	action := env("TEMPORAL_CLIENT_ACTION", action_buffer[:])
 	workflow_id := env("TEMPORAL_CLIENT_WORKFLOW_ID", id_buffer[:])
+	run_id := env("TEMPORAL_CLIENT_RUN_ID", run_id_buffer[:])
 	if len(action) == 0 || len(workflow_id) == 0 {
 		fmt.eprintln("TEMPORAL_CLIENT_ACTION and TEMPORAL_CLIENT_WORKFLOW_ID are required")
 		return 2
@@ -191,6 +210,7 @@ run :: proc() -> int {
 		update_workflow_execution_options = workflow_options_interceptor,
 		workflow_pause_mutation = workflow_pause_interceptor,
 		terminate_workflow = terminate_interceptor,
+		delete_workflow = delete_interceptor,
 	}}
 	client, connect_error := temporal_client.connect_with_options({
 		target_url = "http://localhost:7233",
@@ -202,7 +222,7 @@ run :: proc() -> int {
 		return 1
 	}
 	defer temporal_client.close(&client)
-	handle, handle_error := temporal_client.get_workflow_handle(&client, workflow_id)
+	handle, handle_error := temporal_client.get_workflow_handle(&client, workflow_id, run_id)
 	if handle_error.message != nil {
 		print_error("handle creation", &handle_error)
 		return 1
@@ -346,8 +366,9 @@ run :: proc() -> int {
 		}
 		defer temporal_client.workflow_description_free(&description)
 		fmt.printf(
-			"Odin client described workflow_id=%s status=%v paused=%v pause_identity=%q pause_reason=%q pending_nexus=%d callbacks=%d versioning=%v behavior=%v deployment_name=%q build_id=%q revision=%d reset_points=%d request_ids=%d time_skipping=%v\n",
+			"Odin client described workflow_id=%s run_id=%s status=%v paused=%v pause_identity=%q pause_reason=%q pending_nexus=%d callbacks=%d versioning=%v behavior=%v deployment_name=%q build_id=%q revision=%d reset_points=%d request_ids=%d time_skipping=%v\n",
 			workflow_id,
+			description.run_id,
 			description.status,
 			description.pause_info.present,
 			description.pause_info.identity,
@@ -503,6 +524,8 @@ run :: proc() -> int {
 	case "terminate":
 		reason := env("TEMPORAL_CLIENT_REASON", reason_buffer[:])
 		operation_error = temporal_client.terminate_workflow(&handle, reason)
+	case "delete":
+		operation_error = temporal_client.delete_workflow(&handle)
 	case:
 		fmt.eprintf("unsupported TEMPORAL_CLIENT_ACTION: %s\n", action)
 		return 2

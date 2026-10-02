@@ -2426,7 +2426,15 @@ Signal-With-Start carries both user Payloads and mutable start options, but only
 one isolated Header builder: the pinned Service RPC assigns that map to the
 Signal event and cannot represent an independent Workflow-start Header.
 Cancellation provides mutable reason/request-ID fields, while termination
-provides a mutable reason and optional borrowed Payload view. Visibility
+provides a mutable reason and optional borrowed Payload view. Destructive
+Workflow deletion has a separate typed continuation and requires an exact Run
+ID by default. The explicit `allow_latest_run` opt-in preserves the upstream
+empty-Run-ID behavior, which selects the latest execution and terminates it if
+still running. This adds no C ABI symbol: the terminal uses the existing
+`temporal_core_client_rpc_call` bridge with RPC name
+`DeleteWorkflowExecution` and the pinned generated request/response schema.
+The encoded request is Odin-owned until the blocking call returns; Core's
+response buffer is released by the existing empty-response helper. Visibility
 list/count and the complete Schedule surface expose their semantic inputs and
 preserve the existing allocator-owned result contract through typed
 continuations. Schedule Create returns its owned handle directly; the six
@@ -2436,13 +2444,13 @@ a connection-mutation input and remain direct Core ABI calls at the terminal;
 all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 500-case property checks twenty-two nested operation families and arbitrary
+A 1,000-case property checks twenty-four nested operation families and arbitrary
 short-circuit depth, including all six standalone Nexus lifecycle/Visibility
 interceptor groups. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. The Update wait interceptor likewise wraps
 the complete result long poll and returns an owned Payload. Live start,
-Signal-With-Start, Signal, Query, result, Update, cancellation, termination,
+Signal-With-Start, Signal, Query, result, Update, cancellation, termination, deletion,
 Visibility list/count, and every
 Schedule path cross Service/Core. The live Client example also proves metadata
 replacement plus API-key set/clear interception before later RPCs. A
@@ -3541,9 +3549,10 @@ response plus Describe. The supported-server inventory identified experimental
 Workflow Pause as a coherent control gap; Pause/Unpause is now intercepted and
 live-proven with deferred Signal delivery. Atomic Update-With-Start is now also
 implemented and live-proven on both create and attach paths. Workflow deletion
-is intentionally deprioritized: current language SDK handles generally treat
-it as an operator/CLI concern, and exposing a destructive call needs explicit
-chain/run targeting and safety semantics. Activity-only process
+is now exact-run by default, typed through the Client interceptor chain, and
+live-proven against Core. Empty-Run-ID latest-execution deletion requires an
+explicit opt-in because the Service may terminate a running execution before
+removing its history. Activity-only process
 crash/replacement is now live-proven with a real panic, Start-To-Close timeout,
 retry, and replacement Odin worker. Fixed Workflow stacks now have a
 live-tested native guard page on macOS/Linux; they do not grow, and overflow is

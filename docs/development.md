@@ -1617,10 +1617,24 @@ updated_options, update_options_error := temporal_client.update_workflow_executi
     {update_mask = priority_path[:], priority = &priority},
 )
 defer temporal_client.workflow_execution_options_free(&updated_options)
+
+// Deletion is permanent and should be last. Resolve and pin the exact run.
+description, describe_error := temporal_client.describe_workflow(&existing)
+defer temporal_client.workflow_description_free(&description)
+exact, exact_error := temporal_client.get_workflow_handle(
+    &client,
+    description.workflow_id,
+    description.run_id,
+)
+defer temporal_client.workflow_handle_free(&exact)
+delete_error := temporal_client.delete_workflow(&exact)
 ```
 
 Handle creation only clones identifiers; it does not contact the Service. An
-empty run ID targets the current execution. Signal, cancellation, and reset
+empty run ID targets the current execution for ordinary control operations.
+Deletion is the deliberate exception: its safe default requires an exact Run
+ID, while `{allow_latest_run = true}` opts into the Service's latest-run
+selection and possible termination of a running execution. Signal, cancellation, and reset
 requests generate UUIDv4 deduplication IDs by default. Reset requires a positive
 Workflow Task completed/timed-out/failed/started event ID and returns a separate
 owned handle for the new run without changing the source handle. Its current
@@ -2881,7 +2895,7 @@ metadata, external details, headers, and deterministic request bytes.
 
 `Connect_Options.interceptors` installs ordered, typesafe outbound interceptors
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
-cancellation, termination, Workflow result waiting, Visibility list/count,
+cancellation, termination, deletion, Workflow result waiting, Visibility list/count,
 standalone Nexus start/poll/describe/mutation/list/count, and Schedule
 Describe/List/Count/Matching-Times, plus System Info discovery. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
@@ -2898,7 +2912,9 @@ must treat the API-key field as secret material.
 Signal-With-Start exposes both user Payloads, mutable start options, and the
 single Header map the upstream RPC assigns to its Signal event. Cancellation
 exposes its reason and request ID. Termination exposes its reason plus an
-optional codec-neutral details Payload. Registration order is outermost-first
+optional codec-neutral details Payload. Deletion exposes the handle and mutable
+scope options; the terminal rejects an empty Run ID unless `allow_latest_run`
+is explicitly set. Registration order is outermost-first
 and unwind order is reversed. Skipping `next` deliberately short-circuits the
 RPC, so a successful start/update/query short circuit must return a valid
 operation-specific handle or Payload.
@@ -2922,11 +2938,14 @@ their `user_data` until `close`.
 Client calls may run concurrently; mutable interceptor user data therefore needs
 application-level synchronization.
 
-The unit and 500-case PBT tests cover nested order, short-circuiting, header
+The unit and 1,000-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
 Visibility queries, the complete standalone Nexus surface, and the complete
-Schedule surface. The generative chain now varies twenty-two operation
-families. The `workflow-properties` live scenario
+Schedule surface. The generative chain now varies twenty-four operation
+families. `workflow-delete-integration-test.sh` first proves that an empty Run
+ID is rejected locally, then deletes a unique running execution by exact Run ID
+through Core and requires a later Describe to return gRPC `NOT_FOUND`. The
+`workflow-properties` live scenario
 wraps both Visibility RPCs; the Schedule lifecycle wraps every read RPC and
 all seven create/mutation paths through Core. Every `client_start` live scenario
 also replaces RPC metadata, sets an API key, clears it, and requires the

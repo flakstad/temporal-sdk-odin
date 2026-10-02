@@ -12,6 +12,9 @@ Odin Client over Core's generic WorkflowService RPC bridge. A thin top-level
 without changing the concrete module types or hiding cleanup. The Client also
 sends typed signals, requests cancellation, pauses/unpauses or terminates executions, and updates
 versioning/priority/time-skipping execution options with explicit field masks. It now
+deletes an explicitly run-scoped Workflow execution through Core, while an
+empty Run ID is rejected unless the caller deliberately opts into Temporal's
+broader latest-run semantics. It also
 starts, polls, describes, requests cancellation of, terminates, and deletes
 standalone Nexus operations through an owned Odin handle. Describe owns status,
 pending/cancellation state, timing, input/outcome, headers, Search Attributes,
@@ -784,7 +787,7 @@ Client connections accept an ordered `[]Client_Interceptor`. The current
 typesafe outbound surface wraps Workflow start, Signal-With-Start,
 Update-With-Start, Signal, Query, Workflow result waiting, Update start/result
 waiting, cancellation,
-termination, and Workflow
+termination, exact-run deletion, and Workflow
 Visibility list/count, standalone Nexus start/poll/describe, cancel/terminate/
 delete and list/count, standalone Activity start/poll/describe,
 cancel/terminate/delete, pause/unpause/reset/options update and list/count, plus Schedule
@@ -823,6 +826,12 @@ mutations reach the RPC but never mutate the caller-owned builder. Shared
 mutable `user_data` must be safe for concurrent Client calls. Connection
 mutation inputs borrow their buffers only for the synchronous chain. API keys
 are secrets and telemetry interceptors must not record their value.
+
+Workflow deletion is intentionally stricter than the upstream wire request:
+`delete_workflow` requires a handle with a non-empty Run ID. Use
+`delete_workflow_with_options(handle, {allow_latest_run = true})` only when
+selecting Temporal's latest execution—and terminating it first if running—is
+the intended destructive scope.
 
 Workflow outbound interception is registered on the Worker. The callbacks are
 part of deterministic Workflow execution: do not read wall-clock time, perform

@@ -4136,6 +4136,71 @@ terminate_workflow_json :: proc(
 	return terminate_workflow_payload(handle, reason, codec.payload_view(&payload))
 }
 
+// Workflow deletion permanently removes one execution and its history. By
+// default an exact Run ID is required. Setting allow_latest_run explicitly
+// accepts Temporal's broader empty-Run-ID semantics, which select the latest
+// execution and terminate it first when it is still running.
+Delete_Workflow_Options :: struct {
+	allow_latest_run: bool,
+}
+
+encode_delete_workflow_request :: proc(
+	namespace, workflow_id, run_id: string,
+	options: Delete_Workflow_Options = {},
+) -> (request_bytes: [dynamic]u8, error: Error) {
+	if len(namespace) == 0 || len(workflow_id) == 0 {
+		return nil, error_from_string(.Invalid_Argument, "Workflow deletion requires namespace and Workflow ID")
+	}
+	if len(run_id) == 0 && !options.allow_latest_run {
+		return nil, error_from_string(
+			.Invalid_Argument,
+			"Workflow deletion requires an exact Run ID unless allow_latest_run is true",
+		)
+	}
+	execution := proto.Temporal_Api_Common_V1_WorkflowExecution{
+		workflow_id = workflow_id,
+		run_id = run_id,
+	}
+	request := proto.Temporal_Api_Workflowservice_V1_DeleteWorkflowExecutionRequest{
+		namespace = namespace,
+		workflow_execution = &execution,
+	}
+	return proto.encode_Temporal_Api_Workflowservice_V1_DeleteWorkflowExecutionRequest(&request), {}
+}
+
+delete_workflow_terminal :: proc(input: ^Client_Delete_Workflow_Input) -> Error {
+	if input == nil || !workflow_handle_valid(input.handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	request_bytes, request_error := encode_delete_workflow_request(
+		input.handle.client.namespace,
+		input.handle.id,
+		input.handle.run_id,
+		input.options,
+	)
+	if request_error.message != nil {
+		return request_error
+	}
+	defer delete(request_bytes)
+	return rpc_empty_response(input.handle, "DeleteWorkflowExecution", request_bytes[:])
+}
+
+delete_workflow_with_options :: proc(
+	handle: ^Workflow_Handle,
+	options: Delete_Workflow_Options,
+) -> Error {
+	if !workflow_handle_valid(handle) {
+		return error_from_string(.Invalid_Argument, "Workflow handle is not initialized")
+	}
+	input := Client_Delete_Workflow_Input{handle = handle, options = options}
+	state := Client_Interceptor_State{client = handle.client}
+	return client_delete_workflow_chain(&state, &input)
+}
+
+delete_workflow :: proc(handle: ^Workflow_Handle) -> Error {
+	return delete_workflow_with_options(handle, {})
+}
+
 Result_Page_Kind :: enum {
 	Completed,
 	Follow_Run,

@@ -307,6 +307,27 @@ Client_Terminate_Workflow_Interceptor_Proc :: #type proc(
 	next: Client_Terminate_Workflow_Next,
 ) -> Error
 
+Client_Delete_Workflow_Input :: struct {
+	handle:  ^Workflow_Handle,
+	options: Delete_Workflow_Options,
+}
+
+Client_Delete_Workflow_Next_Proc :: #type proc(
+	data: rawptr,
+	input: ^Client_Delete_Workflow_Input,
+) -> Error
+
+Client_Delete_Workflow_Next :: struct {
+	data:   rawptr,
+	invoke: Client_Delete_Workflow_Next_Proc,
+}
+
+Client_Delete_Workflow_Interceptor_Proc :: #type proc(
+	user_data: rawptr,
+	input: ^Client_Delete_Workflow_Input,
+	next: Client_Delete_Workflow_Next,
+) -> Error
+
 Client_List_Workflows_Input :: struct {
 	client:  ^Client,
 	options: List_Workflows_Options,
@@ -789,6 +810,7 @@ Client_Interceptor :: struct {
 	update_workflow_execution_options: Client_Update_Workflow_Execution_Options_Interceptor_Proc,
 	workflow_pause_mutation: Client_Workflow_Pause_Mutation_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
+	delete_workflow:    Client_Delete_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
 	count_workflows:    Client_Count_Workflows_Interceptor_Proc,
 	start_nexus_operation:    Client_Start_Nexus_Operation_Interceptor_Proc,
@@ -941,6 +963,16 @@ client_terminate_workflow_next :: proc(
 ) -> Error {
 	if next.invoke == nil || input == nil {
 		return error_from_string(.Invalid_Argument, "invalid terminate Workflow interceptor continuation")
+	}
+	return next.invoke(next.data, input)
+}
+
+client_delete_workflow_next :: proc(
+	next: Client_Delete_Workflow_Next,
+	input: ^Client_Delete_Workflow_Input,
+) -> Error {
+	if next.invoke == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid delete Workflow interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -1470,6 +1502,27 @@ client_terminate_workflow_chain :: proc(
 		)
 	}
 	return terminate_workflow_terminal(input)
+}
+
+client_delete_workflow_chain :: proc(
+	data: rawptr,
+	input: ^Client_Delete_Workflow_Input,
+) -> Error {
+	state := cast(^Client_Interceptor_State)data
+	if state == nil || state.client == nil || input == nil {
+		return error_from_string(.Invalid_Argument, "invalid delete Workflow interceptor state")
+	}
+	for index := state.index; index < len(state.client.interceptors); index += 1 {
+		entry := &state.client.interceptors[index]
+		if entry.delete_workflow == nil do continue
+		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
+		return entry.delete_workflow(
+			entry.user_data,
+			input,
+			{data = &next_state, invoke = client_delete_workflow_chain},
+		)
+	}
+	return delete_workflow_terminal(input)
 }
 
 client_list_workflows_chain :: proc(

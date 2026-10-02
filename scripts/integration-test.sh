@@ -147,6 +147,9 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/update-with-start-integration-test.sh"
 
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/workflow-delete-integration-test.sh"
+
 forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \
   TEMPORAL_CORE_LOG_FILTER=trace \
   TEMPORAL_ODIN_SKIP_BUILD=1 \

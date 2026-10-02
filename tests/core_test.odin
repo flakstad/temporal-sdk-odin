@@ -1689,6 +1689,7 @@ Client_Interceptor_Test_State :: struct {
 	workflow_pause_seen:     bool,
 	terminate_reason_seen:   bool,
 	terminate_details_seen:  bool,
+	delete_options_seen:     bool,
 	signal_start_input_seen: bool,
 	update_start_input_seen: bool,
 	get_result_input_seen:   bool,
@@ -1994,6 +1995,30 @@ client_interceptor_test_terminate :: proc(
 		result = temporal_client.error_from_string(.Rpc, "terminate short circuit")
 	} else {
 		result = temporal_client.client_terminate_workflow_next(next, input)
+	}
+	node.state.events[node.state.count] = -node.id
+	node.state.count += 1
+	return result
+}
+
+client_interceptor_test_delete :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Delete_Workflow_Input,
+	next: temporal_client.Client_Delete_Workflow_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Test_Node)user_data
+	node.state.events[node.state.count] = node.id
+	node.state.count += 1
+	if node.id == 1 {
+		input.options.allow_latest_run = true
+	} else {
+		node.state.delete_options_seen = input.options.allow_latest_run
+	}
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "delete short circuit")
+	} else {
+		result = temporal_client.client_delete_workflow_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -14776,6 +14801,93 @@ client_terminate_interceptors_nest_and_preserve_details :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(terminate_error.message), "terminate short circuit")
 	testing.expect(t, state.terminate_reason_seen)
 	testing.expect(t, state.terminate_details_seen)
+	testing.expect_value(t, state.count, 4)
+	expected := [?]int{1, 2, -2, -1}
+	for event, index in expected {
+		testing.expect_value(t, state.events[index], event)
+	}
+}
+
+@(test)
+client_delete_request_requires_explicit_execution_scope :: proc(t: ^testing.T) {
+	request_bytes, request_error := temporal_client.encode_delete_workflow_request(
+		"orders",
+		"order-42",
+		"run-42",
+	)
+	defer delete(request_bytes)
+	defer temporal_client.error_free(&request_error)
+	testing.expect(t, request_error.message == nil)
+
+	decode_arena: virtual.Arena
+	testing.expect(t, virtual.arena_init_growing(&decode_arena) == nil)
+	defer virtual.arena_destroy(&decode_arena)
+	request := proto.Temporal_Api_Workflowservice_V1_DeleteWorkflowExecutionRequest{}
+	previous_allocator := context.allocator
+	context.allocator = virtual.arena_allocator(&decode_arena)
+	decoded := proto.decode_Temporal_Api_Workflowservice_V1_DeleteWorkflowExecutionRequest(
+		request_bytes[:],
+		&request,
+	)
+	context.allocator = previous_allocator
+	testing.expect(t, decoded)
+	testing.expect_value(t, request.namespace, "orders")
+	testing.expect(t, request.workflow_execution != nil)
+	if request.workflow_execution != nil {
+		testing.expect_value(t, request.workflow_execution.workflow_id, "order-42")
+		testing.expect_value(t, request.workflow_execution.run_id, "run-42")
+	}
+
+	latest_bytes, latest_error := temporal_client.encode_delete_workflow_request(
+		"orders",
+		"order-42",
+		"",
+		{allow_latest_run = true},
+	)
+	delete(latest_bytes)
+	testing.expect(t, latest_error.message == nil)
+	temporal_client.error_free(&latest_error)
+
+	unsafe_bytes, unsafe_error := temporal_client.encode_delete_workflow_request(
+		"orders",
+		"order-42",
+		"",
+	)
+	delete(unsafe_bytes)
+	testing.expect_value(t, unsafe_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	testing.expect(t, unsafe_error.message != nil)
+	temporal_client.error_free(&unsafe_error)
+}
+
+@(test)
+client_delete_interceptors_nest_and_can_make_scope_explicit :: proc(t: ^testing.T) {
+	state := Client_Interceptor_Test_State{}
+	first := Client_Interceptor_Test_Node{state = &state, id = 1}
+	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{
+		connection = &connection,
+		interceptors = make([dynamic]temporal_client.Client_Interceptor),
+	}
+	defer delete(client.interceptors)
+	append(
+		&client.interceptors,
+		temporal_client.Client_Interceptor{
+			user_data = &first,
+			delete_workflow = client_interceptor_test_delete,
+		},
+		temporal_client.Client_Interceptor{
+			user_data = &second,
+			delete_workflow = client_interceptor_test_delete,
+		},
+	)
+	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
+
+	delete_error := temporal_client.delete_workflow(&handle)
+	defer temporal_client.error_free(&delete_error)
+	testing.expect_value(t, delete_error.kind, temporal_client.Error_Kind.Rpc)
+	testing.expect_value(t, string(delete_error.message), "delete short circuit")
+	testing.expect(t, state.delete_options_seen)
 	testing.expect_value(t, state.count, 4)
 	expected := [?]int{1, 2, -2, -1}
 	for event, index in expected {

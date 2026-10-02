@@ -173,6 +173,26 @@ client_interceptor_property_terminate :: proc(
 	return result
 }
 
+client_interceptor_property_delete :: proc(
+	user_data: rawptr,
+	input: ^temporal_client.Client_Delete_Workflow_Input,
+	next: temporal_client.Client_Delete_Workflow_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	input.options.allow_latest_run = node.id % 2 == 0
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result = temporal_client.client_delete_workflow_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
 client_interceptor_property_list_workflows :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_List_Workflows_Input,
@@ -377,7 +397,7 @@ client_interceptor_property_system_info :: proc(
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 22))
+	operation := pbt.draw(t, pbt.int_range(0, 23))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
@@ -396,6 +416,7 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	pbt.cover(t, operation == 19 || operation == 20, 6.0, "Nexus Visibility operation")
 	pbt.cover(t, operation == 21, 3.0, "Update-With-Start operation")
 	pbt.cover(t, operation == 22, 3.0, "System Info operation")
+	pbt.cover(t, operation == 23, 3.0, "Workflow deletion")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -459,6 +480,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.update_with_start = client_interceptor_property_update_with_start
 		case 22:
 			interceptor.get_system_info = client_interceptor_property_system_info
+		case 23:
+			interceptor.delete_workflow = client_interceptor_property_delete
 		}
 		append(&client.interceptors, interceptor)
 	}
@@ -625,6 +648,8 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		info: temporal_client.System_Info
 		info, operation_error = temporal_client.get_system_info(&client)
 		temporal_client.system_info_free(&info)
+	case 23:
+		operation_error = temporal_client.delete_workflow(&handle)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {
@@ -653,7 +678,7 @@ client_interceptors_preserve_nested_next_and_header_isolation :: proc(t: ^testin
 	result := pbt.check(
 		"Client interceptors preserve nested next and header isolation",
 		client_interceptor_chain_property,
-		{num_tests = 500, seed = 0x434c_4945_4e54_494e},
+		{num_tests = 1000, seed = 0x434c_4945_4e54_494e},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
