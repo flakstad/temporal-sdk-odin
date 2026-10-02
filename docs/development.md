@@ -1243,6 +1243,12 @@ error rather than silently dropping it. A 1,000-case PBT generates up to 128
 interleaved retains and batched releases, checks both high-water marks against a
 reference model, drains to zero, and verifies that one extra release is
 rejected without corrupting the count.
+A second 1,000-case property uses `test-deps/pbt`, the repository-pinned
+snapshot of `~/Projects/pbt`, to generate up to 256 routed arrivals and
+interleaved completions over one to
+sixteen shards. It checks owned/queue high-water marks and
+`workflow_executor_shards_used` against an independent per-shard load model,
+then drains the generated skew to zero.
 The script's third pass sets `TEMPORAL_ODIN_FORCE_SHUTDOWN=1`, starts enough
 one-hour timer Workflows to cover all four executor shards, waits until one
 activation is executing on each shard, and requests Worker shutdown without
@@ -1250,7 +1256,8 @@ closing the executions. Core may race some final eviction activations against
 the shutdown poll. The pass therefore requires every run to be accounted for
 exactly once by either `workflow_evictions` or
 `workflow_cached_fibers_shutdown`, with at least one direct cached teardown,
-zero completed executions, zero migrations, and balanced activation ownership.
+all four observed scheduler shards, zero completed executions, zero migrations,
+and balanced activation ownership.
 The test Client terminates the orphaned server executions afterward.
 This pass deliberately configures more Core Workflow slots and pollers than
 language executor threads. Otherwise the first few blocked activations can

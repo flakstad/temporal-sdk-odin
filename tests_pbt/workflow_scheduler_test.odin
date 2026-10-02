@@ -1,8 +1,10 @@
 package workflow_pbt_test
 
+import "core:fmt"
 import "core:testing"
 import pbt "pbt:pbt"
 import worker "../temporal/worker"
+import workflow_isolate "../temporal/workflow/isolate"
 
 workflow_scheduler_ownership_property :: proc(t: ^pbt.T) -> pbt.Result {
 	steps := pbt.draw(t, pbt.int_range(1, 128))
@@ -51,6 +53,77 @@ workflow_scheduler_ownership_balances_generated_interleavings :: proc(t: ^testin
 		"Workflow scheduler ownership balances generated interleavings",
 		workflow_scheduler_ownership_property,
 		{num_tests = 1000, seed = 0x5746_5343_4845_4455},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
+workflow_scheduler_shard_load_property :: proc(t: ^pbt.T) -> pbt.Result {
+	shard_count := pbt.draw(t, pbt.int_range(1, 16))
+	events := pbt.draw(t, pbt.array(pbt.int_range(0, 4095), 1, 256))
+	scheduler := worker.In_Process_Workflow_Scheduler{}
+	seen: [16]bool
+	queue_depths: [16]int
+	model_owned := 0
+	model_owned_peak := 0
+	model_queue_peak := 0
+	model_shards_used := 0
+
+	for encoded in events {
+		run_id := fmt.aprintf("generated-run-%d", encoded % 64)
+		shard, shard_ok := workflow_isolate.workflow_shard_index(run_id, shard_count)
+		delete(run_id)
+		if !shard_ok || shard < 0 || shard >= shard_count {
+			return pbt.fail("generated Workflow run did not map to a valid shard")
+		}
+		first_use := !seen[shard]
+		if first_use {
+			seen[shard] = true
+			model_shards_used += 1
+		}
+		queue_depths[shard] += 1
+		model_owned += 1
+		model_owned_peak = max(model_owned_peak, model_owned)
+		model_queue_peak = max(model_queue_peak, queue_depths[shard])
+		worker.workflow_scheduler_retain_activation(
+			&scheduler,
+			queue_depths[shard],
+			first_use,
+		)
+
+		// Generated completion interleavings drain a possibly different shard.
+		drain_shard := (encoded / 64) % shard_count
+		if encoded % 3 == 0 && queue_depths[drain_shard] > 0 {
+			queue_depths[drain_shard] -= 1
+			model_owned -= 1
+			if !worker.workflow_scheduler_release_activations(&scheduler, 1) {
+				return pbt.fail("generated shard completion underflowed ownership")
+			}
+		}
+		if scheduler.activations_owned != model_owned ||
+		   scheduler.peak_owned != model_owned_peak ||
+		   scheduler.queue_peak != model_queue_peak ||
+		   scheduler.shards_used != model_shards_used {
+			return pbt.fail("generated shard load diverged from scheduler observations")
+		}
+	}
+
+	pbt.cover(t, model_shards_used == shard_count, 30, "all configured shards used")
+	pbt.cover(t, model_queue_peak >= 8, 20, "skewed shard queue")
+	pbt.cover(t, model_owned_peak >= 32, 30, "many owned activations")
+	if !worker.workflow_scheduler_release_activations(&scheduler, model_owned) ||
+	   scheduler.activations_owned != 0 {
+		return pbt.fail("generated shard load did not drain ownership")
+	}
+	return pbt.pass()
+}
+
+@(test)
+workflow_scheduler_observes_generated_shard_skew_and_drain :: proc(t: ^testing.T) {
+	result := pbt.check(
+		"Workflow scheduler observes generated shard skew and drain",
+		workflow_scheduler_shard_load_property,
+		{num_tests = 1000, seed = 0x5746_5348_4152_444c},
 	)
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)

@@ -1565,16 +1565,18 @@ workflow_scheduler_ownership_tracks_peak_queue_and_balanced_release :: proc(
 	t: ^testing.T,
 ) {
 	scheduler := worker.In_Process_Workflow_Scheduler{}
-	worker.workflow_scheduler_retain_activation(&scheduler, 1)
+	worker.workflow_scheduler_retain_activation(&scheduler, 1, true)
 	worker.workflow_scheduler_retain_activation(&scheduler, 3)
 	testing.expect_value(t, scheduler.activations_owned, 2)
 	testing.expect_value(t, scheduler.peak_owned, 2)
 	testing.expect_value(t, scheduler.queue_peak, 3)
+	testing.expect_value(t, scheduler.shards_used, 1)
 	testing.expect(t, worker.workflow_scheduler_release_activations(&scheduler, 1))
-	worker.workflow_scheduler_retain_activation(&scheduler, 2)
+	worker.workflow_scheduler_retain_activation(&scheduler, 2, true)
 	testing.expect_value(t, scheduler.activations_owned, 2)
 	testing.expect_value(t, scheduler.peak_owned, 2)
 	testing.expect_value(t, scheduler.queue_peak, 3)
+	testing.expect_value(t, scheduler.shards_used, 2)
 	testing.expect(t, worker.workflow_scheduler_release_activations(&scheduler, 2))
 	testing.expect_value(t, scheduler.activations_owned, 0)
 	testing.expect(t, !worker.workflow_scheduler_release_activations(&scheduler, 1))

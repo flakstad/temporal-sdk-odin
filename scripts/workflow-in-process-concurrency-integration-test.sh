@@ -102,7 +102,7 @@ run_shutdown_probe() {
   fi
 
   grep -q 'In-process Workflow shutdown proved' <<<"$output"
-  grep -Eq 'shards=4 mid_activation_shards=4 activations=([4-9]|[1-9][0-9]+) evictions=([0-9]+) cached_shutdown=([1-9][0-9]*) owned_peak=([1-9][0-9]*) queue_peak=([1-9][0-9]*) migrations=0' <<<"$output"
+  grep -Eq 'shards=4 mid_activation_shards=4 stats_shards=4 activations=([4-9]|[1-9][0-9]+) evictions=([0-9]+) cached_shutdown=([1-9][0-9]*) owned_peak=([1-9][0-9]*) queue_peak=([1-9][0-9]*) migrations=0' <<<"$output"
 }
 
 run_probe "$unique_suffix" 0

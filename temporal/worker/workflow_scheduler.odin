@@ -17,6 +17,7 @@ In_Process_Workflow_Scheduler :: struct {
 	activations_owned:  int,
 	peak_owned:         int,
 	queue_peak:         int,
+	shards_used:        int,
 }
 
 In_Process_Workflow_Shard :: struct {
@@ -28,6 +29,7 @@ In_Process_Workflow_Shard :: struct {
 	available:   sync.Sema,
 	ready:       sync.Sema,
 	queue:       [dynamic][]u8,
+	used:        bool,
 	accepting:   bool,
 	stop:        bool,
 	thread:      ^thread.Thread,
@@ -38,6 +40,7 @@ In_Process_Workflow_Shard :: struct {
 workflow_scheduler_retain_activation :: proc(
 	scheduler: ^In_Process_Workflow_Scheduler,
 	queue_depth: int,
+	first_shard_use := false,
 ) {
 	if scheduler == nil || queue_depth < 0 {
 		return
@@ -46,6 +49,9 @@ workflow_scheduler_retain_activation :: proc(
 	scheduler.activations_owned += 1
 	scheduler.peak_owned = max(scheduler.peak_owned, scheduler.activations_owned)
 	scheduler.queue_peak = max(scheduler.queue_peak, queue_depth)
+	if first_shard_use {
+		scheduler.shards_used += 1
+	}
 	sync.mutex_unlock(&scheduler.mutex)
 }
 
@@ -351,7 +357,13 @@ workflow_shard_enqueue :: proc(
 	}
 	append(&shard.queue, activation)
 	queue_depth := len(shard.queue)
-	workflow_scheduler_retain_activation(shard.scheduler, queue_depth)
+	first_shard_use := !shard.used
+	shard.used = true
+	workflow_scheduler_retain_activation(
+		shard.scheduler,
+		queue_depth,
+		first_shard_use,
+	)
 	sync.mutex_unlock(&shard.mutex)
 	sync.sema_post(&shard.available)
 	return {}
@@ -484,6 +496,7 @@ run_in_process_workflow_executor_loop :: proc(
 	sync.mutex_lock(&scheduler.mutex)
 	stats.workflow_activations_peak_owned = scheduler.peak_owned
 	stats.workflow_executor_queue_peak = scheduler.queue_peak
+	stats.workflow_executor_shards_used = scheduler.shards_used
 	remaining_owned := scheduler.activations_owned
 	sync.mutex_unlock(&scheduler.mutex)
 	if remaining_owned != 0 {

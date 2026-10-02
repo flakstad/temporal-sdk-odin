@@ -372,6 +372,9 @@ Run_Stats :: struct {
 	// Highest queued activation count observed on one fixed in-process shard.
 	// Serial and external-processor execution report zero.
 	workflow_executor_queue_peak:         int,
+	// Number of fixed in-process executor shards which received at least one
+	// activation. Serial and external-processor execution report zero.
+	workflow_executor_shards_used:        int,
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,

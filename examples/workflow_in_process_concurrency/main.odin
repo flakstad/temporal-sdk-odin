@@ -962,12 +962,14 @@ run :: proc() -> int {
 		   run_stats.workflow_cached_fibers_shutdown < 1 ||
 		   run_stats.workflow_cached_fibers_shutdown + run_stats.workflow_evictions !=
 		   len(state.handles) ||
+		   run_stats.workflow_executor_shards_used != EXECUTOR_THREADS ||
 		   run_stats.workflow_activations_peak_owned < 1 ||
 		   run_stats.workflow_executor_queue_peak < 1 || shutdown_migrations != 0 {
 			fmt.eprintf(
-				"In-process Workflow shutdown proof failed handles=%d mid_activation_shards=%d activations=%d completed=%d failures=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+				"In-process Workflow shutdown proof failed handles=%d mid_activation_shards=%d stats_shards=%d activations=%d completed=%d failures=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
 				len(state.handles),
 				shutdown_shards_entered,
+				run_stats.workflow_executor_shards_used,
 				run_stats.workflow_activations_completed,
 				run_stats.workflow_executions_completed,
 				run_stats.workflow_activation_failures,
@@ -980,10 +982,11 @@ run :: proc() -> int {
 			return 1
 		}
 		fmt.printf(
-			"In-process Workflow shutdown proved handles=%d shards=%d mid_activation_shards=%d activations=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+			"In-process Workflow shutdown proved handles=%d shards=%d mid_activation_shards=%d stats_shards=%d activations=%d evictions=%d cached_shutdown=%d owned_peak=%d queue_peak=%d migrations=%d\n",
 			len(state.handles),
 			EXECUTOR_THREADS,
 			shutdown_shards_entered,
+			run_stats.workflow_executor_shards_used,
 			run_stats.workflow_activations_completed,
 			run_stats.workflow_evictions,
 			run_stats.workflow_cached_fibers_shutdown,

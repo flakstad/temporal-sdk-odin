@@ -4249,6 +4249,8 @@ Enqueue increments a shared owned count, normal processing releases one after
 completion cleanup, and fault teardown releases every discarded queued buffer.
 `Run_Stats.workflow_activations_peak_owned` exposes the global high-water mark;
 `workflow_executor_queue_peak` exposes the largest individual shard queue.
+`workflow_executor_shards_used` exposes how many fixed shards received at least
+one activation during the run.
 `workflow_cached_fibers_shutdown` counts in-process fibers still present when
 their owner executor tears down; normal `RemoveFromCache` destruction is
 reported separately by `workflow_evictions`.
@@ -4257,6 +4259,12 @@ turns shutdown balance and bounded Core-to-language handoff into explicit,
 testable invariants. A 1,000-case property test compares generated retain and
 batched-release interleavings with an independent integer/high-water model and
 requires exact drain plus underflow rejection.
+A second 1,000-case PBT generates routed run arrivals and interleaved
+completions across one to sixteen shards. Its independent per-shard load model
+must match global ownership, owned and queue high-water marks, distinct shard
+usage, and final drain. The test suite uses repository-pinned snapshots of the
+projects also checked out at `~/Projects/pbt` and `~/Projects/statecharts`; no
+runtime dependency is added.
 
 ## Core-connected Workflow process isolation
 
