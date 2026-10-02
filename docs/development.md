@@ -1278,6 +1278,14 @@ handler started and completed exactly once, no abandonment or warnings, all
 four shards used, positive per-shard admission minima, and zero thread
 migrations. This covers many simultaneous handler stacks and history
 reconstruction rather than only overlapping one Signal and one Update.
+The fifth pass sets `TEMPORAL_ODIN_MIXED_LOAD=1`. Each run starts a remote
+Activity from its main fiber and from independent Signal and Update routines.
+After a full batch reaches the 32-slot Activity executor, the coordinator
+evicts every cached Workflow while those callbacks are still live. Their
+completions must reconstruct fresh stacks from history, resolve all three
+awaits, cross durable timers, and return `mixed:4:6:10` plus typed Update value
+`10`. Exact task and handler counts, all four Workflow shards, positive replay,
+bounded Activity concurrency, and zero migrations are required.
 
 An optional consecutive-failure circuit breaker opens after a configured number
 of child/session failures and admits one new trial after a monotonic cooldown.

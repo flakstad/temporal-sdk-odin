@@ -6,6 +6,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import activity "../../temporal/activity"
 import temporal_client "../../temporal/client"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
@@ -19,10 +20,14 @@ NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
 SIGNAL_HANDLER_WORKFLOW_TYPE :: "in_process_signal_handler_probe"
 ASYNC_HANDLER_WORKFLOW_TYPE :: "in_process_async_handler_probe"
 HANDLER_LOAD_WORKFLOW_TYPE :: "in_process_handler_load_probe"
+MIXED_LOAD_WORKFLOW_TYPE :: "in_process_mixed_load_probe"
+MIXED_LOAD_ACTIVITY_TYPE :: "in_process_mixed_double"
 SHUTDOWN_WORKFLOW_TYPE :: "in_process_shutdown_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
 HANDLER_LOAD_ROUTINES :: 4
 HANDLER_LOAD_RUNS_PER_SHARD :: 2
+MIXED_LOAD_RUNS_PER_SHARD :: 2
+MIXED_LOAD_ACTIVITY_SLOTS :: 32
 
 Probe_State :: struct {
 	mutex:                 sync.Mutex,
@@ -38,6 +43,9 @@ Probe_State :: struct {
 	shutdown_shards_entered: [EXECUTOR_THREADS]bool,
 	shutdown_shard_count:    int,
 	handler_load_started:    int,
+	mixed_activity_started:  int,
+	mixed_activity_active:   int,
+	mixed_activity_peak:     int,
 }
 
 probe_state: Probe_State
@@ -307,6 +315,114 @@ handler_load_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
 	return fmt.aprintf("load:%d:%d", state.sum, state.peak)
 }
 
+// The wall-clock pause is test-only Activity instrumentation. Unlike Workflow
+// callbacks, Activity callbacks are allowed to block and observe wall time.
+mixed_double_activity :: proc(_: ^activity.Context, value: int) -> int {
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.mixed_activity_started += 1
+	probe_state.mixed_activity_active += 1
+	probe_state.mixed_activity_peak = max(
+		probe_state.mixed_activity_peak,
+		probe_state.mixed_activity_active,
+	)
+	sync.mutex_unlock(&probe_state.mutex)
+	time.sleep(5 * time.Second)
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.mixed_activity_active -= 1
+	sync.mutex_unlock(&probe_state.mutex)
+	return value * 2
+}
+
+Mixed_Load_State :: struct {
+	owner_thread:  int,
+	signal_result: int,
+	update_result: int,
+	signal_done:   bool,
+	update_done:   bool,
+}
+
+mixed_check_affinity :: proc(state: ^Mixed_Load_State) {
+	if state != nil && sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+}
+
+mixed_signal_routine :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Mixed_Load_State,
+	value: int,
+) {
+	mixed_check_affinity(state)
+	state.signal_result = workflow.execute_activity_json(
+		ctx,
+		MIXED_LOAD_ACTIVITY_TYPE,
+		value,
+		int,
+	)
+	workflow.sleep(ctx, 200 * time.Millisecond)
+	mixed_check_affinity(state)
+	state.signal_done = true
+}
+
+mixed_update_routine :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Mixed_Load_State,
+	value: int,
+) -> int {
+	mixed_check_affinity(state)
+	state.update_result = workflow.execute_activity_json(
+		ctx,
+		MIXED_LOAD_ACTIVITY_TYPE,
+		value,
+		int,
+	)
+	workflow.sleep(ctx, 200 * time.Millisecond)
+	mixed_check_affinity(state)
+	state.update_done = true
+	return state.update_result
+}
+
+mixed_load_ready :: proc(state: ^Mixed_Load_State) -> bool {
+	return state.signal_done && state.update_done
+}
+
+mixed_load_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Mixed_Load_State{owner_thread = sync.current_thread_id()}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"mixed_signal",
+		&state,
+		mixed_signal_routine,
+	) || !workflow.set_update_routine_json(
+		ctx,
+		"mixed_update",
+		&state,
+		mixed_update_routine,
+	) {
+		return "mixed handler registration failed"
+	}
+	main_result := workflow.execute_activity_json(
+		ctx,
+		MIXED_LOAD_ACTIVITY_TYPE,
+		2,
+		int,
+	)
+	workflow.sleep(ctx, 200 * time.Millisecond)
+	mixed_check_affinity(&state)
+	if !workflow.await_condition(ctx, &state, mixed_load_ready) {
+		return "mixed handler wait canceled"
+	}
+	workflow.await_all_handlers_finished(ctx)
+	return fmt.aprintf(
+		"mixed:%d:%d:%d",
+		main_result,
+		state.signal_result,
+		state.update_result,
+	)
+}
+
 Concurrency_State :: struct {
 	client:                  ^temporal_client.Client,
 	sdk_worker:              ^worker.Worker,
@@ -328,12 +444,14 @@ Concurrency_State :: struct {
 	async_handler_handle:   temporal_client.Workflow_Handle,
 	has_async_handler_handle: bool,
 	async_handler_closed:   bool,
+	mixed_updates:          [dynamic]temporal_client.Update_Handle,
 	watcher:                 ^thread.Thread,
 	start_error:             temporal_client.Error,
 	result_error:            temporal_client.Error,
 	cancel_error:            temporal_client.Error,
 	signal_error:            temporal_client.Error,
 	async_handler_error:     temporal_client.Error,
+	mixed_error:             temporal_client.Error,
 	eviction_error:          worker.Error,
 	results_ok:              bool,
 	cancellation_ok:         bool,
@@ -343,6 +461,154 @@ Concurrency_State :: struct {
 	force_replay:            bool,
 	force_shutdown:          bool,
 	force_handler_load:      bool,
+	force_mixed_load:        bool,
+}
+
+wait_for_mixed_load_results :: proc(state: ^Concurrency_State) {
+	state.results_ok = true
+	for index in 0 ..< len(state.handles) {
+		handle := &state.handles[index]
+		update_id := fmt.aprintf("mixed-update-%d", index)
+		update, update_error := temporal_client.start_update_json(
+			handle,
+			"mixed_update",
+			5,
+			update_id,
+		)
+		delete(update_id)
+		if update_error.message != nil {
+			state.mixed_error = update_error
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+		append(&state.mixed_updates, update)
+		state.signal_error = temporal_client.signal_workflow_json(
+			handle,
+			"mixed_signal",
+			3,
+		)
+		if state.signal_error.message != nil {
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+	}
+	expected_activities := len(state.handles) * 3
+	expected_in_flight := min(expected_activities, MIXED_LOAD_ACTIVITY_SLOTS)
+	started := 0
+	for _ in 0 ..< 2000 {
+		sync.mutex_lock(&probe_state.mutex)
+		started = probe_state.mixed_activity_started
+		sync.mutex_unlock(&probe_state.mutex)
+		if started >= expected_in_flight {
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	if started < expected_in_flight {
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	// At least one full Activity slot batch is blocked in user callbacks. Drop
+	// every cached Workflow stack so their Activity resolutions must rebuild
+	// deterministically from history on the same affine executor shards.
+	for &handle in state.handles {
+		state.eviction_error = worker.request_workflow_eviction(
+			state.sdk_worker,
+			handle.run_id,
+		)
+		if state.eviction_error.message != nil {
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+	}
+	for &update in state.mixed_updates {
+		result: int
+		update_error := temporal_client.wait_update_json(&update, &result)
+		if update_error.message != nil {
+			state.mixed_error = update_error
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+		if result != 10 {
+			state.results_ok = false
+			worker.request_shutdown(state.sdk_worker)
+			return
+		}
+	}
+	for &handle in state.handles {
+		result: string
+		result_error := temporal_client.get_result_json(&handle, &result)
+		if result_error.message != nil {
+			state.result_error = result_error
+			state.results_ok = false
+			delete(result)
+			break
+		}
+		if result != "mixed:4:6:10" {
+			state.results_ok = false
+		}
+		delete(result)
+		if !state.results_ok {
+			break
+		}
+	}
+	worker.request_shutdown(state.sdk_worker)
+}
+
+start_mixed_load_workflows :: proc(state: ^Concurrency_State) -> bool {
+	if state == nil || state.client == nil || state.sdk_worker == nil {
+		return false
+	}
+	runs_per_shard: [EXECUTOR_THREADS]int
+	covered_shards := 0
+	for candidate in 0 ..< 128 {
+		workflow_id := fmt.aprintf("%s-mixed-%d", state.id_prefix, candidate)
+		handle, start_error := temporal_client.start_workflow_json(
+			state.client,
+			MIXED_LOAD_WORKFLOW_TYPE,
+			workflow_id,
+			{
+				id = workflow_id,
+				task_queue = state.task_queue,
+				workflow_execution_timeout = 2 * time.Minute,
+				workflow_run_timeout = 2 * time.Minute,
+				workflow_task_timeout = 10 * time.Second,
+			},
+		)
+		delete(workflow_id)
+		if start_error.message != nil {
+			state.start_error = start_error
+			return false
+		}
+		append(&state.handles, handle)
+		shard, shard_ok := workflow_isolate.workflow_shard_index(
+			handle.run_id,
+			EXECUTOR_THREADS,
+		)
+		if !shard_ok {
+			return false
+		}
+		runs_per_shard[shard] += 1
+		if runs_per_shard[shard] == MIXED_LOAD_RUNS_PER_SHARD {
+			covered_shards += 1
+		}
+		if covered_shards == EXECUTOR_THREADS {
+			break
+		}
+	}
+	if covered_shards != EXECUTOR_THREADS {
+		return false
+	}
+	state.watcher = thread.create_and_start_with_poly_data(
+		state,
+		wait_for_mixed_load_results,
+	)
+	return state.watcher != nil
 }
 
 wait_for_handler_load_results :: proc(state: ^Concurrency_State) {
@@ -729,6 +995,9 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	if state.force_handler_load {
 		return start_handler_load_workflows(state)
 	}
+	if state.force_mixed_load {
+		return start_mixed_load_workflows(state)
+	}
 	failure_id := fmt.aprintf("%s-invalid", state.id_prefix)
 	failure_handle, failure_start_error := temporal_client.start_workflow_json(
 		state.client,
@@ -906,6 +1175,11 @@ run :: proc() -> int {
 		handler_load_buffer[:],
 		"TEMPORAL_ODIN_HANDLER_LOAD",
 	) == "1"
+	mixed_load_buffer: [64]u8
+	force_mixed_load := os.get_env(
+		mixed_load_buffer[:],
+		"TEMPORAL_ODIN_MIXED_LOAD",
+	) == "1"
 	task_queue_buffer: [256]u8
 	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
 	if len(task_queue) == 0 {
@@ -930,9 +1204,12 @@ run :: proc() -> int {
 
 	options := worker.options_default(task_queue)
 	options.max_concurrent_workflow_tasks = EXECUTOR_THREADS
-	stress_mode := force_shutdown || force_handler_load
+	stress_mode := force_shutdown || force_handler_load || force_mixed_load
 	options.max_workflow_task_slots = stress_mode ? 128 : EXECUTOR_THREADS
 	options.max_cached_workflows = stress_mode ? 128 : 16
+	if force_mixed_load {
+		options.max_concurrent_activities = MIXED_LOAD_ACTIVITY_SLOTS
+	}
 	options.nondeterminism_policy = {
 		fail_workflow_types = []string{NONDETERMINISM_WORKFLOW_TYPE},
 	}
@@ -1014,6 +1291,28 @@ run :: proc() -> int {
 	}
 	register_error = worker.register_json_workflow(
 		&sdk_worker,
+		MIXED_LOAD_WORKFLOW_TYPE,
+		mixed_load_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Mixed-load Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	if force_mixed_load {
+		register_error = worker.register_json_activity(
+			&sdk_worker,
+			MIXED_LOAD_ACTIVITY_TYPE,
+			mixed_double_activity,
+		)
+		if register_error.message != nil {
+			fmt.eprintf("Mixed-load Activity registration failed: %s\n", string(register_error.message))
+			worker.error_free(&register_error)
+			return 1
+		}
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
 		NONDETERMINISM_WORKFLOW_TYPE,
 		nondeterminism_probe,
 	)
@@ -1031,6 +1330,7 @@ run :: proc() -> int {
 		force_replay = force_replay,
 		force_shutdown = force_shutdown,
 		force_handler_load = force_handler_load,
+		force_mixed_load = force_mixed_load,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
 		on_ready = start_concurrent_workflows,
@@ -1043,7 +1343,8 @@ run :: proc() -> int {
 	}
 	defer {
 		for &handle in state.handles {
-			if state.force_shutdown || (state.force_handler_load && !state.results_ok) {
+			if state.force_shutdown ||
+			   ((state.force_handler_load || state.force_mixed_load) && !state.results_ok) {
 				cleanup_error := temporal_client.terminate_workflow(
 					&handle,
 					"in-process affine shutdown proof completed",
@@ -1053,6 +1354,10 @@ run :: proc() -> int {
 			temporal_client.workflow_handle_free(&handle)
 		}
 		delete(state.handles)
+		for &update in state.mixed_updates {
+			temporal_client.update_handle_free(&update)
+		}
+		delete(state.mixed_updates)
 		if state.has_failure_handle {
 			if !state.failure_terminated {
 				cleanup_error := temporal_client.terminate_workflow(
@@ -1134,6 +1439,12 @@ run :: proc() -> int {
 		worker.error_free(&run_error)
 		return 1
 	}
+	if state.mixed_error.message != nil {
+		fmt.eprintf("In-process mixed-load operation failed: %s\n", string(state.mixed_error.message))
+		temporal_client.error_free(&state.mixed_error)
+		worker.error_free(&run_error)
+		return 1
+	}
 	if state.eviction_error.message != nil {
 		fmt.eprintf("In-process Workflow eviction request failed: %s\n", string(state.eviction_error.message))
 		worker.error_free(&state.eviction_error)
@@ -1190,6 +1501,81 @@ run :: proc() -> int {
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
 			shutdown_migrations,
+		)
+		return 0
+	}
+	if force_mixed_load {
+		sync.mutex_lock(&probe_state.mutex)
+		migrations := probe_state.migrations
+		activities_started := probe_state.mixed_activity_started
+		activity_peak := probe_state.mixed_activity_peak
+		sync.mutex_unlock(&probe_state.mutex)
+		expected_activities := len(state.handles) * 3
+		expected_peak := min(expected_activities, MIXED_LOAD_ACTIVITY_SLOTS)
+		if !state.results_ok || len(state.handles) < EXECUTOR_THREADS * MIXED_LOAD_RUNS_PER_SHARD ||
+		   activities_started != expected_activities ||
+		   activity_peak != expected_peak ||
+		   run_stats.activity_tasks_completed != expected_activities ||
+		   run_stats.activity_executions_peak_owned < expected_peak ||
+		   run_stats.activity_executions_peak_owned > MIXED_LOAD_ACTIVITY_SLOTS + 1 ||
+		   run_stats.workflow_executions_completed != len(state.handles) ||
+		   run_stats.workflow_activation_failures != 0 ||
+		   run_stats.workflow_signals_received != len(state.handles) ||
+		   run_stats.workflow_signal_handlers_started != len(state.handles) ||
+		   run_stats.workflow_signal_handlers_completed != len(state.handles) ||
+		   run_stats.workflow_signal_handlers_abandoned != 0 ||
+		   run_stats.workflow_signal_handler_warnings != 0 ||
+		   run_stats.workflow_updates_accepted != len(state.handles) ||
+		   run_stats.workflow_updates_rejected != 0 ||
+		   run_stats.workflow_updates_completed != len(state.handles) ||
+		   run_stats.workflow_update_handlers_abandoned != 0 ||
+		   run_stats.workflow_update_handler_warnings != 0 ||
+		   run_stats.workflow_replay_activations < len(state.handles) ||
+		   run_stats.workflow_evictions < len(state.handles) ||
+		   run_stats.workflow_executor_shards_used != EXECUTOR_THREADS ||
+		   run_stats.workflow_executor_shard_activations_min < 1 ||
+		   run_stats.workflow_executor_shard_activations_max <
+			   run_stats.workflow_executor_shard_activations_min ||
+		   run_stats.workflow_activations_peak_owned < EXECUTOR_THREADS ||
+		   run_stats.workflow_executor_queue_peak < 1 || migrations != 0 {
+			fmt.eprintf(
+				"In-process mixed Workflow/Activity load failed handles=%d activities=%d activity_peak=%d activity_owned_peak=%d signals=%d signal_handlers=%d updates=%d replay_activations=%d evictions=%d shards=%d shard_activations_min=%d shard_activations_max=%d owned_peak=%d queue_peak=%d migrations=%d results_ok=%v\n",
+				len(state.handles),
+				run_stats.activity_tasks_completed,
+				activity_peak,
+				run_stats.activity_executions_peak_owned,
+				run_stats.workflow_signals_received,
+				run_stats.workflow_signal_handlers_completed,
+				run_stats.workflow_updates_completed,
+				run_stats.workflow_replay_activations,
+				run_stats.workflow_evictions,
+				run_stats.workflow_executor_shards_used,
+				run_stats.workflow_executor_shard_activations_min,
+				run_stats.workflow_executor_shard_activations_max,
+				run_stats.workflow_activations_peak_owned,
+				run_stats.workflow_executor_queue_peak,
+				migrations,
+				state.results_ok,
+			)
+			return 1
+		}
+		fmt.printf(
+			"In-process mixed Workflow/Activity load proved handles=%d activities=%d activity_peak=%d activity_owned_peak=%d signals=%d signal_handlers=%d updates=%d replay_activations=%d evictions=%d shards=%d shard_activations_min=%d shard_activations_max=%d owned_peak=%d queue_peak=%d migrations=%d\n",
+			len(state.handles),
+			run_stats.activity_tasks_completed,
+			activity_peak,
+			run_stats.activity_executions_peak_owned,
+			run_stats.workflow_signals_received,
+			run_stats.workflow_signal_handlers_completed,
+			run_stats.workflow_updates_completed,
+			run_stats.workflow_replay_activations,
+			run_stats.workflow_evictions,
+			run_stats.workflow_executor_shards_used,
+			run_stats.workflow_executor_shard_activations_min,
+			run_stats.workflow_executor_shard_activations_max,
+			run_stats.workflow_activations_peak_owned,
+			run_stats.workflow_executor_queue_peak,
+			migrations,
 		)
 		return 0
 	}

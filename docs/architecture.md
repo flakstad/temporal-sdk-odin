@@ -3512,7 +3512,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, mid-activation shutdown, and replay/nondeterminism/handler-load isolation on fixed run-affine concurrent executors on macOS arm64 | Run longer mixed-operation soak/fault tests and validate guard pages plus affinity on every distribution target |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, mid-activation shutdown, replay/nondeterminism/handler-load isolation, and mixed remote-Activity resolution after eviction on fixed run-affine concurrent executors on macOS arm64 | Run longer mixed-operation soak/fault tests and validate guard pages plus affinity on every distribution target |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -3526,10 +3526,11 @@ The current next milestone is production hardening of the run-affine
 in-process scheduler. Replay reconstruction, concurrent activation failure,
 cancellation, immediate and suspending Signal/Update handlers, clean shutdown
 of cached fibers, and Core-detected nondeterminism are now live-proven on
-affine shards. Mid-activation shutdown and handler-heavy fresh-stack replay
-are now covered across all shards, and queue depth plus per-shard admission
-min/max make routing pressure observable. Next, run longer mixed-operation
-soak/fault tests and the guard-page plus affinity suite on all four
+affine shards. Mid-activation shutdown, handler-heavy fresh-stack replay, and
+remote Activity resolution into evicted main/Signal/Update fibers are now
+covered across all shards. Queue depth, Activity ownership, and per-shard
+admission min/max make routing pressure observable. Next, run longer
+mixed-operation soak/fault tests and the guard-page plus affinity suite on all four
 distribution targets. The live proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
@@ -4261,6 +4262,19 @@ histories and fresh fibers must reproduce the Signal handlers and timer
 commands before returning `load:10:4` for every run. The pass requires at
 least 32 non-replay handler starts/completions, no warning or abandonment,
 positive replay/eviction counts, all shards used, and zero fiber migration.
+A fifth pass combines both language executors. Every Workflow run schedules
+three remote Activities: one from the main fiber, one from a stackful Signal
+routine, and one from a stackful Update routine. Activity callbacks block for
+five seconds as test-only instrumentation. Once up to all 32 Activity slots are
+simultaneously occupied, the coordinator requests eviction for every cached
+Workflow. The later Activity completions force fresh-history reconstruction,
+then all three Workflow paths cross durable timers and produce exact typed
+results. The pass requires at least two runs on every shard, exactly three
+completed Activity tasks per run, exact Signal and Update handler counts, no
+warnings or abandonment, positive replay and eviction counts, and zero fiber
+migration. This closes the previously untested interaction between the affine
+Workflow executor and the separate Activity executor; it is still a bounded
+proof rather than a long-running soak test.
 
 The scheduler accounts for ownership at the activation-buffer boundary.
 Enqueue increments a shared owned count, normal processing releases one after

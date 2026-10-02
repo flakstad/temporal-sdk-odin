@@ -65,6 +65,7 @@ run_probe() {
     TEMPORAL_ODIN_FORCE_REPLAY="$force_replay" \
     TEMPORAL_ODIN_FORCE_SHUTDOWN=0 \
     TEMPORAL_ODIN_HANDLER_LOAD=0 \
+    TEMPORAL_ODIN_MIXED_LOAD=0 \
     "$binary" 2>&1
   )"
   status=$?
@@ -94,6 +95,7 @@ run_shutdown_probe() {
     TEMPORAL_ODIN_FORCE_REPLAY=0 \
     TEMPORAL_ODIN_FORCE_SHUTDOWN=1 \
     TEMPORAL_ODIN_HANDLER_LOAD=0 \
+    TEMPORAL_ODIN_MIXED_LOAD=0 \
     "$binary" 2>&1
   )"
   status=$?
@@ -119,6 +121,7 @@ run_handler_load_probe() {
     TEMPORAL_ODIN_FORCE_REPLAY=0 \
     TEMPORAL_ODIN_FORCE_SHUTDOWN=0 \
     TEMPORAL_ODIN_HANDLER_LOAD=1 \
+    TEMPORAL_ODIN_MIXED_LOAD=0 \
     "$binary" 2>&1
   )"
   status=$?
@@ -132,7 +135,34 @@ run_handler_load_probe() {
   grep -Eq 'handles=([8-9]|[1-9][0-9]+) shards=4 signals=([3-9][0-9]|[1-9][0-9]{2,}) handlers=([3-9][0-9]|[1-9][0-9]{2,}) replay_activations=([8-9]|[1-9][0-9]+) evictions=([8-9]|[1-9][0-9]+) shard_activations_min=([1-9][0-9]*) shard_activations_max=([1-9][0-9]*) owned_peak=([4-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) migrations=0' <<<"$output"
 }
 
+run_mixed_load_probe() {
+  local suffix="$1"
+  local output
+  local status
+
+  set +e
+  output="$(
+    TEMPORAL_ODIN_TASK_QUEUE="odin-in-process-concurrent-$suffix" \
+    TEMPORAL_ODIN_WORKFLOW_ID="odin-in-process-concurrent-$suffix" \
+    TEMPORAL_ODIN_FORCE_REPLAY=0 \
+    TEMPORAL_ODIN_FORCE_SHUTDOWN=0 \
+    TEMPORAL_ODIN_HANDLER_LOAD=0 \
+    TEMPORAL_ODIN_MIXED_LOAD=1 \
+    "$binary" 2>&1
+  )"
+  status=$?
+  set -e
+  echo "$output"
+  if [[ "$status" != "0" ]]; then
+    return "$status"
+  fi
+
+  grep -q 'In-process mixed Workflow/Activity load proved' <<<"$output"
+  grep -Eq 'handles=([8-9]|[1-9][0-9]+) activities=([2-9][0-9]|[1-9][0-9]{2,}) activity_peak=([2-9][0-9]|[1-9][0-9]{2,}) activity_owned_peak=([2-9][0-9]|[1-9][0-9]{2,}) signals=([8-9]|[1-9][0-9]+) signal_handlers=([8-9]|[1-9][0-9]+) updates=([8-9]|[1-9][0-9]+) replay_activations=([8-9]|[1-9][0-9]+) evictions=([8-9]|[1-9][0-9]+) shards=4 shard_activations_min=([1-9][0-9]*) shard_activations_max=([1-9][0-9]*) owned_peak=([4-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) migrations=0' <<<"$output"
+}
+
 run_probe "$unique_suffix" 0
 run_probe "$unique_suffix-replay" 1
 run_shutdown_probe "$unique_suffix-shutdown"
 run_handler_load_probe "$unique_suffix-handler-load"
+run_mixed_load_probe "$unique_suffix-mixed-load"

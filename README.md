@@ -616,6 +616,14 @@ for every live run. Fresh stacks must replay every Signal/timer command and
 produce the exact aggregate result with a per-run concurrency peak of four,
 complete every handler without warnings or abandonment, and report zero thread
 migrations.
+A fifth pass exercises the Workflow and Activity executors together. Every run
+starts one Activity from its main fiber, one from a Signal routine, and one
+from an Update routine. Once a full Activity-slot batch is executing, the test
+evicts every Workflow cache entry. Activity completions must rebuild fresh
+Workflow stacks from history, resume all three paths through durable timers,
+and return exact Workflow and Update results. The proof covers every affine
+shard and requires exact Activity/Signal/Update counts, positive replay and
+eviction counts, bounded Activity concurrency, and zero thread migration.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
