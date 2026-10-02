@@ -3576,14 +3576,14 @@ generated statechart traces check failed-generation fencing and multi-route
 capacity. A positive activation deadline now kills and reaps an unresponsive
 executor, joins its pipe reader, and drives the same failed-completion/eviction/
 replay path against the dev server. Generic registry hosting is now proven with
-one shared parent/child registration function and three Workflow types,
-including a typed-JSON result. A canonical registry handshake is now checked once before
+one shared parent/child registration function and four Workflow types,
+including typed-JSON and parent-Activity-awaiting results. A canonical registry handshake is now checked once before
 polling and again for each child generation. Shutdown response and process exit
 are now bounded independently from activation execution; capacity admission is
 immediate rather than deadlocking the serial poll thread; and a cooldown circuit
 breaker bounds consecutive executor failures. Sticky per-run routing with a
-non-zero Core cache is now live-proven: two
-successful children retain two timer Workflows across incremental activations,
+non-zero Core cache is now live-proven: three successful children retain two
+timer Workflows and one Activity/timer Workflow across incremental activations,
 while an initial crash or timeout still evicts and recovers. Protocol v3
 carries the complete language `Process_Result` separately from the authoritative
 opaque Core completion, with live observer evidence for timer sequence fields.
@@ -4376,8 +4376,8 @@ passes its Registry to `isolate.Executor_Host`, which instantiates one
 independent `Fiber_Runtime` per type and selects it from
 `InitializeWorkflow.workflow_type`. Subsequent activations route by run ID
 until eviction. The Registry supports string, one-Payload, repeated-Payload,
-and typed-JSON callbacks; the live proof completes both string and typed-JSON
-types through one executor binary.
+and typed-JSON callbacks; the live proof completes string, typed-JSON, and
+Activity-awaiting types through one executor binary.
 
 External registrations are metadata-only in the parent and cannot be mixed
 with in-process registrations. An external activation processor is mandatory.
@@ -4400,18 +4400,18 @@ serves one Workflow Task and is shut down only after the corresponding
 activation completion. Core then emits language-failure eviction, and the
 Server retries the Workflow Task; fresh child generations rebuild Odin state
 from the history carried by later Core activations. Against the CLI dev server,
-the two timer Workflows currently complete after five generations: one crashed
-initial attempt and four successful zero-cache tasks across scheduling and
-replay/timer resolution. Exact batching and generation counts are diagnostic,
-not an SDK contract.
+the two timer Workflows and one Activity/timer Workflow currently complete
+after eight generations: one crashed initial attempt and seven successful
+zero-cache tasks across Activity scheduling, resolution, timers, and replay.
+Exact batching and generation counts are diagnostic, not an SDK contract.
 
 The second verified mode sets `max_cached_workflows = 100`. After one initial
-crash or timeout, the two Workflow runs each retain one successful child across
-timer suspension and resolution. Core delivers two incremental activations to
-those existing run routes. The live path therefore uses three generations and
-three evictions rather than zero-cache's five, with three graceful shutdowns
-including preflight. Both exact results and all failure-containment assertions
-remain unchanged.
+crash or timeout, all three Workflow runs retain one successful child across
+timer or Activity suspension and resolution. Core delivers four incremental
+activations to those existing run routes. The live path therefore uses four
+generations and four evictions rather than zero-cache's eight, with four
+graceful shutdowns including preflight. All three exact results, the one exact
+Activity completion, and all failure-containment assertions remain unchanged.
 
 A separate sticky-cache dev-server proof now establishes actual
 nondeterminism across this boundary. One normal executor records a one-hour

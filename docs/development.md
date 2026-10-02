@@ -1043,7 +1043,7 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
   ./scripts/workflow-isolate-protocol-fault-integration-test.sh
 ```
 
-The five cases require either one protocol failure or one activation timeout,
+The six cases require either one protocol failure or one activation timeout,
 one failed Workflow activation, complete child reaping, and successful durable
 results from replacement generations. A stale response never shares a pipe or
 route with its replacement generation.
@@ -1072,7 +1072,7 @@ TEMPORAL_ODIN_ISOLATE_FIRST_MODE=stack-overflow \
 
 The first Workflow callback recursively exhausts the minicoro stack. The child
 must terminate with the platform's `SIGSEGV` or `SIGBUS` value, the manager must
-preserve that exit code, and Core eviction/replay must complete both executions
+preserve that exit code, and Core eviction/replay must complete all three executions
 in replacement children. This complements `scripts/fiber-guard-test.sh`, which
 proves the guard mapping and signal in a smaller native fork test.
 
@@ -1085,7 +1085,7 @@ TEMPORAL_ODIN_ISOLATE_FIRST_MODE=panic \
 ```
 
 The child must print the intentional panic and terminate with `SIGTRAP` or
-`SIGILL`; Core eviction/replay must then produce both ordinary Workflow
+`SIGILL`; Core eviction/replay must then produce all three ordinary Workflow
 results. This deliberately tests process recovery rather than installing a
 custom assertion handler or unwinding through the native fiber trampoline.
 
@@ -1099,7 +1099,7 @@ TEMPORAL_ODIN_ISOLATE_FIRST_MODE=infinite-loop \
 
 The executor enters a real infinite Odin loop. The 250 ms activation deadline
 must kill and reap it, increment exactly one timeout rather than a child-exit
-counter, and recover both executions through Core eviction and replay.
+counter, and recover all three executions through Core eviction and replay.
 
 Parent and child now both call the same application-level
 `workflow_isolate_app.register` function. In the parent,
@@ -1107,9 +1107,9 @@ Parent and child now both call the same application-level
 manifest into the Core Worker. In each child, `Executor_Host` instantiates
 independent callback runtimes from the Registry and routes initialization by
 Workflow type plus later activations by run ID. Procedure pointers never cross
-the pipe. The live test completes both a string Workflow and a typed-JSON
-Workflow through the same executor binary, after either a deliberate first
-child crash or timeout.
+the pipe. The live test completes a string Workflow, a typed-JSON Workflow, and
+an Activity-awaiting Workflow through the same executor binary, after either a
+deliberate first child crash or timeout.
 
 Run the non-zero-cache path with:
 
@@ -1118,11 +1118,12 @@ TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky \
   ./scripts/workflow-isolate-core-integration-test.sh
 ```
 
-After one failed generation, two timer Workflows use exactly two successful
-children across suspension and resolution: three generations/evictions total,
-versus five in zero-cache mode. Both timer resolutions are incremental
-activations routed to the already-owned generation. The hang variant passes
-with the same counts.
+After one failed generation, three Workflows use exactly three successful
+children across suspension and resolution: four generations/evictions total,
+versus eight in zero-cache mode. Two Workflows wait directly on timers; the
+third waits on a parent-process Activity and then a timer. All four subsequent
+sticky activations are routed to their already-owned generations. The hang
+variant passes with the same counts.
 
 External and in-process Workflow registrations cannot be mixed on one Worker.
 Workflow loggers and interceptors for external registrations must be configured

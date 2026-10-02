@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:sys/posix"
 import "core:time"
+import activity "../../temporal/activity"
 import temporal_client "../../temporal/client"
 import worker "../../temporal/worker"
 import workflow "../../temporal/workflow"
@@ -14,11 +15,18 @@ Start_State :: struct {
 	client:       ^temporal_client.Client,
 	greeting_id:  string,
 	farewell_id:  string,
+	mixed_id:     string,
 	task_queue:   string,
 	greeting:     temporal_client.Workflow_Handle,
 	farewell:     temporal_client.Workflow_Handle,
+	mixed:        temporal_client.Workflow_Handle,
 	greeting_error: temporal_client.Error,
 	farewell_error: temporal_client.Error,
+	mixed_error:    temporal_client.Error,
+}
+
+format_isolated_activity :: proc(_: ^activity.Context, _: string) -> string {
+	return "an Odin Activity result"
 }
 
 Observation_Stats :: struct {
@@ -120,7 +128,18 @@ start_when_ready :: proc(user_data: rawptr) -> bool {
 		"Odin",
 		farewell_options,
 	)
-	return state.farewell_error.message == nil
+	if state.farewell_error.message != nil {
+		return false
+	}
+	mixed_options := common_options
+	mixed_options.id = state.mixed_id
+	state.mixed, state.mixed_error = temporal_client.start_workflow_json(
+		state.client,
+		workflow_app.MIXED_ACTIVITY_WORKFLOW_TYPE,
+		"Odin",
+		mixed_options,
+	)
+	return state.mixed_error.message == nil
 }
 
 Nondeterminism_Start_State :: struct {
@@ -188,6 +207,8 @@ run :: proc() -> int {
 	}
 	farewell_id := fmt.aprintf("%s-farewell", greeting_id)
 	defer delete(farewell_id)
+	mixed_id := fmt.aprintf("%s-mixed", greeting_id)
+	defer delete(mixed_id)
 
 	client, connect_error := temporal_client.connect()
 	if connect_error.message != nil {
@@ -253,6 +274,18 @@ run :: proc() -> int {
 		fmt.eprintf("External Workflow registry failed: %s\n", string(register_error.message))
 		worker.error_free(&register_error)
 		return 1
+	}
+	if scenario == "standard" {
+		register_error = worker.register_json_activity(
+			&sdk_worker,
+			workflow_app.MIXED_ACTIVITY_TYPE,
+			format_isolated_activity,
+		)
+		if register_error.message != nil {
+			fmt.eprintf("Isolated Activity registration failed: %s\n", string(register_error.message))
+			worker.error_free(&register_error)
+			return 1
+		}
 	}
 
 	child := [?]string{child_command, "--child", task_queue}
@@ -342,7 +375,7 @@ run :: proc() -> int {
 		command = child[:],
 		first_command = first_child[:],
 		expected_registry = &registry,
-		maximum_executors = 2,
+		maximum_executors = 3,
 		activation_timeout = activation_timeout,
 		shutdown_timeout = 2 * time.Second,
 		crash_loop = {
@@ -475,30 +508,37 @@ run :: proc() -> int {
 		client = &client,
 		greeting_id = greeting_id,
 		farewell_id = farewell_id,
+		mixed_id = mixed_id,
 		task_queue = task_queue,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
-		max_workflow_executions = 2,
+		max_workflow_executions = 3,
 		workflow_activation_processor = workflow_isolate.manager_process_activation,
 		workflow_activation_processor_data = &executor_manager,
 		on_workflow_activation = observe_activation,
 		on_ready = start_when_ready,
 		on_ready_data = &start,
 	})
-	if start.greeting_error.message != nil || start.farewell_error.message != nil {
+	if start.greeting_error.message != nil || start.farewell_error.message != nil ||
+	   start.mixed_error.message != nil {
 		if start.greeting_error.message != nil {
 			fmt.eprintf("Greeting Workflow start failed: %s\n", string(start.greeting_error.message))
 		}
 		if start.farewell_error.message != nil {
 			fmt.eprintf("Farewell Workflow start failed: %s\n", string(start.farewell_error.message))
 		}
+		if start.mixed_error.message != nil {
+			fmt.eprintf("Mixed Workflow start failed: %s\n", string(start.mixed_error.message))
+		}
 		temporal_client.error_free(&start.greeting_error)
 		temporal_client.error_free(&start.farewell_error)
+		temporal_client.error_free(&start.mixed_error)
 		worker.error_free(&run_error)
 		return 1
 	}
 	defer temporal_client.workflow_handle_free(&start.greeting)
 	defer temporal_client.workflow_handle_free(&start.farewell)
+	defer temporal_client.workflow_handle_free(&start.mixed)
 	if run_error.message != nil {
 		fmt.eprintf("Worker run failed: %s\n", string(run_error.message))
 		worker.error_free(&run_error)
@@ -527,24 +567,38 @@ run :: proc() -> int {
 		temporal_client.error_free(&farewell_result_error)
 		return 1
 	}
+	mixed_result: string
+	mixed_result_error := temporal_client.get_result_json(
+		&start.mixed,
+		&mixed_result,
+	)
+	defer delete(mixed_result)
+	if mixed_result_error.message != nil {
+		fmt.eprintf("Mixed Workflow result failed: %s\n", string(mixed_result_error.message))
+		temporal_client.error_free(&mixed_result_error)
+		return 1
+	}
 	manager_stats := workflow_isolate.manager_stats(&executor_manager)
 	guard_signal_observed := manager_stats.last_child_exit_code == int(posix.SIGSEGV) ||
 		manager_stats.last_child_exit_code == int(posix.SIGBUS)
 	panic_signal_observed := manager_stats.last_child_exit_code == int(posix.SIGILL) ||
 		manager_stats.last_child_exit_code == int(posix.SIGTRAP)
-	expected_generations := 5
+	expected_generations := 8
 	if cache_mode == "sticky" {
-		expected_generations = 3
+		expected_generations = 4
 	}
 	if first_mode == "normal" {
 		expected_generations -= 1
 	}
 	expected_graceful_shutdowns := expected_generations - expected_activation_failures + 1
-	expected_incremental_activations := 2
-	expected_timer_sequences := cache_mode == "sticky" ? 2 : 4
+	expected_incremental_activations := cache_mode == "sticky" ? 4 : 5
+	expected_timer_sequences := cache_mode == "sticky" ? 3 : 6
 	if greeting_result != "Hello from an isolated Workflow, Odin" ||
 	   farewell_result.message != "Goodbye from the shared registry, Odin" ||
-	   farewell_result.code != 42 || run_stats.workflow_executions_completed != 2 ||
+	   farewell_result.code != 42 ||
+	   mixed_result != "Isolated Workflow received an Odin Activity result" ||
+	   run_stats.workflow_executions_completed != 3 ||
+	   run_stats.activity_tasks_completed != 1 ||
 	   run_stats.workflow_activation_failures != expected_activation_failures ||
 	   manager_stats.child_exits != expected_child_exits ||
 	   manager_stats.activation_timeouts != expected_timeouts ||
@@ -563,18 +617,20 @@ run :: proc() -> int {
 	   (expect_panic_signal && !panic_signal_observed) ||
 	   observations.timer_commands_with_sequence != expected_timer_sequences ||
 	   observations.timer_commands_without_sequence != 0 ||
-	   observations.diagnostic_logs != 2 || observations.diagnostic_metrics != 2 ||
+	   observations.diagnostic_logs != 3 || observations.diagnostic_metrics != 3 ||
 	   observations.malformed_diagnostics != 0 ||
 	   observations.evictions_observed != manager_stats.evictions ||
-	   manager_stats.diagnostics_received != 4 ||
+	   manager_stats.diagnostics_received != 6 ||
 	   workflow_isolate.manager_route_count(&executor_manager) != 0 {
 		fmt.eprintf(
-			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d completed=%d failures=%d exits=%d last_child_exit_code=%d expect_guard_signal=%v expect_panic_signal=%v timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d diagnostic_budget_rejections=%d expected_diagnostic_budget_rejections=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
+			"Unexpected registry isolation cache_mode=%s greeting=%q farewell=%q code=%d mixed=%q completed=%d activities=%d failures=%d exits=%d last_child_exit_code=%d expect_guard_signal=%v expect_panic_signal=%v timeouts=%d generations=%d expected_generations=%d evictions=%d graceful=%d expected_graceful=%d incremental=%d expected_incremental=%d handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d capacity_rejections=%d protocol_failures=%d expected_protocol_failures=%d diagnostic_budget_rejections=%d expected_diagnostic_budget_rejections=%d timer_sequences=%d expected_timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d malformed_diagnostics=%d diagnostics_received=%d routes=%d\n",
 			cache_mode,
 			greeting_result,
 			farewell_result.message,
 			farewell_result.code,
+			mixed_result,
 			run_stats.workflow_executions_completed,
+			run_stats.activity_tasks_completed,
 			run_stats.workflow_activation_failures,
 			manager_stats.child_exits,
 			manager_stats.last_child_exit_code,
@@ -609,12 +665,15 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"Core registry isolation completed greeting_id=%s farewell_id=%s greeting=%q farewell=%q code=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d last_child_exit_code=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d diagnostic_budget_rejections=%d timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d diagnostics_received=%d\n",
+		"Core registry isolation completed greeting_id=%s farewell_id=%s mixed_id=%s greeting=%q farewell=%q code=%d mixed=%q activities=%d registry_types=%d cache_mode=%s first_mode=%s generations=%d child_exits=%d last_child_exit_code=%d activation_timeouts=%d evictions=%d replay_activations=%d incremental_activations=%d graceful_shutdowns=%d manifest_handshakes=%d manifest_mismatches=%d shutdown_timeouts=%d crash_loop_rejections=%d aborted_children=%d capacity_rejections=%d protocol_failures=%d diagnostic_budget_rejections=%d timer_sequences=%d missing_timer_sequences=%d diagnostic_logs=%d diagnostic_metrics=%d diagnostics_received=%d\n",
 		greeting_id,
 		farewell_id,
+		mixed_id,
 		greeting_result,
 		farewell_result.message,
 		farewell_result.code,
+		mixed_result,
+		run_stats.activity_tasks_completed,
 		workflow.registry_count(&registry),
 		cache_mode,
 		first_mode,

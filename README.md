@@ -546,7 +546,10 @@ deployment boundary: run Activities in an Activity-only Odin worker process
 under a supervisor. `./scripts/activity-panic-integration-test.sh` deliberately
 traps that process on attempt 1, starts a replacement Odin worker, and requires
 Temporal to redeliver attempt 2 and complete the still-running Workflow. A
-mixed Workflow/Activity process is not protected by this pattern. Suspended
+process that co-locates Workflow and Activity callbacks is not protected by
+this Activity-only supervisor pattern. The fine-grained Workflow isolation
+path below can instead keep Activities in the parent while Workflow code runs
+in per-run children. Suspended
 Workflow recovery is also live-proven: `./scripts/workflow-crash-integration-test.sh`
 runs the SDK's `temporal/supervisor`, kills child generation 1 after a committed
 Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
@@ -567,8 +570,11 @@ activation deadline kills/reaps the executor and recovers through Core replay.
 Parent and child now share one application registration function: the parent
 copies its Workflow type manifest into Core, while a generic child
 `Executor_Host` independently instantiates and routes the registered callbacks.
-One live Worker completes both string and typed-JSON Workflow types through the
-same executor binary. Procedure pointers never cross the process boundary. It
+One live Worker completes string and typed-JSON Workflow types through the
+same executor binary, while a third isolated Workflow awaits an Activity in
+the parent process and then a durable timer. A forced child crash does not stop
+that Activity executor; Core replays the affected Workflow in a fresh child and
+delivers the exact result. Procedure pointers never cross the process boundary. It
 now verifies a canonical type manifest in a pre-poll child and again in every
 executor generation. Shutdown acknowledgement and process exit have an optional
 deadline, full capacity rejects without blocking a run-affine manager shard,
@@ -650,15 +656,15 @@ The live shutdown pass leaves runs suspended on one-hour durable timers across
 all four shards and requests shutdown while one activation is executing on
 each shard. It then requires every fiber to be destroyed on its owner thread.
 Shutdown also verifies that activation ownership returns to zero.
-With a non-zero Core cache, the two live timer Workflows retain one successful
-child generation each across suspension and incremental resolution; crash and
-timeout recovery still evict and replay safely. Protocol v3 carries the child's
+With a non-zero Core cache, three live Workflows retain one successful child
+generation each across timer and Activity suspension; crash and timeout
+recovery still evict and replay safely. Protocol v3 carries the child's
 complete language `Process_Result` in a separate diagnostic frame, validates
 terminal flags against the unchanged Core completion, and restores normal
 Worker statistics/observer visibility. Protocol v4 additionally carries
 correlated, discriminated log/metric/application diagnostics to a borrowed
 parent observer. The live proof checks timer sequence fields that the parent
-cannot infer from the completion and exactly four structured diagnostic events.
+cannot infer from the completion and exactly six structured diagnostic events.
 Each activation has independent default limits of 256 observations, 1 MiB of
 cumulative encoded diagnostic payload, and one monotonic response deadline.
 An additional sticky-cache proof records a durable Timer with the ordinary
@@ -667,7 +673,7 @@ requires both Core's `NONDETERMINISM` eviction and terminal `[TMPRL1100]`
 history from the CLI dev server.
 The same manager now survives a real guarded Workflow-stack overflow: it
 preserves the child's `SIGSEGV`/`SIGBUS` exit code, fails one Workflow Task,
-waits for Core eviction, and completes both executions through fresh-process
+waits for Core eviction, and completes all three executions through fresh-process
 replay.
 It likewise contains a real Odin Workflow panic (`SIGTRAP`/`SIGILL`) without
 attempting to unwind through C, then recovers through the same Core-owned

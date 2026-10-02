@@ -64,10 +64,10 @@ output="$(
 )"
 echo "$output"
 workflow_log_count="$(grep -c 'isolated-executor workflow_log message="workflow_started"' <<<"$output" || true)"
-expected_hook_count=2
+expected_hook_count=3
 if [[ "$first_mode" == "stack-overflow" || "$first_mode" == "panic" ||
       "$first_mode" == "infinite-loop" ]]; then
-  expected_hook_count=3
+  expected_hook_count=4
 fi
 if [[ "$workflow_log_count" != "$expected_hook_count" ]]; then
   echo "Expected exactly $expected_hook_count replay-suppressed executor Workflow logs; got $workflow_log_count" >&2
@@ -79,25 +79,27 @@ if [[ "$workflow_metric_count" != "$expected_hook_count" ]]; then
   exit 1
 fi
 grep -q 'Core registry isolation completed' <<<"$output"
-grep -q 'registry_types=3' <<<"$output"
+grep -q 'registry_types=4' <<<"$output"
 grep -q 'greeting="Hello from an isolated Workflow, Odin"' <<<"$output"
 grep -q 'farewell="Goodbye from the shared registry, Odin"' <<<"$output"
+grep -q 'mixed="Isolated Workflow received an Odin Activity result"' <<<"$output"
+grep -q 'activities=1' <<<"$output"
 grep -q "first_mode=$first_mode" <<<"$output"
 grep -q "cache_mode=$cache_mode" <<<"$output"
 if [[ "$cache_mode" == "sticky" ]]; then
-  grep -q 'generations=3' <<<"$output"
-  grep -q 'evictions=3' <<<"$output"
-  grep -q 'graceful_shutdowns=3' <<<"$output"
-  grep -q 'manifest_handshakes=4' <<<"$output"
-  grep -q 'incremental_activations=2' <<<"$output"
-  grep -q 'timer_sequences=2' <<<"$output"
+  grep -q 'generations=4' <<<"$output"
+  grep -q 'evictions=4' <<<"$output"
+  grep -q 'graceful_shutdowns=4' <<<"$output"
+  grep -q 'manifest_handshakes=5' <<<"$output"
+  grep -q 'incremental_activations=4' <<<"$output"
+  grep -q 'timer_sequences=3' <<<"$output"
 else
-  grep -q 'generations=5' <<<"$output"
-  grep -q 'evictions=5' <<<"$output"
-  grep -q 'graceful_shutdowns=5' <<<"$output"
-  grep -q 'manifest_handshakes=6' <<<"$output"
-  grep -q 'incremental_activations=2' <<<"$output"
-  grep -q 'timer_sequences=4' <<<"$output"
+  grep -q 'generations=8' <<<"$output"
+  grep -q 'evictions=8' <<<"$output"
+  grep -q 'graceful_shutdowns=8' <<<"$output"
+  grep -q 'manifest_handshakes=9' <<<"$output"
+  grep -q 'incremental_activations=5' <<<"$output"
+  grep -q 'timer_sequences=6' <<<"$output"
 fi
 grep -q 'manifest_mismatches=0' <<<"$output"
 grep -q 'shutdown_timeouts=0' <<<"$output"
@@ -116,9 +118,9 @@ else
   grep -q 'diagnostic_budget_rejections=0' <<<"$output"
 fi
 grep -q 'missing_timer_sequences=0' <<<"$output"
-grep -q 'diagnostic_logs=2' <<<"$output"
-grep -q 'diagnostic_metrics=2' <<<"$output"
-grep -q 'diagnostics_received=4' <<<"$output"
+grep -q 'diagnostic_logs=3' <<<"$output"
+grep -q 'diagnostic_metrics=3' <<<"$output"
+grep -q 'diagnostics_received=6' <<<"$output"
 if [[ "$first_mode" == "crash" || "$first_mode" == "stack-overflow" ||
       "$first_mode" == "panic" ]]; then
   grep -q 'child_exits=1' <<<"$output"

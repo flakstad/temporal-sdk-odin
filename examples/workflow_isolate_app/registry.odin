@@ -7,6 +7,8 @@ import workflow "../../temporal/workflow"
 GREETING_WORKFLOW_TYPE :: "odin_isolated_greeting"
 FAREWELL_WORKFLOW_TYPE :: "odin_isolated_farewell"
 NONDETERMINISM_WORKFLOW_TYPE :: "odin_isolated_nondeterminism"
+MIXED_ACTIVITY_WORKFLOW_TYPE :: "odin_isolated_activity"
+MIXED_ACTIVITY_TYPE :: "odin_isolated_format_activity"
 DEFAULT_TASK_QUEUE :: "odin-isolated-workflow-core"
 
 Farewell_Result :: struct {
@@ -74,6 +76,17 @@ farewell_workflow :: proc(
 nondeterminism_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
 	workflow.sleep(ctx, time.Hour)
 	return fmt.aprintf("Timer completed for %s", name)
+}
+
+mixed_activity_workflow :: proc(ctx: ^workflow.Fiber_Context, name: string) -> string {
+	activity_result := workflow.execute_activity_json(
+		ctx,
+		MIXED_ACTIVITY_TYPE,
+		name,
+		string,
+	)
+	workflow.sleep(ctx, 250 * time.Millisecond)
+	return fmt.aprintf("Isolated Workflow received %s", activity_result)
 }
 
 incompatible_nondeterminism_workflow :: proc(
@@ -165,37 +178,27 @@ register_revision :: proc(
 	if farewell_error.message != nil {
 		return farewell_error
 	}
+	nondeterminism_callback := nondeterminism_workflow
 	if revision == .Incompatible_Nondeterminism {
-		return workflow.registry_register_workflow(
-			registry,
-			NONDETERMINISM_WORKFLOW_TYPE,
-			incompatible_nondeterminism_workflow,
-		)
+		nondeterminism_callback = incompatible_nondeterminism_workflow
+	} else if revision == .Stack_Overflow {
+		nondeterminism_callback = stack_overflow_string_workflow
+	} else if revision == .Panic {
+		nondeterminism_callback = panic_string_workflow
+	} else if revision == .Infinite_Loop {
+		nondeterminism_callback = infinite_loop_string_workflow
 	}
-	if revision == .Stack_Overflow {
-		return workflow.registry_register_workflow(
-			registry,
-			NONDETERMINISM_WORKFLOW_TYPE,
-			stack_overflow_string_workflow,
-		)
-	}
-	if revision == .Panic {
-		return workflow.registry_register_workflow(
-			registry,
-			NONDETERMINISM_WORKFLOW_TYPE,
-			panic_string_workflow,
-		)
-	}
-	if revision == .Infinite_Loop {
-		return workflow.registry_register_workflow(
-			registry,
-			NONDETERMINISM_WORKFLOW_TYPE,
-			infinite_loop_string_workflow,
-		)
-	}
-	return workflow.registry_register_workflow(
+	nondeterminism_error := workflow.registry_register_workflow(
 		registry,
 		NONDETERMINISM_WORKFLOW_TYPE,
-		nondeterminism_workflow,
+		nondeterminism_callback,
+	)
+	if nondeterminism_error.message != nil {
+		return nondeterminism_error
+	}
+	return workflow.registry_register_json_workflow(
+		registry,
+		MIXED_ACTIVITY_WORKFLOW_TYPE,
+		mixed_activity_workflow,
 	)
 }

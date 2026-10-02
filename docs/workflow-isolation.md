@@ -282,7 +282,7 @@ Run the complete proof with no pre-existing infrastructure:
 
 The script uses `temporal server start-dev --headless` when port 7233 is not
 already healthy. It does not use Docker or an external database. The example
-creates a Worker with `max_cached_workflows = 0`, registers the shared two-type
+creates a Worker with `max_cached_workflows = 0`, registers the shared four-type
 manifest, and then:
 
 1. generation 1 exits with status 86 before answering its first activation;
@@ -290,32 +290,34 @@ manifest, and then:
    than crashing the Worker;
 3. Core emits `RemoveFromCache`, which the parent acknowledges even though the
    failed child is already gone;
-4. later generations receive replay history, suspend at durable timers, answer
-   successfully, consume their zero-cache evictions, and exit cleanly;
-5. fresh generations replay history, receive timer resolutions, complete both
-   Workflows, consume eviction, and exit cleanly; and
+4. later generations receive replay history, suspend at durable timers or a
+   parent-process Activity, answer successfully, consume their zero-cache
+   evictions, and exit cleanly;
+5. fresh generations replay history, receive Activity/timer resolutions,
+   complete all three Workflows, consume eviction, and exit cleanly; and
 6. the public Odin Client obtains the exact string result
    `"Hello from an isolated Workflow, Odin"` and decodes the typed JSON result
    `{"message":"Goodbye from the shared registry, Odin","code":42}` from the
-   Temporal Service.
+   Temporal Service, plus `"Isolated Workflow received an Odin Activity
+   result"` after exactly one Activity Task.
 
 The parent observer also requires a non-zero child-reported `timer_seq` for
 every `StartTimer`. That sequence is not reconstructed from the Core completion
 by the parent, so this is live evidence that v3 observation metadata crosses
-the process boundary. The zero-cache path observes four such commands because
-both timer schedules are replayed; sticky mode observes two.
+the process boundary. The zero-cache path observes six such commands because
+all three timer schedules are replayed; sticky mode observes three.
 
 The example host also installs an inbound execution interceptor which emits one
 Workflow log and one counter metric. The logger and example metric emitter write
 to inherited child
 `stderr`; framed protocol data has exclusive ownership of child `stdout`. Both
-zero-cache and sticky live paths require exactly two log and two metric records.
-The two replay initializations in zero-cache emit none because Workflow logging
+zero-cache and sticky live paths require exactly three log and three metric records.
+The replay initializations in zero-cache emit none because Workflow logging
 and metrics suppress history replay by default. This proves that hooks run in
 the executor and observability survives the process boundary without changing
 commands.
 They also enqueue discriminated log/metric diagnostics. The manager's borrowed
-observer requires exactly two of each kind and `diagnostics_received=4` in both
+observer requires exactly three of each kind and `diagnostics_received=6` in both
 cache modes, proving structured child observations reach the parent separately
 from completion metadata.
 
@@ -328,12 +330,13 @@ messages and requires one callback for every counted eviction; unit coverage
 preserves an exact nondeterminism message from protobuf decode through the
 observer.
 
-The live assertion requires one activation failure, one child exit, two
-completed Workflows, no owned route at return, both exact results, and no
+The live assertion requires one activation failure, one child exit, three
+completed Workflows, one completed Activity Task, no owned route at return,
+all three exact results, and no
 capacity, shutdown, crash-loop, or protocol failures. The observed
 CLI-dev-server path currently has
-five generations, five evictions, five graceful shutdowns (including preflight),
-six successful manifest handshakes, and one aborted crashed child. Those exact
+eight generations, eight evictions, eight graceful shutdowns (including preflight),
+nine successful manifest handshakes, and one aborted crashed child. Those exact
 counts are diagnostic rather than an API promise;
 Core may legitimately change activation batching.
 
@@ -359,17 +362,17 @@ delayed beyond the activation deadline. Each protocol fault increments exactly
 one protocol failure; the oversized observation also increments
 `diagnostic_budget_rejections`, while the delayed response increments exactly
 one timeout. The parent aborts and reaps that generation, submits one failed
-activation completion, waits for Core eviction, and completes both Workflows in
+activation completion, waits for Core eviction, and completes all three Workflows in
 fresh generations. Private pipes and generation-owned routes prevent a stale or
 late response from being consumed by the replacement.
 
 Set `TEMPORAL_ODIN_ISOLATE_CACHE_MODE=sticky` to use
-`max_cached_workflows=100`. After one deliberately failed generation, the two
-Workflow runs each keep one child across timer suspension and resolution. The
-live path observes three generations and three evictions instead of the
-zero-cache path's five, while still processing both timer resolutions as
-incremental activations and returning the same exact results. The crash and hang
-variants both pass. This proves the invariant in the non-zero-cache direction:
+`max_cached_workflows=100`. After one deliberately failed generation, the three
+Workflow runs each keep one child across timer or Activity suspension and
+resolution. The live path observes four generations and four evictions instead
+of the zero-cache path's eight, while processing four subsequent resolutions as
+incremental activations and returning the same exact results. The crash and
+hang variants both pass. This proves the invariant in the non-zero-cache direction:
 incremental activations remain routed to the generation that owns the suspended
 fiber until Core explicitly evicts it.
 
@@ -416,7 +419,7 @@ that recursively consumes its fixed minicoro stack. The native guard page
 terminates only that executor with `SIGSEGV` or `SIGBUS`. The manager retains
 the OS exit code, reports one failed activation, consumes Core's language-fail
 eviction, and starts no replacement until that eviction arrives. Ordinary code
-in fresh generations then replays the server history and both Workflows finish
+in fresh generations then replays the server history and all three Workflows finish
 with their exact expected results. The preexisting native guard test separately
 requires the same signals, so this is not simulated with `exit(86)`.
 
