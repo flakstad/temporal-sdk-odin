@@ -1591,7 +1591,7 @@ identical. This does not demonstrate sequential-looking Workflow code, timers,
 multiple outstanding operations, signals, queries, updates, concurrency, or
 nondeterminism detection in the language layer.
 
-### Stackful Workflow fiber experiment
+### Stackful Workflow runtime
 
 Odin `dev-2026-05` has no official portable fiber/coroutine package. The
 standard `core:nbio` package is a callback-based non-blocking I/O layer; Odin's
@@ -1614,9 +1614,9 @@ checked before implementation:
   four planned artifacts. It also exposes explicit create/resume/yield/destroy
   operations and configurable stack ownership.
 
-Minicoro is therefore an experimental implementation dependency, not yet a
-permanent public-SDK commitment. The Odin side sees only these project-owned C
-symbols:
+Minicoro is therefore isolated as an implementation dependency under
+stabilization, not exposed as a permanent public-SDK commitment. The Odin side
+sees only these project-owned C symbols:
 
 ```text
 temporal_odin_fiber_create

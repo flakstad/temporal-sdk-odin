@@ -161,7 +161,8 @@ Metric_Emitter :: struct {
 }
 
 // Fiber_Context is deliberately narrow: Workflow code receives Temporal-aware
-// operations, not a general worker/client handle. This remains an experiment.
+// operations, not a general worker/client handle. Its fields are runtime-owned;
+// application code should use Workflow primitives rather than mutate them.
 Fiber_Context :: struct {
 	instance:       ^Fiber_Instance,
 	update_context: ^Update_Context,

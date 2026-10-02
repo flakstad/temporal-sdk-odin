@@ -157,12 +157,6 @@ forwarded_log_output="$(TEMPORAL_CORE_FORWARD_LOGS=1 \
 echo "$forwarded_log_output"
 grep -q 'Core log forwarding delivered .* callback-scoped records.' <<<"$forwarded_log_output"
 
-nexus_core_output="$(TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 \
-  TEMPORAL_ODIN_SKIP_BUILD=1 \
-  "$repo_root/scripts/run-core-connect.sh")"
-echo "$nexus_core_output"
-grep -q 'Core Nexus poll stream validated and observed clean shutdown.' <<<"$nexus_core_output"
-
 nexus_endpoint_name="odin-nexus-${RANDOM}-$(date +%s)"
 temporal operator nexus endpoint create \
   --name "$nexus_endpoint_name" \

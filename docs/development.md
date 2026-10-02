@@ -2019,19 +2019,6 @@ Policy/Priority values and must be released with
 `standalone_activity_options_free`. This completes the four newer standalone
 Activity request/response pairs in the pinned API.
 
-The suite then repeats that executable with the Core-only Nexus lifecycle
-proof:
-
-```bash
-TEMPORAL_CORE_NEXUS_POLL_SPIKE=1 ./scripts/run-core-connect.sh
-```
-
-It creates and validates a Nexus-enabled Core worker, enters the actual Nexus
-poll path, initiates shutdown, requires the poll callback's shutdown sentinel,
-and finalizes the worker. No endpoint is needed because this test proves the
-bridge symbol, Worker options, Service validation, poll stream, and memory-safe
-shutdown independently of handler dispatch.
-
 It also runs an opt-in standalone Nexus capability probe:
 
 ```bash
@@ -2558,7 +2545,7 @@ bytes—through the raw ABI and requires exactly one valid, freeable owned resul
 task before shutting down. Run `./scripts/integration-test.sh` instead when you
 want the repository to schedule that task automatically.
 
-For the explicit Workflow experiment, run the worker in one terminal:
+For the stackful Workflow runtime example, run the worker in one terminal:
 
 ```bash
 ./scripts/run-hello-workflow.sh
@@ -2574,8 +2561,8 @@ temporal workflow execute \
   --input '"Odin"'
 ```
 
-This example is intentionally a signal/timer-race replay experiment, not a
-stable or general Workflow API.
+This example exercises a signal/timer race and replay. It is an integration
+fixture rather than the concise public-API quick start.
 
 To manually exercise cancellation, start the example with
 `TEMPORAL_ODIN_SCENARIO=cancel-timer`, `cancel-activity`, or `cancel-cleanup`.

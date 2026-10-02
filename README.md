@@ -975,9 +975,10 @@ Prerequisites:
 - Temporal CLI (tested with CLI 1.5.1 / Server 1.29.1)
 - Clang/linker tooling for the target platform
 
-The fiber experiment also builds pinned
-[minicoro](https://github.com/edubart/minicoro) through a seven-symbol local C
-shim. It is a research dependency, not yet a frozen SDK choice.
+The Workflow runtime also builds pinned
+[minicoro](https://github.com/edubart/minicoro) through a small local C
+shim. The shim is project-owned; minicoro remains an implementation dependency
+under stabilization rather than part of the public Odin API.
 The test-only [pbt](https://github.com/flakstad/pbt) submodule generates
 payload/failure contracts, activation races, all six orderings of
 Signal-start/Update-start/token-cancel jobs, and 300 inherited deadline trees,
