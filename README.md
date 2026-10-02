@@ -580,7 +580,9 @@ that Workflow polling itself is never concurrent.
 boundary without child processes: two typed Odin Workflows suspend on Temporal
 timers, resume on their original executor threads, overlap after resumption,
 complete through concurrent Core calls, and receive final eviction on those
-same threads.
+same threads. An unknown Workflow type concurrently produces failed activation
+completions and eviction without poisoning the valid shards or stopping the
+Worker.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's

@@ -12,6 +12,7 @@ import workflow_isolate "../../temporal/workflow/isolate"
 
 EXECUTOR_THREADS :: 4
 WORKFLOW_TYPE :: "in_process_concurrency_probe"
+UNKNOWN_WORKFLOW_TYPE :: "in_process_unknown_probe"
 
 Probe_State :: struct {
 	mutex:      sync.Mutex,
@@ -45,15 +46,17 @@ concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string
 }
 
 Concurrency_State :: struct {
-	client:       ^temporal_client.Client,
-	sdk_worker:   ^worker.Worker,
-	task_queue:   string,
-	id_prefix:    string,
-	handles:      [dynamic]temporal_client.Workflow_Handle,
-	watcher:      ^thread.Thread,
-	start_error:  temporal_client.Error,
-	result_error: temporal_client.Error,
-	results_ok:   bool,
+	client:             ^temporal_client.Client,
+	sdk_worker:         ^worker.Worker,
+	task_queue:         string,
+	id_prefix:          string,
+	handles:            [dynamic]temporal_client.Workflow_Handle,
+	failure_handle:     temporal_client.Workflow_Handle,
+	has_failure_handle: bool,
+	watcher:            ^thread.Thread,
+	start_error:        temporal_client.Error,
+	result_error:       temporal_client.Error,
+	results_ok:         bool,
 }
 
 wait_for_results :: proc(state: ^Concurrency_State) {
@@ -82,6 +85,26 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	if state == nil || state.client == nil || state.sdk_worker == nil {
 		return false
 	}
+	failure_id := fmt.aprintf("%s-invalid", state.id_prefix)
+	failure_handle, failure_start_error := temporal_client.start_workflow_json(
+		state.client,
+		UNKNOWN_WORKFLOW_TYPE,
+		"unknown Workflow type failure probe",
+		{
+			id = failure_id,
+			task_queue = state.task_queue,
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = time.Minute,
+			workflow_task_timeout = 10 * time.Second,
+		},
+	)
+	delete(failure_id)
+	if failure_start_error.message != nil {
+		state.start_error = failure_start_error
+		return false
+	}
+	state.failure_handle = failure_handle
+	state.has_failure_handle = true
 	first_shard := -1
 	found_distinct_shard := false
 	for candidate in 0 ..< 64 {
@@ -196,6 +219,9 @@ run :: proc() -> int {
 			temporal_client.workflow_handle_free(&handle)
 		}
 		delete(state.handles)
+		if state.has_failure_handle {
+			temporal_client.workflow_handle_free(&state.failure_handle)
+		}
 	}
 	if state.start_error.message != nil {
 		fmt.eprintf("In-process concurrency start failed: %s\n", string(state.start_error.message))
@@ -214,17 +240,32 @@ run :: proc() -> int {
 		worker.error_free(&run_error)
 		return 1
 	}
+	if !state.has_failure_handle {
+		fmt.eprintln("In-process concurrency failure probe was not started")
+		return 1
+	}
+	terminate_error := temporal_client.terminate_workflow(
+		&state.failure_handle,
+		"in-process concurrency failure probe completed",
+	)
+	if terminate_error.message != nil {
+		fmt.eprintf("Unknown Workflow termination failed: %s\n", string(terminate_error.message))
+		temporal_client.error_free(&terminate_error)
+		return 1
+	}
 	sync.mutex_lock(&probe_state.mutex)
 	peak := probe_state.peak
 	migrations := probe_state.migrations
 	sync.mutex_unlock(&probe_state.mutex)
 	if !state.results_ok || len(state.handles) < 2 ||
 	   run_stats.workflow_executions_completed != len(state.handles) ||
-	   run_stats.workflow_evictions != len(state.handles) || peak < 2 || migrations != 0 {
+	   run_stats.workflow_activation_failures < 1 ||
+	   run_stats.workflow_evictions < len(state.handles) + 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d evictions=%d peak=%d migrations=%d\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d peak=%d migrations=%d\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
+			run_stats.workflow_activation_failures,
 			run_stats.workflow_evictions,
 			peak,
 			migrations,
@@ -232,9 +273,10 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d evictions=%d peak_activations=%d migrations=%d\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d peak_activations=%d migrations=%d\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
+		run_stats.workflow_activation_failures,
 		run_stats.workflow_evictions,
 		peak,
 		migrations,

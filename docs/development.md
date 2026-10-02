@@ -1200,7 +1200,10 @@ The in-process counterpart is:
 It starts runs whose server-assigned run IDs map to distinct fixed shards. Each
 Workflow suspends on a real Temporal timer, verifies its OS thread before and
 after resumption, and uses a short test-only blocking probe to require measured
-overlap. The test also requires terminal results and one Core eviction per run.
+overlap. The test also starts an unknown Workflow type and requires at least one
+failed activation plus its eviction while valid runs still complete. This
+proves language-level task failure does not become a scheduler/Worker failure.
+Every valid run must produce a terminal result and final Core eviction.
 The blocking probe is instrumentation only; application Workflow code must not
 read wall time or block an executor thread. In concurrent mode, Workflow
 logger/interceptor/metric factory state and the activation observer can be

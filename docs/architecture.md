@@ -4194,8 +4194,10 @@ interceptor, and activation-observer `user_data` must be concurrency-safe.
 Individual Workflow state remains run-local and deterministic. The live
 `workflow_in_process_concurrency` proof suspends two runs on real Core timers,
 requires them to resume on their original executor threads, measures overlap,
-and requires final eviction for each run. Its brief wall-clock block is test
-instrumentation and is not an allowed Workflow programming primitive.
+and requires final eviction for each run. An unknown type simultaneously
+exercises failed activation and rejected-run eviction without stopping valid
+shards. Its brief wall-clock block is test instrumentation and is not an
+allowed Workflow programming primitive.
 
 ## Core-connected Workflow process isolation
 
