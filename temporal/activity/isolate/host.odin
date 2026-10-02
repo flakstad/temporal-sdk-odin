@@ -368,6 +368,12 @@ host_run_loop :: proc(options: Host_Options) -> Error {
 	if !host_options_valid(options) {
 		return {kind = .Invalid_Argument}
 	}
+	manifest, manifest_ok := host_options_manifest_encode(options)
+	if !manifest_ok {
+		return {kind = .Invalid_Argument}
+	}
+	defer delete(manifest)
+	manifest_sent := false
 	for {
 		request, read_error := read(os.stdin, options.maximum_payload_bytes)
 		if read_error.kind == .End_Of_Stream {
@@ -386,6 +392,23 @@ host_run_loop :: proc(options: Host_Options) -> Error {
 			}, options.maximum_payload_bytes)
 			owned_frame_free(&request)
 			return ack_error
+		}
+		if request.frame.kind == .Manifest_Request && !manifest_sent {
+			manifest_error := write(os.stdout, {
+				kind = .Manifest,
+				request_id = request.frame.request_id,
+				payload = manifest,
+			}, options.maximum_payload_bytes)
+			manifest_sent = manifest_error.kind == .None
+			owned_frame_free(&request)
+			if manifest_error.kind != .None {
+				return manifest_error
+			}
+			continue
+		}
+		if !manifest_sent {
+			owned_frame_free(&request)
+			return {kind = .Invalid_Argument}
 		}
 		execute_error := host_execute_request(options, &request)
 		owned_frame_free(&request)

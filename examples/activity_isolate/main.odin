@@ -172,10 +172,14 @@ isolated_activity_manifest :: proc(marker: ^bool) -> [2]activity_isolate.Host_Ac
 	}
 }
 
-run_child :: proc(loop: bool) {
+run_child :: proc(loop: bool, mismatch := false) {
 	marker := true
 	activities := isolated_activity_manifest(&marker)
-	options := activity_isolate.host_options_many(activities[:])
+	mismatched_activities := [?]activity_isolate.Host_Activity{
+		activity_isolate.host_activity("goodbye", &marker, isolated_goodbye_invoke),
+	}
+	manifest := mismatch ? mismatched_activities[:] : activities[:]
+	options := activity_isolate.host_options_many(manifest)
 	host_error := loop ? activity_isolate.host_run_loop(options) : activity_isolate.host_run(options)
 	if host_error.kind != .None {
 		fmt.eprintf("Activity executor host failed: %v\n", host_error.kind)
@@ -204,7 +208,14 @@ run_parent :: proc() {
 	if len(task_queue) == 0 {
 		task_queue = "odin-activity-isolate"
 	}
-	command := [?]string{os.args[0], "--child-loop"}
+	mismatch_buffer: [128]u8
+	mismatch_mode := os.get_env(
+		mismatch_buffer[:],
+		"ACTIVITY_ISOLATE_MANIFEST_MISMATCH",
+	)
+	mismatch_case := len(mismatch_mode) > 0
+	child_mode := mismatch_case ? "--child-loop-mismatch" : "--child-loop"
+	command := [?]string{os.args[0], child_mode}
 	manager := activity_isolate.Manager{}
 	manager_options := activity_isolate.options_default(command[:])
 	manager_options.execution_timeout = 10 * time.Second
@@ -258,11 +269,12 @@ run_parent :: proc() {
 	pool_mode := os.get_env(pool_buffer[:], "ACTIVITY_ISOLATE_POOL")
 	pool_case := pool_mode == "concurrent"
 	fmt.printf(
-		"Odin external Activity parent is polling task queue %s (manifest=%v)\n",
+		"Odin external Activity parent is polling task queue %s (manifest=%v mismatch=%v)\n",
 		task_queue,
 		multi_case,
+		mismatch_case,
 	)
-	max_tasks := cancel_case ? 0 : 2
+	max_tasks := cancel_case ? 0 : (mismatch_case ? 1 : 2)
 	cancel_shutdown_state := Cancellation_Shutdown_State{
 		manager = &manager,
 		sdk_worker = &activity_worker,
@@ -300,6 +312,33 @@ run_parent :: proc() {
 		os.exit(1)
 	}
 	executor_stats := activity_isolate.manager_stats(&manager)
+	if mismatch_case {
+		if stats.activity_tasks_completed != 1 || executor_stats.children_started != 1 ||
+		   executor_stats.children_completed != 0 || executor_stats.child_failures != 1 ||
+		   executor_stats.manifest_handshakes != 0 ||
+		   executor_stats.manifest_mismatches != 1 ||
+		   executor_stats.startup_failures != 1 ||
+		   executor_stats.protocol_failures != 1 ||
+		   executor_stats.peak_pool_children != 0 ||
+		   activity_isolate.manager_in_flight(&manager) != 0 {
+			fmt.eprintf(
+				"unexpected manifest mismatch stats: tasks=%d started=%d completed=%d failures=%d handshakes=%d mismatches=%d startup_failures=%d protocol_failures=%d pool_peak=%d in_flight=%d\n",
+				stats.activity_tasks_completed,
+				executor_stats.children_started,
+				executor_stats.children_completed,
+				executor_stats.child_failures,
+				executor_stats.manifest_handshakes,
+				executor_stats.manifest_mismatches,
+				executor_stats.startup_failures,
+				executor_stats.protocol_failures,
+				executor_stats.peak_pool_children,
+				activity_isolate.manager_in_flight(&manager),
+			)
+			os.exit(1)
+		}
+		fmt.println("warm Activity child manifest mismatch was rejected before dispatch")
+		return
+	}
 	if cancel_case {
 		expected_completed := forced_cancel_case ? 0 : 1
 		expected_failures := forced_cancel_case ? 1 : 0
@@ -315,6 +354,8 @@ run_parent :: proc() {
 		   executor_stats.children_shutdown != expected_shutdown ||
 		   executor_stats.peak_in_flight != 1 ||
 		   executor_stats.peak_pool_children != 1 ||
+		   executor_stats.manifest_handshakes != 1 ||
+		   executor_stats.manifest_mismatches != 0 ||
 		   activity_isolate.manager_in_flight(&manager) != 0 {
 			fmt.eprintf(
 				"unexpected cancellation stats: tasks=%d started=%d completed=%d failures=%d cancellations=%d kills=%d in_flight=%d\n",
@@ -349,6 +390,8 @@ run_parent :: proc() {
 	   executor_stats.children_shutdown != 1 ||
 	   executor_stats.peak_in_flight != 1 ||
 	   executor_stats.peak_pool_children != 1 ||
+	   executor_stats.manifest_handshakes != expected_started ||
+	   executor_stats.manifest_mismatches != 0 ||
 	   executor_stats.heartbeats_forwarded != (reuse_case ? 0 : 1) ||
 	   sync.atomic_load_explicit(&parent_heartbeat_interceptor_calls, .Acquire) != (reuse_case ? 0 : 1) ||
 	   activity_isolate.manager_in_flight(&manager) != 0 {
@@ -382,6 +425,10 @@ main :: proc() {
 	}
 	if len(os.args) >= 2 && os.args[1] == "--child-loop" {
 		run_child(true)
+		return
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-loop-mismatch" {
+		run_child(true, true)
 		return
 	}
 	run_parent()

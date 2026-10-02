@@ -165,6 +165,7 @@ activity_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 		.Control_Stop,
 		.Shutdown,
 		.Shutdown_Ack,
+		.Manifest_Request,
 	}
 	kind := kinds[pbt.draw(t, pbt.int_range(0, len(kinds) - 1))]
 	has_zero := false

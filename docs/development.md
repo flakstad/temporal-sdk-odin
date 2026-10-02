@@ -903,7 +903,7 @@ The repository also contains an experimental per-invocation boundary:
 Unlike the whole-Worker proof below, this keeps the Core-owning parent alive.
 It forwards opaque Core task/completion protobufs over the versioned
 `temporal/activity/isolate` protocol, deliberately panics the first child, and
-requires Temporal retry attempt 2 to complete in a fresh child. Protocol v4
+requires Temporal retry attempt 2 to complete in a fresh child. Protocol v5
 also requires attempt 2's heartbeat to traverse the parent Activity context and
 Core before completion. A second pass delivers cancellation into a cooperative
 child without killing it; a third lets the same callback ignore cancellation
@@ -914,8 +914,10 @@ child build that manifest through the same Odin function; the parent copies
 only its names into Core. A fifth pass submits two concurrent Activities to a
 size-one warm pool and requires exactly one child start, one reuse, serial
 admission, and acknowledged bounded shutdown. Warm pooling remains opt-in and
-lacks startup health/crash-loop fencing, so it is not yet the default production
-executor. See
+requires a canonical type-manifest handshake for every new child. A sixth pass
+starts an incompatible manifest and requires rejection before callback dispatch
+or task-token routing. Crash-loop fencing and general readiness probes are still
+missing, so this is not yet the default production executor. See
 [`activity-isolation.md`](activity-isolation.md).
 
 The supported containment pattern is now exercised end-to-end:

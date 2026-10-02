@@ -35,8 +35,9 @@ returns. External registration data is never freed by `worker.close`.
 exchanges. `cancellation_grace` defaults to five seconds and bounds the interval
 between a forwarded Core cancel task and termination of an unresponsive child.
 `warm_pool_size = 0` retains one process per invocation; a positive value bounds
-the number of persistent children. `shutdown_timeout` independently bounds each
-child's protocol acknowledgement and process exit.
+the number of persistent children. `startup_timeout` bounds the manifest
+handshake for every newly started warm child. `shutdown_timeout` independently
+bounds each child's protocol acknowledgement and process exit.
 
 The child calls `activity_isolate.host_run` with either the single-callback
 `host_options` convenience or an explicit `host_options_many` manifest of
@@ -51,7 +52,7 @@ Activity-local arena, and encodes the standard completion variants.
 
 Every child gets private stdin/stdout pipes and runs at most one callback at a
 time. `host_run` serves one invocation; `host_run_loop` serves serial requests
-until protocol-v4 `Shutdown`. Pool admission blocks excess Activity execution
+until protocol-v5 `Shutdown`. Pool admission blocks excess Activity execution
 threads without exceeding the configured child bound. Successful children are
 returned to the pool; crashed, timed-out, canceled-by-force, or
 protocol-invalid children are retired and replaced on demand. Child stderr is
@@ -59,6 +60,12 @@ inherited and never shares the framed stdout channel. Process starts from the
 Worker supervisor, Workflow isolate manager, and Activity isolate manager use
 one SDK-global lock because Odin's `os.process_start` handle inheritance
 mutation is not thread-safe.
+
+Before a warm child enters the pool, protocol v5 requests its canonical,
+length-prefixed Activity type manifest and requires byte-for-byte equality with
+the parent manifest. Registration order is therefore part of the contract. A
+missing, malformed, stale, reordered, or timed-out manifest retires the process
+before any Core task or task token is dispatched to it.
 
 Processor results carry their allocator explicitly and are released after Core
 copies them; a zero allocator means the synchronous call's context allocator.
@@ -73,7 +80,7 @@ generic cancellation.
 
 As with ordinary remote Temporal Activities, server-requested cancellation is
 observed through heartbeat traffic. A long-running isolated Activity must
-heartbeat for the Service/Core cancel task to reach the parent; protocol v4 then
+heartbeat for the Service/Core cancel task to reach the parent; protocol v5 then
 delivers it independently of any subsequent child heartbeat.
 
 ## Verified path
@@ -97,7 +104,10 @@ with exactly one grace-deadline kill. A fourth queue runs `hello` followed by
 `goodbye` in one child and proves exact type dispatch plus reuse. A fifth starts
 two Activities concurrently against pool size one and requires bounded
 admission, serial execution, one process start, and one reuse. Every surviving
-idle child acknowledges shutdown and exits within the configured deadline.
+idle child acknowledges shutdown and exits within the configured deadline. A
+sixth queue deliberately starts an incompatible child manifest and proves that
+the Workflow observes Activity failure while callback dispatch, pool admission,
+and task-token routing remain at zero.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -110,7 +120,7 @@ This is a correctness and crash-containment slice, not yet the default Activity
 runtime:
 
 - warm pooling is opt-in; the default remains a fresh process per attempt;
-- child heartbeats use protocol v4 `Heartbeat`/`Heartbeat_Ack` frames and run
+- child heartbeats use protocol v5 `Heartbeat`/`Heartbeat_Ack` frames and run
   through the parent's ordinary heartbeat/interceptor/Core chain;
 - Core cancel tasks use a serialized `Cancel` control frame and update the same
   child `activity.Context` observed by the callback. The manager starts a
@@ -120,13 +130,13 @@ runtime:
   still wrap forwarded heartbeats; child-side execute interceptor registration
   is not yet exposed by `Host_Options`;
 - child metrics use a no-op meter; structured log/metric forwarding is not yet
-  part of protocol v4;
+  part of protocol v5;
 - shutdown requires `worker.run` to have drained all invocations; idle children
   are currently drained serially, so the total upper bound scales with pool
   size;
-- prewarming/health handshakes, CPU/memory sandboxing, crash-loop policy,
+- prewarming/general readiness probes, CPU/memory sandboxing, crash-loop policy,
   release signing, and all-target fault evidence remain production work.
 
-The next increment should add a startup/manifest handshake and crash-loop
-fencing before treating the warm pool as a default. Parallel pool shutdown and
-child-side interceptor/diagnostic transport remain follow-up hardening.
+The next increment should add crash-loop fencing before treating the warm pool
+as a default. Parallel pool shutdown, general readiness probes, and child-side
+interceptor/diagnostic transport remain follow-up hardening.

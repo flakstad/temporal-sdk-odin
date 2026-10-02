@@ -1727,9 +1727,11 @@ activity_execution_routes_preserve_opaque_binary_task_tokens :: proc(t: ^testing
 activity_isolation_protocol_rejects_corruption_and_round_trips_binary_tasks :: proc(
 	t: ^testing.T,
 ) {
-	testing.expect_value(t, activity_isolate.VERSION, u16(4))
+	testing.expect_value(t, activity_isolate.VERSION, u16(5))
 	testing.expect(t, activity_isolate.kind_valid(.Shutdown))
 	testing.expect(t, activity_isolate.kind_valid(.Shutdown_Ack))
+	testing.expect(t, activity_isolate.kind_valid(.Manifest_Request))
+	testing.expect(t, activity_isolate.kind_valid(.Manifest))
 	payload := [?]u8{0x00, 0xff, 0x41, 0x00, 0x7f}
 	encoded, encode_error := activity_isolate.encode({
 		kind = .Execute,
@@ -1777,6 +1779,16 @@ activity_isolation_host_manifest_validates_and_dispatches_exact_names :: proc(t:
 	}
 	options := activity_isolate.host_options_many(activities[:])
 	testing.expect(t, activity_isolate.host_options_valid(options))
+	manifest, manifest_ok := activity_isolate.host_options_manifest_encode(options)
+	defer delete(manifest)
+	testing.expect(t, manifest_ok)
+	testing.expect(t, activity_isolate.host_manifest_valid(manifest))
+	reversed := [?]activity_isolate.Host_Activity{activities[1], activities[0]}
+	reversed_manifest, reversed_ok := activity_isolate.host_manifest_encode(reversed[:])
+	defer delete(reversed_manifest)
+	testing.expect(t, reversed_ok)
+	testing.expect(t, !bytes.equal(manifest, reversed_manifest))
+	testing.expect(t, !activity_isolate.host_manifest_valid(manifest[:len(manifest) - 1]))
 	hello, hello_found := activity_isolate.host_activity_find(options, "hello")
 	testing.expect(t, hello_found)
 	testing.expect(t, hello.callback_data == &hello_marker)
@@ -1811,6 +1823,7 @@ activity_isolation_host_manifest_validates_and_dispatches_exact_names :: proc(t:
 		delete(sdk_worker.activity_registrations)
 	}
 	manager := activity_isolate.Manager{initialized = true}
+	defer activity_isolate.manager_close(&manager)
 	registration_error := activity_isolate.register_external_activity_manifest(
 		&sdk_worker,
 		&manager,
@@ -1824,6 +1837,7 @@ activity_isolation_host_manifest_validates_and_dispatches_exact_names :: proc(t:
 		testing.expect_value(t, sdk_worker.activity_registrations[1].name, "goodbye")
 		testing.expect(t, sdk_worker.activity_registrations[0].processor_data == &manager)
 	}
+	testing.expect(t, bytes.equal(manager.expected_manifest, manifest))
 }
 
 @(test)

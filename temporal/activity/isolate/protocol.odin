@@ -8,7 +8,7 @@ import "core:mem"
 import "core:os"
 
 MAGIC :: u32(0x54414953) // "TAIS": Temporal Activity isolation stream.
-VERSION :: u16(4)
+VERSION :: u16(5)
 HEADER_SIZE :: 16
 
 Kind :: enum u16 {
@@ -22,6 +22,8 @@ Kind :: enum u16 {
 	Control_Stop   = 8,
 	Shutdown       = 9,
 	Shutdown_Ack   = 10,
+	Manifest_Request = 11,
+	Manifest         = 12,
 }
 
 Error_Kind :: enum {
@@ -69,7 +71,7 @@ kind_valid :: proc(kind: Kind) -> bool {
 	return kind == .Execute || kind == .Completion || kind == .Executor_Error ||
 	       kind == .Heartbeat || kind == .Heartbeat_Ack || kind == .Cancel ||
 	       kind == .Control_Done || kind == .Control_Stop || kind == .Shutdown ||
-	       kind == .Shutdown_Ack
+	       kind == .Shutdown_Ack || kind == .Manifest_Request || kind == .Manifest
 }
 
 frame_validate :: proc(frame: Frame, maximum_payload_bytes := DEFAULT_MAXIMUM_PAYLOAD_BYTES) -> Error {
@@ -78,6 +80,9 @@ frame_validate :: proc(frame: Frame, maximum_payload_bytes := DEFAULT_MAXIMUM_PA
 	}
 	if u64(len(frame.payload)) > u64(maximum_payload_bytes) {
 		return {kind = .Too_Large}
+	}
+	if frame.kind == .Manifest && !host_manifest_valid(frame.payload) {
+		return {kind = .Invalid_Argument}
 	}
 	return {}
 }

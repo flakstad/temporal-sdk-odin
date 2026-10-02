@@ -32,6 +32,7 @@ Options :: struct {
 	command:               []string,
 	execution_timeout:     time.Duration,
 	cancellation_grace:    time.Duration,
+	startup_timeout:       time.Duration,
 	shutdown_timeout:      time.Duration,
 	warm_pool_size:        int,
 	maximum_payload_bytes: u32,
@@ -41,6 +42,7 @@ options_default :: proc(command: []string) -> Options {
 	return {
 		command = command,
 		cancellation_grace = 5 * time.Second,
+		startup_timeout = 5 * time.Second,
 		shutdown_timeout = 5 * time.Second,
 		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
 	}
@@ -52,6 +54,9 @@ Stats :: struct {
 	children_reused: int,
 	children_retired: int,
 	children_shutdown: int,
+	manifest_handshakes: int,
+	manifest_mismatches: int,
+	startup_failures: int,
 	child_failures: int,
 	protocol_failures: int,
 	timeouts: int,
@@ -89,9 +94,11 @@ Manager :: struct {
 	command:               [dynamic]string,
 	execution_timeout:     time.Duration,
 	cancellation_grace:    time.Duration,
+	startup_timeout:       time.Duration,
 	shutdown_timeout:      time.Duration,
 	warm_pool_size:        int,
 	maximum_payload_bytes: u32,
+	expected_manifest:     []u8,
 	routes:                [dynamic]Route,
 	pool:                  [dynamic]^Session,
 	pool_available:        sync.Sema,
@@ -109,7 +116,8 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 		return manager_error("Activity executor command must not be empty")
 	}
 	if options.execution_timeout < 0 || options.cancellation_grace < 0 ||
-	   options.shutdown_timeout < 0 || options.warm_pool_size < 0 {
+	   options.startup_timeout < 0 || options.shutdown_timeout < 0 ||
+	   options.warm_pool_size < 0 {
 		return manager_error("Activity executor durations and pool size must not be negative")
 	}
 	if options.maximum_payload_bytes == 0 {
@@ -129,6 +137,7 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	manager.pool = make([dynamic]^Session)
 	manager.execution_timeout = options.execution_timeout
 	manager.cancellation_grace = options.cancellation_grace
+	manager.startup_timeout = options.startup_timeout
 	manager.shutdown_timeout = options.shutdown_timeout
 	manager.warm_pool_size = options.warm_pool_size
 	manager.maximum_payload_bytes = options.maximum_payload_bytes
@@ -149,6 +158,18 @@ register_external_activity_manifest :: proc(
 	   !host_options_valid(host_options_many(activities)) {
 		return worker.error_from_string("Activity executor manifest is invalid")
 	}
+	manifest, manifest_ok := host_manifest_encode(activities)
+	if !manifest_ok {
+		return worker.error_from_string("Activity executor manifest could not be encoded")
+	}
+	sync.mutex_lock(&manager.mutex)
+	manifest_already_set := len(manager.expected_manifest) != 0 ||
+	                        len(manager.pool) != 0 || len(manager.routes) != 0
+	sync.mutex_unlock(&manager.mutex)
+	if manifest_already_set {
+		delete(manifest)
+		return worker.error_from_string("Activity executor manifest is already registered")
+	}
 	for activity_registration in activities {
 		registration_error := worker.register_external_activity_processor(
 			sdk_worker,
@@ -158,9 +179,13 @@ register_external_activity_manifest :: proc(
 			cancel_task,
 		)
 		if registration_error.message != nil {
+			delete(manifest)
 			return registration_error
 		}
 	}
+	sync.mutex_lock(&manager.mutex)
+	manager.expected_manifest = manifest
+	sync.mutex_unlock(&manager.mutex)
 	return {}
 }
 
@@ -378,6 +403,54 @@ session_start :: proc(manager: ^Manager, persistent: bool) -> ^Session {
 	return session
 }
 
+session_manifest_handshake :: proc(manager: ^Manager, session: ^Session) -> bool {
+	if manager == nil || session == nil || len(manager.expected_manifest) == 0 {
+		if manager != nil {
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.startup_failures += 1
+			manager.stats.manifest_mismatches += 1
+			sync.mutex_unlock(&manager.mutex)
+		}
+		return false
+	}
+	session.request_id += 1
+	request_id := session.request_id
+	request_payload := transmute([]u8)string("manifest")
+	write_error := session_write(session, {
+		kind = .Manifest_Request,
+		request_id = request_id,
+		payload = request_payload,
+	}, manager.maximum_payload_bytes)
+	if write_error.kind != .None {
+		sync.mutex_lock(&manager.mutex)
+		manager.stats.startup_failures += 1
+		manager.stats.protocol_failures += 1
+		sync.mutex_unlock(&manager.mutex)
+		return false
+	}
+	response, read_error, timed_out := read_with_timeout(
+		session.output,
+		manager.maximum_payload_bytes,
+		manager.startup_timeout,
+		session.process,
+	)
+	defer owned_frame_free(&response)
+	valid := !timed_out && read_error.kind == .None &&
+	         response.frame.kind == .Manifest &&
+	         response.frame.request_id == request_id &&
+	         bytes.equal(response.frame.payload, manager.expected_manifest)
+	sync.mutex_lock(&manager.mutex)
+	if valid {
+		manager.stats.manifest_handshakes += 1
+	} else {
+		manager.stats.startup_failures += 1
+		manager.stats.manifest_mismatches += 1
+		manager.stats.protocol_failures += 1
+	}
+	sync.mutex_unlock(&manager.mutex)
+	return valid
+}
+
 session_prepare :: proc(manager: ^Manager, session: ^Session) {
 	if manager == nil || session == nil {
 		return
@@ -442,6 +515,10 @@ pool_acquire :: proc(manager: ^Manager) -> ^Session {
 			manager.pool_starting += 1
 			sync.mutex_unlock(&manager.mutex)
 			session := session_start(manager, true)
+			if session != nil && !session_manifest_handshake(manager, session) {
+				_ = session_destroy(session, true)
+				session = nil
+			}
 			sync.mutex_lock(&manager.mutex)
 			manager.pool_starting -= 1
 			if session != nil && !manager.closing {
@@ -629,7 +706,7 @@ session_shutdown :: proc(manager: ^Manager, session: ^Session) -> bool {
 }
 
 // manager_shutdown is valid after Worker polling and Activity execution have
-// drained. It closes every idle warm child through protocol v4 and bounds both
+// drained. It closes every idle warm child through protocol v5 and bounds both
 // acknowledgement and process-exit waits.
 manager_shutdown :: proc(manager: ^Manager) -> Manager_Error {
 	if manager == nil || !manager.initialized {
@@ -677,6 +754,8 @@ manager_close :: proc(manager: ^Manager) {
 	manager.routes = nil
 	delete(manager.pool)
 	manager.pool = nil
+	delete(manager.expected_manifest)
+	manager.expected_manifest = nil
 	for argument in manager.command {
 		delete(argument)
 	}
@@ -873,7 +952,7 @@ cancel_task :: proc(processor_data: rawptr, task: []u8) {
 			session.cancel_sent = true
 			cancel_error := session_write(session, {
 				kind = .Cancel,
-				request_id = 1,
+				request_id = session.request_id,
 				payload = task,
 			}, manager.maximum_payload_bytes)
 			if cancel_error.kind != .None {

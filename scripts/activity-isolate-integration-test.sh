@@ -284,6 +284,51 @@ parent_pid=""
 grep -q 'warm Activity pool serialized two concurrent tasks through one reused child' "$parent_log"
 grep -q 'Workflow completed through one warm Activity child' "$driver_log"
 
+mismatch_task_queue="odin-activity-isolate-mismatch-${RANDOM}-$(date +%s)"
+mismatch_workflow_id="odin-activity-isolate-mismatch-${RANDOM}-$(date +%s)"
+ACTIVITY_ISOLATE_MANIFEST_MISMATCH=reject \
+  TEMPORAL_ODIN_TASK_QUEUE="$mismatch_task_queue" \
+  "$binary" >>"$parent_log" 2>&1 &
+parent_pid=$!
+for _ in {1..100}; do
+  if grep -q "external Activity parent is polling task queue $mismatch_task_queue" "$parent_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "Manifest-mismatch Activity parent exited before polling" >&2
+    cat "$parent_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+ACTIVITY_ISOLATED_MANIFEST_MISMATCH=1 \
+  ACTIVITY_WORKFLOW_ID="$mismatch_workflow_id" \
+  TEMPORAL_TASK_QUEUE="$mismatch_task_queue" \
+  cargo run --quiet \
+    --manifest-path "$repo_root/native/Cargo.toml" \
+    --package activity-test-driver >>"$driver_log" 2>&1 &
+driver_pid=$!
+
+if ! wait "$driver_pid"; then
+  driver_pid=""
+  echo "Workflow did not observe the rejected Activity child manifest" >&2
+  cat "$driver_log" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+driver_pid=""
+if ! wait "$parent_pid"; then
+  parent_pid=""
+  echo "Manifest-mismatch Activity parent did not shut down cleanly" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+parent_pid=""
+
+grep -q 'warm Activity child manifest mismatch was rejected before dispatch' "$parent_log"
+grep -q 'Workflow observed rejected Activity child manifest' "$driver_log"
+
 cat "$parent_log"
 cat "$driver_log"
-echo "Activity crash/retry, heartbeat forwarding, cancellation, manifest dispatch, and bounded warm-pool reuse passed through the Core-owning parent."
+echo "Activity crash/retry, heartbeat forwarding, cancellation, manifest fencing, and bounded warm-pool reuse passed through the Core-owning parent."

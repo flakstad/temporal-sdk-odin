@@ -570,9 +570,11 @@ Parent and child build the same explicit multi-Activity manifest. The parent
 copies only its type names into Core, while the live child dispatches sequential
 `hello` and `goodbye` tasks without serializing procedure pointers across the
 process boundary.
-Protocol v4 also proves a size-one warm pool under two concurrent Activity
+Protocol v5 proves a size-one warm pool under two concurrent Activity
 tasks: admission remains bounded, the child is reused serially, and shutdown is
-acknowledged and time-limited.
+acknowledged and time-limited. Every warm generation must first return the exact
+canonical Activity manifest; a live incompatible-child case is rejected before
+callback dispatch or task-token routing.
 See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test
