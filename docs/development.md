@@ -1165,7 +1165,9 @@ already crashed or been killed.
 the external Workflow executor pool. The Worker deliberately keeps exactly one
 Core activation poll outstanding—required by upstream—and dispatches returned
 activations onto the configured number of Odin executor threads. Different
-shards can overlap; each shard serializes access to its process sessions. Run:
+shards can overlap; each shard serializes access to its process sessions.
+`Manager_Options.maximum_executors` is enforced once across active routes plus
+simultaneous admissions on every shard, rather than once per shard. Run:
 
 ```bash
 ./scripts/workflow-concurrency-integration-test.sh

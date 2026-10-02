@@ -521,6 +521,15 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 	})
 	testing.expect(t, invalid_error.message != nil)
 	workflow_isolate.manager_error_free(&invalid_error)
+	invalid_capacity_error := workflow_isolate.concurrent_manager_init(&manager, {
+		manager = {
+			command = command[:],
+			maximum_executors = 0,
+		},
+		shard_count = 4,
+	})
+	testing.expect(t, invalid_capacity_error.message != nil)
+	workflow_isolate.manager_error_free(&invalid_capacity_error)
 
 	init_error := workflow_isolate.concurrent_manager_init(&manager, {
 		manager = {
@@ -532,6 +541,14 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 	testing.expect(t, init_error.message == nil)
 	workflow_isolate.manager_error_free(&init_error)
 	defer workflow_isolate.concurrent_manager_close(&manager)
+	testing.expect_value(t, manager.maximum_executors, 2)
+	testing.expect(t, workflow_isolate.concurrent_capacity_allows_start(0, 0, 2))
+	testing.expect(t, workflow_isolate.concurrent_capacity_allows_start(1, 0, 2))
+	testing.expect(t, workflow_isolate.concurrent_capacity_allows_start(0, 1, 2))
+	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(1, 1, 2))
+	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(2, 0, 2))
+	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(-1, 0, 2))
+	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(0, 0, 0))
 
 	first, first_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
 	second, second_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
@@ -545,11 +562,31 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 
 	manager.shards[0].manager.stats.evictions = 2
 	manager.shards[1].manager.stats.evictions = 3
-	manager.peak_routes = 4
+	manager.shards[0].manager.stats.capacity_rejections = 2
+	manager.capacity_rejections = 3
+	manager.peak_routes = 2
 	stats := workflow_isolate.concurrent_manager_stats(&manager)
 	testing.expect_value(t, stats.evictions, 5)
-	testing.expect_value(t, stats.peak_routes, 4)
+	testing.expect_value(t, stats.capacity_rejections, 5)
+	testing.expect_value(t, stats.peak_routes, 2)
 	testing.expect_value(t, workflow_isolate.concurrent_manager_route_count(&manager), 0)
+
+	manager.active_routes = manager.maximum_executors
+	blocked := workflow_isolate_test_initialization("global-capacity-rejection")
+	capacity_result := workflow_isolate.concurrent_manager_process_activation(
+		&manager,
+		blocked[:],
+	)
+	delete(blocked)
+	testing.expect(t, capacity_result.activation_failed)
+	testing.expect(
+		t,
+		strings.contains(string(capacity_result.error.message), "capacity is exhausted"),
+	)
+	testing.expect_value(t, manager.capacity_rejections, 4)
+	testing.expect_value(t, manager.routes_admitting, 0)
+	manager.active_routes = 0
+	workflow_isolate.process_result_metadata_free(&capacity_result)
 
 	malformed := [?]u8{0xff}
 	processed := workflow_isolate.concurrent_manager_process_activation(&manager, malformed[:])
@@ -562,6 +599,124 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 	shutdown_error = workflow_isolate.concurrent_manager_shutdown(&manager)
 	testing.expect(t, shutdown_error.message == nil)
 	workflow_isolate.manager_error_free(&shutdown_error)
+}
+
+Concurrent_Manager_Admission_Race_State :: struct {
+	manager:    ^workflow_isolate.Concurrent_Manager,
+	activation: []u8,
+	ready:      ^sync.Sema,
+	start:      ^sync.Sema,
+	result:     workflow.Process_Result,
+}
+
+concurrent_manager_admission_race_main :: proc(
+	state: ^Concurrent_Manager_Admission_Race_State,
+) {
+	context.allocator = allocator_runtime.heap_allocator()
+	sync.sema_post(state.ready)
+	sync.sema_wait(state.start)
+	state.result = workflow_isolate.concurrent_manager_process_activation(
+		state.manager,
+		state.activation,
+	)
+}
+
+@(test)
+concurrent_workflow_executor_admission_is_global_across_shards :: proc(t: ^testing.T) {
+	previous_allocator := context.allocator
+	context.allocator = allocator_runtime.heap_allocator()
+	defer {context.allocator = previous_allocator}
+
+	command := [?]string{"/bin/sh", "-c", "sleep 2"}
+	manager := workflow_isolate.Concurrent_Manager{}
+	init_error := workflow_isolate.concurrent_manager_init(&manager, {
+		manager = {
+			command = command[:],
+			maximum_executors = 1,
+			activation_timeout = 300 * time.Millisecond,
+			shutdown_timeout = 20 * time.Millisecond,
+		},
+		shard_count = 2,
+	})
+	testing.expect(t, init_error.message == nil)
+	workflow_isolate.manager_error_free(&init_error)
+	if !manager.initialized {
+		return
+	}
+	defer workflow_isolate.concurrent_manager_close(&manager)
+
+	first_id := "global-capacity-race-0"
+	first_shard, first_ok := workflow_isolate.workflow_shard_index(first_id, 2)
+	testing.expect(t, first_ok)
+	second_id := ""
+	for candidate in 1 ..= 32 {
+		candidate_id := fmt.aprintf("global-capacity-race-%d", candidate)
+		candidate_shard, candidate_ok := workflow_isolate.workflow_shard_index(
+			candidate_id,
+			2,
+		)
+		if candidate_ok && candidate_shard != first_shard {
+			second_id = candidate_id
+			break
+		}
+		delete(candidate_id)
+	}
+	testing.expect(t, len(second_id) > 0)
+	if len(second_id) == 0 {
+		return
+	}
+	defer delete(second_id)
+
+	first_activation := workflow_isolate_test_initialization(first_id)
+	second_activation := workflow_isolate_test_initialization(second_id)
+	defer delete(first_activation)
+	defer delete(second_activation)
+	ready, start := sync.Sema{}, sync.Sema{}
+	states := [2]Concurrent_Manager_Admission_Race_State{
+		{manager = &manager, activation = first_activation[:], ready = &ready, start = &start},
+		{manager = &manager, activation = second_activation[:], ready = &ready, start = &start},
+	}
+	threads := [2]^thread.Thread{}
+	for &state, index in states {
+		threads[index] = thread.create_and_start_with_poly_data(
+			&state,
+			concurrent_manager_admission_race_main,
+		)
+		testing.expect(t, threads[index] != nil)
+	}
+	if threads[0] == nil || threads[1] == nil {
+		for _ in 0 ..< 2 do sync.sema_post(&start)
+		for item in threads {
+			if item != nil {
+				thread.join(item)
+				thread.destroy(item)
+			}
+		}
+		return
+	}
+	sync.sema_wait(&ready)
+	sync.sema_wait(&ready)
+	sync.sema_post(&start)
+	sync.sema_post(&start)
+	for item in threads {
+		thread.join(item)
+		thread.destroy(item)
+	}
+
+	capacity_failures := 0
+	for &state in states {
+		testing.expect(t, state.result.activation_failed)
+		if strings.contains(string(state.result.error.message), "capacity is exhausted") {
+			capacity_failures += 1
+		}
+		workflow_isolate.process_result_metadata_free(&state.result)
+	}
+	stats := workflow_isolate.concurrent_manager_stats(&manager)
+	testing.expect_value(t, capacity_failures, 1)
+	testing.expect_value(t, stats.capacity_rejections, 1)
+	testing.expect_value(t, stats.generations_started, 1)
+	testing.expect_value(t, workflow_isolate.concurrent_manager_route_count(&manager), 1)
+	testing.expect_value(t, manager.routes_admitting, 0)
 }
 
 @(test)

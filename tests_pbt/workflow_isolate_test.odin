@@ -48,6 +48,38 @@ workflow_runs_have_stable_process_independent_shards :: proc(t: ^testing.T) {
 	pbt.require_pass(t, result)
 }
 
+concurrent_workflow_capacity_property :: proc(t: ^pbt.T) -> pbt.Result {
+	maximum := pbt.draw(t, pbt.int_range(1, 64))
+	active := pbt.draw(t, pbt.int_range(0, maximum + 16))
+	admitting := pbt.draw(t, pbt.int_range(0, maximum + 16))
+	expected := active + admitting < maximum
+	actual := workflow_isolate.concurrent_capacity_allows_start(
+		active,
+		admitting,
+		maximum,
+	)
+	pbt.cover(t, active == 0 || admitting == 0, 2, "empty capacity dimension")
+	pbt.cover(t, active < maximum && active + admitting == maximum, 0.5, "reservation boundary")
+	pbt.cover(t, active >= maximum, 20, "active routes at capacity")
+	if actual != expected {
+		return pbt.fail("concurrent Workflow capacity diverged from the reference model")
+	}
+	return pbt.pass()
+}
+
+@(test)
+concurrent_workflow_admission_counts_routes_and_reservations_globally :: proc(
+	t: ^testing.T,
+) {
+	result := pbt.check(
+		"Concurrent Workflow admission counts routes and reservations globally",
+		concurrent_workflow_capacity_property,
+		{num_tests = 1000, seed = 0x434f_4e43_4341_5041},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}
+
 workflow_isolation_frame_property :: proc(t: ^pbt.T) -> pbt.Result {
 	run_id := pbt.draw(t, pbt.non_empty_byte_array(96))
 	payload := pbt.draw(t, pbt.non_empty_byte_array(8_192))

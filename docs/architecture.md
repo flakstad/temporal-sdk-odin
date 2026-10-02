@@ -4185,7 +4185,10 @@ executor threads are required. The CLI-dev-server proof showed that cache size
 zero forces an immediate eviction sequence and effectively serial activation
 delivery, so the SDK rejects that misleading configuration. The
 `examples/workflow_concurrency` proof holds independent child executors for two
-seconds and requires a measured overlap of at least two activations.
+seconds and requires a measured overlap of at least two activations. Its
+`maximum_executors` setting is a global limit across all shards and includes
+starts still in progress, closing the race where simultaneous shard admissions
+could otherwise oversubscribe child processes.
 
 The child protocol carries the Core protobufs opaquely. The parent decodes only
 the routing fields (`run_id`, initialization, eviction, replay flag, history

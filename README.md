@@ -565,7 +565,8 @@ same executor binary. Procedure pointers never cross the process boundary. It
 now verifies a canonical type manifest in a pre-poll child and again in every
 executor generation. Shutdown acknowledgement and process exit have an optional
 deadline, full capacity rejects without blocking a run-affine manager shard,
-and an optional cooldown circuit breaker bounds consecutive executor failures.
+the process limit is global across all shards and in-progress starts, and an
+optional cooldown circuit breaker bounds consecutive executor failures.
 `./scripts/workflow-concurrency-integration-test.sh` adds a live concurrency
 proof: four language executor threads process slow independent Workflow runs on
 distinct shards, the measured activation peak must reach at least two, and all

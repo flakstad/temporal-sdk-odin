@@ -5,9 +5,10 @@ import workflow ".."
 
 Concurrent_Manager_Options :: struct {
 	// Every shard owns an independent Manager with this configuration. The
-	// maximum executor count therefore applies per shard. Concurrent calls must
-	// use Odin's process-safe heap allocator; custom thread-local/arena contexts
-	// cannot own routes that a later poll thread may evict.
+	// manager maximum executor count is enforced globally across every shard.
+	// Concurrent calls must use Odin's process-safe heap allocator; custom
+	// thread-local/arena contexts cannot own routes that a later executor thread
+	// may evict.
 	manager:     Manager_Options,
 	shard_count: int,
 }
@@ -22,6 +23,9 @@ Concurrent_Manager :: struct {
 	stats_mutex:       sync.Mutex,
 	active_routes:     int,
 	peak_routes:       int,
+	routes_admitting:  int,
+	capacity_rejections: int,
+	maximum_executors: int,
 	active_activations: int,
 	peak_activations:   int,
 	initialized:       bool,
@@ -29,9 +33,18 @@ Concurrent_Manager :: struct {
 	shutdown_complete: bool,
 }
 
+// concurrent_capacity_allows_start admits reservations as well as already
+// materialized routes without overflowing active+admitting.
+concurrent_capacity_allows_start :: proc(
+	active, admitting, maximum: int,
+) -> bool {
+	return active >= 0 && admitting >= 0 && maximum > 0 &&
+	       active < maximum && admitting < maximum - active
+}
+
 // workflow_shard_index uses a process-independent FNV-1a hash. A run therefore
 // keeps the same shard for every activation in this process generation,
-// independently of which Worker poll thread received it.
+// independently of which language executor thread handles it.
 workflow_shard_index :: proc(run_id: string, shard_count: int) -> (index: int, ok: bool) {
 	if len(run_id) == 0 || shard_count <= 0 {
 		return
@@ -53,6 +66,9 @@ concurrent_manager_init :: proc(
 	if options.shard_count <= 0 {
 		return manager_error("concurrent Workflow executor manager shard count must be positive")
 	}
+	if options.manager.maximum_executors <= 0 {
+		return manager_error("concurrent Workflow executor capacity must be positive")
+	}
 	manager.shards = make([]Concurrent_Manager_Shard, options.shard_count)
 	for shard_index in 0 ..< options.shard_count {
 		init_error := manager_init(&manager.shards[shard_index].manager, options.manager)
@@ -65,6 +81,7 @@ concurrent_manager_init :: proc(
 			return init_error
 		}
 	}
+	manager.maximum_executors = options.manager.maximum_executors
 	manager.initialized = true
 	return {}
 }
@@ -113,15 +130,37 @@ concurrent_manager_process_activation :: proc(
 	sync.mutex_unlock(&manager.stats_mutex)
 	sync.mutex_lock(&shard.mutex)
 	before_routes := len(shard.manager.routes)
-	result := manager_process_activation(&shard.manager, activation)
-	after_routes := len(shard.manager.routes)
-	if before_routes != after_routes {
+	_, route_found := find_route(&shard.manager, route.run_id)
+	reserved_admission := route.initializes && !route_found
+	if reserved_admission {
 		sync.mutex_lock(&manager.stats_mutex)
-		manager.active_routes += after_routes - before_routes
-		manager.peak_routes = max(manager.peak_routes, manager.active_routes)
+		if !concurrent_capacity_allows_start(
+			manager.active_routes,
+			manager.routes_admitting,
+			manager.maximum_executors,
+		) {
+			manager.capacity_rejections += 1
+			manager.active_activations -= 1
+			sync.mutex_unlock(&manager.stats_mutex)
+			sync.mutex_unlock(&shard.mutex)
+			return failure_result(
+				route.run_id,
+				route_start_failure_message(.Capacity),
+			)
+		}
+		manager.routes_admitting += 1
 		sync.mutex_unlock(&manager.stats_mutex)
 	}
+	result := manager_process_activation(&shard.manager, activation)
+	after_routes := len(shard.manager.routes)
 	sync.mutex_lock(&manager.stats_mutex)
+	if reserved_admission {
+		manager.routes_admitting -= 1
+	}
+	if before_routes != after_routes {
+		manager.active_routes += after_routes - before_routes
+		manager.peak_routes = max(manager.peak_routes, manager.active_routes)
+	}
 	manager.active_activations -= 1
 	sync.mutex_unlock(&manager.stats_mutex)
 	sync.mutex_unlock(&shard.mutex)
@@ -152,6 +191,7 @@ concurrent_manager_shutdown :: proc(manager: ^Concurrent_Manager) -> Manager_Err
 	}
 	sync.mutex_lock(&manager.stats_mutex)
 	manager.active_routes = 0
+	manager.routes_admitting = 0
 	sync.mutex_unlock(&manager.stats_mutex)
 	manager.shutdown_complete = true
 	if had_error {
@@ -200,6 +240,7 @@ concurrent_manager_stats :: proc(manager: ^Concurrent_Manager) -> Manager_Stats 
 	}
 	sync.mutex_lock(&manager.stats_mutex)
 	total.peak_routes = manager.peak_routes
+	total.capacity_rejections += manager.capacity_rejections
 	sync.mutex_unlock(&manager.stats_mutex)
 	return total
 }

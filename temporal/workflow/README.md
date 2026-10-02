@@ -333,7 +333,9 @@ copy any fields that must outlive the synchronous callback.
 `workflow_isolate.Concurrent_Manager` provides deterministic run sharding for
 an external executor pool. It wraps one independently locked `Manager` per
 shard, so same-run activations serialize while different shards can progress in
-parallel. Capacity is currently per shard. Set a positive Workflow cache and
+parallel. `Manager_Options.maximum_executors` is one global route/process bound
+across all shards; in-progress admissions count against it. Set a positive
+Workflow cache and
 `worker.Options.max_concurrent_workflow_tasks > 1` to enable the bounded
 language executor pool. The Worker retains one Core poller, as upstream
 requires, while processor and completion calls overlap on executor threads.

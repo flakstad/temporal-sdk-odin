@@ -249,9 +249,9 @@ opaque run ID with a portable FNV-1a hash. One Core poller submits activations
 to arbitrary language executor threads, but the same run always takes the same
 shard mutex; different shards may execute their child exchanges concurrently.
 Each shard owns separate routes, crash-loop state, commands, and child
-processes. `maximum_executors` currently applies per shard, which is explicit
-but can produce hash-skew admission before another shard is full. Concurrent
-entry requires the process-safe heap allocator because a later executor thread
+processes. `maximum_executors` is enforced globally across materialized routes
+and in-progress admissions, so simultaneous starts on different shards cannot
+multiply the process limit. Concurrent entry requires the process-safe heap allocator because a later executor thread
 may evict a route created by another thread. Aggregate stats preserve an exact
 pool-wide route peak, and a
 1,000-case property checks binary run IDs against an independent hash reference.
