@@ -2,7 +2,7 @@
 
 Status: implementation architecture for a production-capable Odin language SDK.
 The SDK has a verified Core bridge, Activity Worker, schema-derived protobuf
-bindings, an explicit-state reference implementation, and a stackful Workflow
+bindings, and a stackful Workflow
 runtime covering serial operations, two outstanding Activities, handled Activity
 failure, buffered Workflow signals, a durable signal/timer race, and
 cooperative Workflow cancellation with detached cleanup, plus a reusable
@@ -1556,11 +1556,12 @@ for `StartActivityExecution`. The API exists in the pinned client/protos but is
 not available in this server version, so the workflow-only driver is required
 for the requested CLI development loop today.
 
-### Explicit Workflow state-machine reference
+### Historical explicit Workflow state-machine proof
 
-The original state-machine reference implements exactly one Workflow shape and
-is retained as a replay oracle, not as the user-facing Workflow runtime. Its
-explicit phases are:
+The original state-machine proof implemented exactly one Workflow shape. Once
+the stackful runtime covered the same eviction/replay invariant, its executable
+implementation and duplicate test were removed from the shipping package. Its
+historical phases were:
 
 ```text
 InitializeWorkflow

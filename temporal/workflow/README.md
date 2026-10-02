@@ -1,12 +1,5 @@
 # Workflow runtime
 
-`state_machine_reference.odin` retains the original bounded explicit state
-machine for one Workflow shape as a replay oracle:
-
-```text
-initialize -> schedule hello Activity -> resolve Activity -> complete
-```
-
 `runtime.odin` is the active stackful runtime. It drives serial commands,
 multiple outstanding Activities,
 handled Activity failures, buffered signals, a durable signal/timer race, and
