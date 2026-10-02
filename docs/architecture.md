@@ -3185,11 +3185,14 @@ The two rate-limit fields use zero as the C bridge's `None` sentinel. Odin
 rejects negative, NaN, and infinite values; positive values cross unchanged.
 Durations use non-negative Odin `time.Duration` values and round positive
 sub-millisecond fractions upward because the ABI stores `u64` milliseconds.
-The sticky poll ratio is restricted to `[0, 1]`. A cached Worker receives two
-fixed Workflow slots instead of the uncached default of one, and an explicit
-simple Workflow poller below two is rejected, matching Core's cache/poller
-constraint. Eager Activity reservations now match Core's language-SDK default
-of three per Workflow Task. The ordinary `workflow.execute_activity` and
+The sticky poll ratio is restricted to `[0, 1]`. Zero
+`max_workflow_task_slots` derives two fixed Workflow slots for a cached Worker
+or one for an uncached Worker. A positive value maps directly to Core's fixed
+Workflow supplier; value one is rejected with caching, as is an explicit simple
+Workflow poller below two. Slot admission is now independently configurable in
+preparation for the run-affine dispatcher, but it does not imply parallel Odin
+fiber execution yet. Eager Activity reservations now match Core's language-SDK
+default of three per Workflow Task. The ordinary `workflow.execute_activity` and
 `workflow.start_activity` helpers allow eager execution; explicit options can
 still set `disable_eager_execution=true` per command.
 

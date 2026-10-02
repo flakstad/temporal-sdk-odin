@@ -379,6 +379,9 @@ Worker_Options :: struct {
 	identity_override:                              string,
 	max_activity_slots:                             int,
 	max_nexus_task_slots:                           int,
+	// Zero selects one slot without caching and two with caching. A positive
+	// value configures Core admission explicitly; cached workers require two.
+	max_workflow_task_slots:                        int,
 	max_cached_workflows:                           u32,
 	sticky_queue_schedule_to_start_timeout:         time.Duration,
 	max_heartbeat_throttle_interval:                 time.Duration,
@@ -1425,6 +1428,14 @@ worker_options_validate :: proc(options: Worker_Options) -> Error {
 	if !options.resource_based_nexus_tuner.enabled && options.max_nexus_task_slots <= 0 {
 		return client_option_error("max Nexus task slots must be positive")
 	}
+	if options.max_workflow_task_slots < 0 {
+		return client_option_error("max Workflow task slots must not be negative")
+	}
+	if options.max_cached_workflows > 0 && options.max_workflow_task_slots == 1 {
+		return client_option_error(
+			"max Workflow task slots must be at least two when Workflow caching is enabled",
+		)
+	}
 	_, sticky_error := worker_duration_millis(
 		options.sticky_queue_schedule_to_start_timeout,
 		"sticky queue schedule-to-start timeout",
@@ -1605,6 +1616,9 @@ worker_option_bindings_init :: proc(
 		// Cached workers need at least two Workflow slots so a cache eviction
 		// cannot starve the Workflow poll stream.
 		workflow_slots = 2
+	}
+	if options.max_workflow_task_slots > 0 {
+		workflow_slots = uintptr(options.max_workflow_task_slots)
 	}
 	fixed_activity_slots := max(options.max_activity_slots, 1)
 	bindings.raw_options.tuner = raw.Tuner_Holder{

@@ -290,6 +290,7 @@ generated_poller_behavior :: proc(t: ^pbt.T, mode: int, cached: bool) -> tempora
 
 worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	cache_enabled := pbt.draw(t, pbt.boolean())
+	explicit_workflow_slots := pbt.draw(t, pbt.boolean())
 	workflow_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	activity_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
 	nexus_poller_mode := pbt.draw(t, pbt.int_range(0, 2))
@@ -321,6 +322,7 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	task_queue_rate_tenths := pbt.draw(t, pbt.int_range(0, 1_000))
 	ratio_hundredths := pbt.draw(t, pbt.int_range(0, 100))
 	pbt.cover(t, cache_enabled, 30.0, "Workflow cache enabled")
+	pbt.cover(t, explicit_workflow_slots, 30.0, "explicit Workflow slots")
 	pbt.cover(t, workflow_poller_mode == 0, 20.0, "Core-default Workflow poller")
 	pbt.cover(t, workflow_poller_mode == 1, 20.0, "simple Workflow poller")
 	pbt.cover(t, workflow_poller_mode == 2, 20.0, "autoscaling Workflow poller")
@@ -348,6 +350,13 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	}
 	if cache_enabled {
 		options.max_cached_workflows = u32(pbt.draw(t, pbt.int_range(1, 500)))
+	}
+	if explicit_workflow_slots {
+		minimum_workflow_slots := cache_enabled ? 2 : 1
+		options.max_workflow_task_slots = pbt.draw(
+			t,
+			pbt.int_range(minimum_workflow_slots, 64),
+		)
 	}
 	options.sticky_queue_schedule_to_start_timeout =
 		time.Duration(sticky_millis) * time.Millisecond +
@@ -444,12 +453,12 @@ worker_options_binding_property :: proc(t: ^pbt.T) -> pbt.Result {
 	          raw_options.tuner.activity_slot_supplier.fixed_size.num_slots != uintptr(slots) {
 		return pbt.fail("generated fixed Activity slot count changed during binding")
 	}
-	expected_workflow_slots := uintptr(1)
-	if cache_enabled {
-		expected_workflow_slots = 2
+	expected_workflow_slots := uintptr(options.max_workflow_task_slots)
+	if expected_workflow_slots == 0 {
+		expected_workflow_slots = cache_enabled ? 2 : 1
 	}
 	if raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots != expected_workflow_slots {
-		return pbt.fail("Workflow cache did not select a safe Workflow slot count")
+		return pbt.fail("Workflow slot admission changed during binding")
 	}
 	nexus_supplier := &raw_options.tuner.nexus_task_slot_supplier
 	if nexus_resource_tuned {

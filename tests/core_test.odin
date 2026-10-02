@@ -10830,6 +10830,7 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	options.identity_override = "odin-worker@test"
 	options.max_activity_slots = 23
 	options.max_nexus_task_slots = 7
+	options.max_workflow_task_slots = 11
 	options.max_cached_workflows = 17
 	options.sticky_queue_schedule_to_start_timeout = 1500 * time.Millisecond + time.Nanosecond
 	options.max_heartbeat_throttle_interval = 7 * time.Second
@@ -10853,7 +10854,7 @@ worker_options_bind_exactly_to_the_pinned_core_c_abi :: proc(t: ^testing.T) {
 	testing.expect_value(
 		t,
 		raw_options.tuner.workflow_slot_supplier.fixed_size.num_slots,
-		uintptr(2),
+		uintptr(11),
 	)
 	testing.expect_value(
 		t,
@@ -11661,6 +11662,23 @@ worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) 
 	testing.expect(t, invalid_nexus_slots_error.message != nil)
 	temporal_core.error_free(&invalid_nexus_slots_error)
 
+	invalid_workflow_slots := temporal_core.worker_options_default()
+	invalid_workflow_slots.max_workflow_task_slots = -1
+	invalid_workflow_slots_error := temporal_core.worker_options_validate(
+		invalid_workflow_slots,
+	)
+	testing.expect(t, invalid_workflow_slots_error.message != nil)
+	temporal_core.error_free(&invalid_workflow_slots_error)
+
+	invalid_cached_workflow_slots := temporal_core.worker_options_default()
+	invalid_cached_workflow_slots.max_cached_workflows = 1
+	invalid_cached_workflow_slots.max_workflow_task_slots = 1
+	invalid_cached_workflow_slots_error := temporal_core.worker_options_validate(
+		invalid_cached_workflow_slots,
+	)
+	testing.expect(t, invalid_cached_workflow_slots_error.message != nil)
+	temporal_core.error_free(&invalid_cached_workflow_slots_error)
+
 	invalid_nexus_poller := temporal_core.worker_options_default()
 	invalid_nexus_poller.nexus_task_poller_behavior = temporal_core.poller_autoscaling(2, 4, 1)
 	invalid_nexus_poller_error := temporal_core.worker_options_validate(invalid_nexus_poller)
@@ -11761,6 +11779,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	options.identity_override = identity
 	options.max_concurrent_activities = 19
 	options.max_concurrent_nexus_tasks = 5
+	options.max_workflow_task_slots = 9
 	options.max_cached_workflows = 8
 	options.workflow_task_poller_behavior = worker.poller_simple_maximum(3)
 	options.activity_task_poller_behavior = worker.poller_autoscaling(1, 6, 2)
@@ -11785,6 +11804,7 @@ language_worker_options_are_owned_until_close :: proc(t: ^testing.T) {
 	testing.expect_value(t, sdk_worker.core_options.identity_override, "owned-worker-identity")
 	testing.expect_value(t, sdk_worker.core_options.max_activity_slots, 19)
 	testing.expect_value(t, sdk_worker.core_options.max_nexus_task_slots, 5)
+	testing.expect_value(t, sdk_worker.core_options.max_workflow_task_slots, 9)
 	testing.expect_value(
 		t,
 		sdk_worker.core_options.resource_based_activity_tuner.target_memory_usage,

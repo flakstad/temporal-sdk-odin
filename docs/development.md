@@ -471,8 +471,12 @@ poller records address-stable for the synchronous `temporal_core_worker_new`
 call. Null pointers select Core's default poller policy. Durations are converted
 to milliseconds with positive fractions rounded upward, zero rates map to
 Core's `None`, and nonzero rates must be finite and positive. Enabling Workflow
-caching raises the fixed Workflow slot supplier from one to two; an explicitly
-configured simple Workflow poller must likewise be at least two.
+caching raises the automatic fixed Workflow slot supplier from one to two; an
+explicitly configured simple Workflow poller must likewise be at least two.
+`max_workflow_task_slots` can override the automatic count and maps exactly to
+Core's fixed Workflow slot supplier. A cached worker rejects the unsafe value
+one. This configures Core admission only—the current in-process dispatcher is
+still single-threaded until run-affine executor sharding lands.
 
 Activity capacity may instead use Core's resource-based supplier:
 

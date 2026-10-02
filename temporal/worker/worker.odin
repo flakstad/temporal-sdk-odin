@@ -425,6 +425,9 @@ Options :: struct {
 	identity_override:                               string,
 	max_concurrent_activities:                       int,
 	max_concurrent_nexus_tasks:                      int,
+	// Core Workflow Task admission. Zero safely derives one slot without a
+	// cache and two with a cache; this does not change Odin executor threading.
+	max_workflow_task_slots:                         int,
 	max_cached_workflows:                            u32,
 	sticky_queue_schedule_to_start_timeout:          time.Duration,
 	max_heartbeat_throttle_interval:                  time.Duration,
@@ -453,6 +456,7 @@ options_default :: proc(task_queue: string, namespace := "default") -> Options {
 		namespace = namespace,
 		max_concurrent_activities = core_options.max_activity_slots,
 		max_concurrent_nexus_tasks = core_options.max_nexus_task_slots,
+		max_workflow_task_slots = core_options.max_workflow_task_slots,
 		max_cached_workflows = core_options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
 			core_options.sticky_queue_schedule_to_start_timeout,
@@ -655,6 +659,7 @@ create_with_options :: proc(
 		identity_override = options.identity_override,
 		max_activity_slots = options.max_concurrent_activities,
 		max_nexus_task_slots = options.max_concurrent_nexus_tasks,
+		max_workflow_task_slots = options.max_workflow_task_slots,
 		max_cached_workflows = options.max_cached_workflows,
 		sticky_queue_schedule_to_start_timeout =
 			options.sticky_queue_schedule_to_start_timeout,
