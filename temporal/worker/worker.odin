@@ -17,7 +17,6 @@ import temporal_core "../core"
 import proto "../core/proto"
 import nexus "../nexus"
 import workflow "../workflow"
-import workflow_isolate "../workflow/isolate"
 
 String_Activity_Proc :: #type proc(ctx: ^activity.Context, input: string) -> string
 Payload_Activity_Proc :: #type proc(
@@ -2665,8 +2664,8 @@ activity_execution_start :: proc(
 	return execution, {}
 }
 
-Workflow_Activation_Route :: workflow_isolate.Activation_Route
-decode_workflow_activation_route :: workflow_isolate.decode_activation_route
+Workflow_Activation_Route :: workflow.Activation_Route
+decode_workflow_activation_route :: workflow.decode_activation_route
 
 // Workflow_Runtime_Set is confined to one language executor. Its runtimes,
 // run routes, and rejected-run routes must never be accessed by another

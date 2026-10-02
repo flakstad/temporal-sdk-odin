@@ -598,14 +598,14 @@ concurrent_workflow_executor_manager_routes_and_aggregates_shards :: proc(t: ^te
 	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(-1, 0, 2))
 	testing.expect(t, !workflow_isolate.concurrent_capacity_allows_start(0, 0, 0))
 
-	first, first_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
-	second, second_ok := workflow_isolate.workflow_shard_index("stable-run", 4)
+	first, first_ok := workflow.activation_shard_index("stable-run", 4)
+	second, second_ok := workflow.activation_shard_index("stable-run", 4)
 	testing.expect(t, first_ok && second_ok)
 	testing.expect_value(t, first, second)
 	testing.expect(t, first >= 0 && first < 4)
-	_, empty_ok := workflow_isolate.workflow_shard_index("", 4)
+	_, empty_ok := workflow.activation_shard_index("", 4)
 	testing.expect(t, !empty_ok)
-	_, zero_ok := workflow_isolate.workflow_shard_index("stable-run", 0)
+	_, zero_ok := workflow.activation_shard_index("stable-run", 0)
 	testing.expect(t, !zero_ok)
 
 	manager.shards[0].manager.stats.evictions = 2
@@ -694,12 +694,12 @@ concurrent_workflow_executor_admission_is_global_across_shards :: proc(t: ^testi
 	defer workflow_isolate.concurrent_manager_close(&manager)
 
 	first_id := "global-capacity-race-0"
-	first_shard, first_ok := workflow_isolate.workflow_shard_index(first_id, 2)
+	first_shard, first_ok := workflow.activation_shard_index(first_id, 2)
 	testing.expect(t, first_ok)
 	second_id := ""
 	for candidate in 1 ..= 32 {
 		candidate_id := fmt.aprintf("global-capacity-race-%d", candidate)
-		candidate_shard, candidate_ok := workflow_isolate.workflow_shard_index(
+		candidate_shard, candidate_ok := workflow.activation_shard_index(
 			candidate_id,
 			2,
 		)
@@ -1099,7 +1099,7 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 	})
 	encoded := proto.encode_Coresdk_Workflow_Activation_WorkflowActivation(&activation)
 	defer delete(encoded)
-	route, ok := workflow_isolate.decode_activation_route(encoded[:])
+	route, ok := workflow.decode_activation_route(encoded[:])
 	testing.expect(t, ok)
 	testing.expect_value(t, route.run_id, "route-run")
 	testing.expect_value(t, route.workflow_type, "route-workflow")
@@ -1125,7 +1125,7 @@ workflow_activation_route_preserves_process_dispatch_metadata :: proc(t: ^testin
 		&eviction_activation,
 	)
 	defer delete(encoded_eviction)
-	eviction_route, eviction_ok := workflow_isolate.decode_activation_route(
+	eviction_route, eviction_ok := workflow.decode_activation_route(
 		encoded_eviction[:],
 	)
 	testing.expect(t, eviction_ok)

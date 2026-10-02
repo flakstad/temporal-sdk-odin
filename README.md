@@ -2563,8 +2563,8 @@ temporal/worker/          Activity/Workflow/Nexus registry and concurrent pollin
 temporal/supervisor/      whole-Worker child process lifecycle and restart policy
 temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
-temporal/workflow/        explicit-state and stackful-fiber experiments
-temporal/workflow/isolate versioned activation/completion process framing
+temporal/workflow/        stackful Workflow runtime and activation routing
+temporal/workflow/isolate optional versioned subprocess framing and execution
 temporal/client/          owned Client and Workflow handle/control APIs
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade

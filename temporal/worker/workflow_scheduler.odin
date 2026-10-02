@@ -7,7 +7,6 @@ import "core:sync"
 import "core:thread"
 import temporal_core "../core"
 import workflow "../workflow"
-import workflow_isolate "../workflow/isolate"
 
 // In_Process_Workflow_Shard owns one fixed executor thread and a complete set
 // of Workflow runtimes. Activations are assigned by run ID, so a live fiber is
@@ -497,7 +496,7 @@ run_in_process_workflow_executor_loop :: proc(
 				worker_initiate_shutdown(worker)
 				break
 			}
-			shard_index, shard_ok := workflow_isolate.workflow_shard_index(
+			shard_index, shard_ok := workflow.activation_shard_index(
 				route.run_id,
 				started,
 			)

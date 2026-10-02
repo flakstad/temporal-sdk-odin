@@ -59,7 +59,9 @@ core:
 These modules remain supported development work; they are not discarded or
 hidden. They should have explicit capability/version guards and their own tests,
 but a server-version-specific limitation in one of them does not block the core
-SDK release unless the feature is promoted into the stable core.
+SDK release unless the feature is promoted into the stable core. The standard
+Worker depends only on the Workflow routing contract; importing it does not
+compile the opt-in Activity or Workflow subprocess implementations.
 
 ## Deliberately deferred
 

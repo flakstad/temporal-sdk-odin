@@ -42,19 +42,8 @@ concurrent_capacity_allows_start :: proc(
 	       active < maximum && admitting < maximum - active
 }
 
-// workflow_shard_index uses a process-independent FNV-1a hash. A run therefore
-// keeps the same shard for every activation in this process generation,
-// independently of which language executor thread handles it.
-workflow_shard_index :: proc(run_id: string, shard_count: int) -> (index: int, ok: bool) {
-	if len(run_id) == 0 || shard_count <= 0 {
-		return
-	}
-	hash := u64(14695981039346656037)
-	for value in transmute([]u8)run_id {
-		hash = (hash ~ u64(value)) * u64(1099511628211)
-	}
-	return int(hash % u64(shard_count)), true
-}
+// Compatibility alias for callers of the opt-in isolation package.
+workflow_shard_index :: workflow.activation_shard_index
 
 concurrent_manager_init :: proc(
 	manager: ^Concurrent_Manager,
