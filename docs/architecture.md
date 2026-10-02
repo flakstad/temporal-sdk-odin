@@ -1572,7 +1572,7 @@ ResolveActivity(seq=1)
   -> Completed
 ```
 
-The live test deliberately evicts the language state after the schedule
+The historical live test deliberately evicted the language state after the schedule
 command and before executing the Activity. The observed activation sequence was:
 
 | History | Replay | Job/result | Odin action |
@@ -1583,11 +1583,11 @@ command and before executing the Activity. The observed activation sequence was:
 | 9 | no | activity resolved | emit `CompleteWorkflowExecution` |
 | 9 | no | completion eviction | delete the completed instance |
 
-Temporal CLI observed the final `"Hello Odin"` result. This demonstrates that
+Temporal CLI observed the final `"Hello Odin"` result. This demonstrated that
 Core matches deterministic replay commands against history and that Odin state
-can be discarded and reconstructed. The offline state-machine test additionally
-asserts that the initial and replayed schedule completions are byte-for-byte
-identical. This does not demonstrate sequential-looking Workflow code, timers,
+can be discarded and reconstructed. The removed offline state-machine test also
+asserted that the initial and replayed schedule completions were byte-for-byte
+identical. That proof did not demonstrate sequential-looking Workflow code, timers,
 multiple outstanding operations, signals, queries, updates, concurrency, or
 nondeterminism detection in the language layer.
 
@@ -3531,18 +3531,18 @@ Workflows are enabled.
    in-flight task is only meaningful for unbounded production runs; tests must
    not confuse the bounded example control with production cancellation.
 
-## Workflow runtime alternatives: final decision still deferred
+## Workflow runtime decision
 
-| Option | What the evidence says now | First useful test |
+| Option | What the evidence says now | Disposition |
 | --- | --- | --- |
-| Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
+| Explicit state machine | Historically proved Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Removed after the stackful runtime subsumed its replay invariant |
 | Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, mid-activation shutdown, replay/nondeterminism/handler-load isolation, and mixed remote-Activity resolution after eviction on fixed run-affine concurrent executors on macOS arm64 | Run longer mixed-operation soak/fault tests and validate guard pages plus affinity on every distribution target |
-| CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
+| CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Deferred unless the selected stackful runtime fails a release gate |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
 path, and the minimum fiber authoring boundary are now proven. This is enough
-evidence to continue with fibers while retaining the explicit state machine as
-a comparison point; it is not yet enough to freeze the public API.
+evidence to select the stackful runtime. It is not yet enough to freeze the
+public API.
 
 ## Recommended next vertical milestone
 

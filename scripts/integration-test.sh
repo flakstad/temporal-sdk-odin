@@ -1844,7 +1844,7 @@ grep -q 'Client terminate interceptor entered reason="unknown Workflow type test
 grep -q 'Client terminate interceptor exited after Core' <<<"$unknown_terminate_output"
 unknown_workflow_id=""
 
-workflow_id="odin-sdk-workflow-spike-$$-$(date +%s)"
+workflow_id="odin-sdk-workflow-runtime-$$-$(date +%s)"
 temporal workflow execute \
   --workflow-id "$workflow_id" \
   --type odin_hello_workflow \

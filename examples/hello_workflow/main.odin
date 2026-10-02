@@ -2218,17 +2218,17 @@ main :: proc() {
 	if !failed {
 		if expect_cancel_timer {
 			if run_stats.activity_tasks_completed != 0 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 || run_stats.activity_cancellations_requested != 0 {
-				fmt.eprintln("Workflow spike did not cancel its pending timer and Workflow Execution")
+				fmt.eprintln("Workflow runtime did not cancel its pending timer and Workflow Execution")
 				failed = true
 			}
 		} else if expect_cancel_activity {
 			if run_stats.activity_tasks_completed != 1 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
-				fmt.eprintln("Workflow spike did not deliver and acknowledge Activity cancellation")
+				fmt.eprintln("Workflow runtime did not deliver and acknowledge Activity cancellation")
 				failed = true
 			}
 		} else if expect_cancel_cleanup {
 			if run_stats.activity_tasks_completed != 2 || run_stats.activity_cancellations_received != 1 || run_stats.workflow_signals_received != 0 || run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 0 || run_stats.activity_cancellations_requested != 1 {
-				fmt.eprintln("Workflow spike did not complete detached cancellation cleanup")
+				fmt.eprintln("Workflow runtime did not complete detached cancellation cleanup")
 				failed = true
 			}
 		} else if expect_cancellation_tree {
@@ -2385,7 +2385,7 @@ main :: proc() {
 		   (expect_query && (run_stats.workflow_queries_answered != 1 || run_stats.workflow_queries_failed != 0)) ||
 		   (expect_update && (run_stats.workflow_updates_accepted != 3 || run_stats.workflow_updates_rejected != 2 || run_stats.workflow_updates_completed != 2)) {
 			fmt.eprintf(
-				"Workflow spike stats mismatch: activities=%d signals=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d timers_canceled=%d replay_activations=%d\n",
+				"Workflow runtime stats mismatch: activities=%d signals=%d queries=%d query_failures=%d updates_accepted=%d updates_rejected=%d updates_completed=%d timers_canceled=%d replay_activations=%d\n",
 				run_stats.activity_tasks_completed,
 				run_stats.workflow_signals_received,
 				run_stats.workflow_queries_answered,

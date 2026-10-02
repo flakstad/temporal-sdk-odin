@@ -104,8 +104,8 @@ not ready; that label no longer describes the purpose of the whole SDK.
 ## Consequences
 
 This direction prioritizes consolidation over further breadth. The superseded
-explicit state-machine runtime is removed once its shared result/error contract
-is owned by the active runtime. New core work
+explicit state-machine runtime has been removed after its shared result/error
+contract moved to the active runtime. New core work
 should close a release gate or a correctness gap. New extended APIs should be
 small vertical slices justified by an actual consumer and must not destabilize
 Workflow replay or Worker lifecycle.
