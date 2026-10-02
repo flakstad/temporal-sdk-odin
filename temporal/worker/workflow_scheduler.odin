@@ -12,9 +12,17 @@ import workflow_isolate "../workflow/isolate"
 // In_Process_Workflow_Shard owns one fixed executor thread and a complete set
 // of Workflow runtimes. Activations are assigned by run ID, so a live fiber is
 // created, resumed, evicted, and destroyed on the same OS thread.
+In_Process_Workflow_Scheduler :: struct {
+	mutex:              sync.Mutex,
+	activations_owned:  int,
+	peak_owned:         int,
+	queue_peak:         int,
+}
+
 In_Process_Workflow_Shard :: struct {
 	worker:      ^Worker,
 	options:     Run_Options,
+	scheduler:   ^In_Process_Workflow_Scheduler,
 	runtime_set: Workflow_Runtime_Set,
 	mutex:       sync.Mutex,
 	available:   sync.Sema,
@@ -25,6 +33,36 @@ In_Process_Workflow_Shard :: struct {
 	thread:      ^thread.Thread,
 	stats:       Run_Stats,
 	error:       Error,
+}
+
+workflow_scheduler_retain_activation :: proc(
+	scheduler: ^In_Process_Workflow_Scheduler,
+	queue_depth: int,
+) {
+	if scheduler == nil || queue_depth < 0 {
+		return
+	}
+	sync.mutex_lock(&scheduler.mutex)
+	scheduler.activations_owned += 1
+	scheduler.peak_owned = max(scheduler.peak_owned, scheduler.activations_owned)
+	scheduler.queue_peak = max(scheduler.queue_peak, queue_depth)
+	sync.mutex_unlock(&scheduler.mutex)
+}
+
+workflow_scheduler_release_activations :: proc(
+	scheduler: ^In_Process_Workflow_Scheduler,
+	count: int,
+) -> bool {
+	if scheduler == nil || count < 0 {
+		return false
+	}
+	sync.mutex_lock(&scheduler.mutex)
+	balanced := count <= scheduler.activations_owned
+	if balanced {
+		scheduler.activations_owned -= count
+	}
+	sync.mutex_unlock(&scheduler.mutex)
+	return balanced
 }
 
 workflow_runtime_set_close_on_executor :: proc(
@@ -252,6 +290,13 @@ workflow_shard_thread_main :: proc(shard: ^In_Process_Workflow_Shard) {
 		}
 		processed := workflow_shard_process_activation(shard, activation)
 		delete(activation)
+		if !workflow_scheduler_release_activations(shard.scheduler, 1) {
+			workflow_shard_mark_failed(
+				shard,
+				error_from_string("Workflow scheduler activation ownership underflow"),
+			)
+			break
+		}
 		if !processed {
 			break
 		}
@@ -259,11 +304,18 @@ workflow_shard_thread_main :: proc(shard: ^In_Process_Workflow_Shard) {
 
 	sync.mutex_lock(&shard.mutex)
 	shard.accepting = false
+	dropped := len(shard.queue)
 	for activation in shard.queue {
 		delete(activation)
 	}
 	clear(&shard.queue)
 	sync.mutex_unlock(&shard.mutex)
+	if !workflow_scheduler_release_activations(shard.scheduler, dropped) {
+		workflow_shard_mark_failed(
+			shard,
+			error_from_string("Workflow scheduler queued ownership underflow"),
+		)
+	}
 	close_error := workflow_runtime_set_close_on_executor(&shard.runtime_set)
 	if close_error.message != nil {
 		workflow_shard_mark_failed(shard, close_error)
@@ -288,6 +340,8 @@ workflow_shard_enqueue :: proc(
 		return result
 	}
 	append(&shard.queue, activation)
+	queue_depth := len(shard.queue)
+	workflow_scheduler_retain_activation(shard.scheduler, queue_depth)
 	sync.mutex_unlock(&shard.mutex)
 	sync.sema_post(&shard.available)
 	return {}
@@ -342,6 +396,7 @@ run_in_process_workflow_executor_loop :: proc(
 		return {}, error_from_string("concurrent in-process Workflow executor configuration is invalid")
 	}
 	heap := allocator_runtime.heap_allocator()
+	scheduler := In_Process_Workflow_Scheduler{}
 	shards := make([]^In_Process_Workflow_Shard, executor_threads, heap)
 	started := 0
 	defer delete(shards, heap)
@@ -353,6 +408,7 @@ run_in_process_workflow_executor_loop :: proc(
 		}
 		shard.worker = worker
 		shard.options = options
+		shard.scheduler = &scheduler
 		shard.queue = make([dynamic][]u8, heap)
 		shards[index] = shard
 		shard.thread = thread.create_and_start_with_poly_data(
@@ -415,6 +471,19 @@ run_in_process_workflow_executor_loop :: proc(
 	}
 
 	finish_error := workflow_shards_finish(shards[:started], &stats)
+	sync.mutex_lock(&scheduler.mutex)
+	stats.workflow_activations_peak_owned = scheduler.peak_owned
+	stats.workflow_executor_queue_peak = scheduler.queue_peak
+	remaining_owned := scheduler.activations_owned
+	sync.mutex_unlock(&scheduler.mutex)
+	if remaining_owned != 0 {
+		ownership_error := error_from_string("Workflow scheduler did not release every owned activation")
+		if finish_error.message == nil {
+			finish_error = ownership_error
+		} else {
+			error_free(&ownership_error)
+		}
+	}
 	for index in started ..< executor_threads {
 		shard := shards[index]
 		if shard == nil {

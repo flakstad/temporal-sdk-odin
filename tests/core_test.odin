@@ -1561,6 +1561,27 @@ worker_workflow_registration_retains_a_reusable_runtime_factory :: proc(t: ^test
 }
 
 @(test)
+workflow_scheduler_ownership_tracks_peak_queue_and_balanced_release :: proc(
+	t: ^testing.T,
+) {
+	scheduler := worker.In_Process_Workflow_Scheduler{}
+	worker.workflow_scheduler_retain_activation(&scheduler, 1)
+	worker.workflow_scheduler_retain_activation(&scheduler, 3)
+	testing.expect_value(t, scheduler.activations_owned, 2)
+	testing.expect_value(t, scheduler.peak_owned, 2)
+	testing.expect_value(t, scheduler.queue_peak, 3)
+	testing.expect(t, worker.workflow_scheduler_release_activations(&scheduler, 1))
+	worker.workflow_scheduler_retain_activation(&scheduler, 2)
+	testing.expect_value(t, scheduler.activations_owned, 2)
+	testing.expect_value(t, scheduler.peak_owned, 2)
+	testing.expect_value(t, scheduler.queue_peak, 3)
+	testing.expect(t, worker.workflow_scheduler_release_activations(&scheduler, 2))
+	testing.expect_value(t, scheduler.activations_owned, 0)
+	testing.expect(t, !worker.workflow_scheduler_release_activations(&scheduler, 1))
+	testing.expect_value(t, scheduler.activations_owned, 0)
+}
+
+@(test)
 worker_dispatches_online_activations_through_an_external_processor :: proc(t: ^testing.T) {
 	activation := [?]u8{0, 1, 0, 2, 0xff}
 	state := Workflow_Processor_Test_State{return_completion = true}

@@ -260,24 +260,30 @@ run :: proc() -> int {
 	if !state.results_ok || len(state.handles) < 2 ||
 	   run_stats.workflow_executions_completed != len(state.handles) ||
 	   run_stats.workflow_activation_failures < 1 ||
-	   run_stats.workflow_evictions < len(state.handles) + 1 || peak < 2 || migrations != 0 {
+	   run_stats.workflow_evictions < len(state.handles) + 1 ||
+	   run_stats.workflow_activations_peak_owned < 2 ||
+	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d peak=%d migrations=%d\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			run_stats.workflow_evictions,
+			run_stats.workflow_activations_peak_owned,
+			run_stats.workflow_executor_queue_peak,
 			peak,
 			migrations,
 		)
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d peak_activations=%d migrations=%d\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
 		run_stats.workflow_evictions,
+		run_stats.workflow_activations_peak_owned,
+		run_stats.workflow_executor_queue_peak,
 		peak,
 		migrations,
 	)

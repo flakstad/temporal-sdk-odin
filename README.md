@@ -583,6 +583,11 @@ complete through concurrent Core calls, and receive final eviction on those
 same threads. An unknown Workflow type concurrently produces failed activation
 completions and eviction without poisoning the valid shards or stopping the
 Worker.
+`Run_Stats.workflow_activations_peak_owned` reports the largest number of
+polled activations simultaneously owned by Odin, including queued and executing
+work. `workflow_executor_queue_peak` reports the largest queue observed on one
+fixed in-process shard; serial and external-processor execution report zero for
+that shard-specific value. Shutdown verifies that ownership returns to zero.
 With a non-zero Core cache, the two live timer Workflows retain one successful
 child generation each across suspension and incremental resolution; crash and
 timeout recovery still evict and replay safely. Protocol v3 carries the child's

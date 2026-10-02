@@ -366,6 +366,12 @@ Run_Stats :: struct {
 	nexus_executions_peak_owned:            int,
 	workflow_activations_completed:       int,
 	workflow_activation_failures:         int,
+	// Highest number of polled Workflow activations simultaneously owned by
+	// Odin before their completion buffers were submitted and released.
+	workflow_activations_peak_owned:      int,
+	// Highest queued activation count observed on one fixed in-process shard.
+	// Serial and external-processor execution report zero.
+	workflow_executor_queue_peak:         int,
 	workflow_executions_completed:        int,
 	workflow_replay_activations:          int,
 	workflow_evictions:                   int,
@@ -3451,6 +3457,10 @@ run_workflow_loop_serial :: proc(
 		}
 
 		processed, dispatch_error := dispatch_workflow_activation(worker, options, poll.protobuf)
+		stats.workflow_activations_peak_owned = max(
+			stats.workflow_activations_peak_owned,
+			1,
+		)
 		delete(poll.protobuf)
 		if dispatch_error.message != nil {
 			return stats, dispatch_error
@@ -3677,6 +3687,10 @@ run_external_workflow_executor_loop :: proc(
 			allocator_runtime.heap_allocator(),
 			workflow_execution_task,
 			execution,
+		)
+		stats.workflow_activations_peak_owned = max(
+			stats.workflow_activations_peak_owned,
+			thread.pool_num_outstanding(&pool),
 		)
 	}
 	thread.pool_finish(&pool)

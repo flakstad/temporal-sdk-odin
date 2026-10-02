@@ -4199,6 +4199,17 @@ exercises failed activation and rejected-run eviction without stopping valid
 shards. Its brief wall-clock block is test instrumentation and is not an
 allowed Workflow programming primitive.
 
+The scheduler accounts for ownership at the activation-buffer boundary.
+Enqueue increments a shared owned count, normal processing releases one after
+completion cleanup, and fault teardown releases every discarded queued buffer.
+`Run_Stats.workflow_activations_peak_owned` exposes the global high-water mark;
+`workflow_executor_queue_peak` exposes the largest individual shard queue.
+After all executor threads join, a non-zero owned count is a Worker error. This
+turns shutdown balance and bounded Core-to-language handoff into explicit,
+testable invariants. A 1,000-case property test compares generated retain and
+batched-release interleavings with an independent integer/high-water model and
+requires exact drain plus underflow rejection.
+
 ## Core-connected Workflow process isolation
 
 The language boundary can now be replaced for online Workflow activations

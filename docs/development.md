@@ -1204,6 +1204,15 @@ overlap. The test also starts an unknown Workflow type and requires at least one
 failed activation plus its eviction while valid runs still complete. This
 proves language-level task failure does not become a scheduler/Worker failure.
 Every valid run must produce a terminal result and final Core eviction.
+The example also requires
+`Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
+`workflow_executor_queue_peak`. The former counts all activation buffers owned
+by the in-process scheduler; the latter is the maximum queue depth on any one
+shard. Teardown treats a non-zero final ownership balance as an operational
+error rather than silently dropping it. A 1,000-case PBT generates up to 128
+interleaved retains and batched releases, checks both high-water marks against a
+reference model, drains to zero, and verifies that one extra release is
+rejected without corrupting the count.
 The blocking probe is instrumentation only; application Workflow code must not
 read wall time or block an executor thread. In concurrent mode, Workflow
 logger/interceptor/metric factory state and the activation observer can be

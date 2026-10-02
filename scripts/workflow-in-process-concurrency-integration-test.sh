@@ -64,4 +64,4 @@ if [[ "$status" != "0" ]]; then
   exit "$status"
 fi
 grep -q 'In-process Workflow concurrency proved' <<<"$output"
-grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([3-9]|[1-9][0-9]+) peak_activations=([2-9]|[1-9][0-9]+) migrations=0' <<<"$output"
+grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([3-9]|[1-9][0-9]+) owned_peak=([2-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) callback_peak=([2-9]|[1-9][0-9]+) migrations=0' <<<"$output"
