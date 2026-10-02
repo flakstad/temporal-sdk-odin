@@ -3,6 +3,20 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$repo_root/scripts/generate-protos.sh" --check
+
+# Compile the base Client and optional extensions independently so an accidental
+# reverse import cannot collapse the package boundary.
+odin check "$repo_root/temporal/client" \
+	-no-entry-point \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
+odin check "$repo_root/temporal/client/workflow_control" \
+	-no-entry-point \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
+
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
   --package odin-proto-gen
