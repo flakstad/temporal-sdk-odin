@@ -14,6 +14,7 @@ import "core:time"
 import activity "../temporal/activity"
 import activity_isolate "../temporal/activity/isolate"
 import temporal_client "../temporal/client"
+import workflow_control "../temporal/client/workflow_control"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
 import codec "../temporal/codec"
@@ -2157,6 +2158,17 @@ Client_Interceptor_Test_Node :: struct {
 	short_circuit: bool,
 }
 
+Client_Extension_Destroy_Capture :: struct {
+	calls: int,
+}
+
+client_extension_test_destroy :: proc(data: rawptr) {
+	capture := cast(^Client_Extension_Destroy_Capture)data
+	if capture != nil {
+		capture.calls += 1
+	}
+}
+
 client_interceptor_test_signal :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_Signal_Workflow_Input,
@@ -2387,8 +2399,8 @@ client_interceptor_test_workflow_options :: proc(
 
 client_interceptor_test_workflow_pause :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Workflow_Pause_Mutation_Input,
-	next: temporal_client.Client_Workflow_Pause_Mutation_Next,
+	input: ^workflow_control.Client_Workflow_Pause_Mutation_Input,
+	next: workflow_control.Client_Workflow_Pause_Mutation_Next,
 ) -> temporal_client.Error {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
@@ -2403,7 +2415,7 @@ client_interceptor_test_workflow_pause :: proc(
 	if node.short_circuit {
 		result = temporal_client.error_from_string(.Rpc, "Workflow pause short circuit")
 	} else {
-		result = temporal_client.client_workflow_pause_mutation_next(next, input)
+		result = workflow_control.client_workflow_pause_mutation_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -14672,24 +14684,21 @@ client_workflow_pause_interceptors_nest_and_propagate_mutations :: proc(t: ^test
 	first := Client_Interceptor_Test_Node{state = &state, id = 1}
 	second := Client_Interceptor_Test_Node{state = &state, id = 2, short_circuit = true}
 	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
-	client := temporal_client.Client{
-		connection = &connection,
-		interceptors = make([dynamic]temporal_client.Client_Interceptor),
-	}
-	defer delete(client.interceptors)
-	append(
-		&client.interceptors,
-		temporal_client.Client_Interceptor{
-			user_data = &first,
-			workflow_pause_mutation = client_interceptor_test_workflow_pause,
-		},
-		temporal_client.Client_Interceptor{
-			user_data = &second,
-			workflow_pause_mutation = client_interceptor_test_workflow_pause,
-		},
-	)
+	client := temporal_client.Client{connection = &connection}
+	defer temporal_client.client_extensions_close(&client)
+	first_error := workflow_control.add_interceptor(&client, {
+		user_data = &first,
+		workflow_pause_mutation = client_interceptor_test_workflow_pause,
+	})
+	defer temporal_client.error_free(&first_error)
+	second_error := workflow_control.add_interceptor(&client, {
+		user_data = &second,
+		workflow_pause_mutation = client_interceptor_test_workflow_pause,
+	})
+	defer temporal_client.error_free(&second_error)
+	testing.expect(t, first_error.message == nil && second_error.message == nil)
 	handle := temporal_client.Workflow_Handle{client = &client, id = "workflow-id"}
-	pause_error := temporal_client.pause_workflow(&handle, {reason = "caller reason"})
+	pause_error := workflow_control.pause_workflow(&handle, {reason = "caller reason"})
 	defer temporal_client.error_free(&pause_error)
 	testing.expect_value(t, pause_error.kind, temporal_client.Error_Kind.Rpc)
 	testing.expect_value(t, string(pause_error.message), "Workflow pause short circuit")
@@ -14702,8 +14711,47 @@ client_workflow_pause_interceptors_nest_and_propagate_mutations :: proc(t: ^test
 }
 
 @(test)
+client_extension_state_owns_keys_rejects_duplicates_and_destroys_once :: proc(t: ^testing.T) {
+	connection := temporal_core.Client{handle = cast(^raw.Connection)(uintptr(1))}
+	client := temporal_client.Client{connection = &connection}
+	capture := Client_Extension_Destroy_Capture{}
+	mutable_key, clone_error := strings.clone("test.extension.v1")
+	testing.expect(t, clone_error == nil)
+	register_error := temporal_client.client_extension_state_register(
+		&client,
+		mutable_key,
+		&capture,
+		client_extension_test_destroy,
+	)
+	defer temporal_client.error_free(&register_error)
+	testing.expect(t, register_error.message == nil)
+	mutable_key_bytes := transmute([]u8)mutable_key
+	mutable_key_bytes[0] = 'X'
+	delete(mutable_key)
+	testing.expect_value(
+		t,
+		cast(^Client_Extension_Destroy_Capture)temporal_client.client_extension_state_find(
+			&client,
+			"test.extension.v1",
+		),
+		&capture,
+	)
+	duplicate_error := temporal_client.client_extension_state_register(
+		&client,
+		"test.extension.v1",
+		&capture,
+		client_extension_test_destroy,
+	)
+	defer temporal_client.error_free(&duplicate_error)
+	testing.expect_value(t, duplicate_error.kind, temporal_client.Error_Kind.Invalid_Argument)
+	temporal_client.client_extensions_close(&client)
+	temporal_client.client_extensions_close(&client)
+	testing.expect_value(t, capture.calls, 1)
+}
+
+@(test)
 client_workflow_pause_requests_preserve_exact_control_fields :: proc(t: ^testing.T) {
-	pause_bytes, pause_error := temporal_client.encode_workflow_pause_mutation_request(
+	pause_bytes, pause_error := workflow_control.encode_workflow_pause_mutation_request(
 		"orders",
 		"odin-client@test",
 		"workflow-id",
@@ -14734,7 +14782,7 @@ client_workflow_pause_requests_preserve_exact_control_fields :: proc(t: ^testing
 	testing.expect_value(t, pause_request.request_id, "pause-request")
 	virtual.arena_destroy(&arena)
 
-	unpause_bytes, unpause_error := temporal_client.encode_workflow_pause_mutation_request(
+	unpause_bytes, unpause_error := workflow_control.encode_workflow_pause_mutation_request(
 		"orders",
 		"odin-client@test",
 		"workflow-id",
@@ -14761,7 +14809,7 @@ client_workflow_pause_requests_preserve_exact_control_fields :: proc(t: ^testing
 	testing.expect_value(t, unpause_request.request_id, "unpause-request")
 	virtual.arena_destroy(&arena)
 
-	invalid_bytes, invalid_error := temporal_client.encode_workflow_pause_mutation_request(
+	invalid_bytes, invalid_error := workflow_control.encode_workflow_pause_mutation_request(
 		"orders",
 		"odin-client@test",
 		"workflow-id",

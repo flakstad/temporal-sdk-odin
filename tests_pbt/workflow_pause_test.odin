@@ -4,6 +4,7 @@ import "core:mem/virtual"
 import "core:testing"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
+import workflow_control "../temporal/client/workflow_control"
 import proto "../temporal/core/proto"
 
 workflow_pause_request_property :: proc(t: ^pbt.T) -> pbt.Result {
@@ -12,13 +13,13 @@ workflow_pause_request_property :: proc(t: ^pbt.T) -> pbt.Result {
 	reason := pbt.draw(t, pbt.string_ascii(0, 96))
 	request_id := pbt.draw(t, pbt.string_ascii(1, 48))
 	run_id := include_run_id ? "property-run" : ""
-	kind := is_pause ? temporal_client.Workflow_Pause_Mutation_Kind.Pause : .Unpause
+	kind := is_pause ? workflow_control.Workflow_Pause_Mutation_Kind.Pause : .Unpause
 	pbt.cover(t, is_pause, 40.0, "pause request")
 	pbt.cover(t, !is_pause, 40.0, "unpause request")
 	pbt.cover(t, include_run_id, 40.0, "specific Workflow run")
 	pbt.cover(t, len(reason) == 0, 1.0, "empty reason")
 
-	encoded, encode_error := temporal_client.encode_workflow_pause_mutation_request(
+	encoded, encode_error := workflow_control.encode_workflow_pause_mutation_request(
 		"property-namespace",
 		"property-identity",
 		"property-workflow",

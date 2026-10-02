@@ -1556,11 +1556,11 @@ raw_update, err := temporal_client.start_update_payloads_with_options(
 defer temporal_client.update_handle_free(&raw_update)
 err = temporal_client.cancel_workflow(&handle, "customer canceled")
 
-err = temporal_client.pause_workflow(
+err = workflow_control.pause_workflow(
     &handle,
     {reason = "downstream dependency outage"},
 )
-err = temporal_client.unpause_workflow(
+err = workflow_control.unpause_workflow(
     &handle,
     {reason = "downstream dependency recovered"},
 )
@@ -1656,10 +1656,13 @@ update timestamp. Server 1.32 live-proves priority write, canonical response,
 history/Describe read-back, and the outbound interceptor path; that server does
 not yet populate the newer response timestamp.
 
-Experimental Workflow Pause is also exposed as explicit Client operations.
-`pause_workflow` and `unpause_workflow` borrow a handle, accept reason plus an
-optional idempotence ID, generate UUIDv4 IDs by default, and share one typed
-outbound-interceptor family. Server 1.32 live-proves Paused status, Query
+Experimental Workflow Pause is exposed by the optional
+`temporal/client/workflow_control` package. `pause_workflow` and
+`unpause_workflow` borrow a base Client handle, accept reason plus an optional
+idempotence ID, generate UUIDv4 IDs by default, and share one typed
+outbound-interceptor family registered with `workflow_control.add_interceptor`
+after connecting. The base Client owns and destroys that package state without
+depending on its concrete types. Server 1.32 live-proves Paused status, Query
 rejection, accepted-but-deferred Signal delivery, Unpause, and both history
 events. Self-hosted use requires Server 1.30 or newer with
 `frontend.WorkflowPauseEnabled=true`; it is not silently advertised as a stable
@@ -2566,7 +2569,8 @@ temporal/codec/           owned/borrowed Payload model and json/plain codec
 temporal/headers/         shared owned interceptor/context Payload map
 temporal/workflow/        stackful Workflow runtime and activation routing
 temporal/workflow/isolate optional versioned subprocess framing and execution
-temporal/client/          owned Client and Workflow handle/control APIs
+temporal/client/          stable-core Client and Workflow handle APIs
+temporal/client/workflow_control optional Pause/Unpause operations and interceptors
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof

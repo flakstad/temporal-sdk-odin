@@ -262,28 +262,6 @@ Client_Update_Workflow_Execution_Options_Interceptor_Proc :: #type proc(
 	next: Client_Update_Workflow_Execution_Options_Next,
 ) -> (Workflow_Execution_Options, Error)
 
-Client_Workflow_Pause_Mutation_Input :: struct {
-	handle:  ^Workflow_Handle,
-	kind:    Workflow_Pause_Mutation_Kind,
-	options: Workflow_Pause_Options,
-}
-
-Client_Workflow_Pause_Mutation_Next_Proc :: #type proc(
-	data: rawptr,
-	input: ^Client_Workflow_Pause_Mutation_Input,
-) -> Error
-
-Client_Workflow_Pause_Mutation_Next :: struct {
-	data:   rawptr,
-	invoke: Client_Workflow_Pause_Mutation_Next_Proc,
-}
-
-Client_Workflow_Pause_Mutation_Interceptor_Proc :: #type proc(
-	user_data: rawptr,
-	input: ^Client_Workflow_Pause_Mutation_Input,
-	next: Client_Workflow_Pause_Mutation_Next,
-) -> Error
-
 Client_Terminate_Workflow_Input :: struct {
 	handle:      ^Workflow_Handle,
 	reason:      string,
@@ -808,7 +786,6 @@ Client_Interceptor :: struct {
 	cancel_workflow:    Client_Cancel_Workflow_Interceptor_Proc,
 	reset_workflow:     Client_Reset_Workflow_Interceptor_Proc,
 	update_workflow_execution_options: Client_Update_Workflow_Execution_Options_Interceptor_Proc,
-	workflow_pause_mutation: Client_Workflow_Pause_Mutation_Interceptor_Proc,
 	terminate_workflow: Client_Terminate_Workflow_Interceptor_Proc,
 	delete_workflow:    Client_Delete_Workflow_Interceptor_Proc,
 	list_workflows:     Client_List_Workflows_Interceptor_Proc,
@@ -943,16 +920,6 @@ client_update_workflow_execution_options_next :: proc(
 ) -> (Workflow_Execution_Options, Error) {
 	if next.invoke == nil || input == nil {
 		return {}, error_from_string(.Invalid_Argument, "invalid Workflow options interceptor continuation")
-	}
-	return next.invoke(next.data, input)
-}
-
-client_workflow_pause_mutation_next :: proc(
-	next: Client_Workflow_Pause_Mutation_Next,
-	input: ^Client_Workflow_Pause_Mutation_Input,
-) -> Error {
-	if next.invoke == nil || input == nil {
-		return error_from_string(.Invalid_Argument, "invalid Workflow pause interceptor continuation")
 	}
 	return next.invoke(next.data, input)
 }
@@ -1460,27 +1427,6 @@ client_update_workflow_execution_options_chain :: proc(
 		)
 	}
 	return update_workflow_execution_options_terminal(input)
-}
-
-client_workflow_pause_mutation_chain :: proc(
-	data: rawptr,
-	input: ^Client_Workflow_Pause_Mutation_Input,
-) -> Error {
-	state := cast(^Client_Interceptor_State)data
-	if state == nil || state.client == nil || input == nil {
-		return error_from_string(.Invalid_Argument, "invalid Workflow pause interceptor state")
-	}
-	for index := state.index; index < len(state.client.interceptors); index += 1 {
-		entry := &state.client.interceptors[index]
-		if entry.workflow_pause_mutation == nil do continue
-		next_state := Client_Interceptor_State{client = state.client, index = index + 1}
-		return entry.workflow_pause_mutation(
-			entry.user_data,
-			input,
-			{data = &next_state, invoke = client_workflow_pause_mutation_chain},
-		)
-	}
-	return workflow_pause_mutation_terminal(input)
 }
 
 client_terminate_workflow_chain :: proc(

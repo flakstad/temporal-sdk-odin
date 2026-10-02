@@ -142,6 +142,7 @@ Client :: struct {
 	namespace:    string,
 	identity:     string,
 	interceptors: [dynamic]Client_Interceptor,
+	extensions:   [dynamic]Client_Extension_State,
 }
 
 DEFAULT_CLIENT_IDENTITY :: "temporal-sdk-odin@local"
@@ -251,6 +252,7 @@ close :: proc(client: ^Client) {
 		return
 	}
 	heap := allocator_runtime.heap_allocator()
+	client_extensions_close(client)
 	if client.connection != nil {
 		temporal_core.client_close(client.connection)
 		free(client.connection, heap)

@@ -499,8 +499,11 @@ or serialize a fiber itself: `PauseWorkflowExecution` changes the open
 execution's server status and suppresses new Workflow/Activity dispatch until
 `UnpauseWorkflowExecution`. The language layer encodes namespace, Workflow/run
 ID, Core Client identity, reason, and an explicit or generated UUIDv4 request
-ID, then uses the existing generic RPC C symbol. Both operations share one
-typed outbound-interceptor family. A feature-enabled Server 1.32 run proves
+ID, then uses the existing generic RPC C symbol. The implementation and its
+typed interceptor family live in the optional `client/workflow_control`
+package. Base `client.Client` knows only an opaque, keyed extension slot whose
+destroy callback runs before Core connection teardown; it has no reverse
+dependency on Workflow Pause types. A feature-enabled Server 1.32 run proves
 status 8/Paused, typed Query rejection, acceptance of a Signal without an Odin
 activation, subsequent delivery only after Unpause, and history event types 58
 and 59. This is deliberately marked experimental: [Temporal's current Pause
@@ -510,7 +513,9 @@ that the API may change. Generated request/response roots and the pinned Core
 dispatcher are versioned together; no C ABI extension is needed.
 
 `client.Client` heap-owns a stable Core runtime and connection because
-`core.Client` retains a pointer to its runtime. It also owns its namespace.
+`core.Client` retains a pointer to its runtime. It also owns its namespace and
+any opaque optional-package extension slots. Extension keys are cloned;
+duplicate registration is rejected; each destroy callback runs exactly once.
 `Workflow_Handle` owns Workflow/run ID strings and borrows the Client. Closing
 the handle before the Client is therefore an explicit lifetime requirement.
 RPC success/failure buffers are copied out of Core and freed through

@@ -61,7 +61,12 @@ hidden. They should have explicit capability/version guards and their own tests,
 but a server-version-specific limitation in one of them does not block the core
 SDK release unless the feature is promoted into the stable core. The standard
 Worker depends only on the Workflow routing contract; importing it does not
-compile the opt-in Activity or Workflow subprocess implementations.
+compile the opt-in Activity or Workflow subprocess implementations. Workflow
+Pause/Unpause is the first Client extension physically extracted from the base
+package. Its typed interceptors are stored through an owned opaque extension
+slot, so base Client lifecycle remains responsible for cleanup without a
+reverse dependency on the optional package. Schedules, standalone operations,
+and other extended Client families should migrate through the same boundary.
 
 ## Deliberately deferred
 

@@ -1652,11 +1652,11 @@ defer temporal_client.workflow_handle_free(&existing)
 signal_error := temporal_client.signal_workflow_json(&existing, "approval", approval)
 cancel_error := temporal_client.cancel_workflow(&existing, "no longer needed")
 terminate_error := temporal_client.terminate_workflow(&existing, "operator decision")
-pause_error := temporal_client.pause_workflow(
+pause_error := workflow_control.pause_workflow(
     &existing,
     {reason = "downstream dependency outage"},
 )
-unpause_error := temporal_client.unpause_workflow(
+unpause_error := workflow_control.unpause_workflow(
     &existing,
     {reason = "downstream dependency recovered"},
 )
@@ -1761,6 +1761,14 @@ nested responses, and a 500-case property varies both 0–12 argument lists.
 
 Workflow Pause is a feature-gated experimental Service API. Start a compatible
 local server explicitly:
+
+```odin
+import workflow_control "../../temporal/client/workflow_control"
+
+pause_error := workflow_control.pause_workflow(&handle, {
+    reason = "maintenance",
+})
+```
 
 ```bash
 temporal server start-dev \
