@@ -1,13 +1,12 @@
-package client
+package standalone_activity
 
 import "core:encoding/uuid"
 import "core:fmt"
 import "core:math"
-import "core:mem"
 import "core:mem/virtual"
 import "core:time"
-import temporal_core "../core"
-import proto "../core/proto"
+import temporal_core "../../core"
+import proto "../../core/proto"
 
 Standalone_Activity_Options_Update :: struct {
 	update_mask:               []string,
@@ -41,33 +40,6 @@ Standalone_Activity_Option_Path_Priority_Key                 :: "priority.priori
 Standalone_Activity_Option_Path_Priority_Fairness_Key        :: "priority.fairness_key"
 Standalone_Activity_Option_Path_Priority_Fairness_Weight     :: "priority.fairness_weight"
 Standalone_Activity_Option_Path_Start_Delay                  :: "start_delay"
-
-// Standalone_Activity_Options is allocator-owned. Release it with
-// standalone_activity_options_free.
-Standalone_Activity_Options :: struct {
-	task_queue:                string,
-	schedule_to_close_timeout: Optional_Duration,
-	schedule_to_start_timeout: Optional_Duration,
-	start_to_close_timeout:    Optional_Duration,
-	heartbeat_timeout:         Optional_Duration,
-	retry_policy:              Retry_Policy,
-	has_retry_policy:          bool,
-	priority:                  Workflow_Priority,
-	start_delay:               Optional_Duration,
-	allocator:                 mem.Allocator,
-}
-
-standalone_activity_options_free :: proc(options: ^Standalone_Activity_Options) {
-	if options == nil do return
-	allocator := options.allocator
-	if allocator.procedure != nil {
-		delete(options.task_queue, allocator)
-		for value in options.retry_policy.non_retryable_error_types do delete(value, allocator)
-		delete(options.retry_policy.non_retryable_error_types, allocator)
-		delete(options.priority.fairness_key, allocator)
-	}
-	options^ = {}
-}
 
 standalone_activity_option_path_valid :: proc(path: string) -> bool {
 	switch path {
@@ -265,34 +237,6 @@ decode_update_standalone_activity_options_response :: proc(
 	return result, {}
 }
 
-clone_activity_options :: proc(
-	options: ^proto.Temporal_Api_Activity_V1_ActivityOptions,
-	allocator: mem.Allocator,
-) -> (result: Standalone_Activity_Options, ok: bool) {
-	if options == nil || allocator.procedure == nil do return {}, false
-	result.allocator = allocator
-	ok = true
-	if options.task_queue != nil do result.task_queue, ok = description_clone_string(options.task_queue.name, allocator)
-	if !ok {
-		standalone_activity_options_free(&result)
-		return {}, false
-	}
-	result.schedule_to_close_timeout = description_duration(options.schedule_to_close_timeout)
-	result.schedule_to_start_timeout = description_duration(options.schedule_to_start_timeout)
-	result.start_to_close_timeout = description_duration(options.start_to_close_timeout)
-	result.heartbeat_timeout = description_duration(options.heartbeat_timeout)
-	result.start_delay = description_duration(options.start_delay)
-	result.retry_policy,
-	result.has_retry_policy,
-	ok = standalone_activity_clone_retry_policy(options.retry_policy, allocator)
-	if ok do result.priority, ok = description_priority(options.priority, allocator)
-	if !ok {
-		standalone_activity_options_free(&result)
-		return {}, false
-	}
-	return result, true
-}
-
 update_standalone_activity_options_terminal :: proc(
 	input: ^Client_Update_Standalone_Activity_Options_Input,
 ) -> (Standalone_Activity_Options, Error) {
@@ -332,6 +276,6 @@ update_standalone_activity_options :: proc(
 		update = update,
 		allocator = allocator,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_update_standalone_activity_options_chain(&state, &input)
 }

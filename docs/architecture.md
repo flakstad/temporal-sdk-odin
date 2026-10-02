@@ -857,8 +857,13 @@ Odin Client StartActivityExecution
   -> Odin Client PollActivityExecution
 ```
 
-The public slice lives in `temporal/client/standalone_activity.odin`,
-`standalone_activity_options.odin`, and `standalone_activity_visibility.odin`.
+The public slice lives in the optional
+`temporal/client/standalone_activity` package. Its typed interceptor state uses
+the Client's owned opaque extension slot, so importing the stable base Client
+does not compile the standalone lifecycle. The normalized
+`Standalone_Activity_Options` snapshot remains in the base package because
+ordinary Workflow Describe responses use the same schema; the extension aliases
+that shared type instead of duplicating ownership rules.
 It exposes codec-neutral/JSON Start, an
 owned ID/Run-ID handle, monotonic bounded or Core-cancelable result waiting,
 recursive terminal Failure bytes, cancel/terminate/delete, owned Describe
@@ -3663,7 +3668,7 @@ a non-mutating probe exists.
 | Nexus from Workflows | Implemented | `GetSystemInfo.nexus` | Advertised and live-proven | Live suite exposed a timeout behavior change still under classification |
 | Standalone Nexus | Implemented | Safe count RPC | gRPC 12 `UNIMPLEMENTED` | Live-proven on 1.32.0 when `nexusoperation.enableStandalone=true` |
 | Workflow Pause/Unpause | Implemented | No safe probe or System Info bit | Unknown; no mutation is attempted | Live-proven on 1.32.0 |
-| Standalone Activity lifecycle | Implemented: complete pinned Start/Poll/Describe/result/control/options/Visibility surface and interceptors | No safe probe; SDK=true, server support remains unknown | Start returns gRPC 12 `UNIMPLEMENTED` | Complete lifecycle and masked options update live-proven through an Odin Worker on 1.32.0 |
+| Standalone Activity lifecycle | Implemented in optional `client/standalone_activity`: complete pinned Start/Poll/Describe/result/control/options/Visibility surface and interceptors | Safe count RPC through `standalone_activity.probe_support`; generic base probe remains unknown | Count/Start return gRPC 12 `UNIMPLEMENTED` | Complete lifecycle and masked options update live-proven through an Odin Worker on 1.32.0 |
 
 The matrix deliberately distinguishes “SDK surface absent”, “server said
 UNIMPLEMENTED”, and “not safely observed”. Authentication or namespace errors

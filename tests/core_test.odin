@@ -15,6 +15,7 @@ import activity "../temporal/activity"
 import activity_isolate "../temporal/activity/isolate"
 import temporal_client "../temporal/client"
 import schedule "../temporal/client/schedule"
+import standalone_activity "../temporal/client/standalone_activity"
 import standalone_nexus "../temporal/client/standalone_nexus"
 import workflow_control "../temporal/client/workflow_control"
 import temporal_core "../temporal/core"
@@ -2146,9 +2147,9 @@ Client_Interceptor_Test_State :: struct {
 	activity_poll_seen:      bool,
 	activity_describe_seen:  bool,
 	activity_mutation_seen:  bool,
-	activity_mutation_kind:  temporal_client.Standalone_Activity_Mutation_Kind,
+	activity_mutation_kind:  standalone_activity.Standalone_Activity_Mutation_Kind,
 	activity_control_seen:   bool,
-	activity_control_kind:   temporal_client.Standalone_Activity_Control_Kind,
+	activity_control_kind:   standalone_activity.Standalone_Activity_Control_Kind,
 	activity_options_seen:   bool,
 	activity_list_seen:      bool,
 	activity_count_seen:     bool,
@@ -2711,9 +2712,9 @@ client_interceptor_test_nexus_operation_mutation :: proc(
 
 client_interceptor_test_start_standalone_activity :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Start_Standalone_Activity_Input,
-	next: temporal_client.Client_Start_Standalone_Activity_Next,
-) -> (temporal_client.Standalone_Activity_Handle, temporal_client.Error) {
+	input: ^standalone_activity.Client_Start_Standalone_Activity_Input,
+	next: standalone_activity.Client_Start_Standalone_Activity_Next,
+) -> (standalone_activity.Standalone_Activity_Handle, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2722,12 +2723,12 @@ client_interceptor_test_start_standalone_activity :: proc(
 	} else {
 		node.state.activity_start_seen = input.options.activity_type == "intercepted-activity"
 	}
-	result: temporal_client.Standalone_Activity_Handle
+	result: standalone_activity.Standalone_Activity_Handle
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity start short circuit")
 	} else {
-		result, result_error = temporal_client.client_start_standalone_activity_next(next, input)
+		result, result_error = standalone_activity.client_start_standalone_activity_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2736,9 +2737,9 @@ client_interceptor_test_start_standalone_activity :: proc(
 
 client_interceptor_test_poll_standalone_activity :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Poll_Standalone_Activity_Input,
-	next: temporal_client.Client_Poll_Standalone_Activity_Next,
-) -> (temporal_client.Standalone_Activity_Poll_Result, temporal_client.Error) {
+	input: ^standalone_activity.Client_Poll_Standalone_Activity_Input,
+	next: standalone_activity.Client_Poll_Standalone_Activity_Next,
+) -> (standalone_activity.Standalone_Activity_Poll_Result, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2747,12 +2748,12 @@ client_interceptor_test_poll_standalone_activity :: proc(
 	} else {
 		node.state.activity_poll_seen = input.options.timeout == 3 * time.Second
 	}
-	result: temporal_client.Standalone_Activity_Poll_Result
+	result: standalone_activity.Standalone_Activity_Poll_Result
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity poll short circuit")
 	} else {
-		result, result_error = temporal_client.client_poll_standalone_activity_next(next, input)
+		result, result_error = standalone_activity.client_poll_standalone_activity_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2761,9 +2762,9 @@ client_interceptor_test_poll_standalone_activity :: proc(
 
 client_interceptor_test_describe_standalone_activity :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Describe_Standalone_Activity_Input,
-	next: temporal_client.Client_Describe_Standalone_Activity_Next,
-) -> (temporal_client.Standalone_Activity_Description, temporal_client.Error) {
+	input: ^standalone_activity.Client_Describe_Standalone_Activity_Input,
+	next: standalone_activity.Client_Describe_Standalone_Activity_Next,
+) -> (standalone_activity.Standalone_Activity_Description, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2772,12 +2773,12 @@ client_interceptor_test_describe_standalone_activity :: proc(
 	} else {
 		node.state.activity_describe_seen = input.options.include_input
 	}
-	result: temporal_client.Standalone_Activity_Description
+	result: standalone_activity.Standalone_Activity_Description
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity Describe short circuit")
 	} else {
-		result, result_error = temporal_client.client_describe_standalone_activity_next(next, input)
+		result, result_error = standalone_activity.client_describe_standalone_activity_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2786,8 +2787,8 @@ client_interceptor_test_describe_standalone_activity :: proc(
 
 client_interceptor_test_standalone_activity_mutation :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Standalone_Activity_Mutation_Input,
-	next: temporal_client.Client_Standalone_Activity_Mutation_Next,
+	input: ^standalone_activity.Client_Standalone_Activity_Mutation_Input,
+	next: standalone_activity.Client_Standalone_Activity_Mutation_Next,
 ) -> temporal_client.Error {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
@@ -2802,7 +2803,7 @@ client_interceptor_test_standalone_activity_mutation :: proc(
 	if node.short_circuit {
 		result = temporal_client.error_from_string(.Rpc, "standalone Activity mutation short circuit")
 	} else {
-		result = temporal_client.client_standalone_activity_mutation_next(next, input)
+		result = standalone_activity.client_standalone_activity_mutation_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2811,8 +2812,8 @@ client_interceptor_test_standalone_activity_mutation :: proc(
 
 client_interceptor_test_standalone_activity_control :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Standalone_Activity_Control_Input,
-	next: temporal_client.Client_Standalone_Activity_Control_Next,
+	input: ^standalone_activity.Client_Standalone_Activity_Control_Input,
+	next: standalone_activity.Client_Standalone_Activity_Control_Next,
 ) -> temporal_client.Error {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
@@ -2827,7 +2828,7 @@ client_interceptor_test_standalone_activity_control :: proc(
 	if node.short_circuit {
 		result = temporal_client.error_from_string(.Rpc, "standalone Activity control short circuit")
 	} else {
-		result = temporal_client.client_standalone_activity_control_next(next, input)
+		result = standalone_activity.client_standalone_activity_control_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2836,9 +2837,9 @@ client_interceptor_test_standalone_activity_control :: proc(
 
 client_interceptor_test_update_standalone_activity_options :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Update_Standalone_Activity_Options_Input,
-	next: temporal_client.Client_Update_Standalone_Activity_Options_Next,
-) -> (temporal_client.Standalone_Activity_Options, temporal_client.Error) {
+	input: ^standalone_activity.Client_Update_Standalone_Activity_Options_Input,
+	next: standalone_activity.Client_Update_Standalone_Activity_Options_Next,
+) -> (standalone_activity.Standalone_Activity_Options, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2848,12 +2849,12 @@ client_interceptor_test_update_standalone_activity_options :: proc(
 		node.state.activity_options_seen = input.update.task_queue == "intercepted-queue" &&
 		                                   input.allocator.procedure != nil
 	}
-	result: temporal_client.Standalone_Activity_Options
+	result: standalone_activity.Standalone_Activity_Options
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result.task_queue = "intercepted-result"
 	} else {
-		result, result_error = temporal_client.client_update_standalone_activity_options_next(next, input)
+		result, result_error = standalone_activity.client_update_standalone_activity_options_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2862,9 +2863,9 @@ client_interceptor_test_update_standalone_activity_options :: proc(
 
 client_interceptor_test_list_standalone_activities :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_List_Standalone_Activities_Input,
-	next: temporal_client.Client_List_Standalone_Activities_Next,
-) -> (temporal_client.Standalone_Activity_List_Page, temporal_client.Error) {
+	input: ^standalone_activity.Client_List_Standalone_Activities_Input,
+	next: standalone_activity.Client_List_Standalone_Activities_Next,
+) -> (standalone_activity.Standalone_Activity_List_Page, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2875,12 +2876,12 @@ client_interceptor_test_list_standalone_activities :: proc(
 		node.state.activity_list_seen = input.options.query == `ActivityId = "intercepted"` &&
 		                                input.options.page_size == 23
 	}
-	result: temporal_client.Standalone_Activity_List_Page
+	result: standalone_activity.Standalone_Activity_List_Page
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity list short circuit")
 	} else {
-		result, result_error = temporal_client.client_list_standalone_activities_next(next, input)
+		result, result_error = standalone_activity.client_list_standalone_activities_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -2889,9 +2890,9 @@ client_interceptor_test_list_standalone_activities :: proc(
 
 client_interceptor_test_count_standalone_activities :: proc(
 	user_data: rawptr,
-	input: ^temporal_client.Client_Count_Standalone_Activities_Input,
-	next: temporal_client.Client_Count_Standalone_Activities_Next,
-) -> (temporal_client.Standalone_Activity_Count, temporal_client.Error) {
+	input: ^standalone_activity.Client_Count_Standalone_Activities_Input,
+	next: standalone_activity.Client_Count_Standalone_Activities_Next,
+) -> (standalone_activity.Standalone_Activity_Count, temporal_client.Error) {
 	node := cast(^Client_Interceptor_Test_Node)user_data
 	node.state.events[node.state.count] = node.id
 	node.state.count += 1
@@ -2900,12 +2901,12 @@ client_interceptor_test_count_standalone_activities :: proc(
 	} else {
 		node.state.activity_count_seen = input.query == `ActivityStatus = "Running"`
 	}
-	result: temporal_client.Standalone_Activity_Count
+	result: standalone_activity.Standalone_Activity_Count
 	result_error: temporal_client.Error
 	if node.short_circuit {
 		result_error = temporal_client.error_from_string(.Rpc, "standalone Activity count short circuit")
 	} else {
-		result, result_error = temporal_client.client_count_standalone_activities_next(next, input)
+		result, result_error = standalone_activity.client_count_standalone_activities_next(next, input)
 	}
 	node.state.events[node.state.count] = -node.id
 	node.state.count += 1
@@ -14453,9 +14454,10 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 		interceptors = make([dynamic]temporal_client.Client_Interceptor),
 	}
 	defer delete(client.interceptors)
+	defer temporal_client.client_extensions_close(&client)
 	nodes := [?]^Client_Interceptor_Test_Node{&first, &second}
 	for node in nodes {
-		append(&client.interceptors, temporal_client.Client_Interceptor{
+		add_error := standalone_activity.add_interceptor(&client, {
 			user_data = node,
 			start_standalone_activity = client_interceptor_test_start_standalone_activity,
 			poll_standalone_activity = client_interceptor_test_poll_standalone_activity,
@@ -14466,15 +14468,17 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 			list_standalone_activities = client_interceptor_test_list_standalone_activities,
 			count_standalone_activities = client_interceptor_test_count_standalone_activities,
 		})
+		testing.expect(t, add_error.message == nil)
+		temporal_client.error_free(&add_error)
 	}
-	handle := temporal_client.Standalone_Activity_Handle{
+	handle := standalone_activity.Standalone_Activity_Handle{
 		client = &client,
 		id = "interceptor-activity",
 		run_id = "interceptor-run",
 	}
 	expected := [?]int{1, 2, -2, -1}
 
-	started, start_error := temporal_client.start_standalone_activity_payload(
+	started, start_error := standalone_activity.start_standalone_activity_payload(
 		&client,
 		{},
 		{
@@ -14484,32 +14488,32 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 			start_to_close_timeout = time.Minute,
 		},
 	)
-	temporal_client.standalone_activity_handle_free(&started)
+	standalone_activity.standalone_activity_handle_free(&started)
 	testing.expect_value(t, string(start_error.message), "standalone Activity start short circuit")
 	temporal_client.error_free(&start_error)
 	testing.expect(t, state.activity_start_seen)
 	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
 	state.count = 0
-	polled, poll_error := temporal_client.poll_standalone_activity(&handle)
-	temporal_client.standalone_activity_poll_result_free(&polled)
+	polled, poll_error := standalone_activity.poll_standalone_activity(&handle)
+	standalone_activity.standalone_activity_poll_result_free(&polled)
 	testing.expect_value(t, string(poll_error.message), "standalone Activity poll short circuit")
 	temporal_client.error_free(&poll_error)
 	testing.expect(t, state.activity_poll_seen)
 	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
 	state.count = 0
-	description, describe_error := temporal_client.describe_standalone_activity(&handle)
-	temporal_client.standalone_activity_description_free(&description)
+	description, describe_error := standalone_activity.describe_standalone_activity(&handle)
+	standalone_activity.standalone_activity_description_free(&description)
 	testing.expect_value(t, string(describe_error.message), "standalone Activity Describe short circuit")
 	temporal_client.error_free(&describe_error)
 	testing.expect(t, state.activity_describe_seen)
 	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
-	for kind in temporal_client.Standalone_Activity_Mutation_Kind {
+	for kind in standalone_activity.Standalone_Activity_Mutation_Kind {
 		state.count = 0
 		state.activity_mutation_seen = false
-		mutation_error := temporal_client.standalone_activity_mutation(
+		mutation_error := standalone_activity.standalone_activity_mutation(
 			&handle,
 			kind,
 			"caller reason",
@@ -14521,11 +14525,11 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 		for event, index in expected do testing.expect_value(t, state.events[index], event)
 	}
 
-	for kind in temporal_client.Standalone_Activity_Control_Kind {
+	for kind in standalone_activity.Standalone_Activity_Control_Kind {
 		if kind == .Invalid do continue
 		state.count = 0
 		state.activity_control_seen = false
-		control_error := temporal_client.standalone_activity_control(
+		control_error := standalone_activity.standalone_activity_control(
 			&handle,
 			kind,
 			{reason = "caller reason"},
@@ -14538,34 +14542,34 @@ client_standalone_activity_interceptors_cover_the_complete_slice :: proc(t: ^tes
 	}
 
 	state.count = 0
-	updated, update_error := temporal_client.update_standalone_activity_options(
+	updated, update_error := standalone_activity.update_standalone_activity_options(
 		&handle,
-		{update_mask = []string{temporal_client.Standalone_Activity_Option_Path_Task_Queue_Name}, task_queue = "caller-queue"},
+		{update_mask = []string{standalone_activity.Standalone_Activity_Option_Path_Task_Queue_Name}, task_queue = "caller-queue"},
 	)
 	testing.expect(t, update_error.message == nil)
 	testing.expect_value(t, updated.task_queue, "intercepted-result")
-	temporal_client.standalone_activity_options_free(&updated)
+	standalone_activity.standalone_activity_options_free(&updated)
 	temporal_client.error_free(&update_error)
 	testing.expect(t, state.activity_options_seen)
 	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
 	state.count = 0
-	page, list_error := temporal_client.list_standalone_activities(
+	page, list_error := standalone_activity.list_standalone_activities(
 		&client,
 		{page_size = 5, query = `ActivityId = "caller"`},
 	)
-	temporal_client.standalone_activity_list_page_free(&page)
+	standalone_activity.standalone_activity_list_page_free(&page)
 	testing.expect_value(t, string(list_error.message), "standalone Activity list short circuit")
 	temporal_client.error_free(&list_error)
 	testing.expect(t, state.activity_list_seen)
 	for event, index in expected do testing.expect_value(t, state.events[index], event)
 
 	state.count = 0
-	count, count_error := temporal_client.count_standalone_activities(
+	count, count_error := standalone_activity.count_standalone_activities(
 		&client,
 		`ActivityStatus = "Completed"`,
 	)
-	temporal_client.standalone_activity_count_free(&count)
+	standalone_activity.standalone_activity_count_free(&count)
 	testing.expect_value(t, string(count_error.message), "standalone Activity count short circuit")
 	temporal_client.error_free(&count_error)
 	testing.expect(t, state.activity_count_seen)
@@ -30776,7 +30780,7 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 	summary_error := temporal_client.start_metadata_set_static_summary(&start_metadata, "Charge order")
 	testing.expect(t, summary_error.message == nil)
 	temporal_client.error_free(&summary_error)
-	on_conflict := temporal_client.Standalone_Activity_On_Conflict_Options{
+	on_conflict := standalone_activity.Standalone_Activity_On_Conflict_Options{
 		attach_request_id = true,
 		attach_completion_callbacks = true,
 		attach_links = true,
@@ -30789,7 +30793,7 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 		url = "https://callbacks.invalid/activity",
 		headers = []temporal_client.Nexus_Callback_Header{{key = "callback-key", value = "callback-value"}},
 	}}
-	request_bytes, request_error := temporal_client.encode_start_standalone_activity_request(
+	request_bytes, request_error := standalone_activity.encode_start_standalone_activity_request(
 		"orders",
 		"odin-client",
 		codec.payload_view(&input),
@@ -30861,7 +30865,7 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 	}
 	virtual.arena_destroy(&decode_arena)
 
-	invalid_bytes, invalid_error := temporal_client.encode_start_standalone_activity_request(
+	invalid_bytes, invalid_error := standalone_activity.encode_start_standalone_activity_request(
 		"orders",
 		"odin-client",
 		codec.payload_view(&input),
@@ -30885,9 +30889,9 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 		outcome = &outcome,
 	}
 	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&response)
-	result, empty, poll_error := temporal_client.decode_standalone_activity_poll_response(response_bytes[:])
+	result, empty, poll_error := standalone_activity.decode_standalone_activity_poll_response(response_bytes[:])
 	delete(response_bytes)
-	defer temporal_client.standalone_activity_poll_result_free(&result)
+	defer standalone_activity.standalone_activity_poll_result_free(&result)
 	defer temporal_client.error_free(&poll_error)
 	testing.expect(t, poll_error.message == nil && !empty && result.has_result)
 	testing.expect_value(t, result.run_id, "run-1")
@@ -30910,9 +30914,9 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 		outcome = &failure_outcome,
 	}
 	failure_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&failure_response)
-	failed_result, failed_empty, activity_error := temporal_client.decode_standalone_activity_poll_response(failure_bytes[:])
+	failed_result, failed_empty, activity_error := standalone_activity.decode_standalone_activity_poll_response(failure_bytes[:])
 	delete(failure_bytes)
-	defer temporal_client.standalone_activity_poll_result_free(&failed_result)
+	defer standalone_activity.standalone_activity_poll_result_free(&failed_result)
 	defer temporal_client.error_free(&activity_error)
 	testing.expect(t, !failed_empty)
 	testing.expect_value(t, activity_error.kind, temporal_client.Error_Kind.Standalone_Activity_Canceled)
@@ -30920,16 +30924,16 @@ standalone_activity_client_encodes_start_and_owns_poll_outcomes :: proc(t: ^test
 
 	empty_response := proto.Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse{}
 	empty_bytes := proto.encode_Temporal_Api_Workflowservice_V1_PollActivityExecutionResponse(&empty_response)
-	empty_result, is_empty, empty_error := temporal_client.decode_standalone_activity_poll_response(empty_bytes[:])
+	empty_result, is_empty, empty_error := standalone_activity.decode_standalone_activity_poll_response(empty_bytes[:])
 	delete(empty_bytes)
-	defer temporal_client.standalone_activity_poll_result_free(&empty_result)
+	defer standalone_activity.standalone_activity_poll_result_free(&empty_result)
 	defer temporal_client.error_free(&empty_error)
 	testing.expect(t, is_empty && empty_error.message == nil)
 }
 
 @(test)
 standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^testing.T) {
-	pause_bytes, pause_error := temporal_client.encode_standalone_activity_control_request(
+	pause_bytes, pause_error := standalone_activity.encode_standalone_activity_control_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -30941,7 +30945,7 @@ standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^te
 	defer temporal_client.error_free(&pause_error)
 	testing.expect(t, pause_error.message == nil)
 
-	unpause_bytes, unpause_error := temporal_client.encode_standalone_activity_control_request(
+	unpause_bytes, unpause_error := standalone_activity.encode_standalone_activity_control_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -30953,7 +30957,7 @@ standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^te
 	defer temporal_client.error_free(&unpause_error)
 	testing.expect(t, unpause_error.message == nil)
 
-	reset_bytes, reset_error := temporal_client.encode_standalone_activity_control_request(
+	reset_bytes, reset_error := standalone_activity.encode_standalone_activity_control_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -30998,7 +31002,7 @@ standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^te
 	testing.expect(t, reset.restore_original_options)
 	testing.expect(t, reset.reset_heartbeat)
 
-	invalid_bytes, invalid_error := temporal_client.encode_standalone_activity_control_request(
+	invalid_bytes, invalid_error := standalone_activity.encode_standalone_activity_control_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31015,10 +31019,10 @@ standalone_activity_control_requests_match_upstream_wire_contract :: proc(t: ^te
 @(test)
 standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 	paths := [?]string{
-		temporal_client.Standalone_Activity_Option_Path_Task_Queue_Name,
-		temporal_client.Standalone_Activity_Option_Path_Start_To_Close_Timeout,
-		temporal_client.Standalone_Activity_Option_Path_Retry_Policy,
-		temporal_client.Standalone_Activity_Option_Path_Priority,
+		standalone_activity.Standalone_Activity_Option_Path_Task_Queue_Name,
+		standalone_activity.Standalone_Activity_Option_Path_Start_To_Close_Timeout,
+		standalone_activity.Standalone_Activity_Option_Path_Retry_Policy,
+		standalone_activity.Standalone_Activity_Option_Path_Priority,
 	}
 	retry := temporal_client.Retry_Policy{
 		initial_interval = time.Second,
@@ -31032,7 +31036,7 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 		fairness_key = "customer-42",
 		fairness_weight = 1.5,
 	}
-	request_bytes, request_error := temporal_client.encode_update_standalone_activity_options_request(
+	request_bytes, request_error := standalone_activity.encode_update_standalone_activity_options_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31100,20 +31104,20 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 		activity_options = &options_proto,
 	}
 	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_UpdateActivityExecutionOptionsResponse(&response)
-	owned, response_error := temporal_client.decode_update_standalone_activity_options_response(response_bytes[:])
+	owned, response_error := standalone_activity.decode_update_standalone_activity_options_response(response_bytes[:])
 	owned_arena: virtual.Arena
 	testing.expect(t, virtual.arena_init_growing(&owned_arena) == nil)
-	arena_owned, arena_error := temporal_client.decode_update_standalone_activity_options_response(
+	arena_owned, arena_error := standalone_activity.decode_update_standalone_activity_options_response(
 		response_bytes[:],
 		virtual.arena_allocator(&owned_arena),
 	)
 	testing.expect(t, arena_error.message == nil)
 	testing.expect_value(t, arena_owned.priority.fairness_key, "customer-42")
-	temporal_client.standalone_activity_options_free(&arena_owned)
+	standalone_activity.standalone_activity_options_free(&arena_owned)
 	temporal_client.error_free(&arena_error)
 	virtual.arena_destroy(&owned_arena)
 	delete(response_bytes)
-	defer temporal_client.standalone_activity_options_free(&owned)
+	defer standalone_activity.standalone_activity_options_free(&owned)
 	defer temporal_client.error_free(&response_error)
 	testing.expect(t, response_error.message == nil)
 	testing.expect_value(t, owned.task_queue, "priority-payments")
@@ -31125,7 +31129,7 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 	testing.expect_value(t, owned.priority.fairness_key, "customer-42")
 
 	duplicate_paths := [?]string{"priority", "priority"}
-	invalid_bytes, invalid_error := temporal_client.encode_update_standalone_activity_options_request(
+	invalid_bytes, invalid_error := standalone_activity.encode_update_standalone_activity_options_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31137,10 +31141,10 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 	temporal_client.error_free(&invalid_error)
 
 	leaf_paths := [?]string{
-		temporal_client.Standalone_Activity_Option_Path_Retry_Maximum_Attempts,
-		temporal_client.Standalone_Activity_Option_Path_Priority_Fairness_Weight,
+		standalone_activity.Standalone_Activity_Option_Path_Retry_Maximum_Attempts,
+		standalone_activity.Standalone_Activity_Option_Path_Priority_Fairness_Weight,
 	}
-	leaf_bytes, leaf_error := temporal_client.encode_update_standalone_activity_options_request(
+	leaf_bytes, leaf_error := standalone_activity.encode_update_standalone_activity_options_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31176,7 +31180,7 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 	}
 	virtual.arena_destroy(&leaf_arena)
 
-	restore_bytes, restore_error := temporal_client.encode_update_standalone_activity_options_request(
+	restore_bytes, restore_error := standalone_activity.encode_update_standalone_activity_options_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31200,7 +31204,7 @@ standalone_activity_options_update_is_masked_and_owned :: proc(t: ^testing.T) {
 	virtual.arena_destroy(&restore_arena)
 
 	legacy_task_queue_path := [?]string{"task_queue"}
-	legacy_bytes, legacy_error := temporal_client.encode_update_standalone_activity_options_request(
+	legacy_bytes, legacy_error := standalone_activity.encode_update_standalone_activity_options_request(
 		"orders",
 		"odin-client",
 		"activity-42",
@@ -31341,15 +31345,15 @@ standalone_activity_description_and_visibility_own_decoded_data :: proc(t: ^test
 	append(&response.callbacks, activity_callback)
 	defer delete(response.callbacks)
 	response_bytes := proto.encode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse(&response)
-	description, description_error := temporal_client.decode_standalone_activity_description(response_bytes[:])
+	description, description_error := standalone_activity.decode_standalone_activity_description(response_bytes[:])
 	delete(response_bytes)
-	defer temporal_client.standalone_activity_description_free(&description)
+	defer standalone_activity.standalone_activity_description_free(&description)
 	defer temporal_client.error_free(&description_error)
 	testing.expectf(t, description_error.message == nil, "Activity Describe decode failed: %s", string(description_error.message))
 	testing.expect_value(t, description.activity_id, "activity-42")
 	testing.expect_value(t, description.run_id, "activity-run")
 	testing.expect_value(t, description.activity_type, "charge-card")
-	testing.expect_value(t, description.status, temporal_client.Standalone_Activity_Status.Completed)
+	testing.expect_value(t, description.status, standalone_activity.Standalone_Activity_Status.Completed)
 	testing.expect_value(t, description.run_state, temporal_client.Pending_Activity_State.Started)
 	testing.expect(t, description.has_retry_policy)
 	testing.expect_value(t, len(description.retry_policy.non_retryable_error_types), 1)
@@ -31386,15 +31390,15 @@ standalone_activity_description_and_visibility_own_decoded_data :: proc(t: ^test
 	append(&list_response.executions, list_info)
 	list_bytes := proto.encode_Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse(&list_response)
 	delete(list_response.executions)
-	page, page_error := temporal_client.decode_standalone_activity_list_page(list_bytes[:])
+	page, page_error := standalone_activity.decode_standalone_activity_list_page(list_bytes[:])
 	delete(list_bytes)
-	defer temporal_client.standalone_activity_list_page_free(&page)
+	defer standalone_activity.standalone_activity_list_page_free(&page)
 	defer temporal_client.error_free(&page_error)
 	testing.expect(t, page_error.message == nil)
 	testing.expect_value(t, len(page.activities), 1)
 	if len(page.activities) == 1 {
 		testing.expect_value(t, page.activities[0].activity_id, "activity-42")
-		testing.expect_value(t, page.activities[0].status, temporal_client.Standalone_Activity_Status.Completed)
+		testing.expect_value(t, page.activities[0].status, standalone_activity.Standalone_Activity_Status.Completed)
 		testing.expect_value(t, len(page.activities[0].search_attributes), 1)
 	}
 	testing.expect(t, bytes.equal(page.next_page_token, []u8{4, 5, 6}))
@@ -31407,9 +31411,9 @@ standalone_activity_description_and_visibility_own_decoded_data :: proc(t: ^test
 	count_bytes := proto.encode_Temporal_Api_Workflowservice_V1_CountActivityExecutionsResponse(&count_response)
 	delete(group.group_values)
 	delete(count_response.groups)
-	count, count_error := temporal_client.decode_standalone_activity_count(count_bytes[:])
+	count, count_error := standalone_activity.decode_standalone_activity_count(count_bytes[:])
 	delete(count_bytes)
-	defer temporal_client.standalone_activity_count_free(&count)
+	defer standalone_activity.standalone_activity_count_free(&count)
 	defer temporal_client.error_free(&count_error)
 	testing.expect(t, count_error.message == nil)
 	testing.expect_value(t, count.count, i64(1))
@@ -31440,9 +31444,9 @@ standalone_activity_decode_errors_release_partial_ownership :: proc(t: ^testing.
 		info = &info,
 	}
 	encoded := proto.encode_Temporal_Api_Workflowservice_V1_DescribeActivityExecutionResponse(&response)
-	description, description_error := temporal_client.decode_standalone_activity_description(encoded[:])
+	description, description_error := standalone_activity.decode_standalone_activity_description(encoded[:])
 	delete(encoded)
-	defer temporal_client.standalone_activity_description_free(&description)
+	defer standalone_activity.standalone_activity_description_free(&description)
 	defer temporal_client.error_free(&description_error)
 	testing.expect(t, description_error.message != nil)
 	testing.expect_value(t, len(description.activity_id), 0)
@@ -31465,9 +31469,9 @@ standalone_activity_decode_errors_release_partial_ownership :: proc(t: ^testing.
 	append(&list_response.executions, valid, invalid)
 	list_bytes := proto.encode_Temporal_Api_Workflowservice_V1_ListActivityExecutionsResponse(&list_response)
 	delete(list_response.executions)
-	page, page_error := temporal_client.decode_standalone_activity_list_page(list_bytes[:])
+	page, page_error := standalone_activity.decode_standalone_activity_list_page(list_bytes[:])
 	delete(list_bytes)
-	defer temporal_client.standalone_activity_list_page_free(&page)
+	defer standalone_activity.standalone_activity_list_page_free(&page)
 	defer temporal_client.error_free(&page_error)
 	testing.expect(t, page_error.message != nil)
 	testing.expect_value(t, len(page.activities), 0)

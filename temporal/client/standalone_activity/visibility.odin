@@ -1,11 +1,12 @@
-package client
+package standalone_activity
 
 import "core:bytes"
 import "core:mem"
 import "core:mem/virtual"
-import codec "../codec"
-import temporal_core "../core"
-import proto "../core/proto"
+import client ".."
+import codec "../../codec"
+import temporal_core "../../core"
+import proto "../../core/proto"
 
 List_Standalone_Activities_Options :: struct {
 	page_size:       i32,
@@ -260,7 +261,7 @@ list_standalone_activities :: proc(
 		options = options,
 		allocator = allocator,
 	}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_list_standalone_activities_chain(&state, &input)
 }
 
@@ -302,6 +303,21 @@ count_standalone_activities :: proc(
 		query = query,
 		allocator = allocator,
 	}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_count_standalone_activities_chain(&state, &input)
+}
+
+// probe_support safely checks the optional standalone Activity RPC family
+// without making the base Client package depend on this extension.
+probe_support :: proc(
+	temporal_client: ^Client,
+) -> (client.Server_Feature_Observation, Error) {
+	count, probe_error := count_standalone_activities(temporal_client)
+	standalone_activity_count_free(&count)
+	observation := client.server_feature_from_rpc_error(.Standalone_Activity, &probe_error)
+	if observation.support == .Unsupported {
+		client.error_free(&probe_error)
+		return observation, {}
+	}
+	return observation, probe_error
 }

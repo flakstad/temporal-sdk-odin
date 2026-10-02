@@ -1,4 +1,4 @@
-package client
+package standalone_activity
 
 import allocator_runtime "base:runtime"
 import "core:bytes"
@@ -8,9 +8,54 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
 import "core:time"
-import codec "../codec"
-import temporal_core "../core"
-import proto "../core/proto"
+import client ".."
+import codec "../../codec"
+import temporal_core "../../core"
+import proto "../../core/proto"
+
+Client :: client.Client
+Client_Cancellation_Token :: client.Client_Cancellation_Token
+Error :: client.Error
+Error_Kind :: client.Error_Kind
+Link :: client.Link
+Named_Payload :: client.Named_Payload
+Nexus_Completion_Callback :: client.Nexus_Completion_Callback
+Optional_Duration :: client.Optional_Duration
+Optional_Time :: client.Optional_Time
+Pending_Activity_State :: client.Pending_Activity_State
+Priority :: client.Priority
+Retry_Policy :: client.Retry_Policy
+Standalone_Activity_Options :: client.Standalone_Activity_Options
+Start_Metadata :: client.Start_Metadata
+Workflow_Priority :: client.Workflow_Priority
+
+client_request_identity :: client.client_request_identity
+description_clone_named_payload :: client.description_clone_named_payload
+description_clone_payload :: client.description_clone_payload
+description_clone_string :: client.description_clone_string
+description_decode_user_metadata_string :: client.description_decode_user_metadata_string
+description_duration :: client.description_duration
+description_failure_message :: client.description_failure_message
+description_priority :: client.description_priority
+description_time :: client.description_time
+duration_proto :: client.duration_proto
+encode_link :: client.encode_link
+encoded_link_storage_free :: client.encoded_link_storage_free
+encoded_link_storage_make :: client.encoded_link_storage_make
+error_free :: client.error_free
+error_from_core :: client.error_from_core
+error_from_string :: client.error_from_string
+free_start_proto_payloads :: client.free_start_proto_payloads
+link_error :: client.link_error
+link_free :: client.link_free
+link_from_proto :: client.link_from_proto
+request_identity :: client.request_identity
+resolve_request_id :: client.resolve_request_id
+standalone_activity_options_free :: client.standalone_activity_options_free
+standalone_activity_clone_retry_policy :: client.standalone_activity_clone_retry_policy
+clone_activity_options :: client.clone_activity_options
+update_poll_failure_is_timeout :: client.update_poll_failure_is_timeout
+workflow_event_link_error :: client.workflow_event_link_error
 
 Standalone_Activity_Id_Reuse_Policy :: enum {
 	Unspecified,
@@ -603,7 +648,7 @@ start_standalone_activity_payload :: proc(
 		input = input,
 		options = options,
 	}
-	state := Client_Interceptor_State{client = client}
+	state := client_interceptor_state(client)
 	return client_start_standalone_activity_chain(&state, &interceptor_input)
 }
 
@@ -765,28 +810,6 @@ standalone_activity_clone_payloads :: proc(
 		append(target, owned)
 	}
 	return true
-}
-
-standalone_activity_clone_retry_policy :: proc(
-	source: ^proto.Temporal_Api_Common_V1_RetryPolicy,
-	allocator: mem.Allocator,
-) -> (policy: Retry_Policy, present, ok: bool) {
-	if source == nil do return {}, false, true
-	policy.initial_interval = description_duration(source.initial_interval).value
-	policy.backoff_coefficient = source.backoff_coefficient
-	policy.maximum_interval = description_duration(source.maximum_interval).value
-	policy.maximum_attempts = source.maximum_attempts
-	policy.non_retryable_error_types = make([]string, len(source.non_retryable_error_types), allocator)
-	for value, index in source.non_retryable_error_types {
-		owned, cloned := description_clone_string(value, allocator)
-		if !cloned {
-			for existing in policy.non_retryable_error_types[:index] do delete(existing, allocator)
-			delete(policy.non_retryable_error_types, allocator)
-			return {}, true, false
-		}
-		policy.non_retryable_error_types[index] = owned
-	}
-	return policy, true, true
 }
 
 decode_standalone_activity_description :: proc(
@@ -1124,7 +1147,7 @@ describe_standalone_activity :: proc(
 		options = options,
 		allocator = allocator,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_describe_standalone_activity_chain(&state, &interceptor_input)
 }
 
@@ -1209,7 +1232,7 @@ poll_standalone_activity :: proc(
 		handle = handle,
 		options = options,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_poll_standalone_activity_chain(&state, &interceptor_input)
 }
 
@@ -1347,7 +1370,7 @@ standalone_activity_mutation :: proc(
 		reason = reason,
 		request_id = request_id,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_standalone_activity_mutation_chain(&state, &input)
 }
 

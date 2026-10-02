@@ -494,10 +494,7 @@ probe API combines the Odin SDK surface with either authoritative System Info
 evidence or a non-mutating RPC probe:
 
 ```odin
-observed, err := temporal_client.probe_server_feature(
-    &client,
-    .Standalone_Nexus,
-)
+observed, err := standalone_activity.probe_support(&client)
 fmt.println(observed.sdk_implemented)
 fmt.println(observed.support) // Supported, Unsupported, or Unknown
 fmt.println(observed.evidence)
@@ -507,11 +504,11 @@ Only gRPC status 12/`UNIMPLEMENTED` is classified as `Unsupported`. Permission,
 namespace, authentication, and transport failures remain `Unknown` and are
 returned to the caller. A false System Info bit is also `Unknown`, because the
 feature may merely be disabled. The default probes never mutate server state;
-Workflow Pause therefore remains unknown. Standalone Activity reports
-`sdk_implemented=true` because the complete pinned lifecycle exists, while
-server support remains `Unknown`: proving it would require a mutating Start and
-the Service exposes no authoritative capability bit. No result is inferred
-from a parsed server version.
+Workflow Pause therefore remains unknown. Optional RPC families own their safe
+probes: `schedule.probe_count_support`, `standalone_nexus.probe_support`, and
+`standalone_activity.probe_support`. The generic base probe remains unknown for
+those features rather than importing their implementation packages. No result
+is inferred from a parsed server version.
 
 `activity.info(ctx)`
 now exposes the Core-delivered execution
@@ -851,11 +848,9 @@ outbound surface wraps Workflow start, Signal-With-Start,
 Update-With-Start, Signal, Query, Workflow result waiting, Update start/result
 waiting, cancellation,
 termination, exact-run deletion, and Workflow
-Visibility list/count, and standalone Activity start/poll/describe,
-cancel/terminate/delete, pause/unpause/reset/options update and list/count.
-Schedule and standalone Nexus install
-separate typed chains through `schedule.add_interceptor` and
-`standalone_nexus.add_interceptor`; each
+Visibility list/count. Schedule, standalone Nexus, and standalone Activity
+install separate typed chains through the corresponding extension's
+`add_interceptor`; each
 operation has its own input, result, and `next` type. Schedule Create has a
 handle-returning continuation; Update, Backfill, Pause, Unpause, Trigger, and
 Delete share a typed mutation family distinguished by `Schedule_Mutation_Kind`.
@@ -2577,6 +2572,7 @@ temporal/client/          stable-core Client and Workflow handle APIs
 temporal/client/workflow_control optional Pause/Unpause operations and interceptors
 temporal/client/schedule  optional Schedule lifecycle and typed interceptors
 temporal/client/standalone_nexus optional standalone Nexus Client lifecycle
+temporal/client/standalone_activity optional standalone Activity Client lifecycle
 temporal/failure/         owned recursive Temporal Failure model
 examples/sdk_hello_activity/ top-level Client/Worker lifecycle facade
 examples/core_connect/    Odin -> Core -> Temporal proof

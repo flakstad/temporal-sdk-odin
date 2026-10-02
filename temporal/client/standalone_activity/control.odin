@@ -1,9 +1,9 @@
-package client
+package standalone_activity
 
 import "core:encoding/uuid"
 import "core:fmt"
-import temporal_core "../core"
-import proto "../core/proto"
+import temporal_core "../../core"
+import proto "../../core/proto"
 
 // encode_standalone_activity_control_request exposes the exact wire boundary
 // for Pause/Unpause/Reset tests. The caller owns the returned bytes.
@@ -121,7 +121,7 @@ standalone_activity_control :: proc(
 		kind = kind,
 		options = options,
 	}
-	state := Client_Interceptor_State{client = handle.client}
+	state := client_interceptor_state(handle.client)
 	return client_standalone_activity_control_chain(&state, &input)
 }
 

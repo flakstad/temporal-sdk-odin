@@ -2027,6 +2027,15 @@ Policy/Priority values and must be released with
 `standalone_activity_options_free`. This completes the four newer standalone
 Activity request/response pairs in the pinned API.
 
+The lifecycle and its typed outbound interceptors live in the optional
+`temporal/client/standalone_activity` package. Register them with
+`standalone_activity.add_interceptor` after connecting and before concurrent
+Client use. The base Client owns the opaque extension state until close, but
+does not import the optional package. The shared normalized Activity-options
+snapshot remains in the base package because Workflow Describe returns it too.
+`standalone_activity.probe_support` uses the non-mutating count RPC; the generic
+base probe deliberately reports unknown rather than importing the extension.
+
 It also runs an opt-in standalone Nexus capability probe:
 
 ```bash
@@ -2952,11 +2961,11 @@ metadata, external details, headers, and deterministic request bytes.
 for Workflow start, Signal-With-Start, Signal, Query, Update start/result waiting,
 cancellation, termination, deletion, Workflow result waiting, Visibility
 list/count, and System Info discovery. The optional
-`temporal/client/schedule` and `temporal/client/standalone_nexus` packages
-install their own ordered interceptor chains with `schedule.add_interceptor`
-and `standalone_nexus.add_interceptor`. Their owned chain state uses the base
-Client extension lifecycle without making the base package import either
-feature. Each operation has a dedicated
+`temporal/client/schedule`, `temporal/client/standalone_nexus`, and
+`temporal/client/standalone_activity` packages install their own ordered
+interceptor chains with the corresponding package's `add_interceptor`
+procedure. Their owned chain state uses the base Client extension lifecycle
+without making the base package import an optional feature. Each operation has a dedicated
 mutable input and result-bearing `next`; no result passes through an untyped
 pointer. Visibility and Schedule list/count interceptors may replace query and
 pagination options. Schedule matching-time interceptors may replace the time
