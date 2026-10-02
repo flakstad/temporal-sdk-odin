@@ -542,7 +542,9 @@ temporal server start-dev --headless
 
 It uses one custom permit with multiple Core pollers, completes an Activity,
 and requires queued reservation, cancellation, mark-used, release, and free
-callbacks to drain without leaked permits.
+callbacks to drain without leaked permits. The focused proof and every Activity
+case in the full integration matrix use a unique task queue, so a stale task or
+poller from another case cannot satisfy or perturb the supplier assertions.
 
 A 1,000-case PBT property generates partial and complete callback tables plus
 resource-tuner combinations, proving that incomplete or conflicting policies
@@ -1733,6 +1735,11 @@ It checks for a healthy service on `localhost:7233`. If none exists, it starts:
 ```bash
 temporal server start-dev --headless --log-level error
 ```
+
+The Nexus application-metric probe distinguishes an exporter that never
+started from counters that have not yet reached their expected values. It waits
+within the scenario's 60-second Workflow timeout because retries, operation
+timeouts, async completion, and cancellation all precede the final sample.
 
 It first builds and runs `examples/core_connect`, which performs:
 

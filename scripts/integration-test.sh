@@ -21,6 +21,7 @@ slow_update_output_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-slow-update
 unknown_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-unknown-history.XXXXXX")"
 typed_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-typed-history.XXXXXX")"
 replay_history_file="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-replay-history.XXXXXX")"
+client_control_log="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-client-control.XXXXXX")"
 
 cleanup() {
   if [[ -n "$nexus_endpoint_name" ]]; then
@@ -90,7 +91,9 @@ cleanup() {
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
   fi
-  rm -f "$workflow_output_file" "$workflow_control_output_file" "$slow_update_output_file" "$unknown_history_file" "$typed_history_file" "$replay_history_file"
+  rm -f "$workflow_output_file" "$workflow_control_output_file" \
+    "$slow_update_output_file" "$unknown_history_file" "$typed_history_file" \
+    "$replay_history_file" "$client_control_log"
 }
 trap cleanup EXIT INT TERM
 
@@ -175,9 +178,15 @@ NEXUS_ENDPOINT="$nexus_endpoint_name" \
   "$repo_root/scripts/run-hello-nexus-workflow.sh" >"$workflow_output_file" 2>&1 &
 worker_pid=$!
 nexus_metrics_scraped=false
-for _ in {1..100}; do
+nexus_metrics_http_ready=false
+# The Nexus scenario deliberately covers retries, timeouts, async completion,
+# and cancellation before the second handler sample is recorded. Under a busy
+# development machine this can take materially longer than ten seconds, while
+# the Workflow itself has a 60-second execution timeout.
+for _ in {1..600}; do
   if curl -fsS "http://${nexus_metrics_address}/metrics" \
     >"$workflow_control_output_file" 2>/dev/null; then
+    nexus_metrics_http_ready=true
     if grep -Eq '^odin_nexus_handler_calls_total\{.*\} 2(\.0)?$' \
       "$workflow_control_output_file" && \
       grep -Eq '^odin_nexus_cancel_handler_calls_total\{.*\} 1(\.0)?$' \
@@ -194,7 +203,14 @@ for _ in {1..100}; do
   sleep 0.1
 done
 if [[ "$nexus_metrics_scraped" != true ]]; then
-  echo "Nexus application metric endpoint did not become ready at $nexus_metrics_address" >&2
+  if [[ "$nexus_metrics_http_ready" == true ]]; then
+    echo "Nexus application metrics did not reach their expected values at $nexus_metrics_address" >&2
+    grep -E '^odin_nexus_(cancel_)?handler_calls_total' \
+      "$workflow_control_output_file" >&2 || true
+  else
+    echo "Nexus application metric endpoint did not become ready at $nexus_metrics_address" >&2
+  fi
+  cat "$workflow_output_file" >&2
   exit 1
 fi
 nexus_metric_line="$(grep '^odin_nexus_handler_calls_total{' "$workflow_control_output_file")"
@@ -1072,32 +1088,39 @@ grep -q "signal won the durable timer race and replay reproduced timer cancellat
 run_activity_case() {
   local mode="$1"
   local activity_workflow_id=""
+  local activity_task_queue="odin-hello-activity-${mode}-$$-$(date +%s%N)"
   if [[ "$mode" == async-* ]]; then
     activity_workflow_id="odin-sdk-${mode}-$$-$(date +%s%N)"
   fi
   if [[ "$mode" == "retry" ]]; then
     ACTIVITY_EXPECT_RETRY=1 \
+      TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == async-* ]]; then
     ACTIVITY_EXPECT_ASYNC=1 \
       ACTIVITY_ASYNC_MODE="${mode#async-}" \
+      TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == "resource-tuner" ]]; then
     ACTIVITY_RESOURCE_TUNER=1 \
+      TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == "custom-slot-supplier" ]]; then
     ACTIVITY_CUSTOM_SLOT_SUPPLIER=1 \
+      TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   elif [[ "$mode" == "uncooperative" ]]; then
     ACTIVITY_EXPECT_UNCOOPERATIVE=1 \
+      TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
       TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   else
-    TEMPORAL_ODIN_SKIP_BUILD=1 \
+    TEMPORAL_ODIN_TASK_QUEUE="$activity_task_queue" \
+      TEMPORAL_ODIN_SKIP_BUILD=1 \
       "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
   fi
   worker_pid=$!
@@ -1119,34 +1142,48 @@ run_activity_case() {
   fi
 
   if [[ "$mode" == "failure" ]]; then
-    ACTIVITY_EXPECT_FAILURE=1 cargo run --quiet \
+    ACTIVITY_EXPECT_FAILURE=1 \
+      TEMPORAL_TASK_QUEUE="$activity_task_queue" \
+      cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   elif [[ "$mode" == "typed" ]]; then
-    ACTIVITY_TYPED=1 cargo run --quiet \
+    ACTIVITY_TYPED=1 \
+      TEMPORAL_TASK_QUEUE="$activity_task_queue" \
+      cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   elif [[ "$mode" == "retry" ]]; then
-    ACTIVITY_RETRY=1 cargo run --quiet \
+    ACTIVITY_RETRY=1 \
+      TEMPORAL_TASK_QUEUE="$activity_task_queue" \
+      cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   elif [[ "$mode" == async-* ]]; then
     ACTIVITY_ASYNC_MODE="${mode#async-}" \
       ACTIVITY_WORKFLOW_ID="$activity_workflow_id" \
+      TEMPORAL_TASK_QUEUE="$activity_task_queue" \
       cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   elif [[ "$mode" == "uncooperative" ]]; then
-    ACTIVITY_INPUT=uncooperative-drain cargo run --quiet \
+    ACTIVITY_INPUT=uncooperative-drain \
+      TEMPORAL_TASK_QUEUE="$activity_task_queue" \
+      cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   else
-    cargo run --quiet \
+    TEMPORAL_TASK_QUEUE="$activity_task_queue" cargo run --quiet \
       --manifest-path "$repo_root/native/Cargo.toml" \
       --package activity-test-driver
   fi
 
-  wait "$worker_pid"
+  if ! wait "$worker_pid"; then
+    worker_pid=""
+    echo "Odin Activity Worker failed after polling mode=$mode queue=$activity_task_queue" >&2
+    cat "$worker_log" >&2
+    exit 1
+  fi
   worker_pid=""
   cat "$worker_log"
   if [[ "$mode" == "retry" ]]; then

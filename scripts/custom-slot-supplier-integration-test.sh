@@ -7,6 +7,7 @@ worker_binary="$lib_dir/temporal-odin-hello-activity"
 worker_log="$(mktemp "${TMPDIR:-/tmp}/temporal-sdk-odin-custom-slot.XXXXXX")"
 worker_pid=""
 odin_thread_count="${ODIN_THREAD_COUNT:-1}"
+task_queue="odin-custom-slot-$$-$(date +%s%N)"
 
 cleanup() {
   if [[ -n "$worker_pid" ]]; then
@@ -38,7 +39,8 @@ elif [[ ! -x "$worker_binary" ]]; then
 fi
 
 ACTIVITY_CUSTOM_SLOT_SUPPLIER=1 \
-TEMPORAL_ODIN_SKIP_BUILD=1 \
+TEMPORAL_ODIN_TASK_QUEUE="$task_queue" \
+  TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/run-hello-activity.sh" >"$worker_log" 2>&1 &
 worker_pid=$!
 
@@ -61,7 +63,7 @@ if ! grep -q "is polling task queue" "$worker_log" 2>/dev/null; then
   exit 1
 fi
 
-cargo run --quiet \
+TEMPORAL_TASK_QUEUE="$task_queue" cargo run --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
   --package activity-test-driver
 
