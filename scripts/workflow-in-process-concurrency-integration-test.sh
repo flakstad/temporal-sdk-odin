@@ -73,7 +73,7 @@ run_probe() {
   fi
 
   grep -q 'In-process Workflow concurrency proved' <<<"$output"
-  grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([4-9]|[1-9][0-9]+) cancellations=1 canceled_timers=1 signals=2 handlers=2 replay_activations=([0-9]+) owned_peak=([2-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) callback_peak=([2-9]|[1-9][0-9]+) migrations=0 nondeterminism=(true|false)' <<<"$output"
+  grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([4-9]|[1-9][0-9]+) cancellations=1 canceled_timers=1 signals=3 signal_handlers=3 updates=1 replay_activations=([0-9]+) owned_peak=([2-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) callback_peak=([2-9]|[1-9][0-9]+) migrations=0 nondeterminism=(true|false)' <<<"$output"
   if [[ "$force_replay" == "1" ]]; then
     grep -Eq 'replay_activations=([1-9][0-9]*)' <<<"$output"
     grep -q 'nondeterminism=true' <<<"$output"

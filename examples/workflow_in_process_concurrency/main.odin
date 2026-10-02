@@ -17,6 +17,7 @@ UNKNOWN_WORKFLOW_TYPE :: "in_process_unknown_probe"
 CANCELLATION_WORKFLOW_TYPE :: "in_process_cancellation_probe"
 NONDETERMINISM_WORKFLOW_TYPE :: "in_process_nondeterminism_probe"
 SIGNAL_HANDLER_WORKFLOW_TYPE :: "in_process_signal_handler_probe"
+ASYNC_HANDLER_WORKFLOW_TYPE :: "in_process_async_handler_probe"
 CANCELLATION_REASON :: "affine scheduler cancellation probe"
 
 Probe_State :: struct {
@@ -134,6 +135,90 @@ signal_handler_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string 
 	return fmt.aprintf("signals:%d", state.value)
 }
 
+Async_Handler_State :: struct {
+	owner_thread:  int,
+	active:        int,
+	peak:          int,
+	signal_value:  int,
+	update_value:  int,
+	signal_done:   bool,
+	update_done:   bool,
+}
+
+async_handler_enter :: proc(state: ^Async_Handler_State) {
+	if sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+	state.active += 1
+	state.peak = max(state.peak, state.active)
+}
+
+async_handler_leave :: proc(state: ^Async_Handler_State) {
+	if sync.current_thread_id() != state.owner_thread {
+		sync.mutex_lock(&probe_state.mutex)
+		probe_state.migrations += 1
+		sync.mutex_unlock(&probe_state.mutex)
+	}
+	state.active -= 1
+}
+
+async_signal_handler :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Async_Handler_State,
+	value: int,
+) {
+	async_handler_enter(state)
+	workflow.sleep(ctx, 2 * time.Second)
+	state.signal_value = value
+	state.signal_done = true
+	async_handler_leave(state)
+}
+
+async_update_handler :: proc(
+	ctx: ^workflow.Fiber_Context,
+	state: ^Async_Handler_State,
+	value: int,
+) -> int {
+	async_handler_enter(state)
+	workflow.sleep(ctx, 2 * time.Second)
+	state.update_value = value
+	state.update_done = true
+	async_handler_leave(state)
+	return value * 2
+}
+
+async_handlers_ready :: proc(state: ^Async_Handler_State) -> bool {
+	return state.signal_done && state.update_done
+}
+
+async_handler_probe :: proc(ctx: ^workflow.Fiber_Context, _: string) -> string {
+	state := Async_Handler_State{owner_thread = sync.current_thread_id()}
+	if !workflow.set_signal_routine_json(
+		ctx,
+		"async_signal",
+		&state,
+		async_signal_handler,
+	) || !workflow.set_update_routine_json(
+		ctx,
+		"async_update",
+		&state,
+		async_update_handler,
+	) {
+		return "asynchronous handler registration failed"
+	}
+	if !workflow.await_condition(ctx, &state, async_handlers_ready) {
+		return "asynchronous handler wait canceled"
+	}
+	workflow.await_all_handlers_finished(ctx)
+	return fmt.aprintf(
+		"async:%d:%d",
+		state.signal_value + state.update_value,
+		state.peak,
+	)
+}
+
 Concurrency_State :: struct {
 	client:                  ^temporal_client.Client,
 	sdk_worker:              ^worker.Worker,
@@ -152,16 +237,21 @@ Concurrency_State :: struct {
 	signal_handler_handle:  temporal_client.Workflow_Handle,
 	has_signal_handler_handle: bool,
 	signal_handler_closed:  bool,
+	async_handler_handle:   temporal_client.Workflow_Handle,
+	has_async_handler_handle: bool,
+	async_handler_closed:   bool,
 	watcher:                 ^thread.Thread,
 	start_error:             temporal_client.Error,
 	result_error:            temporal_client.Error,
 	cancel_error:            temporal_client.Error,
 	signal_error:            temporal_client.Error,
+	async_handler_error:     temporal_client.Error,
 	eviction_error:          worker.Error,
 	results_ok:              bool,
 	cancellation_ok:         bool,
 	nondeterminism_ok:       bool,
 	signal_handler_ok:      bool,
+	async_handler_ok:       bool,
 	force_replay:            bool,
 }
 
@@ -220,6 +310,62 @@ wait_for_results :: proc(state: ^Concurrency_State) {
 			worker.request_shutdown(state.sdk_worker)
 			return
 		}
+	}
+	async_update, async_update_start_error := temporal_client.start_update_json(
+		&state.async_handler_handle,
+		"async_update",
+		7,
+	)
+	if async_update_start_error.message != nil {
+		state.async_handler_error = async_update_start_error
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	async_signal_error := temporal_client.signal_workflow_json(
+		&state.async_handler_handle,
+		"async_signal",
+		5,
+	)
+	if async_signal_error.message != nil {
+		state.async_handler_error = async_signal_error
+		state.results_ok = false
+		temporal_client.update_handle_free(&async_update)
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	async_update_result: int
+	async_update_error := temporal_client.wait_update_json(
+		&async_update,
+		&async_update_result,
+	)
+	temporal_client.update_handle_free(&async_update)
+	if async_update_error.message != nil {
+		state.async_handler_error = async_update_error
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	async_workflow_result: string
+	async_workflow_error := temporal_client.get_result_json(
+		&state.async_handler_handle,
+		&async_workflow_result,
+	)
+	if async_workflow_error.message != nil {
+		state.async_handler_error = async_workflow_error
+		state.results_ok = false
+		delete(async_workflow_result)
+		worker.request_shutdown(state.sdk_worker)
+		return
+	}
+	state.async_handler_ok =
+		async_update_result == 14 && async_workflow_result == "async:12:2"
+	state.async_handler_closed = true
+	delete(async_workflow_result)
+	if !state.async_handler_ok {
+		state.results_ok = false
+		worker.request_shutdown(state.sdk_worker)
+		return
 	}
 	state.cancel_error = temporal_client.cancel_workflow(
 		&state.cancellation_handle,
@@ -384,6 +530,26 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 	if state.signal_error.message != nil {
 		return false
 	}
+	async_handler_id := fmt.aprintf("%s-async-handler", state.id_prefix)
+	async_handler_handle, async_handler_start_error := temporal_client.start_workflow_json(
+		state.client,
+		ASYNC_HANDLER_WORKFLOW_TYPE,
+		"affine asynchronous handlers",
+		{
+			id = async_handler_id,
+			task_queue = state.task_queue,
+			workflow_execution_timeout = time.Minute,
+			workflow_run_timeout = time.Minute,
+			workflow_task_timeout = 10 * time.Second,
+		},
+	)
+	delete(async_handler_id)
+	if async_handler_start_error.message != nil {
+		state.start_error = async_handler_start_error
+		return false
+	}
+	state.async_handler_handle = async_handler_handle
+	state.has_async_handler_handle = true
 	first_shard := -1
 	found_distinct_shard := false
 	for candidate in 0 ..< 64 {
@@ -530,6 +696,16 @@ run :: proc() -> int {
 	}
 	register_error = worker.register_json_workflow(
 		&sdk_worker,
+		ASYNC_HANDLER_WORKFLOW_TYPE,
+		async_handler_probe,
+	)
+	if register_error.message != nil {
+		fmt.eprintf("Async-handler Workflow registration failed: %s\n", string(register_error.message))
+		worker.error_free(&register_error)
+		return 1
+	}
+	register_error = worker.register_json_workflow(
+		&sdk_worker,
 		NONDETERMINISM_WORKFLOW_TYPE,
 		nondeterminism_probe,
 	)
@@ -600,6 +776,16 @@ run :: proc() -> int {
 			}
 			temporal_client.workflow_handle_free(&state.signal_handler_handle)
 		}
+		if state.has_async_handler_handle {
+			if !state.async_handler_closed {
+				cleanup_error := temporal_client.terminate_workflow(
+					&state.async_handler_handle,
+					"in-process async-handler cleanup",
+				)
+				temporal_client.error_free(&cleanup_error)
+			}
+			temporal_client.workflow_handle_free(&state.async_handler_handle)
+		}
 	}
 	if state.start_error.message != nil {
 		fmt.eprintf("In-process concurrency start failed: %s\n", string(state.start_error.message))
@@ -622,6 +808,12 @@ run :: proc() -> int {
 	if state.signal_error.message != nil {
 		fmt.eprintf("In-process signal delivery failed: %s\n", string(state.signal_error.message))
 		temporal_client.error_free(&state.signal_error)
+		worker.error_free(&run_error)
+		return 1
+	}
+	if state.async_handler_error.message != nil {
+		fmt.eprintf("In-process asynchronous handler failed: %s\n", string(state.async_handler_error.message))
+		temporal_client.error_free(&state.async_handler_error)
 		worker.error_free(&run_error)
 		return 1
 	}
@@ -658,22 +850,27 @@ run :: proc() -> int {
 	sync.mutex_unlock(&probe_state.mutex)
 	if !state.results_ok || len(state.handles) < 2 ||
 	   !state.cancellation_ok || !cancellation_observed || !cancellation_reason_ok ||
-	   !state.signal_handler_ok ||
+	   !state.signal_handler_ok || !state.async_handler_ok ||
 	   (force_replay && !state.nondeterminism_ok) ||
-	   run_stats.workflow_executions_completed != len(state.handles) + 2 + int(force_replay) ||
+	   run_stats.workflow_executions_completed != len(state.handles) + 3 + int(force_replay) ||
 	   run_stats.workflow_activation_failures < 1 ||
 	   run_stats.workflow_evictions < len(state.handles) + 2 ||
 	   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
-	   run_stats.workflow_signals_received != 2 ||
-	   run_stats.workflow_signal_handlers_started != 2 ||
-	   run_stats.workflow_signal_handlers_completed != 2 ||
+	   run_stats.workflow_signals_received != 3 ||
+	   run_stats.workflow_signal_handlers_started != 3 ||
+	   run_stats.workflow_signal_handlers_completed != 3 ||
 	   run_stats.workflow_signal_handlers_abandoned != 0 ||
 	   run_stats.workflow_signal_handler_warnings != 0 ||
+	   run_stats.workflow_updates_accepted != 1 ||
+	   run_stats.workflow_updates_rejected != 0 ||
+	   run_stats.workflow_updates_completed != 1 ||
+	   run_stats.workflow_update_handlers_abandoned != 0 ||
+	   run_stats.workflow_update_handler_warnings != 0 ||
 	   (force_replay && run_stats.workflow_replay_activations < 1) ||
 	   run_stats.workflow_activations_peak_owned < 2 ||
 	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d handlers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v signal_handler_ok=%v nondeterminism_ok=%v\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d signal_handlers=%d updates=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v signal_handler_ok=%v async_handler_ok=%v nondeterminism_ok=%v\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
@@ -682,6 +879,7 @@ run :: proc() -> int {
 			run_stats.timers_canceled,
 			run_stats.workflow_signals_received,
 			run_stats.workflow_signal_handlers_completed,
+			run_stats.workflow_updates_completed,
 			run_stats.workflow_replay_activations,
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
@@ -690,12 +888,13 @@ run :: proc() -> int {
 			state.cancellation_ok && cancellation_observed,
 			cancellation_reason_ok,
 			state.signal_handler_ok,
+			state.async_handler_ok,
 			state.nondeterminism_ok,
 		)
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d handlers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d nondeterminism=%v\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d signals=%d signal_handlers=%d updates=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d nondeterminism=%v\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
@@ -704,6 +903,7 @@ run :: proc() -> int {
 		run_stats.timers_canceled,
 		run_stats.workflow_signals_received,
 		run_stats.workflow_signal_handlers_completed,
+		run_stats.workflow_updates_completed,
 		run_stats.workflow_replay_activations,
 		run_stats.workflow_activations_peak_owned,
 		run_stats.workflow_executor_queue_peak,

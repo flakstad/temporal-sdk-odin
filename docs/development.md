@@ -1227,6 +1227,13 @@ Signals may arrive before registration and are buffered by the runtime; the
 registered handler accumulates their values and releases the main fiber through
 `await_condition`. The proof requires exactly two started and completed
 handlers, `signals:3`, owner-thread execution, and no abandoned handlers.
+Another Workflow registers stackful Signal and Update routines. The coordinator
+starts the Update, waits for acceptance, sends the Signal, then waits for the
+typed Update and Workflow results. Each handler records itself active before a
+durable two-second sleep, so the final `async:12:2` result proves both routines
+were suspended concurrently and later resumed on the same owner thread. Worker
+stats require three total Signal handlers, one accepted/completed Update, and
+zero abandoned or warning handlers.
 The example also requires
 `Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
 `workflow_executor_queue_peak`. The former counts all activation buffers owned

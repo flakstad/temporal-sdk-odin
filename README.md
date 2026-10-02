@@ -601,6 +601,11 @@ A separate affine Workflow registers an immediate typed Signal handler,
 receives two buffered Client Signals, mutates run-local state on its owner
 thread, and completes through `await_condition`. The live pass requires two
 started/completed handlers, the exact result, and no shard migration.
+A second handler Workflow runs a stackful Signal routine and Update routine at
+the same time. Both suspend on durable two-second timers, remain logically
+active together, resume on the owner shard, and drain before the main fiber
+closes. The Client receives the typed Update result and the Workflow requires
+an in-run handler peak of two.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
