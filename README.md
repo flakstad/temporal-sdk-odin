@@ -2326,6 +2326,11 @@ rejects overlapping calls and later calls from another OS thread, then destroys
 any cached fibers on the owning executor before the poll loop exits. This keeps
 minicoro stacks from being resumed, evicted, or destroyed after thread
 migration even if the dispatcher is refactored later.
+Direct in-process registrations also retain a reusable process-local runtime
+factory. The currently used runtime and every later executor-shard runtime own
+separate callback storage; Worker shutdown destroys runtimes before the factory
+registry. Parallel in-process dispatch is not enabled yet—the retained factory
+is the prerequisite that makes fixed, run-affine executor shards possible.
 Detached scope state is local to the currently running main or Update fiber.
 To let a detached handler finish, the main Workflow must itself use a detached
 scope around `workflow.await_all_handlers_finished(ctx)` after observing

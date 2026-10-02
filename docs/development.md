@@ -478,6 +478,15 @@ Core's fixed Workflow slot supplier. A cached worker rejects the unsafe value
 one. This configures Core admission only—the current in-process dispatcher is
 still single-threaded until run-affine executor sharding lands.
 
+Every direct in-process Workflow registration is retained twice with distinct
+ownership: the Worker's `workflow_registry` owns a reusable callback factory,
+and `workflow_registrations` owns the runtime materialized for the current
+single executor. `registry_instantiate` has a focused test proving that the same
+factory creates a second runtime with independent callback storage. Worker
+shutdown closes materialized runtimes before their factories. This is the
+construction boundary for the next scheduler slice: each fixed executor thread
+can own its own runtime set, and no live minicoro stack needs to migrate.
+
 Activity capacity may instead use Core's resource-based supplier:
 
 ```odin

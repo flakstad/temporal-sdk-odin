@@ -495,6 +495,9 @@ Worker :: struct {
 	activity_interceptors:  [dynamic]Activity_Interceptor,
 	workflow_inbound_interceptors: [dynamic]workflow.Inbound_Interceptor,
 	workflow_interceptors:  [dynamic]workflow.Outbound_Interceptor,
+	// The registry is the reusable callback/factory source for in-process
+	// runtimes. workflow_registrations owns the currently materialized runtimes.
+	workflow_registry:      workflow.Registry,
 	workflow_registrations: [dynamic]Workflow_Registration,
 	workflow_runs:          [dynamic]Workflow_Run,
 	rejected_workflow_runs: [dynamic]Rejected_Workflow_Run,
@@ -765,6 +768,16 @@ create_with_options :: proc(
 		delete(owned_task_queue)
 		return {}, error_from_string("could not allocate nondeterminism failure Workflow types")
 	}
+	registry_error := workflow.registry_init(&worker.workflow_registry)
+	if registry_error.message != nil {
+		owned_string_slice_free(owned_failure_types)
+		delete(owned_deployment_name)
+		delete(owned_build_id)
+		delete(owned_identity)
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_workflow(&registry_error)
+	}
 	worker.client = client
 	worker.namespace = owned_namespace
 	worker.task_queue = owned_task_queue
@@ -844,6 +857,12 @@ create_replayer :: proc(
 	worker.workflow_logger = workflow_logger
 	worker.mode = .Replay
 	worker.replay_runtime = runtime
+	registry_error := workflow.registry_init(&worker.workflow_registry)
+	if registry_error.message != nil {
+		delete(owned_namespace)
+		delete(owned_task_queue)
+		return {}, error_from_workflow(&registry_error)
+	}
 	worker.activity_registrations = make([dynamic]Activity_Registration)
 	worker.nexus_operation_registrations = make([dynamic]Nexus_Operation_Registration)
 	worker.activity_interceptors = make([dynamic]Activity_Interceptor)
@@ -1568,36 +1587,52 @@ register_external_workflow_registry :: proc(
 	return {}
 }
 
-register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
+validate_in_process_workflow_registration :: proc(worker: ^Worker, name: string) -> Error {
 	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
 		return error_from_string("worker is not initialized")
 	}
 	if worker.lifecycle != .Configuring {
 		return error_from_string("workflows cannot be registered after worker.run starts")
 	}
-	if len(name) == 0 || callback == nil {
-		return error_from_string("workflow name and callback are required")
+	// Public constructors initialize this eagerly. Keeping registration robust
+	// for zero-value/manual configuring Workers preserves the package's existing
+	// test and embedding surface without weakening lifecycle validation.
+	if !worker.workflow_registry.initialized {
+		registry_error := workflow.registry_init(&worker.workflow_registry)
+		if registry_error.message != nil {
+			return error_from_workflow(&registry_error)
+		}
+	}
+	if len(name) == 0 {
+		return error_from_string("workflow name is required")
 	}
 	for registration in worker.workflow_registrations {
 		if registration.name == name {
 			return error_from_string("workflow is already registered")
 		}
 	}
+	return {}
+}
+
+materialize_registered_workflow :: proc(worker: ^Worker, name: string) -> Error {
 	owned_name, allocation_error := strings.clone(name)
 	if allocation_error != nil {
+		_ = workflow.registry_remove_last(&worker.workflow_registry, name)
 		return error_from_string("could not allocate workflow name")
 	}
 	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init(
+	registry_index := workflow.registry_count(&worker.workflow_registry) - 1
+	init_error := workflow.registry_instantiate(
+		&worker.workflow_registry,
+		registry_index,
 		&runtime,
-		name,
 		worker.task_queue,
-		callback,
 		namespace = workflow_runtime_namespace(worker),
 		stack_options = worker.workflow_stacks,
 	)
 	if init_error.message != nil {
 		delete(owned_name)
+		_ = workflow.registry_remove_last(&worker.workflow_registry, name)
 		result := error_from_string(string(init_error.message))
 		workflow.error_free(&init_error)
 		return result
@@ -1606,6 +1641,7 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 	if configuration_error.message != nil {
 		delete(owned_name)
 		workflow.fiber_runtime_close(&runtime)
+		_ = workflow.registry_remove_last(&worker.workflow_registry, name)
 		return configuration_error
 	}
 	append(
@@ -1615,55 +1651,46 @@ register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fibe
 	return {}
 }
 
+register_workflow :: proc(worker: ^Worker, name: string, callback: workflow.Fiber_Proc) -> Error {
+	validation_error := validate_in_process_workflow_registration(worker, name)
+	if validation_error.message != nil {
+		return validation_error
+	}
+	if callback == nil {
+		return error_from_string("workflow callback is required")
+	}
+	registry_error := workflow.registry_register_workflow(
+		&worker.workflow_registry,
+		name,
+		callback,
+	)
+	if registry_error.message != nil {
+		return error_from_workflow(&registry_error)
+	}
+	return materialize_registered_workflow(worker, name)
+}
+
 register_payload_workflow :: proc(
 	worker: ^Worker,
 	name: string,
 	callback: workflow.Payload_Proc,
 ) -> Error {
-	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
-		return error_from_string("worker is not initialized")
+	validation_error := validate_in_process_workflow_registration(worker, name)
+	if validation_error.message != nil {
+		return validation_error
 	}
-	if worker.lifecycle != .Configuring {
-		return error_from_string("workflows cannot be registered after worker.run starts")
+	if callback == nil {
+		return error_from_string("workflow callback is required")
 	}
-	if len(name) == 0 || callback == nil {
-		return error_from_string("workflow name and callback are required")
-	}
-	for registration in worker.workflow_registrations {
-		if registration.name == name {
-			return error_from_string("workflow is already registered")
-		}
-	}
-	owned_name, allocation_error := strings.clone(name)
-	if allocation_error != nil {
-		return error_from_string("could not allocate workflow name")
-	}
-	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init_payload(
-		&runtime,
+	registry_error := workflow.registry_register_payload_workflow(
+		&worker.workflow_registry,
 		name,
-		worker.task_queue,
 		callback,
-		namespace = workflow_runtime_namespace(worker),
-		stack_options = worker.workflow_stacks,
 	)
-	if init_error.message != nil {
-		delete(owned_name)
-		result := error_from_string(string(init_error.message))
-		workflow.error_free(&init_error)
-		return result
+	if registry_error.message != nil {
+		return error_from_workflow(&registry_error)
 	}
-	configuration_error := configure_workflow_runtime(worker, &runtime)
-	if configuration_error.message != nil {
-		delete(owned_name)
-		workflow.fiber_runtime_close(&runtime)
-		return configuration_error
-	}
-	append(
-		&worker.workflow_registrations,
-		Workflow_Registration{name = owned_name, runtime = runtime},
-	)
-	return {}
+	return materialize_registered_workflow(worker, name)
 }
 
 // register_payloads_workflow exposes the codec-neutral repeated-argument
@@ -1675,50 +1702,22 @@ register_payloads_workflow :: proc(
 	name: string,
 	callback: workflow.Payloads_Proc,
 ) -> Error {
-	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
-		return error_from_string("worker is not initialized")
+	validation_error := validate_in_process_workflow_registration(worker, name)
+	if validation_error.message != nil {
+		return validation_error
 	}
-	if worker.lifecycle != .Configuring {
-		return error_from_string("workflows cannot be registered after worker.run starts")
+	if callback == nil {
+		return error_from_string("workflow callback is required")
 	}
-	if len(name) == 0 || callback == nil {
-		return error_from_string("workflow name and callback are required")
-	}
-	for registration in worker.workflow_registrations {
-		if registration.name == name {
-			return error_from_string("workflow is already registered")
-		}
-	}
-	owned_name, allocation_error := strings.clone(name)
-	if allocation_error != nil {
-		return error_from_string("could not allocate workflow name")
-	}
-	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init_payloads(
-		&runtime,
+	registry_error := workflow.registry_register_payloads_workflow(
+		&worker.workflow_registry,
 		name,
-		worker.task_queue,
 		callback,
-		namespace = workflow_runtime_namespace(worker),
-		stack_options = worker.workflow_stacks,
 	)
-	if init_error.message != nil {
-		delete(owned_name)
-		result := error_from_string(string(init_error.message))
-		workflow.error_free(&init_error)
-		return result
+	if registry_error.message != nil {
+		return error_from_workflow(&registry_error)
 	}
-	configuration_error := configure_workflow_runtime(worker, &runtime)
-	if configuration_error.message != nil {
-		delete(owned_name)
-		workflow.fiber_runtime_close(&runtime)
-		return configuration_error
-	}
-	append(
-		&worker.workflow_registrations,
-		Workflow_Registration{name = owned_name, runtime = runtime},
-	)
-	return {}
+	return materialize_registered_workflow(worker, name)
 }
 
 register_json_workflow :: proc(
@@ -1726,88 +1725,22 @@ register_json_workflow :: proc(
 	name: string,
 	callback: proc(ctx: ^workflow.Fiber_Context, input: $Input) -> $Output,
 ) -> Error {
-	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
-		return error_from_string("worker is not initialized")
+	validation_error := validate_in_process_workflow_registration(worker, name)
+	if validation_error.message != nil {
+		return validation_error
 	}
-	if worker.lifecycle != .Configuring {
-		return error_from_string("workflows cannot be registered after worker.run starts")
+	if callback == nil {
+		return error_from_string("workflow callback is required")
 	}
-	if len(name) == 0 || callback == nil {
-		return error_from_string("workflow name and callback are required")
-	}
-	for registration in worker.workflow_registrations {
-		if registration.name == name {
-			return error_from_string("workflow is already registered")
-		}
-	}
-	owned_name, name_error := strings.clone(name)
-	if name_error != nil {
-		return error_from_string("could not allocate workflow name")
-	}
-
-	Callback :: #type proc(ctx: ^workflow.Fiber_Context, input: Input) -> Output
-	allocator := allocator_runtime.heap_allocator()
-	owned_callback, callback_error := new(Callback, allocator)
-	if callback_error != nil {
-		delete(owned_name)
-		return error_from_string("could not allocate workflow callback")
-	}
-	owned_callback^ = callback
-	runtime := workflow.Fiber_Runtime{}
-	init_error := workflow.fiber_runtime_init_invoker(
-		&runtime,
+	registry_error := workflow.registry_register_json_workflow(
+		&worker.workflow_registry,
 		name,
-		worker.task_queue,
-		owned_callback,
-		proc(data: rawptr, ctx: ^workflow.Fiber_Context, inputs: []codec.Payload_View) -> workflow.Payload_Result {
-			if len(inputs) != 1 {
-				return workflow.payload_fail(
-					"typed Workflow requires exactly one argument",
-					"OdinWorkflowArgumentCountError",
-				)
-			}
-			value: Input
-			if codec.decode_json(inputs[0], &value) != .None {
-				return workflow.payload_fail(
-					"could not decode Workflow input as json/plain",
-					"OdinWorkflowPayloadConversionError",
-				)
-			}
-			callback := cast(^Callback)data
-			output := callback^(ctx, value)
-			payload, encode_error := codec.encode_json(output)
-			if encode_error != .None {
-				return workflow.payload_fail(
-					"could not encode Workflow result as json/plain",
-					"OdinWorkflowPayloadConversionError",
-				)
-			}
-			return workflow.payload_complete(payload)
-		},
-		proc(data: rawptr) {
-			free(cast(^Callback)data, allocator_runtime.heap_allocator())
-		},
-		namespace = workflow_runtime_namespace(worker),
-		stack_options = worker.workflow_stacks,
+		callback,
 	)
-	if init_error.message != nil {
-		delete(owned_name)
-		free(owned_callback, allocator)
-		result := error_from_string(string(init_error.message))
-		workflow.error_free(&init_error)
-		return result
+	if registry_error.message != nil {
+		return error_from_workflow(&registry_error)
 	}
-	configuration_error := configure_workflow_runtime(worker, &runtime)
-	if configuration_error.message != nil {
-		delete(owned_name)
-		workflow.fiber_runtime_close(&runtime)
-		return configuration_error
-	}
-	append(
-		&worker.workflow_registrations,
-		Workflow_Registration{name = owned_name, runtime = runtime},
-	)
-	return {}
+	return materialize_registered_workflow(worker, name)
 }
 
 find_activity :: proc(worker: ^Worker, name: string) -> (^Activity_Registration, bool) {
@@ -4339,6 +4272,7 @@ close :: proc(worker: ^Worker) -> Error {
 		}
 		delete(registration.name)
 	}
+	workflow.registry_close(&worker.workflow_registry)
 	for workflow_run in worker.workflow_runs {
 		delete(workflow_run.run_id)
 	}
@@ -4364,6 +4298,7 @@ close :: proc(worker: ^Worker) -> Error {
 	worker.activity_interceptors = nil
 	worker.workflow_inbound_interceptors = nil
 	worker.workflow_interceptors = nil
+	worker.workflow_registry = {}
 	worker.workflow_registrations = nil
 	worker.workflow_runs = nil
 	worker.rejected_workflow_runs = nil

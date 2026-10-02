@@ -77,6 +77,27 @@ registry_find :: proc(registry: ^Registry, name: string) -> (index: int, found: 
 	return
 }
 
+// registry_remove_last is a transactional rollback primitive for owners that
+// materialize a runtime immediately after adding a registration. Removing an
+// arbitrary entry would invalidate stable manifest indices, so only the most
+// recent matching registration is accepted.
+registry_remove_last :: proc(registry: ^Registry, expected_name: string) -> bool {
+	if registry == nil || !registry.initialized || len(registry.registrations) == 0 {
+		return false
+	}
+	last_index := len(registry.registrations) - 1
+	registration := &registry.registrations[last_index]
+	if registration.name != expected_name {
+		return false
+	}
+	if registration.user_data != nil && registration.destroy != nil {
+		registration.destroy(registration.user_data)
+	}
+	delete(registration.name)
+	pop(&registry.registrations)
+	return true
+}
+
 registry_add :: proc(
 	registry: ^Registry,
 	name: string,

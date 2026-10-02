@@ -1434,6 +1434,111 @@ workflow_processor_test_invoke :: proc(
 
 workflow_registry_test_log :: proc(_: rawptr, _: ^workflow.Log_Record) {}
 
+Workflow_Registry_Rollback_State :: struct {
+	destroys: int,
+}
+
+workflow_registry_rollback_instantiate :: proc(
+	_: rawptr,
+	_: ^workflow.Fiber_Runtime,
+	_, _, _: string,
+	_: workflow.Stack_Options,
+) -> workflow.Error {
+	return {}
+}
+
+workflow_registry_rollback_destroy :: proc(user_data: rawptr) {
+	state := cast(^Workflow_Registry_Rollback_State)user_data
+	state.destroys += 1
+}
+
+@(test)
+workflow_registry_transactional_rollback_only_removes_latest_match :: proc(t: ^testing.T) {
+	registry := workflow.Registry{}
+	init_error := workflow.registry_init(&registry)
+	testing.expect(t, init_error.message == nil)
+	workflow.error_free(&init_error)
+	defer workflow.registry_close(&registry)
+
+	first := Workflow_Registry_Rollback_State{}
+	second := Workflow_Registry_Rollback_State{}
+	first_error := workflow.registry_add(
+		&registry,
+		"first",
+		&first,
+		workflow_registry_rollback_instantiate,
+		workflow_registry_rollback_destroy,
+	)
+	second_error := workflow.registry_add(
+		&registry,
+		"second",
+		&second,
+		workflow_registry_rollback_instantiate,
+		workflow_registry_rollback_destroy,
+	)
+	testing.expect(t, first_error.message == nil)
+	testing.expect(t, second_error.message == nil)
+	workflow.error_free(&first_error)
+	workflow.error_free(&second_error)
+
+	testing.expect(t, !workflow.registry_remove_last(&registry, "first"))
+	testing.expect_value(t, workflow.registry_count(&registry), 2)
+	testing.expect_value(t, first.destroys, 0)
+	testing.expect_value(t, second.destroys, 0)
+	testing.expect(t, workflow.registry_remove_last(&registry, "second"))
+	testing.expect_value(t, workflow.registry_count(&registry), 1)
+	testing.expect_value(t, second.destroys, 1)
+	testing.expect(t, !workflow.registry_remove_last(&registry, "second"))
+	workflow.registry_close(&registry)
+	testing.expect_value(t, first.destroys, 1)
+	testing.expect_value(t, second.destroys, 1)
+}
+
+@(test)
+worker_workflow_registration_retains_a_reusable_runtime_factory :: proc(t: ^testing.T) {
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	sdk_worker, create_error := worker.create(&client, "factory-test-queue")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+	defer {
+		close_error := worker.close(&sdk_worker)
+		testing.expect(t, close_error.message == nil)
+		worker.error_free(&close_error)
+	}
+
+	register_error := worker.register_workflow(
+		&sdk_worker,
+		"factory-test",
+		registry_first_test_workflow,
+	)
+	testing.expect(t, register_error.message == nil)
+	worker.error_free(&register_error)
+	testing.expect_value(t, workflow.registry_count(&sdk_worker.workflow_registry), 1)
+	testing.expect_value(t, len(sdk_worker.workflow_registrations), 1)
+	if len(sdk_worker.workflow_registrations) != 1 {
+		return
+	}
+
+	fresh := workflow.Fiber_Runtime{}
+	instantiate_error := workflow.registry_instantiate(
+		&sdk_worker.workflow_registry,
+		0,
+		&fresh,
+		sdk_worker.task_queue,
+	)
+	testing.expect(t, instantiate_error.message == nil)
+	workflow.error_free(&instantiate_error)
+	defer workflow.fiber_runtime_close(&fresh)
+	testing.expect(t, fresh.callback_data != nil)
+	testing.expect(
+		t,
+		fresh.callback_data != sdk_worker.workflow_registrations[0].runtime.callback_data,
+	)
+}
+
 @(test)
 worker_dispatches_online_activations_through_an_external_processor :: proc(t: ^testing.T) {
 	activation := [?]u8{0, 1, 0, 2, 0xff}
@@ -16798,6 +16903,9 @@ typed_workflow_payloads_survive_activity_and_fresh_stack_replay :: proc(t: ^test
 		workflow_registrations = make([dynamic]worker.Workflow_Registration),
 		lifecycle = .Configuring,
 	}
+	registry_init_error := workflow.registry_init(&sdk_worker.workflow_registry)
+	testing.expect(t, registry_init_error.message == nil)
+	workflow.error_free(&registry_init_error)
 	defer {
 		close_error := worker.close(&sdk_worker)
 		testing.expect(t, close_error.message == nil)
@@ -16956,6 +17064,9 @@ typed_workflow_rejects_incompatible_input_as_application_failure :: proc(t: ^tes
 		workflow_registrations = make([dynamic]worker.Workflow_Registration),
 		lifecycle = .Configuring,
 	}
+	registry_init_error := workflow.registry_init(&sdk_worker.workflow_registry)
+	testing.expect(t, registry_init_error.message == nil)
+	workflow.error_free(&registry_init_error)
 	defer {
 		close_error := worker.close(&sdk_worker)
 		testing.expect(t, close_error.message == nil)
