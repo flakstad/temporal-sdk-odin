@@ -16,6 +16,13 @@ import worker "../../worker"
 
 Manager_Error :: struct { message: []u8 }
 
+Crash_Loop_Policy :: struct {
+	// Zero disables the breaker. Once the threshold is reached, new child
+	// starts are rejected until cooldown admits one trial generation.
+	maximum_consecutive_failures: int,
+	cooldown:                     time.Duration,
+}
+
 manager_error :: proc(message: string) -> Manager_Error {
 	return {message = bytes.clone(transmute([]u8)message)}
 }
@@ -35,6 +42,7 @@ Options :: struct {
 	startup_timeout:       time.Duration,
 	shutdown_timeout:      time.Duration,
 	warm_pool_size:        int,
+	crash_loop:            Crash_Loop_Policy,
 	maximum_payload_bytes: u32,
 }
 
@@ -57,6 +65,8 @@ Stats :: struct {
 	manifest_handshakes: int,
 	manifest_mismatches: int,
 	startup_failures: int,
+	crash_loop_rejections: int,
+	crash_loop_recoveries: int,
 	child_failures: int,
 	protocol_failures: int,
 	timeouts: int,
@@ -97,6 +107,7 @@ Manager :: struct {
 	startup_timeout:       time.Duration,
 	shutdown_timeout:      time.Duration,
 	warm_pool_size:        int,
+	crash_loop:            Crash_Loop_Policy,
 	maximum_payload_bytes: u32,
 	expected_manifest:     []u8,
 	routes:                [dynamic]Route,
@@ -106,6 +117,9 @@ Manager :: struct {
 	pool_waiters:          int,
 	pool_wakeups:          int,
 	closing:               bool,
+	consecutive_failures:  int,
+	last_failure:          time.Tick,
+	crash_loop_trial:      bool,
 	mutex:                 sync.Mutex,
 	stats:                 Stats,
 	initialized:           bool,
@@ -119,6 +133,12 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	   options.startup_timeout < 0 || options.shutdown_timeout < 0 ||
 	   options.warm_pool_size < 0 {
 		return manager_error("Activity executor durations and pool size must not be negative")
+	}
+	if options.crash_loop.maximum_consecutive_failures < 0 ||
+	   options.crash_loop.cooldown < 0 ||
+	   (options.crash_loop.maximum_consecutive_failures > 0 &&
+	    options.crash_loop.cooldown <= 0) {
+		return manager_error("Activity executor crash-loop policy is invalid")
 	}
 	if options.maximum_payload_bytes == 0 {
 		return manager_error("Activity executor payload limit must be positive")
@@ -140,6 +160,7 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	manager.startup_timeout = options.startup_timeout
 	manager.shutdown_timeout = options.shutdown_timeout
 	manager.warm_pool_size = options.warm_pool_size
+	manager.crash_loop = options.crash_loop
 	manager.maximum_payload_bytes = options.maximum_payload_bytes
 	manager.initialized = true
 	return {}
@@ -487,11 +508,78 @@ session_destroy :: proc(session: ^Session, kill: bool) -> os.Process_State {
 	return state
 }
 
+// crash_loop_allows_start is pure so generated tests can cover threshold and
+// cooldown boundaries independently of the process clock.
+crash_loop_allows_start :: proc(
+	consecutive_failures: int,
+	elapsed_since_failure: time.Duration,
+	policy: Crash_Loop_Policy,
+) -> (allowed, trial: bool) {
+	if policy.maximum_consecutive_failures == 0 ||
+	   consecutive_failures < policy.maximum_consecutive_failures {
+		return true, false
+	}
+	if elapsed_since_failure >= policy.cooldown {
+		return true, true
+	}
+	return false, false
+}
+
+manager_allows_start_locked :: proc(manager: ^Manager) -> bool {
+	if manager.crash_loop.maximum_consecutive_failures == 0 {
+		return true
+	}
+	if manager.crash_loop_trial {
+		manager.stats.crash_loop_rejections += 1
+		return false
+	}
+	elapsed := time.Duration(0)
+	if manager.last_failure._nsec != 0 {
+		elapsed = time.tick_diff(manager.last_failure, time.tick_now())
+	}
+	allowed, trial := crash_loop_allows_start(
+		manager.consecutive_failures,
+		elapsed,
+		manager.crash_loop,
+	)
+	if !allowed {
+		manager.stats.crash_loop_rejections += 1
+		return false
+	}
+	manager.crash_loop_trial = trial
+	return true
+}
+
+manager_record_success_locked :: proc(manager: ^Manager) {
+	if manager.consecutive_failures > 0 || manager.crash_loop_trial {
+		manager.stats.crash_loop_recoveries += 1
+	}
+	manager.consecutive_failures = 0
+	manager.last_failure = {}
+	manager.crash_loop_trial = false
+}
+
+manager_record_failure_locked :: proc(manager: ^Manager) {
+	manager.consecutive_failures += 1
+	manager.last_failure = time.tick_now()
+	manager.crash_loop_trial = false
+}
+
 pool_acquire :: proc(manager: ^Manager) -> ^Session {
 	if manager.warm_pool_size == 0 {
+		sync.mutex_lock(&manager.mutex)
+		allowed := manager_allows_start_locked(manager)
+		sync.mutex_unlock(&manager.mutex)
+		if !allowed {
+			return nil
+		}
 		session := session_start(manager, false)
 		if session != nil {
 			session_prepare(manager, session)
+		} else {
+			sync.mutex_lock(&manager.mutex)
+			manager_record_failure_locked(manager)
+			sync.mutex_unlock(&manager.mutex)
 		}
 		return session
 	}
@@ -512,6 +600,10 @@ pool_acquire :: proc(manager: ^Manager) -> ^Session {
 			}
 		}
 		if len(manager.pool) + manager.pool_starting < manager.warm_pool_size {
+			if !manager_allows_start_locked(manager) {
+				sync.mutex_unlock(&manager.mutex)
+				return nil
+			}
 			manager.pool_starting += 1
 			sync.mutex_unlock(&manager.mutex)
 			session := session_start(manager, true)
@@ -521,6 +613,9 @@ pool_acquire :: proc(manager: ^Manager) -> ^Session {
 			}
 			sync.mutex_lock(&manager.mutex)
 			manager.pool_starting -= 1
+			if session == nil {
+				manager_record_failure_locked(manager)
+			}
 			if session != nil && !manager.closing {
 				session_prepare(manager, session)
 				append(&manager.pool, session)
@@ -561,6 +656,7 @@ pool_release :: proc(manager: ^Manager, session: ^Session) {
 	session.busy = false
 	session.uses += 1
 	manager.stats.children_completed += 1
+	manager_record_success_locked(manager)
 	notify := manager.pool_waiters > manager.pool_wakeups
 	if notify {
 		manager.pool_wakeups += 1
@@ -583,6 +679,7 @@ pool_retire :: proc(manager: ^Manager, session: ^Session) {
 		}
 	}
 	manager.stats.children_retired += 1
+	manager_record_failure_locked(manager)
 	notify := manager.pool_waiters > manager.pool_wakeups
 	if notify {
 		manager.pool_wakeups += 1
@@ -611,16 +708,20 @@ execution_finish :: proc(
 		return
 	}
 	state := session_destroy(session, healthy == nil || !healthy^)
+	sync.mutex_lock(&manager.mutex)
 	if healthy != nil && healthy^ {
-		sync.mutex_lock(&manager.mutex)
 		if state.exited && state.success {
 			manager.stats.children_completed += 1
+			manager_record_success_locked(manager)
 		} else {
 			healthy^ = false
 			manager.stats.child_failures += 1
+			manager_record_failure_locked(manager)
 		}
-		sync.mutex_unlock(&manager.mutex)
+	} else {
+		manager_record_failure_locked(manager)
 	}
+	sync.mutex_unlock(&manager.mutex)
 }
 
 Process_Wait_State :: struct {

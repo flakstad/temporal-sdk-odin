@@ -3401,8 +3401,9 @@ Workflows are enabled.
    in a new child. Its next-attempt heartbeat also traverses the parent
    Activity interceptor/Core recorder. Size-one pool admission and reuse are
    live-proven under concurrent submission. Per-generation canonical manifest
-   verification now fences parent/child skew before dispatch. The remaining
-   concurrency risks are warm-pool crash-loop fencing and general readiness,
+   verification now fences parent/child skew before dispatch. An optional
+   cooldown circuit breaker prevents repeated failed generations. The remaining
+   concurrency risks are warm-pool general readiness,
    infinite Workflow code, and process-level recovery after an uncooperative
    in-process callback notification.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
@@ -3464,7 +3465,9 @@ Workflows are enabled.
    pool now serializes callbacks per child, replaces failed children, and drains
    them through a deadline-bounded shutdown exchange. A deadline-bounded
    canonical manifest handshake rejects incompatible generations before
-   dispatch. General readiness and crash-loop fencing remain unimplemented.
+   dispatch. An optional consecutive-failure/cooldown breaker bounds respawn
+   loops and admits only one post-cooldown trial. General readiness remains
+   unimplemented.
    Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
@@ -3553,8 +3556,8 @@ containment option for panicking, overflowing, or uncooperative Workflow code.
 In parallel, Activity isolation now has opt-in warm children in a bounded pool
 without changing its duplex-heartbeat and cooperative-cancellation semantics.
 Concurrent admission, failed-child replacement, and bounded shutdown are
-live-proven. Per-generation manifest verification is also live-proven;
-crash-loop fencing, general readiness, parallel shutdown, and longer fault/soak
+live-proven. Per-generation manifest verification and crash-loop fencing are
+also live-proven; general readiness, parallel shutdown, and longer fault/soak
 evidence remain.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
@@ -4527,11 +4530,11 @@ single child control reader into the callback's `activity.Context`; a
 per-execution grace timer kills only a child that ignores it. Parent-side execute
 interceptors are rejected for external registrations because they cannot
 truthfully wrap code executing in another process; heartbeat interceptors still
-wrap forwarded heartbeat events. Protocol-v4 shutdown bounds acknowledgement
+wrap forwarded heartbeat events. Protocol-v5 shutdown bounds acknowledgement
 and exit separately. The live matrix proves sequential `hello`/`goodbye`
 dispatch and two concurrently submitted tasks through one reused child.
-General readiness probes, crash-loop fencing, parallel pool shutdown, and
-child-side execute interceptors/metrics remain. See
+General readiness probes, parallel pool shutdown, and child-side execute
+interceptors/metrics remain. See
 `docs/activity-isolation.md` for the live crash/retry proof and ownership rules.
 
 ### Local Activity boundary

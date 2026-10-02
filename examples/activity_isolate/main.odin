@@ -222,6 +222,12 @@ run_parent :: proc() {
 	manager_options.cancellation_grace = 500 * time.Millisecond
 	manager_options.shutdown_timeout = 2 * time.Second
 	manager_options.warm_pool_size = 1
+	if mismatch_case {
+		manager_options.crash_loop = {
+			maximum_consecutive_failures = 1,
+			cooldown = time.Hour,
+		}
+	}
 	manager_error := activity_isolate.manager_init(&manager, manager_options)
 	if manager_error.message != nil {
 		fmt.eprintf("Activity executor manager failed: %s\n", string(manager_error.message))
@@ -274,7 +280,7 @@ run_parent :: proc() {
 		multi_case,
 		mismatch_case,
 	)
-	max_tasks := cancel_case ? 0 : (mismatch_case ? 1 : 2)
+	max_tasks := cancel_case ? 0 : 2
 	cancel_shutdown_state := Cancellation_Shutdown_State{
 		manager = &manager,
 		sdk_worker = &activity_worker,
@@ -313,16 +319,17 @@ run_parent :: proc() {
 	}
 	executor_stats := activity_isolate.manager_stats(&manager)
 	if mismatch_case {
-		if stats.activity_tasks_completed != 1 || executor_stats.children_started != 1 ||
-		   executor_stats.children_completed != 0 || executor_stats.child_failures != 1 ||
+		if stats.activity_tasks_completed != 2 || executor_stats.children_started != 1 ||
+		   executor_stats.children_completed != 0 || executor_stats.child_failures != 2 ||
 		   executor_stats.manifest_handshakes != 0 ||
 		   executor_stats.manifest_mismatches != 1 ||
 		   executor_stats.startup_failures != 1 ||
 		   executor_stats.protocol_failures != 1 ||
+		   executor_stats.crash_loop_rejections != 1 ||
 		   executor_stats.peak_pool_children != 0 ||
 		   activity_isolate.manager_in_flight(&manager) != 0 {
 			fmt.eprintf(
-				"unexpected manifest mismatch stats: tasks=%d started=%d completed=%d failures=%d handshakes=%d mismatches=%d startup_failures=%d protocol_failures=%d pool_peak=%d in_flight=%d\n",
+				"unexpected manifest mismatch stats: tasks=%d started=%d completed=%d failures=%d handshakes=%d mismatches=%d startup_failures=%d protocol_failures=%d breaker_rejections=%d pool_peak=%d in_flight=%d\n",
 				stats.activity_tasks_completed,
 				executor_stats.children_started,
 				executor_stats.children_completed,
@@ -331,12 +338,13 @@ run_parent :: proc() {
 				executor_stats.manifest_mismatches,
 				executor_stats.startup_failures,
 				executor_stats.protocol_failures,
+				executor_stats.crash_loop_rejections,
 				executor_stats.peak_pool_children,
 				activity_isolate.manager_in_flight(&manager),
 			)
 			os.exit(1)
 		}
-		fmt.println("warm Activity child manifest mismatch was rejected before dispatch")
+		fmt.println("warm Activity manifest mismatch opened the crash-loop breaker before respawn")
 		return
 	}
 	if cancel_case {

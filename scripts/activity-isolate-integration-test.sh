@@ -326,8 +326,8 @@ if ! wait "$parent_pid"; then
 fi
 parent_pid=""
 
-grep -q 'warm Activity child manifest mismatch was rejected before dispatch' "$parent_log"
-grep -q 'Workflow observed rejected Activity child manifest' "$driver_log"
+grep -q 'warm Activity manifest mismatch opened the crash-loop breaker before respawn' "$parent_log"
+grep -q 'Workflow observed manifest rejection and crash-loop fencing' "$driver_log"
 
 cat "$parent_log"
 cat "$driver_log"

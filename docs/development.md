@@ -916,8 +916,10 @@ size-one warm pool and requires exactly one child start, one reuse, serial
 admission, and acknowledged bounded shutdown. Warm pooling remains opt-in and
 requires a canonical type-manifest handshake for every new child. A sixth pass
 starts an incompatible manifest and requires rejection before callback dispatch
-or task-token routing. Crash-loop fencing and general readiness probes are still
-missing, so this is not yet the default production executor. See
+or task-token routing. Its one-failure circuit breaker must reject a second
+Activity without starting another process. General readiness probes and other
+production hardening are still missing, so this is not yet the default
+production executor. See
 [`activity-isolation.md`](activity-isolation.md).
 
 The supported containment pattern is now exercised end-to-end:

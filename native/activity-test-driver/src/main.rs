@@ -374,19 +374,21 @@ struct IsolatedActivityManifestMismatchDriverWorkflow;
 impl IsolatedActivityManifestMismatchDriverWorkflow {
     #[run(name = "odin_isolated_activity_manifest_mismatch_driver")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
-        let result = ctx
-            .execute_activity(
-                HelloActivity,
-                "Odin".to_string(),
-                ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
-                    .retry_policy(RetryPolicy::builder().maximum_attempts(1).build())
-                    .build(),
-            )
-            .await;
-        match result {
-            Ok(value) => Ok(format!("unexpected mismatched child success: {value}")),
-            Err(_) => Ok("Workflow observed rejected Activity child manifest".to_string()),
+        for sequence in 0..2 {
+            let result = ctx
+                .execute_activity(
+                    HelloActivity,
+                    format!("Odin-{sequence}"),
+                    ActivityOptions::with_start_to_close_timeout(Duration::from_secs(20))
+                        .retry_policy(RetryPolicy::builder().maximum_attempts(1).build())
+                        .build(),
+                )
+                .await;
+            if let Ok(value) = result {
+                return Ok(format!("unexpected mismatched child success: {value}"));
+            }
         }
+        Ok("Workflow observed manifest rejection and crash-loop fencing".to_string())
     }
 }
 
@@ -462,7 +464,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await??;
             shutdown();
-            if result != "Workflow observed rejected Activity child manifest" {
+            if result != "Workflow observed manifest rejection and crash-loop fencing" {
                 return Err(format!("unexpected manifest mismatch result: {result}").into());
             }
             println!("{result}");

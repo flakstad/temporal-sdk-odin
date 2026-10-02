@@ -553,3 +553,58 @@ workflow_executor_crash_loop_breaker_obeys_threshold_and_cooldown :: proc(
 	defer pbt.destroy_check_result(&result)
 	pbt.require_pass(t, result)
 }
+
+activity_executor_crash_loop_breaker_property :: proc(t: ^pbt.T) -> pbt.Result {
+	maximum := pbt.draw(t, pbt.int_range(0, 16))
+	failures := pbt.draw(t, pbt.int_range(0, 24))
+	cooldown_millis := pbt.draw(t, pbt.int_range(1, 10_000))
+	elapsed_millis := pbt.draw(t, pbt.int_range(0, 20_000))
+	policy := activity_isolate.Crash_Loop_Policy{
+		maximum_consecutive_failures = maximum,
+		cooldown = time.Duration(cooldown_millis) * time.Millisecond,
+	}
+	elapsed := time.Duration(elapsed_millis) * time.Millisecond
+	allowed, trial := activity_isolate.crash_loop_allows_start(
+		failures,
+		elapsed,
+		policy,
+	)
+	pbt.cover(t, maximum == 0, 5, "Activity breaker disabled")
+	pbt.cover(
+		t,
+		maximum > 0 && failures >= maximum && elapsed < policy.cooldown,
+		15,
+		"Activity breaker open",
+	)
+	pbt.cover(
+		t,
+		maximum > 0 && failures >= maximum && elapsed >= policy.cooldown,
+		15,
+		"Activity cooldown trial",
+	)
+	if maximum == 0 || failures < maximum {
+		if !allowed || trial {
+			return pbt.fail("Activity breaker rejected below its threshold")
+		}
+	} else if elapsed < policy.cooldown {
+		if allowed || trial {
+			return pbt.fail("Activity breaker admitted a child before cooldown")
+		}
+	} else if !allowed || !trial {
+		return pbt.fail("Activity breaker did not admit one post-cooldown trial")
+	}
+	return pbt.pass()
+}
+
+@(test)
+activity_executor_crash_loop_breaker_obeys_threshold_and_cooldown :: proc(
+	t: ^testing.T,
+) {
+	result := pbt.check(
+		"Activity executor crash-loop breaker obeys threshold and cooldown",
+		activity_executor_crash_loop_breaker_property,
+		{num_tests = 1000, seed = 0x4143_5449_4352_4153},
+	)
+	defer pbt.destroy_check_result(&result)
+	pbt.require_pass(t, result)
+}

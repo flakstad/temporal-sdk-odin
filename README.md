@@ -574,7 +574,9 @@ Protocol v5 proves a size-one warm pool under two concurrent Activity
 tasks: admission remains bounded, the child is reused serially, and shutdown is
 acknowledged and time-limited. Every warm generation must first return the exact
 canonical Activity manifest; a live incompatible-child case is rejected before
-callback dispatch or task-token routing.
+callback dispatch or task-token routing. An optional consecutive-failure
+circuit breaker prevents an incompatible or repeatedly crashing executable from
+being respawned per Activity task; cooldown permits one trial generation.
 See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test

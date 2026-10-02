@@ -1849,6 +1849,15 @@ activity_isolation_manager_validates_warm_pool_and_empty_shutdown :: proc(t: ^te
 	invalid_error := activity_isolate.manager_init(&invalid_manager, invalid_options)
 	testing.expect(t, invalid_error.message != nil)
 	activity_isolate.manager_error_free(&invalid_error)
+	invalid_breaker_options := activity_isolate.options_default(command[:])
+	invalid_breaker_options.crash_loop.maximum_consecutive_failures = 1
+	invalid_breaker_manager := activity_isolate.Manager{}
+	invalid_breaker_error := activity_isolate.manager_init(
+		&invalid_breaker_manager,
+		invalid_breaker_options,
+	)
+	testing.expect(t, invalid_breaker_error.message != nil)
+	activity_isolate.manager_error_free(&invalid_breaker_error)
 
 	options := activity_isolate.options_default(command[:])
 	options.warm_pool_size = 2
@@ -1866,6 +1875,29 @@ activity_isolation_manager_validates_warm_pool_and_empty_shutdown :: proc(t: ^te
 	stats := activity_isolate.manager_stats(&manager)
 	testing.expect_value(t, stats.children_started, 0)
 	testing.expect_value(t, stats.children_shutdown, 0)
+}
+
+@(test)
+activity_isolation_crash_loop_admits_only_one_cooldown_trial :: proc(t: ^testing.T) {
+	manager := activity_isolate.Manager{
+		crash_loop = {
+			maximum_consecutive_failures = 1,
+			cooldown = time.Hour,
+		},
+		consecutive_failures = 1,
+		last_failure = time.tick_now(),
+	}
+	testing.expect(t, !activity_isolate.manager_allows_start_locked(&manager))
+	testing.expect_value(t, manager.stats.crash_loop_rejections, 1)
+	manager.last_failure = time.tick_add(time.tick_now(), -2 * time.Hour)
+	testing.expect(t, activity_isolate.manager_allows_start_locked(&manager))
+	testing.expect(t, manager.crash_loop_trial)
+	testing.expect(t, !activity_isolate.manager_allows_start_locked(&manager))
+	testing.expect_value(t, manager.stats.crash_loop_rejections, 2)
+	activity_isolate.manager_record_success_locked(&manager)
+	testing.expect(t, !manager.crash_loop_trial)
+	testing.expect_value(t, manager.consecutive_failures, 0)
+	testing.expect_value(t, manager.stats.crash_loop_recoveries, 1)
 }
 
 @(test)

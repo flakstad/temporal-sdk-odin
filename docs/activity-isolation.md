@@ -37,7 +37,11 @@ between a forwarded Core cancel task and termination of an unresponsive child.
 `warm_pool_size = 0` retains one process per invocation; a positive value bounds
 the number of persistent children. `startup_timeout` bounds the manifest
 handshake for every newly started warm child. `shutdown_timeout` independently
-bounds each child's protocol acknowledgement and process exit.
+bounds each child's protocol acknowledgement and process exit. The optional
+`crash_loop` policy opens after a configured number of consecutive child/start
+failures and rejects new starts until its cooldown admits one trial generation.
+A successful Activity completion resets the count; a successful handshake alone
+does not, because a callback may still crash immediately.
 
 The child calls `activity_isolate.host_run` with either the single-callback
 `host_options` convenience or an explicit `host_options_many` manifest of
@@ -105,9 +109,10 @@ with exactly one grace-deadline kill. A fourth queue runs `hello` followed by
 two Activities concurrently against pool size one and requires bounded
 admission, serial execution, one process start, and one reuse. Every surviving
 idle child acknowledges shutdown and exits within the configured deadline. A
-sixth queue deliberately starts an incompatible child manifest and proves that
-the Workflow observes Activity failure while callback dispatch, pool admission,
-and task-token routing remain at zero.
+sixth queue deliberately starts an incompatible child manifest twice. The first
+failure opens a one-failure breaker; the second task is rejected without a new
+process, while callback dispatch, pool admission, and task-token routing remain
+at zero.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -134,9 +139,9 @@ runtime:
 - shutdown requires `worker.run` to have drained all invocations; idle children
   are currently drained serially, so the total upper bound scales with pool
   size;
-- prewarming/general readiness probes, CPU/memory sandboxing, crash-loop policy,
-  release signing, and all-target fault evidence remain production work.
+- prewarming/general readiness probes, CPU/memory sandboxing, release signing,
+  and all-target fault evidence remain production work.
 
-The next increment should add crash-loop fencing before treating the warm pool
-as a default. Parallel pool shutdown, general readiness probes, and child-side
-interceptor/diagnostic transport remain follow-up hardening.
+Parallel pool shutdown, general readiness probes, and child-side
+interceptor/diagnostic transport remain the next hardening steps before treating
+the warm pool as a default.
