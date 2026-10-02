@@ -3394,12 +3394,14 @@ Workflows are enabled.
    heartbeats, exact Core cancellation flags, completion flush, and clean
    finalization. Activity-only process crash/replacement and suspended Workflow
    process loss/replay on an identical replacement Worker are live-proven. A
-   second live path now keeps the Core-owning parent alive and executes each
-   Activity attempt in a fresh child through opaque Core task/completion bytes;
+   second live path now keeps the Core-owning parent alive and executes
+   Activities through opaque Core task/completion bytes in either fresh
+   children or a bounded warm pool;
    an attempt-1 Odin panic becomes a retryable failure and attempt 2 completes
    in a new child. Its next-attempt heartbeat also traverses the parent
-   Activity interceptor/Core recorder. The remaining concurrency risks are
-   warm-pool scheduling for isolated Activities,
+   Activity interceptor/Core recorder. Size-one pool admission and reuse are
+   live-proven under concurrent submission. The remaining concurrency risks are
+   warm-pool startup health/crash-loop fencing,
    infinite Workflow code, and process-level recovery after an uncooperative
    in-process callback notification.
 4. **Workflow runtime.** The fiber proves nested Odin suspension, durable
@@ -3457,8 +3459,10 @@ Workflows are enabled.
    Activity routing is now connected to a versioned per-invocation subprocess
    executor with completion/task-token validation and live crash/retry evidence.
    Heartbeat forwarding, cooperative child cancellation, and the bounded
-   uncooperative-child kill fallback are live-proven; a warm production pool
-   remains unimplemented. Typed JSON decode/encode errors
+   uncooperative-child kill fallback are live-proven. An opt-in bounded warm
+   pool now serializes callbacks per child, replaces failed children, and drains
+   them through a deadline-bounded shutdown exchange. Startup health and
+   crash-loop fencing remain unimplemented. Typed JSON decode/encode errors
    become non-retryable Activity failures instead of worker-fatal errors.
 8. **Client/server feature skew.** Workflow start/result, signals, queries,
    Activity-awaiting Updates, cancellation, termination, Describe/history, and
@@ -3543,10 +3547,11 @@ distribution targets. The live proofs establish the
 architecture, but they are not yet the soak/fault evidence needed to call
 concurrent fibers production-ready. Process-isolated execution remains the
 containment option for panicking, overflowing, or uncooperative Workflow code.
-In parallel, Activity isolation can advance from its verified one-process-
-per-attempt, duplex-heartbeat, and cooperative-cancellation protocol to warm
-children in a bounded pool. Admission, child health, crash-loop fencing, and
-shutdown bounds must preserve the semantics already proven per attempt.
+In parallel, Activity isolation now has opt-in warm children in a bounded pool
+without changing its duplex-heartbeat and cooperative-cancellation semantics.
+Concurrent admission, failed-child replacement, and bounded shutdown are
+live-proven. Startup health/manifest verification, crash-loop fencing, parallel
+shutdown, and longer fault/soak evidence remain.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core,
@@ -3770,7 +3775,7 @@ and its crash/replacement retry path is live-proven. The SDK can now supervise
 and restart that whole Worker child. It also has a live-proven per-attempt
 Activity subprocess executor that keeps the Core parent alive across a callback
 panic; heartbeat transport, cooperative cancellation, and a bounded forced-kill
-fallback are now live-proven, while warm pooling remains future work. Activity and Nexus callback
+fallback and bounded warm-child reuse are now live-proven. Activity and Nexus callback
 drains now have deadline observation without forced thread termination; truly
 stuck callbacks still require the supervisor's parent process to detect and
 replace the child. Infinite Workflow code cannot reach the activation boundary
@@ -4496,9 +4501,10 @@ sent to a child. The child returns an owned
 result and the exact original token before forwarding the unchanged bytes to
 Core. No new C ABI or direct Server RPC is involved.
 
-Protocol v3 in `temporal/activity/isolate` uses a fixed magic/version/kind/
-request-ID header plus a bounded stream record. A fresh process and private
-pipes are created for each attempt. Parent and child construct the same
+Protocol v4 in `temporal/activity/isolate` uses a fixed magic/version/kind/
+request-ID header plus a bounded stream record. Each child has private pipes;
+the default host serves one attempt, while an opt-in bounded pool assigns
+serial requests with monotonically increasing IDs. Parent and child construct the same
 application manifest; `register_external_activity_manifest` copies only its
 type names into the Core Worker, while the child retains the process-local
 callbacks. It decodes the requested type and dispatches without transferring
@@ -4510,17 +4516,18 @@ contracts. Child exit, timeout, malformed framing, stale request ID, or
 mismatched completion becomes a retryable Activity failure; only a failure in
 the parent's Core completion call shuts the Worker down.
 
-This boundary is not yet operationally complete for a warm pool. Heartbeats use
+The warm boundary is operational but not yet the default. Heartbeats use
 a duplex child-event/parent-ack exchange and re-enter the parent's ordinary
 Activity heartbeat/interceptor/Core chain. Cancellation is delivered through a
 single child control reader into the callback's `activity.Context`; a
 per-execution grace timer kills only a child that ignores it. Parent-side execute
 interceptors are rejected for external registrations because they cannot
 truthfully wrap code executing in another process; heartbeat interceptors still
-wrap forwarded heartbeat events. Child-side execute interceptors and metrics,
-then bounded warm-process reuse are the remaining order of work. The live
-matrix now also proves sequential `hello`/`goodbye` dispatch from one child
-manifest. See
+wrap forwarded heartbeat events. Protocol-v4 shutdown bounds acknowledgement
+and exit separately. The live matrix proves sequential `hello`/`goodbye`
+dispatch and two concurrently submitted tasks through one reused child.
+Startup/manifest health handshakes, crash-loop fencing, parallel pool shutdown,
+and child-side execute interceptors/metrics remain. See
 `docs/activity-isolation.md` for the live crash/retry proof and ownership rules.
 
 ### Local Activity boundary

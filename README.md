@@ -556,11 +556,11 @@ Workflow Task, and requires bounded-backoff restart, generation-2 readiness,
 fresh-stack history replay, and Signal-driven completion. The whole-Worker
 supervisor contract is documented in
 [`docs/supervision.md`](docs/supervision.md). Fine-grained per-Workflow
-execution and per-invocation Activity process isolation are now implemented
-experimentally; warm per-Activity production subprocess pools are not. The
-Activity path keeps Core polling and completion in the parent, sends the exact
-Core task to a fresh child, validates the returned completion/task token, and
-converts child loss into a retryable Activity failure.
+execution and Activity process isolation are now implemented experimentally.
+The Activity path keeps Core polling and completion in the parent, sends the
+exact Core task to either a fresh child or an opt-in bounded warm pool, validates
+the returned completion/task token, and converts child loss into a retryable
+Activity failure.
 `./scripts/activity-isolate-integration-test.sh` proves a real Odin panic on
 attempt 1 while the parent remains alive and Temporal completes attempt 2.
 Child heartbeats now round-trip through the parent's ordinary heartbeat/
@@ -570,6 +570,9 @@ Parent and child build the same explicit multi-Activity manifest. The parent
 copies only its type names into Core, while the live child dispatches sequential
 `hello` and `goodbye` tasks without serializing procedure pointers across the
 process boundary.
+Protocol v4 also proves a size-one warm pool under two concurrent Activity
+tasks: admission remains bounded, the child is reused serially, and shutdown is
+acknowledged and time-limited.
 See [`docs/activity-isolation.md`](docs/activity-isolation.md). The experimental
 [`docs/workflow-isolation.md`](docs/workflow-isolation.md) path is now connected
 to online Core polling in zero-cache and sticky-cache modes. Its live test
@@ -2533,7 +2536,7 @@ temporal/core/proto/      generated Core Activity and Workflow schema types
 temporal/history_json/    optional Temporal CLI History JSON replay converter
 temporal/protobuf/        protobuf wire runtime used by generated code
 temporal/activity/        Activity context
-temporal/activity/isolate versioned per-invocation Activity process boundary
+temporal/activity/isolate versioned fresh/warm Activity process boundary
 temporal/nexus/           sync/async Nexus operation context and results
 temporal/worker/          Activity/Workflow/Nexus registry and concurrent polling
 temporal/supervisor/      whole-Worker child process lifecycle and restart policy

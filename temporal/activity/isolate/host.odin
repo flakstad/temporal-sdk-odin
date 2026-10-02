@@ -274,17 +274,9 @@ host_heartbeat_recorder :: proc(
 	return activity.Heartbeat_Status(status_value)
 }
 
-// host_run executes exactly one Activity task and exits. A fresh process per
-// invocation makes fatal Odin panics/native faults containable; Temporal's
-// retry policy remains authoritative in the Core-owning parent.
-host_run :: proc(options: Host_Options) -> Error {
-	if !host_options_valid(options) {
+host_execute_request :: proc(options: Host_Options, request: ^Owned_Frame) -> Error {
+	if request == nil {
 		return {kind = .Invalid_Argument}
-	}
-	request, read_error := read(os.stdin, options.maximum_payload_bytes)
-	defer owned_frame_free(&request)
-	if read_error.kind != .None {
-		return read_error
 	}
 	if request.frame.kind != .Execute {
 		return {kind = .Invalid_Argument}
@@ -351,4 +343,54 @@ host_run :: proc(options: Host_Options) -> Error {
 		request_id = request.frame.request_id,
 		payload = processed.completion[:],
 	}, options.maximum_payload_bytes)
+}
+
+// host_run executes exactly one Activity task and exits. It remains the
+// lowest-cost crash-containment mode and preserves the original one-shot host
+// API.
+host_run :: proc(options: Host_Options) -> Error {
+	if !host_options_valid(options) {
+		return {kind = .Invalid_Argument}
+	}
+	request, read_error := read(os.stdin, options.maximum_payload_bytes)
+	defer owned_frame_free(&request)
+	if read_error.kind != .None {
+		return read_error
+	}
+	return host_execute_request(options, &request)
+}
+
+// host_run_loop executes Activities serially until the parent sends Shutdown.
+// A callback panic still terminates the process; the parent retires that child
+// and Temporal remains authoritative for retry. Each Execute has a distinct
+// request ID so stale control/completion frames cannot cross invocations.
+host_run_loop :: proc(options: Host_Options) -> Error {
+	if !host_options_valid(options) {
+		return {kind = .Invalid_Argument}
+	}
+	for {
+		request, read_error := read(os.stdin, options.maximum_payload_bytes)
+		if read_error.kind == .End_Of_Stream {
+			owned_frame_free(&request)
+			return {}
+		}
+		if read_error.kind != .None {
+			owned_frame_free(&request)
+			return read_error
+		}
+		if request.frame.kind == .Shutdown {
+			ack_error := write(os.stdout, {
+				kind = .Shutdown_Ack,
+				request_id = request.frame.request_id,
+				payload = transmute([]u8)string("ok"),
+			}, options.maximum_payload_bytes)
+			owned_frame_free(&request)
+			return ack_error
+		}
+		execute_error := host_execute_request(options, &request)
+		owned_frame_free(&request)
+		if execute_error.kind != .None {
+			return execute_error
+		}
+	}
 }

@@ -1727,6 +1727,9 @@ activity_execution_routes_preserve_opaque_binary_task_tokens :: proc(t: ^testing
 activity_isolation_protocol_rejects_corruption_and_round_trips_binary_tasks :: proc(
 	t: ^testing.T,
 ) {
+	testing.expect_value(t, activity_isolate.VERSION, u16(4))
+	testing.expect(t, activity_isolate.kind_valid(.Shutdown))
+	testing.expect(t, activity_isolate.kind_valid(.Shutdown_Ack))
 	payload := [?]u8{0x00, 0xff, 0x41, 0x00, 0x7f}
 	encoded, encode_error := activity_isolate.encode({
 		kind = .Execute,
@@ -1821,6 +1824,34 @@ activity_isolation_host_manifest_validates_and_dispatches_exact_names :: proc(t:
 		testing.expect_value(t, sdk_worker.activity_registrations[1].name, "goodbye")
 		testing.expect(t, sdk_worker.activity_registrations[0].processor_data == &manager)
 	}
+}
+
+@(test)
+activity_isolation_manager_validates_warm_pool_and_empty_shutdown :: proc(t: ^testing.T) {
+	command := [?]string{"unused-activity-child"}
+	invalid_options := activity_isolate.options_default(command[:])
+	invalid_options.warm_pool_size = -1
+	invalid_manager := activity_isolate.Manager{}
+	invalid_error := activity_isolate.manager_init(&invalid_manager, invalid_options)
+	testing.expect(t, invalid_error.message != nil)
+	activity_isolate.manager_error_free(&invalid_error)
+
+	options := activity_isolate.options_default(command[:])
+	options.warm_pool_size = 2
+	manager := activity_isolate.Manager{}
+	init_error := activity_isolate.manager_init(&manager, options)
+	testing.expect(t, init_error.message == nil)
+	activity_isolate.manager_error_free(&init_error)
+	defer activity_isolate.manager_close(&manager)
+	shutdown_error := activity_isolate.manager_shutdown(&manager)
+	testing.expect(t, shutdown_error.message == nil)
+	activity_isolate.manager_error_free(&shutdown_error)
+	second_shutdown_error := activity_isolate.manager_shutdown(&manager)
+	testing.expect(t, second_shutdown_error.message == nil)
+	activity_isolate.manager_error_free(&second_shutdown_error)
+	stats := activity_isolate.manager_stats(&manager)
+	testing.expect_value(t, stats.children_started, 0)
+	testing.expect_value(t, stats.children_shutdown, 0)
 }
 
 @(test)

@@ -239,6 +239,51 @@ parent_pid=""
 grep -q 'isolated Activity host dispatched two Activity types from one explicit manifest' "$parent_log"
 grep -q 'Workflow dispatched through the isolated Activity manifest: Recovered on Activity attempt 1; Goodbye Odin' "$driver_log"
 
+pool_task_queue="odin-activity-isolate-pool-${RANDOM}-$(date +%s)"
+pool_workflow_id="odin-activity-isolate-pool-${RANDOM}-$(date +%s)"
+ACTIVITY_ISOLATE_POOL=concurrent \
+  TEMPORAL_ODIN_TASK_QUEUE="$pool_task_queue" \
+  "$binary" >>"$parent_log" 2>&1 &
+parent_pid=$!
+for _ in {1..100}; do
+  if grep -q "external Activity parent is polling task queue $pool_task_queue" "$parent_log" 2>/dev/null; then
+    break
+  fi
+  if ! kill -0 "$parent_pid" 2>/dev/null; then
+    echo "Warm-pool Activity parent exited before polling" >&2
+    cat "$parent_log" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+ACTIVITY_ISOLATED_POOL=1 \
+  ACTIVITY_WORKFLOW_ID="$pool_workflow_id" \
+  TEMPORAL_TASK_QUEUE="$pool_task_queue" \
+  cargo run --quiet \
+    --manifest-path "$repo_root/native/Cargo.toml" \
+    --package activity-test-driver >>"$driver_log" 2>&1 &
+driver_pid=$!
+
+if ! wait "$driver_pid"; then
+  driver_pid=""
+  echo "Workflow did not complete through the bounded warm Activity pool" >&2
+  cat "$driver_log" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+driver_pid=""
+if ! wait "$parent_pid"; then
+  parent_pid=""
+  echo "Warm-pool Activity parent did not shut down cleanly" >&2
+  cat "$parent_log" >&2
+  exit 1
+fi
+parent_pid=""
+
+grep -q 'warm Activity pool serialized two concurrent tasks through one reused child' "$parent_log"
+grep -q 'Workflow completed through one warm Activity child' "$driver_log"
+
 cat "$parent_log"
 cat "$driver_log"
-echo "Per-invocation Activity crash/retry, heartbeat forwarding, cancellation, and multi-type manifest dispatch passed through the Core-owning parent."
+echo "Activity crash/retry, heartbeat forwarding, cancellation, manifest dispatch, and bounded warm-pool reuse passed through the Core-owning parent."

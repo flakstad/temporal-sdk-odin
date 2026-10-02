@@ -2,8 +2,8 @@
 
 `temporal/activity/isolate` is an experimental execution boundary for Odin
 Activities. SDK Core, its Worker, task polling, task-token routing, and final
-completion remain in the parent process. Each callback invocation runs in a
-fresh child process:
+completion remain in the parent process. Callbacks run either in fresh children
+or serially in an opt-in bounded warm pool:
 
 ```text
 Core ActivityTask protobuf
@@ -34,6 +34,9 @@ returns. External registration data is never freed by `worker.close`.
 `execution_timeout` bounds the complete invocation, including heartbeat
 exchanges. `cancellation_grace` defaults to five seconds and bounds the interval
 between a forwarded Core cancel task and termination of an unresponsive child.
+`warm_pool_size = 0` retains one process per invocation; a positive value bounds
+the number of persistent children. `shutdown_timeout` independently bounds each
+child's protocol acknowledgement and process exit.
 
 The child calls `activity_isolate.host_run` with either the single-callback
 `host_options` convenience or an explicit `host_options_many` manifest of
@@ -46,11 +49,16 @@ then decodes the Core task and reconstructs the complete callback-visible
 timeouts, priority, and previous heartbeat details), runs the callback in an
 Activity-local arena, and encodes the standard completion variants.
 
-Every invocation gets private stdin/stdout pipes and a fresh process. Child
-stderr is inherited and never shares the framed stdout channel. Process starts
-from the Worker supervisor, Workflow isolate manager, and Activity isolate
-manager use one SDK-global lock because Odin's `os.process_start` handle
-inheritance mutation is not thread-safe.
+Every child gets private stdin/stdout pipes and runs at most one callback at a
+time. `host_run` serves one invocation; `host_run_loop` serves serial requests
+until protocol-v4 `Shutdown`. Pool admission blocks excess Activity execution
+threads without exceeding the configured child bound. Successful children are
+returned to the pool; crashed, timed-out, canceled-by-force, or
+protocol-invalid children are retired and replaced on demand. Child stderr is
+inherited and never shares the framed stdout channel. Process starts from the
+Worker supervisor, Workflow isolate manager, and Activity isolate manager use
+one SDK-global lock because Odin's `os.process_start` handle inheritance
+mutation is not thread-safe.
 
 Processor results carry their allocator explicitly and are released after Core
 copies them; a zero allocator means the synchronous call's context allocator.
@@ -65,7 +73,7 @@ generic cancellation.
 
 As with ordinary remote Temporal Activities, server-requested cancellation is
 observed through heartbeat traffic. A long-running isolated Activity must
-heartbeat for the Service/Core cancel task to reach the parent; protocol v3 then
+heartbeat for the Service/Core cancel task to reach the parent; protocol v4 then
 delivers it independently of any subsequent child heartbeat.
 
 ## Verified path
@@ -86,7 +94,10 @@ require two children, one failed child, one valid completion, one attempt-2
 heartbeat acknowledged by Core, and a fully drained route set. Two additional
 queues prove cooperative cancellation with zero kills and ignored cancellation
 with exactly one grace-deadline kill. A fourth queue runs `hello` followed by
-`goodbye` and proves exact type dispatch from one two-entry child manifest.
+`goodbye` in one child and proves exact type dispatch plus reuse. A fifth starts
+two Activities concurrently against pool size one and requires bounded
+admission, serial execution, one process start, and one reuse. Every surviving
+idle child acknowledges shutdown and exits within the configured deadline.
 
 Unit tests additionally cover binary frame bytes, corrupt magic, truncation,
 payload limits, full Activity metadata reconstruction, and exact/mismatched
@@ -98,8 +109,8 @@ binary task-token routing in the parent.
 This is a correctness and crash-containment slice, not yet the default Activity
 runtime:
 
-- a fresh process is started per attempt; there is no warm bounded pool;
-- child heartbeats use protocol v3 `Heartbeat`/`Heartbeat_Ack` frames and run
+- warm pooling is opt-in; the default remains a fresh process per attempt;
+- child heartbeats use protocol v4 `Heartbeat`/`Heartbeat_Ack` frames and run
   through the parent's ordinary heartbeat/interceptor/Core chain;
 - Core cancel tasks use a serialized `Cancel` control frame and update the same
   child `activity.Context` observed by the callback. The manager starts a
@@ -109,12 +120,13 @@ runtime:
   still wrap forwarded heartbeats; child-side execute interceptor registration
   is not yet exposed by `Host_Options`;
 - child metrics use a no-op meter; structured log/metric forwarding is not yet
-  part of protocol v3;
-- shutdown currently assumes `worker.run` has drained all invocations before
-  `manager_close`; forced manager teardown is best-effort;
-- CPU/memory sandboxing, warm-pool admission, crash-loop policy, release
-  signing, and all-target fault evidence remain production work.
+  part of protocol v4;
+- shutdown requires `worker.run` to have drained all invocations; idle children
+  are currently drained serially, so the total upper bound scales with pool
+  size;
+- prewarming/health handshakes, CPU/memory sandboxing, crash-loop policy,
+  release signing, and all-target fault evidence remain production work.
 
-The next increment can now address persistent warm children without weakening
-manifest dispatch, heartbeat, or cancellation semantics. Pool admission,
-idle-child health, crash-loop fencing, and shutdown must remain bounded.
+The next increment should add a startup/manifest handshake and crash-loop
+fencing before treating the warm pool as a default. Parallel pool shutdown and
+child-side interceptor/diagnostic transport remain follow-up hardening.

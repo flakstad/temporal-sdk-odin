@@ -1,5 +1,6 @@
 package activity_isolate
 
+import allocator_runtime "base:runtime"
 import "core:bytes"
 import "core:mem/virtual"
 import "core:os"
@@ -31,6 +32,8 @@ Options :: struct {
 	command:               []string,
 	execution_timeout:     time.Duration,
 	cancellation_grace:    time.Duration,
+	shutdown_timeout:      time.Duration,
+	warm_pool_size:        int,
 	maximum_payload_bytes: u32,
 }
 
@@ -38,6 +41,7 @@ options_default :: proc(command: []string) -> Options {
 	return {
 		command = command,
 		cancellation_grace = 5 * time.Second,
+		shutdown_timeout = 5 * time.Second,
 		maximum_payload_bytes = DEFAULT_MAXIMUM_PAYLOAD_BYTES,
 	}
 }
@@ -45,6 +49,9 @@ options_default :: proc(command: []string) -> Options {
 Stats :: struct {
 	children_started: int,
 	children_completed: int,
+	children_reused: int,
+	children_retired: int,
+	children_shutdown: int,
 	child_failures: int,
 	protocol_failures: int,
 	timeouts: int,
@@ -52,17 +59,25 @@ Stats :: struct {
 	forced_cancellation_kills: int,
 	heartbeats_forwarded: int,
 	peak_in_flight: int,
+	peak_pool_children: int,
 }
 
 Session :: struct {
 	manager:         ^Manager,
 	process:         os.Process,
 	input:           ^os.File,
+	output:          ^os.File,
 	write_mutex:     sync.Mutex,
 	cancel_sent:     bool,
 	finished:        bool,
 	done:            sync.Sema,
 	fallback_thread: ^thread.Thread,
+	request_id:      u64,
+	uses:            int,
+	busy:            bool,
+	persistent:      bool,
+	reaped:          bool,
+	exit_state:      os.Process_State,
 }
 
 Route :: struct {
@@ -74,8 +89,16 @@ Manager :: struct {
 	command:               [dynamic]string,
 	execution_timeout:     time.Duration,
 	cancellation_grace:    time.Duration,
+	shutdown_timeout:      time.Duration,
+	warm_pool_size:        int,
 	maximum_payload_bytes: u32,
 	routes:                [dynamic]Route,
+	pool:                  [dynamic]^Session,
+	pool_available:        sync.Sema,
+	pool_starting:         int,
+	pool_waiters:          int,
+	pool_wakeups:          int,
+	closing:               bool,
 	mutex:                 sync.Mutex,
 	stats:                 Stats,
 	initialized:           bool,
@@ -85,8 +108,9 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 	if manager == nil || len(options.command) == 0 || len(options.command[0]) == 0 {
 		return manager_error("Activity executor command must not be empty")
 	}
-	if options.execution_timeout < 0 || options.cancellation_grace < 0 {
-		return manager_error("Activity executor timeouts must not be negative")
+	if options.execution_timeout < 0 || options.cancellation_grace < 0 ||
+	   options.shutdown_timeout < 0 || options.warm_pool_size < 0 {
+		return manager_error("Activity executor durations and pool size must not be negative")
 	}
 	if options.maximum_payload_bytes == 0 {
 		return manager_error("Activity executor payload limit must be positive")
@@ -102,8 +126,11 @@ manager_init :: proc(manager: ^Manager, options: Options) -> Manager_Error {
 		append(&manager.command, owned)
 	}
 	manager.routes = make([dynamic]Route)
+	manager.pool = make([dynamic]^Session)
 	manager.execution_timeout = options.execution_timeout
 	manager.cancellation_grace = options.cancellation_grace
+	manager.shutdown_timeout = options.shutdown_timeout
+	manager.warm_pool_size = options.warm_pool_size
 	manager.maximum_payload_bytes = options.maximum_payload_bytes
 	manager.initialized = true
 	return {}
@@ -135,26 +162,6 @@ register_external_activity_manifest :: proc(
 		}
 	}
 	return {}
-}
-
-manager_close :: proc(manager: ^Manager) {
-	if manager == nil {
-		return
-	}
-	sync.mutex_lock(&manager.mutex)
-	for route in manager.routes {
-		_ = os.process_kill(route.session.process)
-		delete(route.task_token)
-	}
-	delete(manager.routes)
-	manager.routes = nil
-	sync.mutex_unlock(&manager.mutex)
-	for argument in manager.command {
-		delete(argument)
-	}
-	delete(manager.command)
-	manager.command = nil
-	manager.initialized = false
 }
 
 manager_stats :: proc(manager: ^Manager) -> Stats {
@@ -202,7 +209,6 @@ route_add :: proc(manager: ^Manager, token: []u8, session: ^Session) -> bool {
 		}
 	}
 	append(&manager.routes, Route{task_token = token, session = session})
-	manager.stats.children_started += 1
 	manager.stats.peak_in_flight = max(manager.stats.peak_in_flight, len(manager.routes))
 	return true
 }
@@ -326,6 +332,359 @@ forward_heartbeat :: proc(
 	return activity.heartbeat_payload(ctx, codec.payload_view(&details)), true
 }
 
+session_start :: proc(manager: ^Manager, persistent: bool) -> ^Session {
+	child_input, parent_input, input_error := os.pipe()
+	if input_error != nil {
+		return nil
+	}
+	parent_output, child_output, output_error := os.pipe()
+	if output_error != nil {
+		os.close(child_input)
+		os.close(parent_input)
+		return nil
+	}
+	process, start_error := process_start.start({
+		command = manager.command[:],
+		stdin = child_input,
+		stdout = child_output,
+		stderr = os.stderr,
+	})
+	os.close(child_input)
+	os.close(child_output)
+	if start_error != nil {
+		os.close(parent_input)
+		os.close(parent_output)
+		return nil
+	}
+	heap := allocator_runtime.heap_allocator()
+	session, allocation_error := new(Session, heap)
+	if allocation_error != nil {
+		_ = os.process_kill(process)
+		_, _ = os.process_wait(process)
+		os.close(parent_input)
+		os.close(parent_output)
+		return nil
+	}
+	session^ = {
+		manager = manager,
+		process = process,
+		input = parent_input,
+		output = parent_output,
+		persistent = persistent,
+	}
+	sync.mutex_lock(&manager.mutex)
+	manager.stats.children_started += 1
+	sync.mutex_unlock(&manager.mutex)
+	return session
+}
+
+session_prepare :: proc(manager: ^Manager, session: ^Session) {
+	if manager == nil || session == nil {
+		return
+	}
+	session.request_id += 1
+	session.cancel_sent = false
+	session.fallback_thread = nil
+	sync.atomic_store_explicit(&session.finished, false, .Release)
+	session.busy = true
+}
+
+session_destroy :: proc(session: ^Session, kill: bool) -> os.Process_State {
+	if session == nil {
+		return {}
+	}
+	if kill && !session.reaped {
+		_ = os.process_kill(session.process)
+	}
+	state := session.exit_state
+	if !session.reaped {
+		state, _ = os.process_wait(session.process)
+		session.reaped = true
+		session.exit_state = state
+	}
+	if session.input != nil {
+		os.close(session.input)
+		session.input = nil
+	}
+	if session.output != nil {
+		os.close(session.output)
+		session.output = nil
+	}
+	free(session, allocator_runtime.heap_allocator())
+	return state
+}
+
+pool_acquire :: proc(manager: ^Manager) -> ^Session {
+	if manager.warm_pool_size == 0 {
+		session := session_start(manager, false)
+		if session != nil {
+			session_prepare(manager, session)
+		}
+		return session
+	}
+	for {
+		sync.mutex_lock(&manager.mutex)
+		if manager.closing || !manager.initialized {
+			sync.mutex_unlock(&manager.mutex)
+			return nil
+		}
+		for session in manager.pool {
+			if !session.busy {
+				session_prepare(manager, session)
+				if session.uses > 0 {
+					manager.stats.children_reused += 1
+				}
+				sync.mutex_unlock(&manager.mutex)
+				return session
+			}
+		}
+		if len(manager.pool) + manager.pool_starting < manager.warm_pool_size {
+			manager.pool_starting += 1
+			sync.mutex_unlock(&manager.mutex)
+			session := session_start(manager, true)
+			sync.mutex_lock(&manager.mutex)
+			manager.pool_starting -= 1
+			if session != nil && !manager.closing {
+				session_prepare(manager, session)
+				append(&manager.pool, session)
+				manager.stats.peak_pool_children = max(
+					manager.stats.peak_pool_children,
+					len(manager.pool),
+				)
+				sync.mutex_unlock(&manager.mutex)
+				return session
+			}
+			sync.mutex_unlock(&manager.mutex)
+			if session != nil {
+				_ = session_destroy(session, true)
+			}
+			sync.mutex_lock(&manager.mutex)
+			notify := manager.pool_waiters > manager.pool_wakeups
+			if notify {
+				manager.pool_wakeups += 1
+			}
+			sync.mutex_unlock(&manager.mutex)
+			if notify {
+				sync.sema_post(&manager.pool_available)
+			}
+			return nil
+		}
+		manager.pool_waiters += 1
+		sync.mutex_unlock(&manager.mutex)
+		sync.sema_wait(&manager.pool_available)
+		sync.mutex_lock(&manager.mutex)
+		manager.pool_waiters -= 1
+		manager.pool_wakeups -= 1
+		sync.mutex_unlock(&manager.mutex)
+	}
+}
+
+pool_release :: proc(manager: ^Manager, session: ^Session) {
+	sync.mutex_lock(&manager.mutex)
+	session.busy = false
+	session.uses += 1
+	manager.stats.children_completed += 1
+	notify := manager.pool_waiters > manager.pool_wakeups
+	if notify {
+		manager.pool_wakeups += 1
+	}
+	sync.mutex_unlock(&manager.mutex)
+	if notify {
+		sync.sema_post(&manager.pool_available)
+	}
+}
+
+pool_retire :: proc(manager: ^Manager, session: ^Session) {
+	if manager == nil || session == nil {
+		return
+	}
+	sync.mutex_lock(&manager.mutex)
+	for pooled, index in manager.pool {
+		if pooled == session {
+			ordered_remove(&manager.pool, index)
+			break
+		}
+	}
+	manager.stats.children_retired += 1
+	notify := manager.pool_waiters > manager.pool_wakeups
+	if notify {
+		manager.pool_wakeups += 1
+	}
+	sync.mutex_unlock(&manager.mutex)
+	_ = session_destroy(session, true)
+	if notify {
+		sync.sema_post(&manager.pool_available)
+	}
+}
+
+execution_finish :: proc(
+	manager: ^Manager,
+	session: ^Session,
+	token: []u8,
+	healthy: ^bool,
+) {
+	route_remove(manager, token)
+	session_finish(manager, session)
+	if session.persistent {
+		if healthy != nil && healthy^ {
+			pool_release(manager, session)
+		} else {
+			pool_retire(manager, session)
+		}
+		return
+	}
+	state := session_destroy(session, healthy == nil || !healthy^)
+	if healthy != nil && healthy^ {
+		sync.mutex_lock(&manager.mutex)
+		if state.exited && state.success {
+			manager.stats.children_completed += 1
+		} else {
+			healthy^ = false
+			manager.stats.child_failures += 1
+		}
+		sync.mutex_unlock(&manager.mutex)
+	}
+}
+
+Process_Wait_State :: struct {
+	process: os.Process,
+	state:   os.Process_State,
+	error:   os.Error,
+	done:    sync.Sema,
+}
+
+process_wait_main :: proc(wait: ^Process_Wait_State) {
+	wait.state, wait.error = os.process_wait(wait.process)
+	sync.sema_post(&wait.done)
+}
+
+process_wait_with_timeout :: proc(
+	process: os.Process,
+	timeout: time.Duration,
+) -> (state: os.Process_State, timed_out: bool) {
+	if timeout <= 0 {
+		state, _ = os.process_wait(process)
+		return
+	}
+	wait := Process_Wait_State{process = process}
+	wait_thread := thread.create_and_start_with_poly_data(&wait, process_wait_main)
+	if wait_thread == nil {
+		_ = os.process_kill(process)
+		state, _ = os.process_wait(process)
+		return state, true
+	}
+	finished := sync.sema_wait_with_timeout(&wait.done, timeout)
+	if !finished {
+		_ = os.process_kill(process)
+	}
+	thread.join(wait_thread)
+	thread.destroy(wait_thread)
+	return wait.state, !finished
+}
+
+session_shutdown :: proc(manager: ^Manager, session: ^Session) -> bool {
+	if manager == nil || session == nil {
+		return false
+	}
+	session.request_id += 1
+	request_id := session.request_id
+	payload := [1]u8{0}
+	write_error := session_write(session, {
+		kind = .Shutdown,
+		request_id = request_id,
+		payload = payload[:],
+	}, manager.maximum_payload_bytes)
+	ack_ok := false
+	if write_error.kind == .None {
+		response, read_error, timed_out := read_with_timeout(
+			session.output,
+			manager.maximum_payload_bytes,
+			manager.shutdown_timeout,
+			session.process,
+		)
+		ack_ok = !timed_out && read_error.kind == .None &&
+		         response.frame.kind == .Shutdown_Ack &&
+		         response.frame.request_id == request_id
+		owned_frame_free(&response)
+	}
+	if !ack_ok {
+		_ = os.process_kill(session.process)
+	}
+	state, timed_out := process_wait_with_timeout(
+		session.process,
+		manager.shutdown_timeout,
+	)
+	session.exit_state = state
+	session.reaped = true
+	graceful := ack_ok && !timed_out && state.exited && state.success
+	sync.mutex_lock(&manager.mutex)
+	if graceful {
+		manager.stats.children_shutdown += 1
+	} else {
+		manager.stats.child_failures += 1
+	}
+	sync.mutex_unlock(&manager.mutex)
+	_ = session_destroy(session, false)
+	return graceful
+}
+
+// manager_shutdown is valid after Worker polling and Activity execution have
+// drained. It closes every idle warm child through protocol v4 and bounds both
+// acknowledgement and process-exit waits.
+manager_shutdown :: proc(manager: ^Manager) -> Manager_Error {
+	if manager == nil || !manager.initialized {
+		return manager_error("Activity executor manager is not initialized")
+	}
+	sync.mutex_lock(&manager.mutex)
+	if manager.closing {
+		sync.mutex_unlock(&manager.mutex)
+		return {}
+	}
+	if len(manager.routes) != 0 || manager.pool_starting != 0 {
+		sync.mutex_unlock(&manager.mutex)
+		return manager_error("Activity executor manager cannot shut down with work in flight")
+	}
+	manager.closing = true
+	sessions := make([]^Session, len(manager.pool))
+	copy(sessions, manager.pool[:])
+	delete(manager.pool)
+	manager.pool = nil
+	sync.mutex_unlock(&manager.mutex)
+	all_graceful := true
+	for session in sessions {
+		was_busy := session.busy
+		shutdown_ok := session_shutdown(manager, session)
+		if was_busy || !shutdown_ok {
+			all_graceful = false
+		}
+	}
+	delete(sessions)
+	if !all_graceful {
+		return manager_error("one or more Activity executor children did not shut down cleanly")
+	}
+	return {}
+}
+
+manager_close :: proc(manager: ^Manager) {
+	if manager == nil {
+		return
+	}
+	if manager.initialized && !manager.closing {
+		shutdown_error := manager_shutdown(manager)
+		manager_error_free(&shutdown_error)
+	}
+	delete(manager.routes)
+	manager.routes = nil
+	delete(manager.pool)
+	manager.pool = nil
+	for argument in manager.command {
+		delete(argument)
+	}
+	delete(manager.command)
+	manager.command = nil
+	manager.initialized = false
+}
+
 process_task :: proc(
 	processor_data: rawptr,
 	ctx: ^activity.Context,
@@ -339,62 +698,33 @@ process_task :: proc(
 	if !token_ok {
 		return {error = worker.error_from_string("external Activity task is malformed")}
 	}
-
-	child_input, parent_input, input_error := os.pipe()
-	if input_error != nil {
-		delete(token)
-		return {error = worker.error_from_string("could not create Activity executor input pipe")}
-	}
-	parent_output, child_output, output_error := os.pipe()
-	if output_error != nil {
-		os.close(child_input)
-		os.close(parent_input)
-		delete(token)
-		return {error = worker.error_from_string("could not create Activity executor output pipe")}
-	}
-	process, start_error := process_start.start({
-		command = manager.command[:],
-		stdin = child_input,
-		stdout = child_output,
-		stderr = os.stderr,
-	})
-	os.close(child_input)
-	os.close(child_output)
-	if start_error != nil {
-		os.close(parent_input)
-		os.close(parent_output)
+	session := pool_acquire(manager)
+	if session == nil {
 		delete(token)
 		sync.mutex_lock(&manager.mutex)
 		manager.stats.child_failures += 1
 		sync.mutex_unlock(&manager.mutex)
 		return {error = worker.error_from_string("could not start Activity executor child")}
 	}
-	session := Session{
-		manager = manager,
-		process = process,
-		input = parent_input,
-	}
-	if !route_add(manager, token, &session) {
-		_ = os.process_kill(process)
-		_, _ = os.process_wait(process)
-		os.close(parent_input)
-		os.close(parent_output)
+	if !route_add(manager, token, session) {
+		if session.persistent {
+			pool_retire(manager, session)
+		} else {
+			_ = session_destroy(session, true)
+		}
 		delete(token)
 		return {error = worker.error_from_string("duplicate Activity executor task token")}
 	}
-	defer os.close(parent_input)
-	defer os.close(parent_output)
-	defer session_finish(manager, &session)
-	defer route_remove(manager, token)
+	healthy := false
+	defer execution_finish(manager, session, token, &healthy)
 
-	write_error := session_write(&session, {
+	write_error := session_write(session, {
 		kind = .Execute,
-		request_id = 1,
+		request_id = session.request_id,
 		payload = task,
 	}, manager.maximum_payload_bytes)
 	if write_error.kind != .None {
-		_ = os.process_kill(process)
-		_, _ = os.process_wait(process)
+		_ = os.process_kill(session.process)
 		sync.mutex_lock(&manager.mutex)
 		manager.stats.protocol_failures += 1
 		sync.mutex_unlock(&manager.mutex)
@@ -409,8 +739,7 @@ process_task :: proc(
 		if read_timeout > 0 {
 			read_timeout -= time.tick_diff(execution_started, time.tick_now())
 			if read_timeout <= 0 {
-				_ = os.process_kill(process)
-				_, _ = os.process_wait(process)
+				_ = os.process_kill(session.process)
 				sync.mutex_lock(&manager.mutex)
 				manager.stats.timeouts += 1
 				manager.stats.child_failures += 1
@@ -419,10 +748,10 @@ process_task :: proc(
 			}
 		}
 		response, read_error, timed_out := read_with_timeout(
-			parent_output,
+			session.output,
 			manager.maximum_payload_bytes,
 			read_timeout,
-			process,
+			session.process,
 		)
 		if timed_out {
 			owned_frame_free(&response)
@@ -430,21 +759,18 @@ process_task :: proc(
 			manager.stats.timeouts += 1
 			manager.stats.child_failures += 1
 			sync.mutex_unlock(&manager.mutex)
-			_, _ = os.process_wait(process)
 			return {error = worker.error_from_string("Activity executor timed out")}
 		}
 		if read_error.kind != .None {
 			owned_frame_free(&response)
-			_, _ = os.process_wait(process)
 			sync.mutex_lock(&manager.mutex)
 			manager.stats.child_failures += 1
 			sync.mutex_unlock(&manager.mutex)
 			return {error = worker.error_from_string("Activity executor exited without a completion")}
 		}
-		if response.frame.request_id != 1 {
+		if response.frame.request_id != session.request_id {
 			owned_frame_free(&response)
-			_ = os.process_kill(process)
-			_, _ = os.process_wait(process)
+			_ = os.process_kill(session.process)
 			sync.mutex_lock(&manager.mutex)
 			manager.stats.protocol_failures += 1
 			sync.mutex_unlock(&manager.mutex)
@@ -454,22 +780,20 @@ process_task :: proc(
 			heartbeat_status, heartbeat_ok := forward_heartbeat(ctx, response.frame.payload, token)
 			owned_frame_free(&response)
 			if !heartbeat_ok {
-				_ = os.process_kill(process)
-				_, _ = os.process_wait(process)
+				_ = os.process_kill(session.process)
 				sync.mutex_lock(&manager.mutex)
 				manager.stats.protocol_failures += 1
 				sync.mutex_unlock(&manager.mutex)
 				return {error = worker.error_from_string("Activity executor returned an invalid heartbeat")}
 			}
 			ack := [1]u8{u8(heartbeat_status)}
-			ack_error := session_write(&session, {
+			ack_error := session_write(session, {
 				kind = .Heartbeat_Ack,
-				request_id = 1,
+				request_id = session.request_id,
 				payload = ack[:],
 			}, manager.maximum_payload_bytes)
 			if ack_error.kind != .None {
-				_ = os.process_kill(process)
-				_, _ = os.process_wait(process)
+				_ = os.process_kill(session.process)
 				return {error = worker.error_from_string("could not acknowledge Activity heartbeat")}
 			}
 			sync.mutex_lock(&manager.mutex)
@@ -480,14 +804,13 @@ process_task :: proc(
 		if response.frame.kind == .Control_Done {
 			owned_frame_free(&response)
 			stop_payload := [1]u8{0}
-			stop_error := session_write(&session, {
+			stop_error := session_write(session, {
 				kind = .Control_Stop,
-				request_id = 1,
+				request_id = session.request_id,
 				payload = stop_payload[:],
 			}, manager.maximum_payload_bytes)
 			if stop_error.kind != .None {
-				_ = os.process_kill(process)
-				_, _ = os.process_wait(process)
+				_ = os.process_kill(session.process)
 				return {error = worker.error_from_string("could not stop Activity child control loop")}
 			}
 			continue
@@ -495,7 +818,6 @@ process_task :: proc(
 		if response.frame.kind == .Executor_Error {
 			message := string(bytes.clone(response.frame.payload))
 			owned_frame_free(&response)
-			_, _ = os.process_wait(process)
 			sync.mutex_lock(&manager.mutex)
 			manager.stats.child_failures += 1
 			sync.mutex_unlock(&manager.mutex)
@@ -505,8 +827,7 @@ process_task :: proc(
 		}
 		if response.frame.kind != .Completion {
 			owned_frame_free(&response)
-			_ = os.process_kill(process)
-			_, _ = os.process_wait(process)
+			_ = os.process_kill(session.process)
 			sync.mutex_lock(&manager.mutex)
 			manager.stats.protocol_failures += 1
 			sync.mutex_unlock(&manager.mutex)
@@ -516,17 +837,18 @@ process_task :: proc(
 		owned_frame_free(&response)
 		break
 	}
-	state, _ := os.process_wait(process)
-	if !state.exited || !state.success {
-		delete(completion, completion_allocator)
-		sync.mutex_lock(&manager.mutex)
-		manager.stats.child_failures += 1
-		sync.mutex_unlock(&manager.mutex)
-		return {error = worker.error_from_string("Activity executor exited unsuccessfully")}
+	if !session.persistent {
+		session.exit_state, _ = os.process_wait(session.process)
+		session.reaped = true
+		if !session.exit_state.exited || !session.exit_state.success {
+			delete(completion, completion_allocator)
+			sync.mutex_lock(&manager.mutex)
+			manager.stats.child_failures += 1
+			sync.mutex_unlock(&manager.mutex)
+			return {error = worker.error_from_string("Activity executor exited unsuccessfully")}
+		}
 	}
-	sync.mutex_lock(&manager.mutex)
-	manager.stats.children_completed += 1
-	sync.mutex_unlock(&manager.mutex)
+	healthy = true
 	return {completion = completion, allocator = completion_allocator}
 }
 

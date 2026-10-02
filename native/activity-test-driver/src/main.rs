@@ -342,6 +342,30 @@ impl IsolatedActivityManifestDriverWorkflow {
     }
 }
 
+#[workflow]
+#[derive(Default)]
+struct IsolatedActivityPoolDriverWorkflow;
+
+#[workflow_methods]
+impl IsolatedActivityPoolDriverWorkflow {
+    #[run(name = "odin_isolated_activity_pool_driver")]
+    async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<String> {
+        let activities = ["pool-a", "pool-b"].map(|name| {
+            ctx.execute_activity(
+                HelloActivity,
+                name.to_string(),
+                ActivityOptions::start_to_close_timeout(Duration::from_secs(20)),
+            )
+        });
+        let results = temporalio_sdk::workflows::join_all(activities).await;
+        let mut outputs = Vec::with_capacity(results.len());
+        for result in results {
+            outputs.push(result?);
+        }
+        Ok(outputs.join(" & "))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target =
@@ -360,6 +384,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let isolated_cancellation_uncooperative =
         std::env::var_os("ACTIVITY_ISOLATED_CANCELLATION_UNCOOPERATIVE").is_some();
     let isolated_manifest = std::env::var_os("ACTIVITY_ISOLATED_MANIFEST").is_some();
+    let isolated_pool = std::env::var_os("ACTIVITY_ISOLATED_POOL").is_some();
     let async_mode = std::env::var("ACTIVITY_ASYNC_MODE").ok();
     let expected = if shutdown_case {
         "Workflow observed Worker shutdown Activity failure".to_string()
@@ -387,6 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_workflow::<ActivityPanicRecoveryDriverWorkflow>()?
         .register_workflow::<IsolatedActivityCancellationDriverWorkflow>()?
         .register_workflow::<IsolatedActivityManifestDriverWorkflow>()?
+        .register_workflow::<IsolatedActivityPoolDriverWorkflow>()?
         .build();
     let mut worker = Worker::new(&runtime, client.clone(), options)?;
     let shutdown = worker.shutdown_handle();
@@ -395,6 +421,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow_id = std::env::var("ACTIVITY_WORKFLOW_ID")
         .unwrap_or_else(|_| format!("odin-sdk-activity-spike-{}-{unique}", std::process::id()));
     let driver = async move {
+        if isolated_pool {
+            let handle = client
+                .start_workflow(
+                    IsolatedActivityPoolDriverWorkflow::run,
+                    (),
+                    WorkflowStartOptions::new(queue, workflow_id).build(),
+                )
+                .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.get_result(WorkflowGetResultOptions::default()),
+            )
+            .await??;
+            shutdown();
+            let expected = "Recovered on Activity attempt 1 & Recovered on Activity attempt 1";
+            if result != expected {
+                return Err(format!("unexpected isolated pool result: {result}").into());
+            }
+            println!("Workflow completed through one warm Activity child: {result}");
+            return Ok::<(), Box<dyn std::error::Error>>(());
+        }
         if isolated_manifest {
             let handle = client
                 .start_workflow(

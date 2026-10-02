@@ -110,6 +110,9 @@ isolated_hello :: proc(ctx: ^activity.Context, inputs: []codec.Payload_View) -> 
 			)
 		}
 	}
+	if name == "pool-a" || name == "pool-b" {
+		time.sleep(100 * time.Millisecond)
+	}
 	message := fmt.aprintf("Recovered on Activity attempt %d", attempt)
 	defer delete(message)
 	payload, encode_error := codec.encode_json(message)
@@ -169,11 +172,11 @@ isolated_activity_manifest :: proc(marker: ^bool) -> [2]activity_isolate.Host_Ac
 	}
 }
 
-run_child :: proc() {
+run_child :: proc(loop: bool) {
 	marker := true
 	activities := isolated_activity_manifest(&marker)
 	options := activity_isolate.host_options_many(activities[:])
-	host_error := activity_isolate.host_run(options)
+	host_error := loop ? activity_isolate.host_run_loop(options) : activity_isolate.host_run(options)
 	if host_error.kind != .None {
 		fmt.eprintf("Activity executor host failed: %v\n", host_error.kind)
 		os.exit(1)
@@ -201,11 +204,13 @@ run_parent :: proc() {
 	if len(task_queue) == 0 {
 		task_queue = "odin-activity-isolate"
 	}
-	command := [?]string{os.args[0], "--child"}
+	command := [?]string{os.args[0], "--child-loop"}
 	manager := activity_isolate.Manager{}
 	manager_options := activity_isolate.options_default(command[:])
 	manager_options.execution_timeout = 10 * time.Second
 	manager_options.cancellation_grace = 500 * time.Millisecond
+	manager_options.shutdown_timeout = 2 * time.Second
+	manager_options.warm_pool_size = 1
 	manager_error := activity_isolate.manager_init(&manager, manager_options)
 	if manager_error.message != nil {
 		fmt.eprintf("Activity executor manager failed: %s\n", string(manager_error.message))
@@ -249,6 +254,9 @@ run_parent :: proc() {
 	multi_buffer: [32]u8
 	multi_mode := os.get_env(multi_buffer[:], "ACTIVITY_ISOLATE_MULTI")
 	multi_case := multi_mode == "manifest"
+	pool_buffer: [32]u8
+	pool_mode := os.get_env(pool_buffer[:], "ACTIVITY_ISOLATE_POOL")
+	pool_case := pool_mode == "concurrent"
 	fmt.printf(
 		"Odin external Activity parent is polling task queue %s (manifest=%v)\n",
 		task_queue,
@@ -285,16 +293,28 @@ run_parent :: proc() {
 		worker.error_free(&close_error)
 		os.exit(1)
 	}
+	shutdown_error := activity_isolate.manager_shutdown(&manager)
+	if shutdown_error.message != nil {
+		fmt.eprintf("Activity executor shutdown failed: %s\n", string(shutdown_error.message))
+		activity_isolate.manager_error_free(&shutdown_error)
+		os.exit(1)
+	}
 	executor_stats := activity_isolate.manager_stats(&manager)
 	if cancel_case {
 		expected_completed := forced_cancel_case ? 0 : 1
 		expected_failures := forced_cancel_case ? 1 : 0
 		expected_kills := forced_cancel_case ? 1 : 0
+		expected_shutdown := forced_cancel_case ? 0 : 1
+		expected_retired := forced_cancel_case ? 1 : 0
 		if stats.activity_tasks_completed != 1 || executor_stats.children_started != 1 ||
 		   executor_stats.children_completed != expected_completed ||
 		   executor_stats.child_failures != expected_failures ||
 		   executor_stats.cancellations_forwarded != 1 ||
 		   executor_stats.forced_cancellation_kills != expected_kills ||
+		   executor_stats.children_retired != expected_retired ||
+		   executor_stats.children_shutdown != expected_shutdown ||
+		   executor_stats.peak_in_flight != 1 ||
+		   executor_stats.peak_pool_children != 1 ||
 		   activity_isolate.manager_in_flight(&manager) != 0 {
 			fmt.eprintf(
 				"unexpected cancellation stats: tasks=%d started=%d completed=%d failures=%d cancellations=%d kills=%d in_flight=%d\n",
@@ -315,13 +335,22 @@ run_parent :: proc() {
 		}
 		return
 	}
-	expected_completed := multi_case ? 2 : 1
-	expected_failures := multi_case ? 0 : 1
-	if stats.activity_tasks_completed != 2 || executor_stats.children_started != 2 ||
+	reuse_case := multi_case || pool_case
+	expected_completed := reuse_case ? 2 : 1
+	expected_failures := reuse_case ? 0 : 1
+	expected_started := reuse_case ? 1 : 2
+	expected_reused := reuse_case ? 1 : 0
+	expected_retired := reuse_case ? 0 : 1
+	if stats.activity_tasks_completed != 2 || executor_stats.children_started != expected_started ||
 	   executor_stats.children_completed != expected_completed ||
 	   executor_stats.child_failures != expected_failures ||
-	   executor_stats.heartbeats_forwarded != (multi_case ? 0 : 1) ||
-	   sync.atomic_load_explicit(&parent_heartbeat_interceptor_calls, .Acquire) != (multi_case ? 0 : 1) ||
+	   executor_stats.children_reused != expected_reused ||
+	   executor_stats.children_retired != expected_retired ||
+	   executor_stats.children_shutdown != 1 ||
+	   executor_stats.peak_in_flight != 1 ||
+	   executor_stats.peak_pool_children != 1 ||
+	   executor_stats.heartbeats_forwarded != (reuse_case ? 0 : 1) ||
+	   sync.atomic_load_explicit(&parent_heartbeat_interceptor_calls, .Acquire) != (reuse_case ? 0 : 1) ||
 	   activity_isolate.manager_in_flight(&manager) != 0 {
 		fmt.eprintf(
 			"unexpected isolation stats: tasks=%d started=%d completed=%d failures=%d heartbeats=%d intercepted=%d in_flight=%d\n",
@@ -339,12 +368,20 @@ run_parent :: proc() {
 		fmt.println("isolated Activity host dispatched two Activity types from one explicit manifest")
 		return
 	}
+	if pool_case {
+		fmt.println("warm Activity pool serialized two concurrent tasks through one reused child")
+		return
+	}
 	fmt.println("isolated Activity panic was contained, heartbeat forwarded, and retry completed")
 }
 
 main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "--child" {
-		run_child()
+		run_child(false)
+		return
+	}
+	if len(os.args) >= 2 && os.args[1] == "--child-loop" {
+		run_child(true)
 		return
 	}
 	run_parent()
