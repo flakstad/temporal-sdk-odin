@@ -1208,6 +1208,14 @@ entered that fiber, requests cancellation through the public Client, and
 requires the same executor thread to observe the exact reason and cancel the
 timer. Every valid run must produce its expected terminal result and final Core
 eviction.
+The script performs a second pass with `TEMPORAL_ODIN_FORCE_REPLAY=1`. After
+the initial timer-command activations complete, a coordinator calls
+`worker.request_workflow_eviction` for every valid run. Core emits
+`RemoveFromCache`, later fetches the durable histories, and marks the rebuilt
+activations as replay. The pass requires a positive replay count, same-shard
+fiber reconstruction, callback overlap after timer resolution, and zero thread
+migrations. The helper is asynchronous: success means Core accepted the
+request, while the ordinary activation stream proves completion.
 The example also requires
 `Run_Stats.workflow_activations_peak_owned >= 2` and a non-zero
 `workflow_executor_queue_peak`. The former counts all activation buffers owned

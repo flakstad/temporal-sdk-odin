@@ -12006,6 +12006,37 @@ worker_client_replacement_rejects_invalid_lifecycle_and_handles :: proc(t: ^test
 }
 
 @(test)
+worker_workflow_eviction_rejects_invalid_lifecycle :: proc(t: ^testing.T) {
+	nil_error := worker.request_workflow_eviction(nil, "run-id")
+	testing.expect(t, nil_error.message != nil)
+	worker.error_free(&nil_error)
+
+	raw_runtime := raw.Runtime{}
+	runtime := temporal_core.Runtime{handle = &raw_runtime}
+	raw_connection := raw.Connection{}
+	client := temporal_core.Client{handle = &raw_connection, runtime = &runtime}
+	sdk_worker, create_error := worker.create(&client, "eviction-worker")
+	testing.expect(t, create_error.message == nil)
+	worker.error_free(&create_error)
+
+	before_run_error := worker.request_workflow_eviction(&sdk_worker, "run-id")
+	testing.expect(t, before_run_error.message != nil)
+	worker.error_free(&before_run_error)
+
+	replay_worker := worker.Worker{mode = .Replay, lifecycle = .Running}
+	replay_error := worker.request_workflow_eviction(&replay_worker, "run-id")
+	testing.expect(t, replay_error.message != nil)
+	worker.error_free(&replay_error)
+
+	close_error := worker.close(&sdk_worker)
+	testing.expect(t, close_error.message == nil)
+	worker.error_free(&close_error)
+	after_close_error := worker.request_workflow_eviction(&sdk_worker, "run-id")
+	testing.expect(t, after_close_error.message != nil)
+	worker.error_free(&after_close_error)
+}
+
+@(test)
 worker_options_reject_invalid_values_before_crossing_ffi :: proc(t: ^testing.T) {
 	invalid_simple := temporal_core.worker_options_default()
 	invalid_simple.workflow_task_poller_behavior = temporal_core.poller_simple_maximum(0)

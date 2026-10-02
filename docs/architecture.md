@@ -3504,7 +3504,7 @@ Workflows are enabled.
 | Option | What the evidence says now | First useful test |
 | --- | --- | --- |
 | Explicit state machine | Proven for Activity scheduling, forced eviction, replay, resolution, and completion; authoring API is unacceptable | Keep as a reference oracle, not the primary authoring direction |
-| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and fixed run-affine concurrent executors on macOS arm64 | Stress replay, failure, cancellation, and handler-rich histories across many shards without moving a live fiber |
+| Stackful coroutine/fiber | Proven for serial operations, multiple outstanding Activities, handled/unhandled Activity failure, buffered and handler-dispatched signals, a durable signal/timer race, read-only queries, concurrent Activity-awaiting Updates, shared handler draining/default abandonment, detached main/Update cancellation work, Child Workflow start/result/failure/signal/cancel, external Workflow signal/cancel, Continue-As-New, patch/versioning, registered dispatch, eviction, replay, and replay reconstruction on fixed run-affine concurrent executors on macOS arm64 | Stress nondeterminism and handler-rich histories across many shards without moving a live fiber |
 | CPS/code generation | Can make state explicit while retaining source syntax; high tooling cost | Transform a two-await example and compare generated commands on replay |
 
 Activity transport, protobuf, worker lifecycle, command matching, the replay
@@ -3515,14 +3515,14 @@ a comparison point; it is not yet enough to freeze the public API.
 ## Recommended next vertical milestone
 
 The current next milestone is production hardening of the run-affine
-in-process scheduler. Exercise replay-driven reconstruction, nondeterminism,
-cancellation, handler-rich histories, and shutdown faults concurrently across
+in-process scheduler. Replay reconstruction, concurrent activation failure,
+and cancellation are now live-proven on affine shards. Next, exercise
+nondeterminism, handler-rich histories, and shutdown faults concurrently across
 many shards; add queue-depth/fairness observations; and run the guard-page plus
-affinity suite on all four distribution targets. The live two-run timer proof
-establishes the architecture, but it is not yet the soak/fault evidence needed
-to call concurrent fibers production-ready. Process-isolated execution remains
-the containment option for panicking, overflowing, or uncooperative Workflow
-code.
+affinity suite on all four distribution targets. The live proofs establish the
+architecture, but they are not yet the soak/fault evidence needed to call
+concurrent fibers production-ready. Process-isolated execution remains the
+containment option for panicking, overflowing, or uncooperative Workflow code.
 
 The complete pinned standalone Nexus RPC family used by this SDK—start, poll,
 cancel, describe, terminate, delete, list, and count—is now wired through Core,
@@ -4199,6 +4199,14 @@ exercises failed activation and rejected-run eviction without stopping valid
 shards. A cancellation run stays suspended on a durable one-hour timer; the
 public Client then cancels it, and the proof requires same-thread resumption,
 exact cancellation reason, timer cancellation, canceled close, and eviction.
+The integration script repeats the scenario after explicitly requesting Core
+eviction for every valid timer run. `RemoveFromCache` destroys each fiber on its
+owning shard; subsequent timer work causes Core to fetch history and send
+`is_replaying` activations, which instantiate fresh fibers on the same hash
+shards. The replay pass requires positive replay statistics, overlapping
+post-timer callbacks, and no thread migration. `worker.request_workflow_eviction`
+is an asynchronous operational/test hook over the existing C bridge symbol;
+normal cache pressure and terminal eviction remain Core-owned.
 Its brief wall-clock block is test instrumentation and is not an allowed
 Workflow programming primitive.
 

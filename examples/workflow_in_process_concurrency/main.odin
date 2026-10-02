@@ -21,6 +21,8 @@ Probe_State :: struct {
 	active:                int,
 	peak:                  int,
 	migrations:            int,
+	valid_started:         int,
+	timer_activations_completed: int,
 	cancellation_started:  bool,
 	cancellation_observed: bool,
 	cancellation_reason_ok: bool,
@@ -33,7 +35,10 @@ probe_state: Probe_State
 // observe wall time. Here it makes simultaneous executor entry measurable.
 concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
 	owner_thread := sync.current_thread_id()
-	workflow.sleep(ctx, 100 * time.Millisecond)
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.valid_started += 1
+	sync.mutex_unlock(&probe_state.mutex)
+	workflow.sleep(ctx, 2 * time.Second)
 	if sync.current_thread_id() != owner_thread {
 		sync.mutex_lock(&probe_state.mutex)
 		probe_state.migrations += 1
@@ -48,6 +53,16 @@ concurrency_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string
 	probe_state.active -= 1
 	sync.mutex_unlock(&probe_state.mutex)
 	return value
+}
+
+observe_workflow_activation :: proc(result: ^workflow.Process_Result) {
+	if result == nil || result.activation_failed || result.evicted ||
+	   result.is_replaying || !result.started_timer {
+		return
+	}
+	sync.mutex_lock(&probe_state.mutex)
+	probe_state.timer_activations_completed += 1
+	sync.mutex_unlock(&probe_state.mutex)
 }
 
 cancellation_probe :: proc(ctx: ^workflow.Fiber_Context, value: string) -> string {
@@ -83,26 +98,51 @@ Concurrency_State :: struct {
 	start_error:             temporal_client.Error,
 	result_error:            temporal_client.Error,
 	cancel_error:            temporal_client.Error,
+	eviction_error:          worker.Error,
 	results_ok:              bool,
 	cancellation_ok:         bool,
+	force_replay:            bool,
 }
 
 wait_for_results :: proc(state: ^Concurrency_State) {
 	state.results_ok = true
 	started := false
+	valid_started := 0
+	timer_activations_completed := 0
 	for _ in 0 ..< 500 {
 		sync.mutex_lock(&probe_state.mutex)
 		started = probe_state.cancellation_started
+		valid_started = probe_state.valid_started
+		timer_activations_completed = probe_state.timer_activations_completed
 		sync.mutex_unlock(&probe_state.mutex)
-		if started {
+		if started && valid_started >= len(state.handles) &&
+		   timer_activations_completed >= len(state.handles) + 1 {
 			break
 		}
 		time.sleep(10 * time.Millisecond)
 	}
-	if !started {
+	if !started || valid_started < len(state.handles) ||
+	   timer_activations_completed < len(state.handles) + 1 {
 		state.results_ok = false
 		worker.request_shutdown(state.sdk_worker)
 		return
+	}
+	if state.force_replay {
+		// The observer runs after Core has accepted each completion. Give Core's
+		// internal Workflow stream a short window to install the sticky cache
+		// entry before requesting eviction from this coordinating thread.
+		time.sleep(200 * time.Millisecond)
+		for &handle in state.handles {
+			state.eviction_error = worker.request_workflow_eviction(
+				state.sdk_worker,
+				handle.run_id,
+			)
+			if state.eviction_error.message != nil {
+				state.results_ok = false
+				worker.request_shutdown(state.sdk_worker)
+				return
+			}
+		}
 	}
 	state.cancel_error = temporal_client.cancel_workflow(
 		&state.cancellation_handle,
@@ -237,6 +277,11 @@ start_concurrent_workflows :: proc(user_data: rawptr) -> bool {
 }
 
 run :: proc() -> int {
+	replay_buffer: [64]u8
+	force_replay := os.get_env(
+		replay_buffer[:],
+		"TEMPORAL_ODIN_FORCE_REPLAY",
+	) == "1"
 	task_queue_buffer: [256]u8
 	task_queue := os.get_env(task_queue_buffer[:], "TEMPORAL_ODIN_TASK_QUEUE")
 	if len(task_queue) == 0 {
@@ -303,10 +348,12 @@ run :: proc() -> int {
 		sdk_worker = &sdk_worker,
 		task_queue = task_queue,
 		id_prefix = id_prefix,
+		force_replay = force_replay,
 	}
 	run_stats, run_error := worker.run(&sdk_worker, {
 		on_ready = start_concurrent_workflows,
 		on_ready_data = &state,
+		on_workflow_activation = observe_workflow_activation,
 	})
 	if state.watcher != nil {
 		thread.join(state.watcher)
@@ -356,6 +403,12 @@ run :: proc() -> int {
 		worker.error_free(&run_error)
 		return 1
 	}
+	if state.eviction_error.message != nil {
+		fmt.eprintf("In-process Workflow eviction request failed: %s\n", string(state.eviction_error.message))
+		worker.error_free(&state.eviction_error)
+		worker.error_free(&run_error)
+		return 1
+	}
 	if run_error.message != nil {
 		fmt.eprintf("In-process concurrency Worker failed: %s\n", string(run_error.message))
 		worker.error_free(&run_error)
@@ -387,16 +440,18 @@ run :: proc() -> int {
 	   run_stats.workflow_activation_failures < 1 ||
 	   run_stats.workflow_evictions < len(state.handles) + 2 ||
 	   run_stats.workflow_cancellations_received != 1 || run_stats.timers_canceled != 1 ||
+	   (force_replay && run_stats.workflow_replay_activations < 1) ||
 	   run_stats.workflow_activations_peak_owned < 2 ||
 	   run_stats.workflow_executor_queue_peak < 1 || peak < 2 || migrations != 0 {
 		fmt.eprintf(
-			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v\n",
+			"In-process concurrency proof failed handles=%d completed=%d failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d cancellation_ok=%v reason_ok=%v\n",
 			len(state.handles),
 			run_stats.workflow_executions_completed,
 			run_stats.workflow_activation_failures,
 			run_stats.workflow_evictions,
 			run_stats.workflow_cancellations_received,
 			run_stats.timers_canceled,
+			run_stats.workflow_replay_activations,
 			run_stats.workflow_activations_peak_owned,
 			run_stats.workflow_executor_queue_peak,
 			peak,
@@ -407,13 +462,14 @@ run :: proc() -> int {
 		return 1
 	}
 	fmt.printf(
-		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
+		"In-process Workflow concurrency proved handles=%d executor_threads=%d activation_failures=%d evictions=%d cancellations=%d canceled_timers=%d replay_activations=%d owned_peak=%d queue_peak=%d callback_peak=%d migrations=%d\n",
 		len(state.handles),
 		EXECUTOR_THREADS,
 		run_stats.workflow_activation_failures,
 		run_stats.workflow_evictions,
 		run_stats.workflow_cancellations_received,
 		run_stats.timers_canceled,
+		run_stats.workflow_replay_activations,
 		run_stats.workflow_activations_peak_owned,
 		run_stats.workflow_executor_queue_peak,
 		peak,

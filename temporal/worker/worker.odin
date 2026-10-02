@@ -4285,6 +4285,26 @@ request_shutdown :: proc(worker: ^Worker) {
 	worker_initiate_shutdown(worker)
 }
 
+// request_workflow_eviction asks Core to remove one cached Workflow run. Core
+// delivers the resulting RemoveFromCache activation asynchronously through the
+// ordinary Workflow poll stream. If later work arrives for the run, Core
+// rebuilds it from server history and the language runtime creates a fresh
+// Workflow instance. This is primarily an operational/testing escape hatch;
+// normal cache ownership remains Core-managed.
+request_workflow_eviction :: proc(worker: ^Worker, run_id: string) -> Error {
+	if worker == nil || worker.lifecycle == .Uninitialized || worker.lifecycle == .Closed {
+		return error_from_string("worker is not initialized")
+	}
+	if worker.mode != .Online {
+		return error_from_string("replay workers cannot request Workflow eviction")
+	}
+	if worker.lifecycle != .Running || worker.core.handle == nil {
+		return error_from_string("Workflow eviction can only be requested while worker.run is active")
+	}
+	core_error := temporal_core.worker_request_workflow_eviction(&worker.core, run_id)
+	return error_from_core(&core_error)
+}
+
 // replace_client moves subsequent Core polls and Worker heartbeats to the new
 // connection. An already-issued poll must return or fail before the next poll
 // observes the replacement. It is intended for recovery/failover and may be

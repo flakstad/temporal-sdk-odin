@@ -51,17 +51,33 @@ elif [[ ! -x "$binary" ]]; then
 fi
 
 unique_suffix="${RANDOM}-$(date +%s)"
-set +e
-output="$(
-  TEMPORAL_ODIN_TASK_QUEUE="odin-in-process-concurrent-$unique_suffix" \
-  TEMPORAL_ODIN_WORKFLOW_ID="odin-in-process-concurrent-$unique_suffix" \
-  "$binary" 2>&1
-)"
-status=$?
-set -e
-echo "$output"
-if [[ "$status" != "0" ]]; then
-  exit "$status"
-fi
-grep -q 'In-process Workflow concurrency proved' <<<"$output"
-grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([4-9]|[1-9][0-9]+) cancellations=1 canceled_timers=1 owned_peak=([2-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) callback_peak=([2-9]|[1-9][0-9]+) migrations=0' <<<"$output"
+
+run_probe() {
+  local suffix="$1"
+  local force_replay="$2"
+  local output
+  local status
+
+  set +e
+  output="$(
+    TEMPORAL_ODIN_TASK_QUEUE="odin-in-process-concurrent-$suffix" \
+    TEMPORAL_ODIN_WORKFLOW_ID="odin-in-process-concurrent-$suffix" \
+    TEMPORAL_ODIN_FORCE_REPLAY="$force_replay" \
+    "$binary" 2>&1
+  )"
+  status=$?
+  set -e
+  echo "$output"
+  if [[ "$status" != "0" ]]; then
+    return "$status"
+  fi
+
+  grep -q 'In-process Workflow concurrency proved' <<<"$output"
+  grep -Eq 'executor_threads=4 activation_failures=([1-9][0-9]*) evictions=([4-9]|[1-9][0-9]+) cancellations=1 canceled_timers=1 replay_activations=([0-9]+) owned_peak=([2-9]|[1-9][0-9]+) queue_peak=([1-9][0-9]*) callback_peak=([2-9]|[1-9][0-9]+) migrations=0' <<<"$output"
+  if [[ "$force_replay" == "1" ]]; then
+    grep -Eq 'replay_activations=([1-9][0-9]*)' <<<"$output"
+  fi
+}
+
+run_probe "$unique_suffix" 0
+run_probe "$unique_suffix-replay" 1

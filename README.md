@@ -585,6 +585,14 @@ completions and eviction without poisoning the valid shards or stopping the
 Worker. A third Workflow remains suspended on a one-hour Temporal timer while a
 Client cancellation arrives; it resumes on its original shard, observes the
 exact reason, cancels the durable timer, closes as canceled, and is evicted.
+The integration script runs a second history with explicit Core cache eviction
+after the initial timer commands are accepted. The valid Workflow fibers are
+destroyed, reconstructed from server history on their original hash shards,
+and overlap again after timer resolution. That pass requires a positive
+`workflow_replay_activations` count and zero thread migrations. The public
+`worker.request_workflow_eviction` helper exposes Core's asynchronous
+language-requested eviction for diagnostics and tests; ordinary applications
+should leave cache management to Core.
 `Run_Stats.workflow_activations_peak_owned` reports the largest number of
 polled activations simultaneously owned by Odin, including queued and executing
 work. `workflow_executor_queue_peak` reports the largest queue observed on one
