@@ -1993,6 +1993,22 @@ The smallest complete public-SDK acceptance path is:
 public Client and Workflow packages. It connects, registers one typed Workflow
 and Activity, starts the Workflow from the Worker's ready callback, executes the
 Activity through Core, waits for the result, and checks bounded Worker stats.
+The script uses an existing local service when present; otherwise it directly
+starts `temporal server start-dev --headless`, waits for health, and stops only
+the process it started.
+
+The server-independent external-consumer gate is:
+
+```bash
+./scripts/external-consumer-test.sh
+```
+
+It copies `tests_consumer/core_sdk` outside the checkout, imports the SDK via an
+Odin package collection, instantiates the typed Workflow/Activity/Client API,
+links SDK Core and the fiber shim, and exercises Runtime initialization plus
+16 idempotent double-shutdown cycles. `scripts/test.sh` always runs this gate, including when a
+verified prebuilt native package is supplied through
+`TEMPORAL_ODIN_NATIVE_LIB_DIR`.
 
 ### Standalone Activities
 
@@ -3020,8 +3036,9 @@ application-level synchronization.
 The unit and 1,000-case PBT tests cover nested order, short-circuiting, header
 isolation, Signal-With-Start, mutable cancellation/termination inputs,
 Visibility queries, the complete standalone Nexus surface, and the complete
-Schedule surface across the base and optional chains. The generative chain now
-varies twenty-four operation families. `workflow-delete-integration-test.sh`
+Schedule and standalone Activity surfaces across the base and optional chains.
+The generative chain now varies thirty-two operation families.
+`workflow-delete-integration-test.sh`
 first proves that an empty Run
 ID is rejected locally, then deletes a unique running execution by exact Run ID
 through Core and requires a later Describe to return gRPC `NOT_FOUND`. The

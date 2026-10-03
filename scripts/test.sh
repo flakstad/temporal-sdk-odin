@@ -51,6 +51,7 @@ if [[ -z "${TEMPORAL_ODIN_NATIVE_LIB_DIR:-}" ]]; then
   "$repo_root/scripts/build-core.sh"
 fi
 TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" "$repo_root/scripts/fiber-guard-test.sh"
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" "$repo_root/scripts/external-consumer-test.sh"
 
 odin_thread_count="${ODIN_THREAD_COUNT:-1}"
 odin test "$repo_root/tests" \

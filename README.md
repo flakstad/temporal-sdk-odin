@@ -1030,7 +1030,14 @@ The facade keeps Client and Worker errors distinct and does not hide cleanup.
 See `examples/sdk_hello_activity` for the Activity-only lifecycle and
 `examples/sdk_hello_workflow` for the smallest complete Client → Worker →
 Workflow → Activity → result path against the Temporal CLI dev server. Run the
-latter with `./scripts/core-sdk-integration-test.sh`.
+latter with `./scripts/core-sdk-integration-test.sh`; it starts and later stops
+`temporal server start-dev` itself when no service is already listening.
+
+`./scripts/external-consumer-test.sh` additionally copies a collection-based
+consumer into a temporary directory, compiles it with
+`-collection:sdk=/path/to/temporal-sdk-odin`, links the native runtime, and runs
+16 Core initialization plus idempotent double-shutdown cycles. This guards against examples
+passing only because they use in-repository relative imports.
 
 Build a host-specific native runtime archive and verify that the packaged Core
 ABI can initialize and shut down:
@@ -2603,6 +2610,7 @@ examples/hello_workflow/  sequential suspension/replay/eviction proof
 examples/child_workflow/  child and external Workflow operation proofs
 tests/                    lifecycle, codec, protobuf, replay, and fiber tests
 tests_pbt/                generated activation-order and replay properties
+tests_consumer/core_sdk/  out-of-tree Odin collection/import/link contract
 test-deps/pbt/            pinned, test-only property-testing submodule
 test-deps/statecharts/    pinned, test-only lifecycle-model submodule
 ```

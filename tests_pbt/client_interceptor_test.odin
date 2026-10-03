@@ -5,6 +5,7 @@ import "core:time"
 import pbt "pbt:pbt"
 import temporal_client "../temporal/client"
 import schedule "../temporal/client/schedule"
+import standalone_activity "../temporal/client/standalone_activity"
 import standalone_nexus "../temporal/client/standalone_nexus"
 import temporal_core "../temporal/core"
 import raw "../temporal/core/raw"
@@ -378,6 +379,208 @@ client_interceptor_property_count_nexus_operations :: proc(user_data: rawptr, in
 	return
 }
 
+client_interceptor_property_start_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Start_Standalone_Activity_Input,
+	next: standalone_activity.Client_Start_Standalone_Activity_Next,
+) -> (result: standalone_activity.Standalone_Activity_Handle, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.options.activity_type != "generated activity" {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity start interceptor input mutation was not propagated",
+		)
+	}
+	input.options.activity_type = "generated activity"
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_start_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_poll_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Poll_Standalone_Activity_Input,
+	next: standalone_activity.Client_Poll_Standalone_Activity_Next,
+) -> (result: standalone_activity.Standalone_Activity_Poll_Result, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.options.timeout != 2 * time.Second {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity poll interceptor input mutation was not propagated",
+		)
+	}
+	input.options.timeout = 2 * time.Second
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_poll_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_describe_standalone_activity :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Describe_Standalone_Activity_Input,
+	next: standalone_activity.Client_Describe_Standalone_Activity_Next,
+) -> (result: standalone_activity.Standalone_Activity_Description, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && !input.options.include_input {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity Describe interceptor input mutation was not propagated",
+		)
+	}
+	input.options.include_input = true
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_describe_standalone_activity_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_standalone_activity_mutation :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Standalone_Activity_Mutation_Input,
+	next: standalone_activity.Client_Standalone_Activity_Mutation_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.reason != "generated Activity mutation" {
+		return temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity mutation interceptor input mutation was not propagated",
+		)
+	}
+	input.reason = "generated Activity mutation"
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result = standalone_activity.client_standalone_activity_mutation_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
+client_interceptor_property_standalone_activity_control :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Standalone_Activity_Control_Input,
+	next: standalone_activity.Client_Standalone_Activity_Control_Next,
+) -> temporal_client.Error {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.options.reason != "generated Activity control" {
+		return temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity control interceptor input mutation was not propagated",
+		)
+	}
+	input.options.reason = "generated Activity control"
+	result: temporal_client.Error
+	if node.short_circuit {
+		result = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result = standalone_activity.client_standalone_activity_control_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return result
+}
+
+client_interceptor_property_update_standalone_activity_options :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Update_Standalone_Activity_Options_Input,
+	next: standalone_activity.Client_Update_Standalone_Activity_Options_Next,
+) -> (result: standalone_activity.Standalone_Activity_Options, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.update.task_queue != "generated Activity queue" {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity options interceptor input mutation was not propagated",
+		)
+	}
+	input.update.task_queue = "generated Activity queue"
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_update_standalone_activity_options_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_list_standalone_activities :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_List_Standalone_Activities_Input,
+	next: standalone_activity.Client_List_Standalone_Activities_Next,
+) -> (result: standalone_activity.Standalone_Activity_List_Page, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.options.query != "generated Activity list query" {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity list interceptor input mutation was not propagated",
+		)
+	}
+	input.options.query = "generated Activity list query"
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_list_standalone_activities_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
+client_interceptor_property_count_standalone_activities :: proc(
+	user_data: rawptr,
+	input: ^standalone_activity.Client_Count_Standalone_Activities_Input,
+	next: standalone_activity.Client_Count_Standalone_Activities_Next,
+) -> (result: standalone_activity.Standalone_Activity_Count, error: temporal_client.Error) {
+	node := cast(^Client_Interceptor_Property_Node)user_data
+	node.state.events[node.state.event_count] = node.id
+	node.state.event_count += 1
+	if node.id > 1 && input.query != "generated Activity count query" {
+		return {}, temporal_client.error_from_string(
+			.Invalid_Argument,
+			"standalone Activity count interceptor input mutation was not propagated",
+		)
+	}
+	input.query = "generated Activity count query"
+	if node.short_circuit {
+		error = temporal_client.error_from_string(.Rpc, "generated short circuit")
+	} else {
+		result, error = standalone_activity.client_count_standalone_activities_next(next, input)
+	}
+	node.state.events[node.state.event_count] = -node.id
+	node.state.event_count += 1
+	return
+}
+
 client_interceptor_property_system_info :: proc(
 	user_data: rawptr,
 	input: ^temporal_client.Client_Get_System_Info_Input,
@@ -399,26 +602,28 @@ client_interceptor_property_system_info :: proc(
 client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	depth := pbt.draw(t, pbt.int_range(1, 12))
 	short_index := pbt.draw(t, pbt.int_range(0, depth - 1))
-	operation := pbt.draw(t, pbt.int_range(0, 23))
+	operation := pbt.draw(t, pbt.int_range(0, 31))
 	pbt.cover(t, short_index == 0, 5.0, "outermost short circuit")
 	pbt.cover(t, short_index == depth - 1, 5.0, "innermost short circuit")
 	pbt.cover(t, depth >= 9, 20.0, "deep chain")
-	pbt.cover(t, operation == 0, 3.0, "Workflow Signal")
-	pbt.cover(t, operation == 1, 3.0, "Workflow cancellation")
-	pbt.cover(t, operation == 2, 3.0, "Workflow termination")
-	pbt.cover(t, operation == 3, 3.0, "Signal-With-Start")
-	pbt.cover(t, operation == 4, 3.0, "Workflow result")
-	pbt.cover(t, operation == 5, 3.0, "Workflow Visibility list")
-	pbt.cover(t, operation == 6, 3.0, "Workflow Visibility count")
-	pbt.cover(t, operation >= 7 && operation <= 10, 12.0, "Schedule read operation")
-	pbt.cover(t, operation == 11 || operation == 12, 6.0, "Schedule mutation operation")
-	pbt.cover(t, operation == 13, 3.0, "connection mutation operation")
-	pbt.cover(t, operation == 14, 3.0, "Update wait operation")
-	pbt.cover(t, operation >= 15 && operation <= 18, 12.0, "Nexus lifecycle operation")
-	pbt.cover(t, operation == 19 || operation == 20, 6.0, "Nexus Visibility operation")
-	pbt.cover(t, operation == 21, 3.0, "Update-With-Start operation")
-	pbt.cover(t, operation == 22, 3.0, "System Info operation")
-	pbt.cover(t, operation == 23, 3.0, "Workflow deletion")
+	pbt.cover(t, operation == 0, 2.0, "Workflow Signal")
+	pbt.cover(t, operation == 1, 2.0, "Workflow cancellation")
+	pbt.cover(t, operation == 2, 2.0, "Workflow termination")
+	pbt.cover(t, operation == 3, 2.0, "Signal-With-Start")
+	pbt.cover(t, operation == 4, 2.0, "Workflow result")
+	pbt.cover(t, operation == 5, 2.0, "Workflow Visibility list")
+	pbt.cover(t, operation == 6, 2.0, "Workflow Visibility count")
+	pbt.cover(t, operation >= 7 && operation <= 10, 9.0, "Schedule read operation")
+	pbt.cover(t, operation == 11 || operation == 12, 4.0, "Schedule mutation operation")
+	pbt.cover(t, operation == 13, 2.0, "connection mutation operation")
+	pbt.cover(t, operation == 14, 2.0, "Update wait operation")
+	pbt.cover(t, operation >= 15 && operation <= 18, 9.0, "Nexus lifecycle operation")
+	pbt.cover(t, operation == 19 || operation == 20, 4.0, "Nexus Visibility operation")
+	pbt.cover(t, operation == 21, 2.0, "Update-With-Start operation")
+	pbt.cover(t, operation == 22, 2.0, "System Info operation")
+	pbt.cover(t, operation == 23, 2.0, "Workflow deletion")
+	pbt.cover(t, operation >= 24 && operation <= 29, 14.0, "standalone Activity lifecycle operation")
+	pbt.cover(t, operation == 30 || operation == 31, 4.0, "standalone Activity Visibility operation")
 
 	state := Client_Interceptor_Property_State{}
 	nodes: [12]Client_Interceptor_Property_Node
@@ -438,8 +643,10 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		interceptor := temporal_client.Client_Interceptor{user_data = &nodes[index]}
 		schedule_interceptor := schedule.Interceptor{user_data = &nodes[index]}
 		nexus_interceptor := standalone_nexus.Interceptor{user_data = &nodes[index]}
+		activity_interceptor := standalone_activity.Interceptor{user_data = &nodes[index]}
 		is_schedule_operation := operation >= 7 && operation <= 12
 		is_nexus_operation := operation >= 15 && operation <= 20
+		is_activity_operation := operation >= 24 && operation <= 31
 		switch operation {
 		case 0:
 			interceptor.signal_workflow = client_interceptor_property_signal
@@ -489,6 +696,22 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			interceptor.get_system_info = client_interceptor_property_system_info
 		case 23:
 			interceptor.delete_workflow = client_interceptor_property_delete
+		case 24:
+			activity_interceptor.start_standalone_activity = client_interceptor_property_start_standalone_activity
+		case 25:
+			activity_interceptor.poll_standalone_activity = client_interceptor_property_poll_standalone_activity
+		case 26:
+			activity_interceptor.describe_standalone_activity = client_interceptor_property_describe_standalone_activity
+		case 27:
+			activity_interceptor.standalone_activity_mutation = client_interceptor_property_standalone_activity_mutation
+		case 28:
+			activity_interceptor.standalone_activity_control = client_interceptor_property_standalone_activity_control
+		case 29:
+			activity_interceptor.update_standalone_activity_options = client_interceptor_property_update_standalone_activity_options
+		case 30:
+			activity_interceptor.list_standalone_activities = client_interceptor_property_list_standalone_activities
+		case 31:
+			activity_interceptor.count_standalone_activities = client_interceptor_property_count_standalone_activities
 		}
 		if is_schedule_operation {
 			add_error := schedule.add_interceptor(&client, schedule_interceptor)
@@ -501,6 +724,12 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 			if add_error.message != nil {
 				temporal_client.error_free(&add_error)
 				return pbt.error("could not register generated standalone Nexus interceptor")
+			}
+		} else if is_activity_operation {
+			add_error := standalone_activity.add_interceptor(&client, activity_interceptor)
+			if add_error.message != nil {
+				temporal_client.error_free(&add_error)
+				return pbt.error("could not register generated standalone Activity interceptor")
 			}
 		} else {
 			append(&client.interceptors, interceptor)
@@ -531,6 +760,11 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 	nexus_handle := standalone_nexus.Nexus_Operation_Handle{
 		client = &client,
 		id = "property-operation",
+		run_id = "property-run",
+	}
+	activity_handle := standalone_activity.Standalone_Activity_Handle{
+		client = &client,
+		id = "property-activity",
 		run_id = "property-run",
 	}
 	operation_error: temporal_client.Error
@@ -671,6 +905,55 @@ client_interceptor_chain_property :: proc(t: ^pbt.T) -> pbt.Result {
 		temporal_client.system_info_free(&info)
 	case 23:
 		operation_error = temporal_client.delete_workflow(&handle)
+	case 24:
+		started: standalone_activity.Standalone_Activity_Handle
+		started, operation_error = standalone_activity.start_standalone_activity_payload(
+			&client,
+			{},
+			{
+				id = "property-activity",
+				activity_type = "caller-activity",
+				task_queue = "property-queue",
+				start_to_close_timeout = time.Minute,
+			},
+		)
+		standalone_activity.standalone_activity_handle_free(&started)
+	case 25:
+		result: standalone_activity.Standalone_Activity_Poll_Result
+		result, operation_error = standalone_activity.poll_standalone_activity(&activity_handle)
+		standalone_activity.standalone_activity_poll_result_free(&result)
+	case 26:
+		result: standalone_activity.Standalone_Activity_Description
+		result, operation_error = standalone_activity.describe_standalone_activity(&activity_handle)
+		standalone_activity.standalone_activity_description_free(&result)
+	case 27:
+		operation_error = standalone_activity.standalone_activity_mutation(
+			&activity_handle,
+			standalone_activity.Standalone_Activity_Mutation_Kind(pbt.draw(t, pbt.int_range(0, 2))),
+			"caller reason",
+		)
+	case 28:
+		operation_error = standalone_activity.standalone_activity_control(
+			&activity_handle,
+			standalone_activity.Standalone_Activity_Control_Kind(pbt.draw(t, pbt.int_range(1, 3))),
+			{reason = "caller reason"},
+		)
+	case 29:
+		paths := [?]string{standalone_activity.Standalone_Activity_Option_Path_Task_Queue_Name}
+		result: standalone_activity.Standalone_Activity_Options
+		result, operation_error = standalone_activity.update_standalone_activity_options(
+			&activity_handle,
+			{update_mask = paths[:], task_queue = "caller-queue"},
+		)
+		standalone_activity.standalone_activity_options_free(&result)
+	case 30:
+		page: standalone_activity.Standalone_Activity_List_Page
+		page, operation_error = standalone_activity.list_standalone_activities(&client)
+		standalone_activity.standalone_activity_list_page_free(&page)
+	case 31:
+		count: standalone_activity.Standalone_Activity_Count
+		count, operation_error = standalone_activity.count_standalone_activities(&client)
+		standalone_activity.standalone_activity_count_free(&count)
 	}
 	defer temporal_client.error_free(&operation_error)
 	if operation_error.kind != .Rpc || string(operation_error.message) != "generated short circuit" {

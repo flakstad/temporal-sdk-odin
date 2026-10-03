@@ -26,6 +26,19 @@ directory. The repository scripts do this with:
 -L/path/to/archive/lib -Wl,-rpath,/path/to/archive/lib
 ```
 
+A separate application can expose the source checkout as an Odin collection:
+
+```bash
+odin build . \
+  -collection:sdk=/path/to/temporal-sdk-odin \
+  -extra-linker-flags:"-L/path/to/archive/lib -Wl,-rpath,/path/to/archive/lib"
+```
+
+and import packages such as `"sdk:temporal"`, `"sdk:temporal/client"`, and
+`"sdk:temporal/workflow"`. `scripts/external-consumer-test.sh` verifies this
+layout from a temporary directory so no relative path back to an example is
+available.
+
 The Core and History JSON bridges are dynamic; the fiber shim is static. A
 program links the History JSON bridge only when it imports
 `temporal/history_json`. macOS uses `@rpath` install names. Linux packages

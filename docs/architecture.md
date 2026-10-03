@@ -2469,9 +2469,9 @@ a connection-mutation input and remain direct Core ABI calls at the terminal;
 all buffers are borrowed for that synchronous chain.
 Their terminal continuations encode only after the complete chain has run. The
 Client owns a copy of interceptor records, but callback `user_data` is borrowed.
-A 1,000-case property checks twenty-four nested operation families and arbitrary
-short-circuit depth, including all six standalone Nexus lifecycle/Visibility
-interceptor groups. `get_result` surrounds the whole logical
+A 1,000-case property checks thirty-two nested operation families and arbitrary
+short-circuit depth, including all six standalone Nexus and all eight standalone
+Activity lifecycle/Visibility interceptor groups. `get_result` surrounds the whole logical
 wait, including any Core history long polls and followed Continue-As-New/retry
 runs; its Payload result is owned. The Update wait interceptor likewise wraps
 the complete result long poll and returns an owned Payload. Live start,
