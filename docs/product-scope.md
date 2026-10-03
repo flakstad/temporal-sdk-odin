@@ -66,6 +66,12 @@ service. The test kills the first Worker after two Activities and a durable
 timer are committed, then requires a replacement Worker to replay and complete
 without repeating those Activities.
 
+`applications/kvist_hello_workflow` adds a second language-level consumer of
+that same boundary. Kvist imports the public Odin packages directly and defines
+the Activity and stackful Workflow without a raw Odin shim. Its focused live
+test proves the full Kvist-to-Odin-to-Core-to-Server path; the adjacent Kvist
+compiler is a development dependency, not part of SDK artifacts.
+
 ## Extended surface
 
 The repository already implements valuable capabilities outside the stable

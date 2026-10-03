@@ -3,3 +3,4 @@
 /native/prebuilt/
 /dist/
 /.DS_Store
+/.kvist-cache/

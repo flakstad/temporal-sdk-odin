@@ -39,6 +39,16 @@ Client as separate processes, and shuts down only the server it owns. See the
 two-terminal workflow. Its acceptance run also replaces the Worker while a
 durable timer is pending and verifies that completed Activities are not rerun.
 
+[`applications/kvist_hello_workflow`](applications/kvist_hello_workflow) proves
+the same public SDK can be consumed from [Kvist](https://kvist-lang.org/), which
+lowers directly to Odin. Its Activity and sequential-looking Workflow are both
+written in Kvist; no raw Odin shim is involved. With the sibling Kvist checkout
+and compiler at `../kvist/kvist`, run:
+
+```bash
+./scripts/kvist-hello-workflow-integration-test.sh
+```
+
 ## Implementation inventory
 
 The repository builds the official Rust Core C

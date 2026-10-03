@@ -157,6 +157,29 @@ Activity and durable timer are visible through the status Query; a replacement
 must replay and complete the same execution without repeating completed
 Activities.
 
+### Kvist consumer
+
+`applications/kvist_hello_workflow` imports the SDK's Odin packages directly
+from Kvist. Build it with the adjacent Kvist checkout requested for development:
+
+```bash
+./scripts/build-kvist-hello-workflow.sh
+```
+
+The default compiler path is `../kvist/kvist`; set `KVIST_BIN=kvist` to use an
+installed compiler. The build supplies `LIBRARY_PATH` because the current Kvist
+CLI does not forward arbitrary Odin linker flags. The live wrapper supplies
+`DYLD_LIBRARY_PATH` on macOS or `LD_LIBRARY_PATH` on Linux:
+
+```bash
+./scripts/kvist-hello-workflow-integration-test.sh
+```
+
+The application uses no embedded raw Odin. The only current source-level
+workaround is constructing `worker.Run_Options` rather than the facade alias
+`temporal.Worker_Run_Options`; Kvist currently lowers the qualified imported
+alias as a conversion instead of a named struct literal.
+
 ## Native packages and platform CI
 
 Create the package for the current host with:

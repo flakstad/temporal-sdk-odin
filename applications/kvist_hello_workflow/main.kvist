@@ -1,0 +1,131 @@
+;; A complete Kvist -> Odin SDK -> SDK Core -> Temporal application.
+(package main)
+
+(import fmt "core:fmt")
+(import os "core:os")
+(import time "core:time")
+(import temporal "../../temporal")
+(import activity "../../temporal/activity")
+(import client "../../temporal/client")
+(import worker "../../temporal/worker")
+(import workflow "../../temporal/workflow")
+
+(def Task-Queue "kvist-sdk-hello")
+(def Workflow-Type "kvist_sdk_hello_workflow")
+
+(defn hello-activity [ctx: ^activity.Context, name: string] -> string
+  ;; Activity code may perform ordinary side effects. This sample keeps the
+  ;; result allocation-free so ownership at the SDK callback boundary is clear.
+  (let [info (activity.info ctx)]
+    (fmt.printf "Kvist Activity type=%s attempt=%d input=%q\n"
+                info.activity_type
+                info.attempt
+                name)
+    (if (= name "Temporal")
+      "Hello Temporal from Kvist"
+      "Hello from Kvist")))
+
+(defn hello-workflow [ctx: ^workflow.Fiber_Context, name: string] -> string
+  ;; This looks sequential, but execute_activity suspends the stackful Workflow
+  ;; until a later Core activation resolves the durable Activity command.
+  (workflow.execute_activity ctx "kvist_hello_activity" name))
+
+(defn print-client-error [operation: string, err: ^client.Error] -> int
+  (fmt.eprintf "%s failed (kind=%v status=%d): %s\n"
+               operation
+               err^.kind
+               err^.status_code
+               (string err^.message))
+  (client.error_free err)
+  1)
+
+(defn print-worker-error [operation: string, err: ^temporal.Worker_Error] -> int
+  (fmt.eprintf "%s failed: %s\n" operation (string err^.message))
+  (temporal.worker_error_free err)
+  1)
+
+(defn close-worker [sdk-worker: ^temporal.Worker]
+  (let [err (temporal.worker_close sdk-worker)]
+    (when (!= err.message nil)
+      (discard (print-worker-error "close Worker" (addr err))))))
+
+(defn run [] -> int
+  (let [[sdk-client connect-error] (temporal.connect)]
+    (if (!= connect-error.message nil)
+      (print-client-error "connect" (addr connect-error))
+      (do
+        (defer (temporal.client_close (addr sdk-client)))
+        (let [[sdk-worker create-error]
+              (temporal.worker_create (addr sdk-client) Task-Queue)]
+          (if (!= create-error.message nil)
+            (print-worker-error "create Worker" (addr create-error))
+            (do
+              (defer (close-worker (addr sdk-worker)))
+              (let [activity-error
+                    (temporal.worker_register_activity
+                      (addr sdk-worker)
+                      "kvist_hello_activity"
+                      hello-activity)]
+                (if (!= activity-error.message nil)
+                  (print-worker-error "register Activity" (addr activity-error))
+                  (let [workflow-error
+                        (temporal.worker_register_workflow
+                          (addr sdk-worker)
+                          Workflow-Type
+                          hello-workflow)]
+                    (if (!= workflow-error.message nil)
+                      (print-worker-error "register Workflow" (addr workflow-error))
+                      (let [workflow-id
+                            (fmt.aprintf
+                              "kvist-sdk-hello-%d"
+                              (time.time_to_unix_nano (time.now)))
+                            :defer
+                            [handle start-error]
+                            (client.start_workflow_json
+                              (addr sdk-client)
+                              Workflow-Type
+                              "Temporal"
+                              (client.Start_Workflow_Options
+                                :id workflow-id
+                                :task_queue Task-Queue
+                                :workflow_execution_timeout time.Minute
+                                :workflow_run_timeout time.Minute
+                                :workflow_task_timeout (* 10 time.Second)))]
+                        (if (!= start-error.message nil)
+                          (print-client-error "start Workflow" (addr start-error))
+                          (do
+                            (defer (client.workflow_handle_free (addr handle)))
+                            (let [[stats run-error]
+                                  (temporal.worker_run
+                                    (addr sdk-worker)
+                                    (worker.Run_Options
+                                      :max_activity_tasks 1
+                                      :max_workflow_executions 1))]
+                              (if (!= run-error.message nil)
+                                (print-worker-error "run Worker" (addr run-error))
+                                (let [result: string ""
+                                      result-error
+                                      (client.get_result_json
+                                        (addr handle)
+                                        (addr result))]
+                                  (defer (delete result))
+                                  (if (!= result-error.message nil)
+                                    (print-client-error
+                                      "get Workflow result"
+                                      (addr result-error))
+                                    (if (!= result "Hello Temporal from Kvist")
+                                      (do
+                                        (fmt.eprintf "unexpected result: %q\n" result)
+                                        1)
+                                      (do
+                                        (fmt.printf
+                                          "Kvist completed workflow_id=%s run_id=%s activities=%d workflows=%d result=%q\n"
+                                          handle.id
+                                          handle.run_id
+                                          stats.activity_tasks_completed
+                                          stats.workflow_executions_completed
+                                          result)
+                                        0))))))))))))))))))))
+
+(defn main []
+  (os.exit (run)))
