@@ -78,6 +78,11 @@ jobs:
       - name: Build every example
         run: ./scripts/build-examples.sh
 
+      - name: Build reference application
+        env:
+          TEMPORAL_ODIN_SKIP_BUILD: "1"
+        run: ./scripts/build-order-fulfillment.sh
+
       - name: Package native runtime
         env:
           TEMPORAL_ODIN_SKIP_BUILD: "1"

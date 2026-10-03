@@ -54,6 +54,18 @@ settings and builds a collection-based consumer outside the checkout. Passing
 these smoke tests means the usable SDK core is assembled. It does not by itself
 satisfy the production release gates below.
 
+The larger `applications/order_fulfillment` reference consumer proves that the
+assembled surface composes into one program across process boundaries. It uses
+only public collection imports and exercises typed Client start/result, Worker
+registration and lifecycle, three Activities, Workflow suspension on a Signal
+and durable timer, and a read-only Query. Its live acceptance script starts the
+CLI dev server when necessary and performs application operations through the
+Odin Client rather than the Temporal CLI. The Activities are local adapter
+stubs, so this is SDK integration evidence rather than a production commerce
+service. The test kills the first Worker after two Activities and a durable
+timer are committed, then requires a replacement Worker to replay and complete
+without repeating those Activities.
+
 ## Extended surface
 
 The repository already implements valuable capabilities outside the stable

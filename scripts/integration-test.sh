@@ -132,6 +132,7 @@ if ! temporal operator cluster health \
 fi
 
 "$repo_root/scripts/build-examples.sh"
+TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/build-order-fulfillment.sh" >/dev/null
 
 TEMPORAL_ODIN_SKIP_BUILD=1 "$repo_root/scripts/run-core-connect.sh"
 
@@ -143,6 +144,9 @@ TEMPORAL_ODIN_SKIP_BUILD=1 \
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/core-sdk-integration-test.sh"
+
+TEMPORAL_ODIN_SKIP_BUILD=1 \
+  "$repo_root/scripts/order-fulfillment-integration-test.sh"
 
 TEMPORAL_ODIN_SKIP_BUILD=1 \
   "$repo_root/scripts/worker-replace-client-integration-test.sh"

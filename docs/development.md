@@ -130,6 +130,33 @@ one-task Activity Worker against the CLI dev server:
 ./native/target/release/temporal-odin-sdk-hello-activity
 ```
 
+## Reference application
+
+The order-fulfillment application is compiled as a collection consumer instead
+of using relative imports:
+
+```bash
+./scripts/build-order-fulfillment.sh
+```
+
+Its source is under `applications/order_fulfillment`. The executable combines
+an unbounded Worker mode with separate Client commands for start, status Query,
+approval Signal, cancellation, and result waiting. The focused live test uses
+the bounded `worker-once` mode so Worker shutdown and cleanup are deterministic:
+
+```bash
+./scripts/order-fulfillment-integration-test.sh
+```
+
+The live test starts `temporal server start-dev --headless` only if
+`localhost:7233` is not already healthy. It does not use the Temporal CLI to
+start, signal, query, or await the application Workflow. Set `TEMPORAL_ADDRESS`
+and `TEMPORAL_NAMESPACE` when invoking the application directly to override its
+local defaults. During acceptance the first Worker is killed after the payment
+Activity and durable timer are visible through the status Query; a replacement
+must replay and complete the same execution without repeating completed
+Activities.
+
 ## Native packages and platform CI
 
 Create the package for the current host with:

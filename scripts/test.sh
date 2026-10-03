@@ -40,6 +40,14 @@ odin check "$repo_root/temporal/client/standalone_activity" \
 	-strict-style \
 	-warnings-as-errors
 
+# Keep the reference application on public collection imports. This check does
+# not need the native bridge; linked and live paths have separate gates.
+odin check "$repo_root/applications/order_fulfillment" \
+	-collection:sdk="$repo_root" \
+	-vet \
+	-strict-style \
+	-warnings-as-errors
+
 cargo test --quiet \
   --manifest-path "$repo_root/native/Cargo.toml" \
   --package odin-proto-gen

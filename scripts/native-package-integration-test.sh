@@ -26,6 +26,9 @@ TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" \
 TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" \
   "$repo_root/scripts/build-examples.sh"
 
+TEMPORAL_ODIN_NATIVE_LIB_DIR="$lib_dir" \
+  "$repo_root/scripts/build-order-fulfillment.sh"
+
 install_dir="${lib_dir%/lib}"
 target="$(basename "$install_dir")"
 fiber_library="$lib_dir/libtemporal_odin_fiber.a"

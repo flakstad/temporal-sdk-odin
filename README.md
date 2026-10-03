@@ -17,6 +17,28 @@ operations, advanced controls, and process isolation remain available as an
 extended surface. See [product scope](docs/product-scope.md) for the exact
 boundary, release gates, and reconsideration rules.
 
+## Reference application
+
+[`applications/order_fulfillment`](applications/order_fulfillment) is a real
+multi-command Odin consumer of the public SDK packages. A separate Worker
+process reserves inventory, waits durably for an approval Signal, charges and
+dispatches through Activities, exposes a status Query, and returns a typed
+result after a durable timer. Client commands start, inspect, approve, cancel,
+and await an order without using the Temporal CLI for application operations.
+
+Run the complete path against the recommended CLI dev server with:
+
+```bash
+./scripts/order-fulfillment-integration-test.sh
+```
+
+The script starts `temporal server start-dev` only when no local server is
+healthy, builds the application through collection imports, runs the Worker and
+Client as separate processes, and shuts down only the server it owns. See the
+[application README](applications/order_fulfillment/README.md) for the manual
+two-terminal workflow. Its acceptance run also replaces the Worker while a
+durable timer is pending and verifies that completed Activities are not rerun.
+
 ## Implementation inventory
 
 The repository builds the official Rust Core C
