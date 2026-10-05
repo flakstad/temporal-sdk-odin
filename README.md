@@ -49,6 +49,17 @@ and compiler at `../kvist/kvist`, run:
 ./scripts/kvist-hello-workflow-integration-test.sh
 ```
 
+[`applications/kvist_replay_workflow`](applications/kvist_replay_workflow)
+extends that proof across process loss. Its acceptance test executes an
+Activity, kills the Worker with `SIGKILL` while a durable timer is pending, and
+starts a replacement Worker. The replacement must replay the persisted history
+on a fresh Kvist fiber, complete the Workflow, and report zero Activity
+executions so the already recorded side effect is not repeated:
+
+```bash
+./scripts/kvist-replay-workflow-integration-test.sh
+```
+
 ## Implementation inventory
 
 The repository builds the official Rust Core C

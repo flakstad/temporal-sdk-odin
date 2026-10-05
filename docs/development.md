@@ -180,6 +180,21 @@ workaround is constructing `worker.Run_Options` rather than the facade alias
 `temporal.Worker_Run_Options`; Kvist currently lowers the qualified imported
 alias as a conversion instead of a named struct literal.
 
+The separate `applications/kvist_replay_workflow` consumer proves durability
+across a complete Worker-process loss. Build or run its acceptance test with:
+
+```bash
+./scripts/build-kvist-replay-workflow.sh
+./scripts/kvist-replay-workflow-integration-test.sh
+```
+
+The test kills the first Worker with `SIGKILL` after its Activity result and
+durable timer command are in Temporal history. A replacement Worker reports
+replay activations, restores the suspended Workflow on a fresh fiber stack,
+and completes after the timer without invoking the Activity callback again.
+Activation diagnostics are emitted by the Worker observer, outside
+deterministic Workflow code.
+
 ## Native packages and platform CI
 
 Create the package for the current host with:

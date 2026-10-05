@@ -72,6 +72,14 @@ the Activity and stackful Workflow without a raw Odin shim. Its focused live
 test proves the full Kvist-to-Odin-to-Core-to-Server path; the adjacent Kvist
 compiler is a development dependency, not part of SDK artifacts.
 
+`applications/kvist_replay_workflow` strengthens that evidence beyond a
+single-process happy path. Its acceptance run kills the original Worker while
+a durable timer is pending, observes replay in a replacement process, and
+requires the completed Activity count across both processes to remain one.
+This proves that a Kvist Workflow's sequential local state can be reconstructed
+from Temporal history on a fresh stack without repeating an Activity side
+effect.
+
 ## Extended surface
 
 The repository already implements valuable capabilities outside the stable
