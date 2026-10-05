@@ -49,83 +49,101 @@
     (when (!= err.message nil)
       (discard (print-worker-error "close Worker" (addr err))))))
 
+(defn read-workflow-result [handle: ^client.Workflow_Handle,
+                            stats: worker.Run_Stats] -> int
+  (let [result: string ""
+        result-error (client.get_result_json handle (addr result))]
+    (defer (delete result))
+
+    (when (!= result-error.message nil)
+      (return (print-client-error "get Workflow result" (addr result-error))))
+
+    (when (!= result "Hello Temporal from Kvist")
+      (fmt.eprintf "unexpected result: %q\n" result)
+      (return 1))
+
+    (fmt.printf
+      "Kvist completed workflow_id=%s run_id=%s activities=%d workflows=%d result=%q\n"
+      handle^.id
+      handle^.run_id
+      stats.activity_tasks_completed
+      stats.workflow_executions_completed
+      result)
+    0))
+
+(defn run-worker [sdk-worker: ^temporal.Worker,
+                  handle: ^client.Workflow_Handle] -> int
+  (let [[stats run-error]
+        (temporal.worker_run
+          sdk-worker
+          (worker.Run_Options
+            :max_activity_tasks 1
+            :max_workflow_executions 1))]
+    (when (!= run-error.message nil)
+      (return (print-worker-error "run Worker" (addr run-error))))
+
+    (read-workflow-result handle stats)))
+
+(defn start-workflow [sdk-client: ^temporal.Client,
+                       sdk-worker: ^temporal.Worker] -> int
+  (let [workflow-id
+        (fmt.aprintf
+          "kvist-sdk-hello-%d"
+          (time.time_to_unix_nano (time.now)))
+        :defer
+        [handle start-error]
+        (client.start_workflow_json
+          sdk-client
+          Workflow-Type
+          "Temporal"
+          (client.Start_Workflow_Options
+            :id workflow-id
+            :task_queue Task-Queue
+            :workflow_execution_timeout time.Minute
+            :workflow_run_timeout time.Minute
+            :workflow_task_timeout (* 10 time.Second)))]
+    (when (!= start-error.message nil)
+      (return (print-client-error "start Workflow" (addr start-error))))
+
+    (defer (client.workflow_handle_free (addr handle)))
+    (run-worker sdk-worker (addr handle))))
+
+(defn register-handlers-and-start [sdk-client: ^temporal.Client,
+                                   sdk-worker: ^temporal.Worker] -> int
+  (let [activity-error
+        (temporal.worker_register_activity
+          sdk-worker
+          "kvist_hello_activity"
+          hello-activity)]
+    (when (!= activity-error.message nil)
+      (return (print-worker-error "register Activity" (addr activity-error)))))
+
+  (let [workflow-error
+        (temporal.worker_register_workflow
+          sdk-worker
+          Workflow-Type
+          hello-workflow)]
+    (when (!= workflow-error.message nil)
+      (return (print-worker-error "register Workflow" (addr workflow-error)))))
+
+  (start-workflow sdk-client sdk-worker))
+
+(defn create-worker-and-run [sdk-client: ^temporal.Client] -> int
+  (let [[sdk-worker create-error]
+        (temporal.worker_create sdk-client Task-Queue)]
+    (when (!= create-error.message nil)
+      (return (print-worker-error "create Worker" (addr create-error))))
+
+    (defer (close-worker (addr sdk-worker)))
+    (register-handlers-and-start sdk-client (addr sdk-worker))))
+
 (defn run [] -> int
   (let [[sdk-client connect-error] (temporal.connect)]
-    (if (!= connect-error.message nil)
-      (print-client-error "connect" (addr connect-error))
-      (do
-        (defer (temporal.client_close (addr sdk-client)))
-        (let [[sdk-worker create-error]
-              (temporal.worker_create (addr sdk-client) Task-Queue)]
-          (if (!= create-error.message nil)
-            (print-worker-error "create Worker" (addr create-error))
-            (do
-              (defer (close-worker (addr sdk-worker)))
-              (let [activity-error
-                    (temporal.worker_register_activity
-                      (addr sdk-worker)
-                      "kvist_hello_activity"
-                      hello-activity)]
-                (if (!= activity-error.message nil)
-                  (print-worker-error "register Activity" (addr activity-error))
-                  (let [workflow-error
-                        (temporal.worker_register_workflow
-                          (addr sdk-worker)
-                          Workflow-Type
-                          hello-workflow)]
-                    (if (!= workflow-error.message nil)
-                      (print-worker-error "register Workflow" (addr workflow-error))
-                      (let [workflow-id
-                            (fmt.aprintf
-                              "kvist-sdk-hello-%d"
-                              (time.time_to_unix_nano (time.now)))
-                            :defer
-                            [handle start-error]
-                            (client.start_workflow_json
-                              (addr sdk-client)
-                              Workflow-Type
-                              "Temporal"
-                              (client.Start_Workflow_Options
-                                :id workflow-id
-                                :task_queue Task-Queue
-                                :workflow_execution_timeout time.Minute
-                                :workflow_run_timeout time.Minute
-                                :workflow_task_timeout (* 10 time.Second)))]
-                        (if (!= start-error.message nil)
-                          (print-client-error "start Workflow" (addr start-error))
-                          (do
-                            (defer (client.workflow_handle_free (addr handle)))
-                            (let [[stats run-error]
-                                  (temporal.worker_run
-                                    (addr sdk-worker)
-                                    (worker.Run_Options
-                                      :max_activity_tasks 1
-                                      :max_workflow_executions 1))]
-                              (if (!= run-error.message nil)
-                                (print-worker-error "run Worker" (addr run-error))
-                                (let [result: string ""
-                                      result-error
-                                      (client.get_result_json
-                                        (addr handle)
-                                        (addr result))]
-                                  (defer (delete result))
-                                  (if (!= result-error.message nil)
-                                    (print-client-error
-                                      "get Workflow result"
-                                      (addr result-error))
-                                    (if (!= result "Hello Temporal from Kvist")
-                                      (do
-                                        (fmt.eprintf "unexpected result: %q\n" result)
-                                        1)
-                                      (do
-                                        (fmt.printf
-                                          "Kvist completed workflow_id=%s run_id=%s activities=%d workflows=%d result=%q\n"
-                                          handle.id
-                                          handle.run_id
-                                          stats.activity_tasks_completed
-                                          stats.workflow_executions_completed
-                                          result)
-                                        0))))))))))))))))))))
+    (when (!= connect-error.message nil)
+      (return (print-client-error "connect" (addr connect-error))))
+
+    (defer (temporal.client_close (addr sdk-client)))
+    (create-worker-and-run (addr sdk-client))))
 
 (defn main []
   (os.exit (run)))
